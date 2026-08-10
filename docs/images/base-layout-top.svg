@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="720" viewBox="0 0 1100 720" role="img" aria-labelledby="title desc">
+  <title id="title">採掘ドック上面配置図</title>
+  <desc id="desc">タートルの前を採掘方向、後ろを搬出チェストとする上面配置</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#1d4ed8"/></marker>
+    <style>.grid{stroke:#cbd5e1;stroke-width:2}.cell{stroke:#334155;stroke-width:3}.h{font:700 30px sans-serif;fill:#0f172a}.l{font:600 21px sans-serif;fill:#0f172a}.s{font:17px sans-serif;fill:#334155}.a{stroke:#1d4ed8;stroke-width:5;marker-end:url(#arrow)}</style>
+  </defs>
+  <rect width="1100" height="720" fill="#fff"/>
+  <text x="550" y="52" text-anchor="middle" class="h">採掘ドック — 上面図</text>
+  <text x="550" y="86" text-anchor="middle" class="s">1マス = 1ブロック。タートル前面を必ず採掘方向へ向ける。</text>
+
+  <g transform="translate(260,150)">
+    <rect x="0" y="0" width="600" height="450" fill="#f8fafc" stroke="#94a3b8" stroke-width="3"/>
+    <g class="grid">
+      <path d="M0 0V450 M75 0V450 M150 0V450 M225 0V450 M300 0V450 M375 0V450 M450 0V450 M525 0V450 M600 0V450"/>
+      <path d="M0 0H600 M0 75H600 M0 150H600 M0 225H600 M0 300H600 M0 375H600 M0 450H600"/>
+    </g>
+
+    <rect class="cell" x="262.5" y="187.5" width="75" height="75" fill="#f59e0b"/>
+    <text x="300" y="216" text-anchor="middle" class="l">T</text>
+    <text x="300" y="244" text-anchor="middle" class="s">Turtle</text>
+
+    <rect class="cell" x="262.5" y="337.5" width="75" height="75" fill="#a16207"/>
+    <text x="300" y="366" text-anchor="middle" class="l" fill="#fff">O</text>
+    <text x="300" y="394" text-anchor="middle" class="s" fill="#fff">Output</text>
+
+    <rect class="cell" x="75" y="187.5" width="75" height="75" fill="#06b6d4"/>
+    <text x="112.5" y="216" text-anchor="middle" class="l">C</text>
+    <text x="112.5" y="244" text-anchor="middle" class="s">Control</text>
+
+    <rect class="cell" x="0" y="187.5" width="75" height="75" fill="#7c3aed"/>
+    <text x="37.5" y="216" text-anchor="middle" class="l" fill="#fff">M</text>
+    <text x="37.5" y="244" text-anchor="middle" class="s" fill="#fff">Modem</text>
+
+    <path class="a" d="M300 187.5 L300 35"/>
+    <text x="320" y="62" class="l" fill="#1d4ed8">採掘方向（前）</text>
+
+    <path d="M337.5 225 H570" stroke="#7c3aed" stroke-width="4" stroke-dasharray="10 8"/>
+    <text x="455" y="210" text-anchor="middle" class="s" fill="#7c3aed">無線通信</text>
+  </g>
+
+  <text x="550" y="645" text-anchor="middle" class="l">燃料チェストは上面図ではタートルと重なり、実際にはタートルの1ブロック上です。</text>
+  <text x="550" y="680" text-anchor="middle" class="s">後方1マスは搬出チェスト専用。前方は幅W・長さL・深さDの採掘空間として確保してください。</text>
+</svg>
