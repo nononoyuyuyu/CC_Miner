@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+  <title id="title">CC Miner V2 システム全体図</title>
+  <desc id="desc">コントローラー、無線通信、採掘タートル、燃料チェスト、搬出チェスト、採掘領域の関係</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#334155"/></marker>
+    <style>
+      .box{fill:#f8fafc;stroke:#334155;stroke-width:3;rx:16}.title{font:700 28px sans-serif;fill:#0f172a}.label{font:600 21px sans-serif;fill:#0f172a}.small{font:17px sans-serif;fill:#334155}.arrow{stroke:#334155;stroke-width:4;fill:none;marker-end:url(#arrow)}.wireless{stroke:#7c3aed;stroke-width:4;fill:none;stroke-dasharray:12 9;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect width="1200" height="620" fill="#ffffff"/>
+  <text x="600" y="48" text-anchor="middle" class="title">CC Miner V2 — システム全体図</text>
+
+  <rect class="box" x="55" y="150" width="260" height="190"/>
+  <text x="185" y="195" text-anchor="middle" class="label">拠点コントローラー</text>
+  <text x="185" y="235" text-anchor="middle" class="small">Advanced Computer</text>
+  <text x="185" y="268" text-anchor="middle" class="small">Wireless Modem</text>
+  <text x="185" y="301" text-anchor="middle" class="small">任意: Advanced Monitor</text>
+
+  <rect class="box" x="470" y="210" width="260" height="150"/>
+  <text x="600" y="255" text-anchor="middle" class="label">採掘タートル</text>
+  <text x="600" y="295" text-anchor="middle" class="small">Advanced Mining Turtle</text>
+  <text x="600" y="328" text-anchor="middle" class="small">+ Wireless Modem</text>
+
+  <rect class="box" x="470" y="65" width="260" height="90"/>
+  <text x="600" y="108" text-anchor="middle" class="label">燃料チェスト</text>
+  <text x="600" y="137" text-anchor="middle" class="small">タートルの真上</text>
+
+  <rect class="box" x="470" y="430" width="260" height="105"/>
+  <text x="600" y="474" text-anchor="middle" class="label">搬出チェスト</text>
+  <text x="600" y="506" text-anchor="middle" class="small">ホーム時の真後ろ</text>
+
+  <rect class="box" x="885" y="180" width="260" height="210"/>
+  <text x="1015" y="225" text-anchor="middle" class="label">採掘領域</text>
+  <text x="1015" y="266" text-anchor="middle" class="small">幅 W: タートルの右方向</text>
+  <text x="1015" y="301" text-anchor="middle" class="small">長さ L: タートルの前方向</text>
+  <text x="1015" y="336" text-anchor="middle" class="small">深さ D: 下方向</text>
+  <text x="1015" y="371" text-anchor="middle" class="small">全ブロックを蛇行採掘</text>
+
+  <rect class="box" x="865" y="455" width="300" height="105"/>
+  <text x="1015" y="497" text-anchor="middle" class="label">後段の物流（任意）</text>
+  <text x="1015" y="530" text-anchor="middle" class="small">Create Funnel / Belt / AE2</text>
+
+  <path class="wireless" d="M315 245 C375 195,410 195,470 250"/>
+  <text x="394" y="190" text-anchor="middle" class="small" fill="#7c3aed">Rednet 無線</text>
+  <path class="arrow" d="M600 155 L600 210"/>
+  <path class="arrow" d="M600 360 L600 430"/>
+  <path class="arrow" d="M730 285 L885 285"/>
+  <path class="arrow" d="M730 485 L865 505"/>
+
+  <text x="600" y="594" text-anchor="middle" class="small">タートルは満杯・燃料不足前に自動帰還し、搬出・補給後に同じ採掘地点へ戻ります。</text>
+</svg>
