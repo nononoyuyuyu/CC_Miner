@@ -167,9 +167,22 @@ local sortingWarned = false
 -- more top-level locals (CC Lua caps a chunk at 200 active locals).
 noticeState.remoteSession = nil
 noticeState.remoteApi = {}
+noticeState.configureMonitor = function(device)
+  if not device then return end
+  if device.setTextScale then pcall(device.setTextScale, config.monitorTextScale or 0.5) end
+  if device.setPaletteColor and colors then
+    -- The default monitor blue is extremely dark.  Keep the terminal palette
+    -- untouched, but use a brighter, high-contrast monitor palette.
+    pcall(device.setPaletteColor, colors.black, 0.035, 0.055, 0.09)
+    pcall(device.setPaletteColor, colors.blue, 0.10, 0.38, 0.88)
+    pcall(device.setPaletteColor, colors.lightBlue, 0.32, 0.70, 1.00)
+    pcall(device.setPaletteColor, colors.gray, 0.28, 0.34, 0.43)
+    pcall(device.setPaletteColor, colors.lightGray, 0.78, 0.83, 0.90)
+  end
+end
 
 for _, entry in ipairs(monitors) do
-  if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end
+  noticeState.configureMonitor(entry.device)
 end
 
 local function invalidate()
@@ -1347,8 +1360,8 @@ end
 
 local function drawButton(key, x, y, width, label, action, enabled, selectedButton)
   width = math.max(3, math.floor(width))
-  local background = colors and (selectedButton and colors.lightBlue or enabled == false and colors.gray or colors.blue) or nil
-  local foreground = colors and (enabled == false and colors.lightGray or colors.white) or nil
+  local background = colors and (selectedButton and colors.yellow or enabled == false and colors.gray or colors.lightBlue) or nil
+  local foreground = colors and (enabled == false and colors.lightGray or colors.black) or nil
   common.writeAt(x, y, common.center(label, width), foreground, background)
   if enabled ~= false and action then addHitbox(key, x, y, x + width - 1, y, action) end
 end
@@ -1356,12 +1369,13 @@ end
 local function buttonRow(key, y, width, definitions)
   if width < 1 or y < 1 then return end
   local count = math.max(1, #definitions)
-  local base = math.max(1, math.floor(width / count))
+  local gap = width >= count * 5 + count - 1 and 1 or 0
+  local base = math.max(1, math.floor((width - gap * (count - 1)) / count))
   local x = 1
   for index, definition in ipairs(definitions) do
     local buttonWidth = index == count and (width - x + 1) or base
     drawButton(key, x, y, buttonWidth, definition[1], definition[2], definition[3] ~= false, definition[4])
-    x = x + buttonWidth
+    x = x + buttonWidth + gap
   end
 end
 
@@ -2683,6 +2697,10 @@ local function dashboardAction(name)
       invalidate()
     elseif name == "info" then
       if id then mode = "info" else setNotice("No worker selected.", true) end
+    elseif name == "more" then mode = "more"
+    elseif name == "items" then
+      if id and noticeState.openItems then noticeState.openItems()
+      else setNotice("Select a worker before opening item settings.", true) end
     elseif name == "remote" then
       if id then
         setNotice(("Remote console is CLI-only: ccm remote %s [-- <command...>]"):format(tostring(id)), false)

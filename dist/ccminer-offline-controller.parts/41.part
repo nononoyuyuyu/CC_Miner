@@ -1,6 +1,117 @@
+    common.clear(colors and colors.black or nil, colors and colors.white or nil)
+    if mode == "dashboard" then renderDashboard(target, key)
+    elseif mode == "more" then noticeState.renderMore(target, key)
+    elseif mode == "items" then noticeState.renderItems(target, key)
+    elseif mode == "groups" then renderGroups(target, key)
+    elseif mode == "group_info" then renderGroupInfo(target, key)
+    elseif mode == "group_dimensions" or mode == "group_job" then renderGroupDimensions(target, key)
+    elseif mode == "job_dimensions" then renderDimensions(target, key)
+    elseif mode == "job_grid" or mode == "job_chunks" then renderGrid(target, key)
+    elseif mode == "preflight" then renderPreflight(target, key)
+    elseif mode == "progress" then renderProgress(target, key)
+    elseif mode == "stop_menu" then renderStopMenu(target, key)
+    elseif mode == "recovery" then renderRecovery(target, key)
+    elseif mode == "info" then renderInfo(target, key)
+    elseif mode == "report" then renderReport(target, key)
+    elseif mode == "confirm" then renderConfirm(target, key)
+    elseif mode == "error_detail" then renderErrorDetail(target, key)
+    else mode = "dashboard"; renderDashboard(target, key) end
+  end)
+  renderCache[key] = signature
+end
+
+local function render()
+  if not dirty then return end
+  renderOne(term.current(), "term")
+  for _, entry in ipairs(monitors) do renderOne(entry.device, entry.name) end
+  dirty = false
+end
+
+local function handlePointer(key, x, y)
+  local boxes = hitboxes[key] or {}
+  for index = #boxes, 1, -1 do
+    local box = boxes[index]
+    if x >= box.x1 and x <= box.x2 and y >= box.y1 and y <= box.y2 then box.action(); invalidate(); return true end
+  end
+  return false
+end
+]] },
+  { source = [[src/ccminer/controller_parts/03.part]], target = [[controller_parts/03.part]], digest = [[d0a6d88e220998b4a04f4900cf24b33772e783cefa30feca923da5a669d91fa7]], content = [[-- CC Miner V4 - keyboard/CLI compatibility and event loop.
+
+local function processChar(character)
+  character = string.lower(character or "")
+  if mode == "job_dimensions" then
+    if character:match("%d") or character == "-" then draftDigit(character) end
+    return
+  elseif mode == "group_dimensions" or mode == "group_job" then
+    if character:match("%d") or character == "-" then groupDraftDigit(character)
+    elseif character == "p" then
+      local gid = selectedGroupRecord()
+      if gid and groupDraft then commitGroupDraftField(); groupDraft.preflight = computeGroupPreflight(gid, groupDraft); invalidate() end
+    elseif character == "s" then
+      local gid = selectedGroupRecord()
+      if gid and groupDraft then commitGroupDraftField(); local result = groupDraft.preflight or computeGroupPreflight(gid, groupDraft); groupDraft.preflight = result; if result and not result.fatal then startGroup(gid, groupDraft) end; invalidate() end
+    elseif character == "b" or character == "q" then mode = "groups"; invalidate() end
+    return
+  elseif mode == "confirm" then
+    if character == "y" then
+      if confirmState and confirmState.twoStep and not confirmState.armed then
+        confirmState.armed = true; confirmState.message = "FINAL confirmation: press Y again to send REHOME RESET."; invalidate(); return
+      end
+      local id = selectedWorker()
+      if confirmState and id then
+        if confirmState.command == "stop" then stageStop(id, (confirmState.payload or {}).mode or "abort") else sendCommand(id, confirmState.command, confirmState.payload) end
+      end
+      confirmState, mode = nil, "dashboard"
+    elseif character == "n" then confirmState, mode = nil, "dashboard"; setNotice("Cancelled.", false) end
+    return
+  elseif mode == "error_detail" then
+    if character == "o" or character == "b" or character == "q" then noticeState.dismiss() end
+    return
+  elseif mode == "job_grid" then
+    if character == "a" then allGrid(true) elseif character == "c" then allGrid(false) elseif character == "i" then invertGrid() elseif character == "r" then draft.rectMode = not draft.rectMode; draft.rectStart = nil; invalidate() end
+    return
+  elseif mode == "groups" then
+    local ids = orderedGroupIds()
+    if character == "s" then groupAction("start")()
+    elseif character == "p" then groupAction("pause")()
+    elseif character == "r" then groupAction("resume")()
+    elseif character == "h" then groupAction("return")()
+    elseif character == "v" then mode = "group_info"; invalidate()
+    end
+    return
+  elseif mode == "group_info" then
+    if character == "b" or character == "q" then mode = "groups"; invalidate() end
+    return
+  elseif mode == "more" then
+    if character == "i" then dashboardAction("items")()
+    elseif character == "b" or character == "q" then mode = "dashboard"; invalidate() end
+    return
+  elseif mode == "items" then
+    if character == "1" and noticeState.discardDraft then noticeState.discardDraft.mode = "KEEP_ALL"; invalidate()
+    elseif character == "2" and noticeState.discardDraft then noticeState.discardDraft.mode = "DISCARD_EXCESS_STONE"; invalidate()
+    elseif character == "3" and noticeState.discardDraft then noticeState.discardDraft.mode = "CUSTOM_ALLOWLIST"; invalidate()
+    elseif character == "b" or character == "q" then mode = "more"; invalidate() end
+    return
+  end
+  if mode ~= "dashboard" then return end
+  local id = selectedWorker()
+  if character == "d" then discover()
+  elseif character == "n" then dashboardAction("new")()
+  elseif character == "p" then sendCommand(id, "pause")
+  elseif character == "r" then sendCommand(id, "resume")
+  elseif character == "h" then sendCommand(id, "recall")
+  elseif character == "s" then dashboardAction("stop")()
+  elseif character == "x" then dashboardAction("abort")()
+  elseif character == "c" then dashboardAction("clear")()
+  elseif character == "i" then dashboardAction("info")()
+  elseif character == "g" then dashboardAction("progress")()
+  elseif character == "o" then dashboardAction("remote")()
+  elseif character == "e" then dashboardAction("recovery")()
   elseif character == "t" then dashboardAction("report")()
   elseif character == "l" then dashboardAction("gps")()
   elseif character == "v" then dashboardAction("groups")()
+  elseif character == "m" then dashboardAction("more")()
   elseif character == "q" then running = false end
 end
 
@@ -135,98 +246,3 @@ end
 
 local function printQueue()
   if #db.queue == 0 then print("Queue empty."); return end
-  for index, item in ipairs(db.queue) do print(("%d: #%s %dx%dx%d profile=%s queued=%s"):format(index, tostring(item.workerId or "-"), tonumber(item.width) or 0, tonumber(item.length) or 0, tonumber(item.depth) or 0, tostring(item.profile or "balanced"), tostring(item.queuedAt or "-"))) end
-end
-
-local function printHistory()
-  if #db.history == 0 then print("No history."); return end
-  for index = #db.history, 1, -1 do
-    local item = db.history[index]
-    print(("%s %-8s worker=%s job=%s reason=%s"):format(tostring(item.finishedAt or "-"), tostring(item.status or "-"), tostring(item.workerId or "-"), tostring(item.jobId or item.id or "-"), tostring(item.reason or "-")))
-  end
-end
-
-local function splitCsv(value)
-  local out = {}
-  for item in tostring(value or ""):gmatch("[^,]+") do out[#out + 1] = tonumber(item) or common.trim(item) end
-  return out
-end
-
-local function splitMap(value)
-  local out = {}
-  for item in tostring(value or ""):gmatch("[^,]+") do
-    local key, mapped = item:match("^([^=]+)=(.+)$")
-    if key and mapped then out[common.trim(key)] = common.trim(mapped) end
-  end
-  return out
-end
-
-local function printGroups()
-  local ids = orderedGroupIds()
-  if #ids == 0 then print("No groups."); return end
-  for _, gid in ipairs(ids) do
-    local group = groupRecord(gid)
-    local job = activeGroupJob(gid)
-    local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, online = 0, total = #groupWorkerIds(group), minFuel = "-", warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
-    print(("%s name=%s workers=%d/%d status=%s progress=%s%% minFuel=%s ACK=%d/%d warn=%s"):format(tostring(gid), groupName(group, gid), aggregate.online or 0, aggregate.total or 0, tostring(job and job.status or "idle"), tostring(aggregate.percent or 0), tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0, table.concat(aggregate.warnings or {}, ";")))
-  end
-end
-
-local function commandGroupMode()
-  local sub = string.lower(args[2] or "list")
-  if sub == "list" or sub == "status" then printGroups(); return true end
-  if sub == "show" then
-    local gid = args[3]
-    local group = gid and groupRecord(gid)
-    if not group then print("Group not found.") else
-      local job = activeGroupJob(gid)
-      local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, minFuel = "-", warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
-      print(("%s name=%s mode=%s partition=%s dock=%s bay=%s progress=%s%% minFuel=%s ACK=%d/%d"):format(tostring(gid), groupName(group, gid), tostring(group.mode or "world"), tostring(group.partition or "stripe"), tostring(group.dockId or "-"), tostring(group.bayId or "-"), tostring(aggregate.percent or 0), tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0))
-      print("workers=" .. table.concat(groupWorkerIds(group), ",") .. " warnings=" .. table.concat(aggregate.warnings or {}, ";"))
-    end
-    return true
-  end
-  if sub == "register" or sub == "save" then
-    local gid, csv = args[3], args[4]
-    local ids = splitCsv(csv)
-    local ok, err = registerGroup(gid, ids, { name = args[5], dockId = args[6], bayId = args[7], mode = args[8], partition = args[9], workerBays = splitMap(args[10]), workerDocks = splitMap(args[11]) })
-    print(ok and "Group saved." or ("Group error: " .. tostring(err))); return true
-  end
-  local gid = args[3]
-  if not gid then print("Usage: group list|show <id>|register <id> <workerIds comma> [name dock bay mode partition workerBayMap workerDockMap]|start|pause|resume|return|service|abort|clear|reassign <id> <stopped> [target]"); return true end
-  if sub == "start" then
-    discover(); pumpFor(1)
-    local group = groupRecord(gid)
-    if not group then print("Group not found."); return true end
-    local value = groupDraftDefaults(group)
-    value.width, value.length = tonumber(args[4]) or value.width, tonumber(args[5]) or value.length
-    if value.mode == "world" then value.bottomY = tonumber(args[6]) or value.bottomY else value.depth = tonumber(args[6]) or value.depth end
-    local result = computeGroupPreflight(gid, value)
-    if result and not result.fatal then startGroup(gid, value) else print("Group preflight blocked: " .. tostring(result and result.warnings and table.concat(result.warnings, ";") or "unavailable")) end
-    pumpFor(2); print(notice); return true
-  end
-  if sub == "reassign" then
-    local stopped, target = tonumber(args[4]), tonumber(args[5])
-    local job = activeGroupJob(gid)
-    local ok = job and stopped and reassignGroupAssignment(job.groupJobId, stopped, target)
-    print(ok and "Residual range reassigned." or (notice ~= "" and notice or "Reassign failed.")); return true
-  end
-  local wire = sub == "return" and "return" or sub
-  if sub == "pause" or sub == "resume" or sub == "return" or sub == "service" or sub == "abort" or sub == "clear" then
-    groupCommand(gid, wire); pumpFor(2); print(notice); return true
-  end
-  print("Usage: group list|show|register|start|pause|resume|return|service|abort|clear|reassign"); return true
-end
-
-local function commandLineMode()
-  local command = string.lower(args[1] or "")
-  if command == "group" or command == "groups" then return commandGroupMode() end
-  if command == "dock" or command == "bay" then
-    local sub, id = string.lower(args[2] or "list"), args[3]
-    local registry = command == "dock" and db.docks or db.bays
-    if sub == "list" then
-      for key, value in pairs(registry or {}) do print(("%s world=%s,%s,%s facing=%s maxDepth=%s"):format(tostring(key), tostring(value.world and value.world.x or "-"), tostring(value.world and value.world.y or "-"), tostring(value.world and value.world.z or "-"), tostring(value.facing or "-"), tostring(value.maxDepth or "-"))) end
-    elseif sub == "register" and id then
-      local value = { world = { x = tonumber(args[4]), y = tonumber(args[5]), z = tonumber(args[6]) }, facing = args[7], maxDepth = tonumber(args[8]) }
-      local ok, err = command == "dock" and registerDock(id, value) or registerBay(id, value)
-      print(ok and ((command == "dock" and "Dock" or "Bay") .. " saved.") or ("Register error: " .. tostring(err)))

@@ -1,3 +1,62 @@
+    { "PROFILE " .. tostring(groupDraft.profile or "balanced"), function() local modes = { "safe", "balanced", "turbo" }; local now = groupDraft.profile or "balanced"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; groupDraft.profile = modes[n % #modes + 1]; groupDraft.preflight = nil; invalidate() end },
+    { "PART " .. tostring(groupDraft.partition or group.partition or "stripe"), function() groupDraft.partition = (tostring(groupDraft.partition or group.partition or "stripe") == "stripe") and "round_robin" or "stripe"; groupDraft.preflight = nil; invalidate() end },
+  })
+  local canStart = result and not result.fatal
+  buttonRow(key, math.max(1, height - 2), width, {
+    { "PRECHECK", function() commitGroupDraftField(); groupDraft.preflight = computeGroupPreflight(gid, groupDraft); invalidate() end },
+    { "START", function() commitGroupDraftField(); local checked = groupDraft.preflight or computeGroupPreflight(gid, groupDraft); groupDraft.preflight = checked; if checked and not checked.fatal then startGroup(gid, groupDraft) end; invalidate() end, canStart },
+    { "BACK", function() mode = "groups"; invalidate() end },
+  })
+  noticeLine(target, height)
+end
+
+local function renderGroups(target, key)
+  local width, height = target.getSize()
+  writeHeader("WORKER GROUPS", target)
+  local ids = orderedGroupIds()
+  common.writeAt(1, 2, common.fit(("Groups %d | selected=%d"):format(#ids, selectedGroup), width), colors and colors.lightGray or nil)
+  local maxRows = math.max(1, height - 9)
+  if #ids == 0 then
+    common.writeAt(2, 4, common.fit("No groups. Register: group register <id> <workers> [name dock bay mode partition]", width), colors and colors.yellow or nil)
+    common.writeAt(2, 5, common.fit("Per-bay maps: worker=bay,worker=bay (dock map follows).", width), colors and colors.lightGray or nil)
+  else
+    local first = selectedGroup > maxRows and selectedGroup - maxRows + 1 or 1
+    for row = 1, maxRows do
+      local index = first + row - 1
+      local gid = ids[index]
+      if not gid then break end
+      local group = groupRecord(gid)
+      local job = activeGroupJob(gid)
+      local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, online = 0, total = #groupWorkerIds(group), minFuel = nil, warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
+      local warning = aggregate.warnings and aggregate.warnings[1] or "-"
+      local line = ("%s%-12s %-10s W=%d/%d P=%3d%% F=%s ACK=%d/%d %s"):format(index == selectedGroup and ">" or " ", common.fit(groupName(group, gid), 12), tostring(job and job.status or "idle"), aggregate.online or 0, aggregate.total or 0, aggregate.percent or 0, tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0, common.fit(warning, math.max(1, width - 70)))
+      local y = 3 + row
+      common.writeAt(1, y, common.fit(line, width), index == selectedGroup and (colors and colors.black or nil) or colors and colors.white or nil, index == selectedGroup and (colors and colors.white or nil) or nil)
+      addHitbox(key, 1, y, width, y, function() selectedGroup = index; invalidate() end)
+    end
+  end
+  local bottom = math.max(1, height - 5)
+  buttonRow(key, bottom, width, { { "START", groupAction("start") }, { "PAUSE", groupAction("pause") }, { "RESUME", groupAction("resume") }, { "RETURN", groupAction("return") } })
+  buttonRow(key, bottom + 1, width, { { "SERVICE", groupAction("service") }, { "ABORT", groupAction("abort") }, { "CLEAR", groupAction("clear") }, { "DRILLDOWN", function() mode = "group_info"; invalidate() end } })
+  buttonRow(key, bottom + 2, width, { { "BACK", function() mode = "dashboard" end }, { "REFRESH", function() local gid = selectedGroupRecord(); local job = gid and activeGroupJob(gid); if job then updateGroupAggregate(job) end; invalidate() end } })
+  noticeLine(target, height)
+end
+
+local function renderGroupInfo(target, key)
+  local width, height = target.getSize()
+  local gid, group = selectedGroupRecord()
+  local job = gid and activeGroupJob(gid) or nil
+  writeHeader("GROUP DRILLDOWN", target, colors and colors.cyan or nil)
+  if not gid or not group then
+    common.writeAt(1, 3, common.fit("No group selected.", width), colors and colors.yellow or nil)
+  else
+    local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, minFuel = nil, warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
+    common.writeAt(1, 2, common.fit(("%s (%s) mode=%s partition=%s"):format(groupName(group, gid), tostring(gid), tostring(group.mode or "world"), tostring(group.partition or "stripe")), width), colors and colors.lightGray or nil)
+    common.writeAt(1, 3, common.fit(("GROUP %s%% | BOTTOM Y=%s | minFuel=%s | ACK %d/%d | warnings=%d"):format(tostring(aggregate.percent or 0), tostring(job and job.bottomY or "-"), tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0, #(aggregate.warnings or {})), width), colors and colors.cyan or nil)
+    local row = 5
+    for _, workerId in ipairs(groupWorkerIds(group)) do
+      if row >= height - 5 then break end
+      local worker = workers[workerId]
       local data = worker and worker.data or {}
       local assignment = job and job.assignments and (job.assignments[tostring(workerId)] or job.assignments[workerId]) or nil
       local status = assignment and assignment.status or statusOf(worker)
@@ -79,97 +138,3 @@ local function renderDimensions(target, key)
   local optionY = math.max(4, summaryY + 1)
   buttonRow(key, optionY, width, {
     { "LIGHT " .. tostring(draft.lighting and draft.lighting.mode or "safe"), function() local modes = { "off", "safe", "custom" }; local now = draft.lighting and draft.lighting.mode or "safe"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; draft.lighting.mode = modes[n % #modes + 1]; invalidate() end },
-    { "WATER " .. tostring(draft.waterMode or "seal"), function() local modes = { "ignore", "stop", "seal" }; local now = draft.waterMode or "seal"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; draft.waterMode = modes[n % #modes + 1]; invalidate() end },
-    { "PROFILE " .. tostring(draft.profile or "balanced"), function() local modes = { "safe", "balanced", "turbo" }; local now = draft.profile or "balanced"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; draft.profile = modes[n % #modes + 1]; invalidate() end },
-    { "AUTO: QUEUE", function() draft.autoAssign = false; setNotice("Single footprint is sent to the selected worker; queue dispatch handles parallel jobs.", false) end },
-  })
-  buttonRow(key, math.max(1, height - 2), width, {
-    { "GRID", function() commitDraftField(); mode = "job_grid"; draft.gridPageX, draft.gridPageZ = 1, 1; invalidate() end },
-    { "PREFLIGHT", function() commitDraftField(); local result = computePreflight(); if result then mode = "preflight" end; invalidate() end },
-    { "QUEUE", function() commitDraftField(); queueDraft() end, config.queueEnabled ~= false },
-    { "CANCEL", function() mode, draft = "dashboard", nil; invalidate() end },
-  })
-  noticeLine(target, height)
-end
-
-local function gridCatalog()
-  local catalog, err, chunkMode, calibration, rootKey = buildDraftCatalog()
-  if not catalog then return nil, err end
-  return catalog, nil, chunkMode, calibration, rootKey
-end
-
-local function chunkGrid(catalog)
-  local byCoordinate, xSeen, zSeen, xValues, zValues = {}, {}, {}, {}, {}
-  for _, chunk in ipairs(catalog or {}) do
-    local cx, cz = tonumber(chunk.cx), tonumber(chunk.cz)
-    if cx and cz then
-      byCoordinate[tostring(cx) .. ":" .. tostring(cz)] = chunk
-      if not xSeen[cx] then xSeen[cx] = true; xValues[#xValues + 1] = cx end
-      if not zSeen[cz] then zSeen[cz] = true; zValues[#zValues + 1] = cz end
-    end
-  end
-  table.sort(xValues); table.sort(zValues)
-  local xIndex, zIndex = {}, {}
-  for index, value in ipairs(xValues) do xIndex[value] = index end
-  for index, value in ipairs(zValues) do zIndex[value] = index end
-  return byCoordinate, xValues, zValues, xIndex, zIndex
-end
-
-local function toggleChunk(chunk, catalog, rootKey)
-  if not draft then return end
-  if not chunk or chunk.key == rootKey then setNotice("Entrance chunk is locked.", true); return end
-  draft.excluded = draft.excluded or {}
-  if draft.rectMode and draft.rectStart then
-    local sx, sz = draft.rectStart.cx, draft.rectStart.cz
-    local minX, maxX = math.min(sx, chunk.cx), math.max(sx, chunk.cx)
-    local minZ, maxZ = math.min(sz, chunk.cz), math.max(sz, chunk.cz)
-    for _, candidate in ipairs(catalog or {}) do
-      if candidate.key ~= rootKey then
-        local inside = candidate.cx >= minX and candidate.cx <= maxX and candidate.cz >= minZ and candidate.cz <= maxZ
-        draft.excluded[candidate.key] = not inside
-      end
-    end
-    draft.rectStart = nil; draft.rectMode = false
-    setNotice("RECT mining selection applied to whole chunks.", false)
-  elseif draft.rectMode then
-    draft.rectStart = { cx = tonumber(chunk.cx), cz = tonumber(chunk.cz), key = chunk.key }
-    setNotice("RECT first point stored; touch a second chunk.", false)
-  else
-    draft.excluded[chunk.key] = not draft.excluded[chunk.key]
-  end
-  invalidate()
-end
-
-local function allGrid(value)
-  local catalog, err, _, _, rootKey = gridCatalog()
-  if not catalog then setNotice(err, true); return end
-  normalizeChunkMask(catalog, rootKey)
-  draft.excluded = draft.excluded or {}
-  for _, chunk in ipairs(catalog) do if chunk.key ~= rootKey then draft.excluded[chunk.key] = not (value == true) end end
-  draft.partialMask = false
-  setNotice(value == true and "ALL: all chunks selected for mining." or "CLEAR: all non-entry chunks deselected.", false)
-  invalidate()
-end
-
-local function invertGrid()
-  local catalog, err, _, _, rootKey = gridCatalog()
-  if not catalog then setNotice(err, true); return end
-  normalizeChunkMask(catalog, rootKey)
-  draft.excluded = draft.excluded or {}
-  for _, chunk in ipairs(catalog) do if chunk.key ~= rootKey then draft.excluded[chunk.key] = not draft.excluded[chunk.key] end end
-  setNotice("INVERT: chunk mining selection inverted; entrance remains selected.", false)
-  invalidate()
-end
-
-local function renderGrid(target, key)
-  local width, height = target.getSize()
-  local catalog, err, chunkMode, _, rootKey = gridCatalog()
-  writeHeader("NEW JOB - TOUCH GRID", target)
-  if not catalog then common.writeAt(1, 3, common.fit(tostring(err), width), colors and colors.red or nil); drawButton(key, 1, height - 1, width, "BACK", function() mode = "job_dimensions" end, true); return end
-  local partialMask = normalizeChunkMask(catalog, rootKey)
-  local byCoordinate, xValues, zValues, xIndex, zIndex = chunkGrid(catalog)
-  local cellWidth = width >= 48 and 2 or 1
-  local cols = common.clamp(math.floor((width - 3) / cellWidth), 1, math.max(1, #xValues))
-  local rows = common.clamp(height - 8, 1, math.max(1, #zValues))
-  draft.gridPageX = common.clamp(draft.gridPageX or 1, 1, math.max(1, #xValues - cols + 1))
-  draft.gridPageZ = common.clamp(draft.gridPageZ or 1, 1, math.max(1, #zValues - rows + 1))

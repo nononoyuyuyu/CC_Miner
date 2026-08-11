@@ -1,3 +1,98 @@
+  for index, item in ipairs(db.queue) do print(("%d: #%s %dx%dx%d profile=%s queued=%s"):format(index, tostring(item.workerId or "-"), tonumber(item.width) or 0, tonumber(item.length) or 0, tonumber(item.depth) or 0, tostring(item.profile or "balanced"), tostring(item.queuedAt or "-"))) end
+end
+
+local function printHistory()
+  if #db.history == 0 then print("No history."); return end
+  for index = #db.history, 1, -1 do
+    local item = db.history[index]
+    print(("%s %-8s worker=%s job=%s reason=%s"):format(tostring(item.finishedAt or "-"), tostring(item.status or "-"), tostring(item.workerId or "-"), tostring(item.jobId or item.id or "-"), tostring(item.reason or "-")))
+  end
+end
+
+local function splitCsv(value)
+  local out = {}
+  for item in tostring(value or ""):gmatch("[^,]+") do out[#out + 1] = tonumber(item) or common.trim(item) end
+  return out
+end
+
+local function splitMap(value)
+  local out = {}
+  for item in tostring(value or ""):gmatch("[^,]+") do
+    local key, mapped = item:match("^([^=]+)=(.+)$")
+    if key and mapped then out[common.trim(key)] = common.trim(mapped) end
+  end
+  return out
+end
+
+local function printGroups()
+  local ids = orderedGroupIds()
+  if #ids == 0 then print("No groups."); return end
+  for _, gid in ipairs(ids) do
+    local group = groupRecord(gid)
+    local job = activeGroupJob(gid)
+    local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, online = 0, total = #groupWorkerIds(group), minFuel = "-", warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
+    print(("%s name=%s workers=%d/%d status=%s progress=%s%% minFuel=%s ACK=%d/%d warn=%s"):format(tostring(gid), groupName(group, gid), aggregate.online or 0, aggregate.total or 0, tostring(job and job.status or "idle"), tostring(aggregate.percent or 0), tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0, table.concat(aggregate.warnings or {}, ";")))
+  end
+end
+
+local function commandGroupMode()
+  local sub = string.lower(args[2] or "list")
+  if sub == "list" or sub == "status" then printGroups(); return true end
+  if sub == "show" then
+    local gid = args[3]
+    local group = gid and groupRecord(gid)
+    if not group then print("Group not found.") else
+      local job = activeGroupJob(gid)
+      local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, minFuel = "-", warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
+      print(("%s name=%s mode=%s partition=%s dock=%s bay=%s progress=%s%% minFuel=%s ACK=%d/%d"):format(tostring(gid), groupName(group, gid), tostring(group.mode or "world"), tostring(group.partition or "stripe"), tostring(group.dockId or "-"), tostring(group.bayId or "-"), tostring(aggregate.percent or 0), tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0))
+      print("workers=" .. table.concat(groupWorkerIds(group), ",") .. " warnings=" .. table.concat(aggregate.warnings or {}, ";"))
+    end
+    return true
+  end
+  if sub == "register" or sub == "save" then
+    local gid, csv = args[3], args[4]
+    local ids = splitCsv(csv)
+    local ok, err = registerGroup(gid, ids, { name = args[5], dockId = args[6], bayId = args[7], mode = args[8], partition = args[9], workerBays = splitMap(args[10]), workerDocks = splitMap(args[11]) })
+    print(ok and "Group saved." or ("Group error: " .. tostring(err))); return true
+  end
+  local gid = args[3]
+  if not gid then print("Usage: group list|show <id>|register <id> <workerIds comma> [name dock bay mode partition workerBayMap workerDockMap]|start|pause|resume|return|service|abort|clear|reassign <id> <stopped> [target]"); return true end
+  if sub == "start" then
+    discover(); pumpFor(1)
+    local group = groupRecord(gid)
+    if not group then print("Group not found."); return true end
+    local value = groupDraftDefaults(group)
+    value.width, value.length = tonumber(args[4]) or value.width, tonumber(args[5]) or value.length
+    if value.mode == "world" then value.bottomY = tonumber(args[6]) or value.bottomY else value.depth = tonumber(args[6]) or value.depth end
+    local result = computeGroupPreflight(gid, value)
+    if result and not result.fatal then startGroup(gid, value) else print("Group preflight blocked: " .. tostring(result and result.warnings and table.concat(result.warnings, ";") or "unavailable")) end
+    pumpFor(2); print(notice); return true
+  end
+  if sub == "reassign" then
+    local stopped, target = tonumber(args[4]), tonumber(args[5])
+    local job = activeGroupJob(gid)
+    local ok = job and stopped and reassignGroupAssignment(job.groupJobId, stopped, target)
+    print(ok and "Residual range reassigned." or (notice ~= "" and notice or "Reassign failed.")); return true
+  end
+  local wire = sub == "return" and "return" or sub
+  if sub == "pause" or sub == "resume" or sub == "return" or sub == "service" or sub == "abort" or sub == "clear" then
+    groupCommand(gid, wire); pumpFor(2); print(notice); return true
+  end
+  print("Usage: group list|show|register|start|pause|resume|return|service|abort|clear|reassign"); return true
+end
+
+local function commandLineMode()
+  local command = string.lower(args[1] or "")
+  if command == "group" or command == "groups" then return commandGroupMode() end
+  if command == "dock" or command == "bay" then
+    local sub, id = string.lower(args[2] or "list"), args[3]
+    local registry = command == "dock" and db.docks or db.bays
+    if sub == "list" then
+      for key, value in pairs(registry or {}) do print(("%s world=%s,%s,%s facing=%s maxDepth=%s"):format(tostring(key), tostring(value.world and value.world.x or "-"), tostring(value.world and value.world.y or "-"), tostring(value.world and value.world.z or "-"), tostring(value.facing or "-"), tostring(value.maxDepth or "-"))) end
+    elseif sub == "register" and id then
+      local value = { world = { x = tonumber(args[4]), y = tonumber(args[5]), z = tonumber(args[6]) }, facing = args[7], maxDepth = tonumber(args[8]) }
+      local ok, err = command == "dock" and registerDock(id, value) or registerBay(id, value)
+      print(ok and ((command == "dock" and "Dock" or "Bay") .. " saved.") or ("Register error: " .. tostring(err)))
     else print("Usage: " .. command .. " list|register <id> <x> <y> <z> [facing=south|east|north|west|0..3] [maxDepth]") end
     return true
   end
@@ -76,144 +171,3 @@
     print("CC Miner controller doctor")
     print("network=" .. tostring(networkReady) .. " modems=" .. tostring(#(modemNames or {})))
     print("db=" .. tostring(dbError and ("WARN " .. dbError) or "ok") .. " path=" .. DB_PATH)
-    print("workers=" .. tostring(#orderedIds()) .. " leases=" .. tostring(#(db.leases or {})) .. " queue=" .. tostring(#db.queue))
-    print("sorting=" .. tostring(config.sorting and config.sorting.enabled == true and "enabled" or "off"))
-    return true
-  end
-  return false
-end
-
-if #args > 0 and commandLineMode() then return end
-
-(function()
-  discover()
-  local refreshTimer = os.startTimer(1)
-  while running do
-    render()
-    local event, a, b, c = os.pullEvent()
-    if event == "rednet_message" and c == common.PROTOCOL then
-      handleMessage(a, b)
-    elseif event == "char" then
-      processChar(a)
-    elseif event == "key" then
-      processKey(a)
-    elseif event == "mouse_click" then
-      handlePointer("term", b, c)
-    elseif event == "monitor_touch" then
-      if config.touchEnabled ~= false then handlePointer(a, b, c) end
-    elseif event == "timer" then
-      if alertTimers[a] then
-        local alertOutput = alertTimers[a]; alertTimers[a] = nil
-        if alertOutput.global and redstone and redstone.setOutput then pcall(redstone.setOutput, alertOutput.side or "back", false) end
-        if alertOutput.relay and alertOutput.relay.setOutput then pcall(alertOutput.relay.setOutput, alertOutput.side or "back", false) end
-        for _, relay in ipairs(alertOutput.relays or {}) do if relay and relay.setOutput then pcall(relay.setOutput, alertOutput.side or "back", false) end end
-      elseif a == refreshTimer then
-        dispatchQueue()
-        groupSchedulerTick()
-        sortingTick()
-        if common.nowSeconds() - lastDiscovery >= (config.discoverySeconds or 5) then discover() end
-        dirty = true
-        refreshTimer = os.startTimer(1)
-      end
-    elseif event == "term_resize" or event == "monitor_resize" or event == "peripheral" or event == "peripheral_detach" then
-      monitors = common.findPeripherals("monitor")
-      speakers = common.findPeripherals("speaker")
-      redstoneDevices = common.findPeripherals("redstoneIntegrator")
-      for _, entry in ipairs(monitors) do if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end end
-      renderCache = {}; dirty = true
-    end
-  end
-
-  common.clear(colors and colors.black or nil, colors and colors.white or nil)
-  print("CC Miner controller stopped. Run 'ccm dashboard' to reopen it.")
-end)()
-]] },
-}
-local FILE_COUNT = 10
-local WORKER_PARTS = {}
-local CONTROLLER_PARTS = {[[controller_parts/01.part]], [[controller_parts/02.part]], [[controller_parts/03.part]]}
-local ENTRYPOINT = [[controller.lua]]
-local UPDATE_SENTINEL = [[-- CC Miner V4 update-incomplete sentinel for controller
-error("CC Miner runtime update is incomplete. Re-transfer the offline bundle and run update-low-space.", 0)
-]]
-local LOW_SPACE_STEPS = {
-  { kind = "runtime", index = 1 },
-  { kind = "runtime", index = 2 },
-  { kind = "runtime", index = 3 },
-  { kind = "runtime", index = 4 },
-  { kind = "runtime", index = 5 },
-  { kind = "runtime", index = 6 },
-  { kind = "runtime", index = 8 },
-  { kind = "runtime", index = 9 },
-  { kind = "runtime", index = 10 },
-  { kind = "obsolete", target = [[lib/geo.lua]] },
-  { kind = "obsolete", target = [[worker.lua]] },
-  { kind = "obsolete", target = [[worker_parts/01.part]] },
-  { kind = "obsolete", target = [[worker_parts/02.part]] },
-  { kind = "obsolete", target = [[worker_parts/03.part]] },
-  { kind = "obsolete", target = [[worker_parts/04.part]] },
-  { kind = "obsolete", target = [[worker_parts/05.part]] },
-  { kind = "obsolete", target = [[gps_host.lua]] },
-}
-
-local function fail(message)
-  error(tostring(message), 0)
-end
-local function ensureDir(path)
-  if not path or path == "" or fs.exists(path) then return end
-  local parent = fs.getDir(path)
-  if parent and parent ~= "" and parent ~= path then ensureDir(parent) end
-  fs.makeDir(path)
-end
-local function readFile(path)
-  if not fs.exists(path) or fs.isDir(path) then return nil end
-  local handle = fs.open(path, "rb")
-  if not handle then return nil end
-  local text = handle.readAll(); handle.close(); return text
-end
-local function writeFile(path, text)
-  ensureDir(fs.getDir(path))
-  local handle = fs.open(path, "wb")
-  if not handle then return false, "Cannot write " .. path end
-  local ok, writeError = pcall(handle.write, text or "")
-  handle.close()
-  if not ok then return false, tostring(writeError) end
-  return true
-end
-local function digest(text)
-  if not textutils or type(textutils.sha256) ~= "function" then
-    return nil, "textutils.sha256 is required for strict offline bundle verification."
-  end
-  local ok, value = pcall(textutils.sha256, text or "")
-  if not ok or type(value) ~= "string" then return nil, tostring(value or "sha256 failed") end
-  return string.lower(value)
-end
-local function compileText(label, text)
-  local loader = loadstring or load
-  local compiled, compileError = loader(text, "@" .. label)
-  if not compiled then return false, tostring(compileError) end
-  return true
-end
-local function validateEmbedded()
-  if #files ~= FILE_COUNT then fail("Embedded runtime file count is invalid for role " .. ROLE) end
-  local seen = {}
-  local aggregate = {
-    "ccminer-offline-role", "\0", VERSION, "\0", tostring(SCHEMA), "\0", ROLE, "\0", tostring(#files), "\0",
-  }
-  for index, file in ipairs(files) do
-    if type(file.target) ~= "string" or type(file.content) ~= "string" or seen[file.target] then
-      fail("Embedded runtime order/target is invalid at index " .. tostring(index))
-    end
-    seen[file.target] = true
-    local actual, digestError = digest(file.content)
-    if not actual then fail(digestError) end
-    if actual ~= string.lower(file.digest or "") then
-      fail("Embedded runtime digest mismatch: " .. tostring(file.target))
-    end
-    aggregate[#aggregate + 1] = file.source; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.target; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.digest; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.content; aggregate[#aggregate + 1] = "\0"
-  end
-  local aggregateDigest, aggregateError = digest(table.concat(aggregate))
-  if not aggregateDigest then fail(aggregateError) end

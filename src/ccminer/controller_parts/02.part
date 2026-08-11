@@ -165,7 +165,7 @@ local function renderDashboard(target, key)
   common.writeAt(1, 2, common.fit(("Controller #%d | Workers %d/%d | Q%d H%d"):format(os.getComputerID(), online, #ids, #db.queue, #db.history), width), colors and colors.lightGray or nil)
   local headerY = 4
   common.writeAt(1, headerY, common.fit(width >= 48 and " ID    NAME           STATUS       PROGRESS       FUEL" or " ID NAME      STATUS   PROGRESS", width), colors and colors.yellow or nil)
-  local maxRows = math.max(1, height - 10)
+  local maxRows = math.max(1, height - 7)
   if #ids == 0 then
     common.writeAt(2, headerY + 2, common.fit("No workers. DISCOVER (D).", math.max(1, width - 2)), colors and colors.lightGray or nil)
   else
@@ -187,33 +187,18 @@ local function renderDashboard(target, key)
       addHitbox(key, 1, y, width, y, function() selected = index; invalidate() end)
     end
   end
-  local bottom = math.max(1, height - 4)
+  local bottom = math.max(1, height - 2)
   buttonRow(key, bottom, width, {
     { "DISCOVER", dashboardAction("discover") }, { "NEW JOB", dashboardAction("new") },
-    { "PROGRESS", dashboardAction("progress") }, { "INFO", dashboardAction("info") },
-    { "REMOTE", dashboardAction("remote") },
+    { "PROGRESS", dashboardAction("progress") }, { "MORE", dashboardAction("more") },
   })
   buttonRow(key, bottom + 1, width, {
-    { "STOP", dashboardAction("stop") }, { "RECOVERY", dashboardAction("recovery") },
-    { "REPORT", dashboardAction("report") }, { "GPS", dashboardAction("gps") },
-  })
-  buttonRow(key, bottom + 2, width, {
     { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
-    { "RECALL", dashboardAction("recall") }, { "SERVICE", dashboardAction("service") },
-  })
-  buttonRow(key, bottom + 3, width, {
-    { "ABORT", dashboardAction("abort") }, { "CLEAR", dashboardAction("clear") },
-    { "REHOME", dashboardAction("rehome") }, { "LAST ERR", dashboardAction("last_error") },
-  })
-  -- Group controls are additive; the legacy single-worker rows above remain
-  -- unchanged so old monitors and keyboard shortcuts continue to work.
-  buttonRow(key, math.max(1, bottom - 1), width, {
-    { "GROUPS", dashboardAction("groups") }, { "G START", dashboardAction("group_start") },
-    { "G PAUSE", dashboardAction("group_pause") }, { "G RETURN", dashboardAction("group_return") },
+    { "RETURN", dashboardAction("recall") }, { "STOP", dashboardAction("stop") },
   })
   local groupIds = orderedGroupIds()
   if #groupIds > 0 then
-    local gy = math.max(2, bottom - 2)
+    local gy = 3
     local gid, g = selectedGroupRecord()
     local gj = gid and activeGroupJob(gid) or nil
     local aggregate = gj and (gj.aggregate or updateGroupAggregate(gj)) or nil
@@ -221,6 +206,109 @@ local function renderDashboard(target, key)
     common.writeAt(1, gy, common.fit(line, width), colors and colors.cyan or nil)
   end
   noticeLine(target, height)
+end
+
+noticeState.renderMore = function(target, key)
+  local width, height = target.getSize()
+  writeHeader("MORE COMMANDS", target)
+  common.writeAt(1, 3, common.fit("Less-used commands are kept here.", width), colors and colors.lightGray or nil)
+  buttonRow(key, 4, width, {
+    { "INFO", dashboardAction("info") }, { "ITEMS", dashboardAction("items") },
+    { "REPORT", dashboardAction("report") }, { "RECOVERY", dashboardAction("recovery") },
+  })
+  buttonRow(key, 5, width, {
+    { "GROUPS", dashboardAction("groups") }, { "REMOTE", dashboardAction("remote") },
+    { "GPS", dashboardAction("gps") }, { "LAST ERR", dashboardAction("last_error") },
+  })
+  buttonRow(key, 6, width, {
+    { "SERVICE", dashboardAction("service") }, { "CLEAR", dashboardAction("clear") },
+    { "REHOME", dashboardAction("rehome") }, { "BACK", function() mode = "dashboard"; invalidate() end },
+  })
+  noticeLine(target, height)
+end
+
+noticeState.openItems = function()
+  local id, worker = selectedWorker()
+  if not id or not worker then setNotice("No worker selected.", true); return end
+  local data = worker.data or {}
+  local current = data.discard or {}
+  local selectedItems = {}
+  for _, name in ipairs(current.allowlist or {}) do selectedItems[tostring(name)] = true end
+  noticeState.discardDraft = {
+    workerId = id,
+    mode = tostring(current.mode or "KEEP_ALL"),
+    selected = selectedItems,
+    page = 1,
+  }
+  mode = "items"
+  invalidate()
+end
+
+noticeState.renderItems = function(target, key)
+  local width, height = target.getSize()
+  local id, worker = selectedWorker()
+  local data = worker and worker.data or {}
+  local form = noticeState.discardDraft
+  writeHeader("AUTO DISCARD ITEMS", target)
+  if not id or not form or tonumber(form.workerId) ~= tonumber(id) then
+    common.writeAt(1, 3, common.fit("Select a worker and reopen ITEMS.", width), colors and colors.red or nil)
+    drawButton(key, 1, height - 1, width, "BACK", function() mode = "more"; invalidate() end, true)
+    return
+  end
+  local byName = {}
+  for _, item in ipairs((data.inventory and data.inventory.slots) or {}) do
+    local name = tostring(item.name or "")
+    if name ~= "" then
+      local row = byName[name] or { name = name, count = 0, locked = false, reserve = false }
+      row.count = row.count + (tonumber(item.count) or 0)
+      row.locked = row.locked or item.torch == true or item.fuel == true
+      row.reserve = row.reserve or item.seal == true
+      byName[name] = row
+    end
+  end
+  for name in pairs(form.selected or {}) do byName[name] = byName[name] or { name = name, count = 0 } end
+  local items = {}
+  for _, item in pairs(byName) do items[#items + 1] = item end
+  table.sort(items, function(a, b) return a.name < b.name end)
+  local modes = {
+    { "KEEP", "KEEP_ALL" }, { "STONE", "DISCARD_EXCESS_STONE" }, { "CHOOSE", "CUSTOM_ALLOWLIST" },
+  }
+  common.writeAt(1, 2, common.fit("Touch item names, then APPLY. [LOCK] cannot be discarded.", width), colors and colors.lightGray or nil)
+  local modeButtons = {}
+  for _, entry in ipairs(modes) do
+    local label, value = entry[1], entry[2]
+    modeButtons[#modeButtons + 1] = { label, function() form.mode = value; invalidate() end, true, form.mode == value }
+  end
+  buttonRow(key, 3, width, modeButtons)
+  local rows = math.max(1, height - 7)
+  local pages = math.max(1, math.ceil(#items / rows))
+  form.page = common.clamp(tonumber(form.page) or 1, 1, pages)
+  local first = (form.page - 1) * rows + 1
+  for row = 1, rows do
+    local item = items[first + row - 1]
+    if not item then break end
+    local suffix = item.locked and " [LOCK]" or item.reserve and " [RESERVE]" or ""
+    local label = ("%s x%d%s"):format(item.name, item.count, suffix)
+    local enabled = not item.locked
+    drawButton(key, 1, 3 + row, width, label, function()
+      form.selected[item.name] = not form.selected[item.name] or nil
+      if form.selected[item.name] then form.mode = "CUSTOM_ALLOWLIST" end
+      invalidate()
+    end, enabled, form.selected[item.name] == true)
+  end
+  common.writeAt(1, height - 3, common.fit(("Page %d/%d | selected %d"):format(form.page, pages, common.tableCount(form.selected)), width), colors and colors.lightGray or nil)
+  buttonRow(key, height - 2, width, {
+    { "PREV", function() form.page = math.max(1, form.page - 1); invalidate() end, form.page > 1 },
+    { "NEXT", function() form.page = math.min(pages, form.page + 1); invalidate() end, form.page < pages },
+    { "APPLY", function()
+      local allowlist = {}
+      for name, chosen in pairs(form.selected) do if chosen then allowlist[#allowlist + 1] = name end end
+      table.sort(allowlist)
+      sendCommand(id, "discard_config", { mode = form.mode, allowlist = allowlist })
+      setNotice("Discard settings sent to worker #" .. tostring(id) .. ".", false)
+    end },
+  })
+  drawButton(key, 1, height - 1, width, "BACK", function() mode = "more"; invalidate() end, true)
 end
 
 local function groupAction(groupCommandName)
@@ -831,6 +919,8 @@ local function renderOne(target, key)
   common.withTerm(target, function()
     common.clear(colors and colors.black or nil, colors and colors.white or nil)
     if mode == "dashboard" then renderDashboard(target, key)
+    elseif mode == "more" then noticeState.renderMore(target, key)
+    elseif mode == "items" then noticeState.renderItems(target, key)
     elseif mode == "groups" then renderGroups(target, key)
     elseif mode == "group_info" then renderGroupInfo(target, key)
     elseif mode == "group_dimensions" or mode == "group_job" then renderGroupDimensions(target, key)

@@ -46,6 +46,22 @@ end
 
 local function statusPayload()
   local used, empty, items = inventoryStats()
+  local inventorySlots = {}
+  for slot = 1, 16 do
+    local count = turtle.getItemCount(slot)
+    if count > 0 then
+      local name = itemName(slot) or "unknown"
+      inventorySlots[#inventorySlots + 1] = {
+        slot = slot,
+        name = name,
+        count = count,
+        seal = isSealItemName(name) == true,
+        torch = isTorchItemName(name) == true,
+        fuel = isFuelItem(slot) == true,
+        reserved = isReservedSlot(slot) == true,
+      }
+    end
+  end
   local profile = effectiveProfile()
   local remoteActive = remoteSession ~= nil
     and common.nowSeconds() < tonumber(remoteSession.expiresAt or 0)
@@ -167,6 +183,7 @@ local function statusPayload()
       stateJournal = true,
       completionReport = true,
       discardPolicy = true,
+      discardConfig = true,
       shortestServiceRoute = type(quarry.shortestServiceRoute) == "function",
       edgeTransition = type(quarry.edgeTransition) == "function",
       groupAssignment = true,
@@ -177,6 +194,12 @@ local function statusPayload()
     inventoryUsed = used,
     inventoryEmpty = empty,
     inventoryItems = items,
+    inventory = {
+      used = used,
+      empty = empty,
+      items = items,
+      slots = inventorySlots,
+    },
     remoteConsole = {
       enabled = config.remoteConsole.enabled == true,
       allowShell = config.remoteConsole.allowShell == true,
@@ -249,17 +272,3 @@ end
 local function locateGPS()
   state.gps = state.gps or common.defaultState().gps
   if gpsConfig().enabled == false then
-    state.gps.available = false
-    state.gps.lastError = "GPS is disabled in configuration."
-    return nil, state.gps.lastError
-  end
-  if not gps or type(gps.locate) ~= "function" then
-    state.gps.available = false
-    state.gps.lastError = "GPS API is unavailable."
-    return nil, state.gps.lastError
-  end
-  local ok, x, y, z = pcall(gps.locate, tonumber(gpsConfig().timeout) or 2, false)
-  if not ok then
-    local text = tostring(x)
-    -- gps.locate waits for events. Preserve Ctrl+T as a real local stop even
-    -- when it arrives during a GPS lookup instead of a rednet receive.

@@ -1,3 +1,63 @@
+
+local function tryPlaceTorchWall(relativeDir)
+  local originalDir = state.pose.dir
+  local originalSlot = turtle.getSelectedSlot()
+  local targetDir = (originalDir + relativeDir) % 4
+  local turned, turnError = turnTo(targetDir)
+  if not turned then return false, turnError end
+
+  local function restoreContext(reason)
+    turtle.select(originalSlot)
+    local restored, restoreError = turnTo(originalDir)
+    if not restored then return false, restoreError end
+    return false, reason
+  end
+
+  local present, data = turtle.inspect()
+  if present then
+    if relativeDir ~= 1 and relativeDir ~= 3 then return restoreContext("occupied") end
+    local protected, name = isProtected(data)
+    if protected or isInventoryBlock("front", data) or isLava(data) or isWater(data) or isGravityBlock(data) then
+      return restoreContext("occupied")
+    end
+    local _, emptySlots = inventoryStats()
+    if emptySlots <= 0 then return restoreContext("inventory_full") end
+    -- In a normal 1x1 tunnel, carve a one-block niche only from an ordinary
+    -- solid side block.  The dig and subsequent place are separately journaled
+    -- so a power loss can be re-inspected idempotently.
+    turtle.select(originalSlot)
+    local prepared, prepareError = beginPhysicalAction("dig_torch_niche_forward", {
+      block = name, side = relativeDir,
+    }, poseCopy())
+    if not prepared then return restoreContext(prepareError) end
+    local dug, digError = turtle.dig()
+    if not dug then
+      cancelPhysicalAction()
+      return restoreContext(digError or "torch_niche_dig_failed")
+    end
+    state.stats.blocksDug = (state.stats.blocksDug or 0) + 1
+    noteMinedMaterial(name)
+    state.fluidSealRun = 0
+    state.fluidSealMarker = nil
+    commitPhysicalAction()
+    local slot = selectTorchMaterial()
+    if not slot then return restoreContext("torch_material") end
+    local placedPrepared, placedPrepareError = beginPhysicalAction("torch_niche_forward", {
+      side = relativeDir, material = itemName(slot),
+    }, poseCopy())
+    if not placedPrepared then return restoreContext(placedPrepareError) end
+    local placed, placeError = turtle.place()
+    if not placed then
+      cancelPhysicalAction()
+      return restoreContext(placeError or "torch_niche_place_failed")
+    end
+    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
+    state.lighting.placed = (state.lighting.placed or 0) + 1
+    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
+    commitPhysicalAction()
+    turtle.select(originalSlot)
+    local restored, restoreError = turnTo(originalDir)
+    if not restored then return false, restoreError end
     state.lighting.lastAt = common.nowSeconds()
     state.lighting.lastPose = poseCopy()
     return true
@@ -155,7 +215,7 @@ local function moveOne(direction, context)
         local prepared, prepareError = beginPhysicalAction("dig_" .. direction, { block = name }, poseCopy())
         if not prepared then return false, prepareError end
 ]] },
-  { source = [[src/ccminer/worker_parts/03.part]], target = [[worker_parts/03.part]], digest = [[0e1a1a8310d8401357afdbdd3d0a284923b66321b82d23b3cb19a0adb6a992f4]], content = [=[        local dug, digReason = action.dig()
+  { source = [[src/ccminer/worker_parts/03.part]], target = [[worker_parts/03.part]], digest = [[090bb2620b59f88f9880507add1162707af7633b668c92a97f6833df9badbab2]], content = [=[        local dug, digReason = action.dig()
         if dug then
           state.stats.blocksDug = (state.stats.blocksDug or 0) + 1
           if not preserveSealMarker then noteMinedMaterial(name) end
@@ -225,66 +285,3 @@ local function moveZ(targetZ, context)
   end
   return true
 end
-
-local function moveY(targetY, context)
-  while state.pose.y < targetY do
-    local ok, err = moveOne("up", context)
-    if not ok then return false, err end
-  end
-  while state.pose.y > targetY do
-    local ok, err = moveOne("down", context)
-    if not ok then return false, err end
-  end
-  return true
-end
-
-local function navigateTo(target, route, context)
-  target = target or { x = 0, y = 0, z = 0 }
-  local ok, err
-  if route == "home" then
-    ok, err = moveY(target.y or 0, context); if not ok then return false, err end
-    ok, err = moveX(target.x or 0, context); if not ok then return false, err end
-    ok, err = moveZ(target.z or 0, context); if not ok then return false, err end
-  elseif route == "inside" then
-    ok, err = moveX(target.x or 0, context); if not ok then return false, err end
-    ok, err = moveZ(target.z or 0, context); if not ok then return false, err end
-    ok, err = moveY(target.y or 0, context); if not ok then return false, err end
-  else
-    ok, err = moveZ(target.z or 0, context); if not ok then return false, err end
-    ok, err = moveX(target.x or 0, context); if not ok then return false, err end
-    ok, err = moveY(target.y or 0, context); if not ok then return false, err end
-  end
-  return true
-end
-
-local function chunkAnchor(plan, key, y)
-  local chunk = plan and plan.chunks and plan.chunks[key]
-  if not chunk then return nil, "Unknown chunk " .. tostring(key) end
-  return { x = chunk.anchor.x, y = y, z = chunk.anchor.z }
-end
-
-local function serviceDockAnchor(plan, y)
-  local key = plan and (plan.dockKey or plan.entranceKey or plan.rootKey)
-  if not key then return nil, "Service plan has no dock chunk." end
-  local anchor, err = chunkAnchor(plan, key, y)
-  if not anchor then return nil, err end
-  anchor.chunkKey = key
-  return anchor, key
-end
-
-local function moveBetweenChunkAnchors(plan, fromKey, toKey, y, context)
-  local from = plan.chunks[fromKey]
-  local target, err = chunkAnchor(plan, toKey, y)
-  if not from or not target then return false, err or "Missing chunk anchor." end
-  local adjacent = false
-  for _, key in ipairs(from.neighbors or {}) do if key == toKey then adjacent = true; break end end
-  if not adjacent then return false, "Chunk route is not adjacent: " .. tostring(fromKey) .. " -> " .. tostring(toKey) end
-  return navigateTo(target, "inside", context)
-end
-
-local function normalizeWaypoint(value, fallbackY)
-  if type(value) ~= "table" then return nil end
-  local pose = value.pose or value.position or value.target or value
-  if type(pose) ~= "table" then return nil end
-  local x, z = tonumber(pose.x), tonumber(pose.z)
-  if not x or not z then return nil end

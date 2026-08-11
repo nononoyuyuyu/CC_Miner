@@ -1,3 +1,107 @@
+    local count, name = turtle.getItemCount(slot), itemName(slot)
+    if count > 0 and discardCandidate(slot, name, totalSeal, policy, mode)
+      and not (isSealItemName(name) and totalSeal - count < (tonumber(policy.retainSealTarget) or 64)) then
+      turtle.select(slot)
+      discardStats.attempts = (discardStats.attempts or 0) + 1
+      local before = turtle.getItemCount(slot)
+      local prepared, prepareError = beginPhysicalAction("discard_field", {
+        slot = slot, item = name, count = before, direction = side,
+      }, poseCopy())
+      if not prepared then
+        discardStats.lastError = prepareError or "Could not journal field discard action."
+        break
+      end
+      local dropped = dropFunction() -- world discard is always stack-at-a-time
+      local after = turtle.getItemCount(slot)
+      if dropped and after == 0 then
+        commitPhysicalAction()
+        discardedStacks = discardedStacks + 1
+        noteDiscard(name, before)
+        if isSealItemName(name) then totalSeal = totalSeal - before end
+      else
+        cancelPhysicalAction()
+        noteDiscardSkip(name, isUnknownModItem(name))
+        discardStats.lastError = "Field discard failed; stack retained."
+      end
+    end
+  end
+  discardStats.passes = (discardStats.passes or 0) + 1
+  discardStats.enabled = true
+  discardStats.mode = mode
+  discardStats.lastAt = common.nowSeconds()
+  discardStats.lastInventoryItems = totalItems
+  restoreSideDirection(side, restoreDir)
+  turtle.select(originalSlot)
+  saveState("field_discard")
+  return discardStats.lastError == nil, discardStats.lastError
+end
+
+local function targetFuelForService()
+  local target = tonumber(config.fuelTarget) or 12000
+  if state.service and state.service.resumeAfter and state.checkpoint then
+    local checkpointDistance = estimatedReturnDistance(state.checkpoint)
+    if not checkpointDistance then
+      checkpointDistance = distance({ x = 0, y = 0, z = 0 }, state.checkpoint)
+    end
+    target = math.max(target, checkpointDistance * 2 + profileFuelBuffer())
+  end
+  local limit = fuelLimit()
+  if limit == "unlimited" then return "unlimited" end
+  if type(limit) == "number" and limit > 0 then target = math.min(target, limit) end
+  return math.max(1, math.floor(target))
+end
+
+local function refuelAtHome()
+  state.phase, state.status = "refueling", "working"
+  saveState()
+  local current = fuelLevel()
+  if current == "unlimited" then return true end
+  local target = targetFuelForService()
+  local fuelSide = config.fuelSide or "top"
+  local inspectFunction, suckFunction, dropFunction, restoreDir, sideError = sideFunctions(fuelSide)
+  if not inspectFunction then return false, sideError end
+  local checkSide = (fuelSide == "top" and "top") or (fuelSide == "bottom" and "bottom") or "front"
+  if not inventoryPresent(checkSide, inspectFunction) then
+    restoreSideDirection(fuelSide, restoreDir)
+    return false, "Fuel inventory missing on configured side " .. fuelSide .. "."
+  end
+  if target == "unlimited" or current >= target then
+    restoreSideDirection(fuelSide, restoreDir)
+    return true
+  end
+
+  local originalSlot = turtle.getSelectedSlot()
+  local attempts = 0
+  while fuelLevel() ~= "unlimited" and fuelLevel() < target do
+    drainNetwork(3)
+    if movementInterrupted("service") then
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "control_request"
+    end
+    attempts = attempts + 1
+    if attempts > 1024 then
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Fuel loading safety limit reached."
+    end
+    local slot = firstFuelSlot()
+    if not slot then
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "No empty slot available while refueling."
+    end
+    turtle.select(slot)
+    local sucked = runInventoryPhysicalAction("refuel_suck", {
+      slot = slot, count = 1, direction = fuelSide,
+    }, function() return suckFunction(1) end)
+    if not sucked then
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Fuel inventory is empty."
+    end
+    local validFuel = runInventoryPhysicalAction("refuel_probe", {
+      slot = slot, count = turtle.getItemCount(slot), direction = fuelSide,
     }, function() return turtle.refuel(0) end)
     if not validFuel then
       runInventoryPhysicalAction("refuel_reject", {
@@ -179,91 +283,3 @@ local function refillTorchAtHome()
       turtle.select(originalSlot)
       return false, "No inventory space for torches."
     end
-    turtle.select(slot)
-    local need = math.min(target - torchMaterialCount(), turtle.getItemSpace(slot))
-    if need <= 0 then need = 1 end
-    local sucked = runInventoryPhysicalAction("refill_torch_suck", {
-      slot = slot, count = need, direction = side,
-    }, function() return suckFunction(need) end)
-    if not sucked then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Torch inventory is empty."
-    end
-    if not isTorchItemName(itemName(slot)) then
-      runInventoryPhysicalAction("refill_torch_reject", {
-        slot = slot, item = itemName(slot), direction = side,
-      }, dropFunction)
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Torch inventory contains an unsupported item."
-    end
-    state.stats.torchRefills = (state.stats.torchRefills or 0) + 1
-  end
-  local restored, restoreError = restoreSideDirection(side, restoreDir)
-  turtle.select(originalSlot)
-  if not restored then return false, restoreError end
-  saveState("refill_torch_done")
-  return true
-end
-
-local function beginService(resumeAfter, finalStatus, reason, preserveCheckpoint)
-  if not state.service then
-    if not isHome() and not state.checkpoint then installCheckpointToken(checkpointToken()) end
-    state.serviceReturn = {}
-    state.service = {
-      resumeAfter = resumeAfter == true,
-      finalStatus = finalStatus or (resumeAfter and "working" or "paused"),
-      preserveCheckpoint = preserveCheckpoint == true,
-      reason = reason or "service",
-      startedAt = common.nowSeconds(),
-      returnDistance = 0,
-      returnStartedAt = nil,
-      returnEndedAt = nil,
-    }
-  else
-    if resumeAfter == false then state.service.resumeAfter = false end
-    if finalStatus then state.service.finalStatus = finalStatus end
-    if preserveCheckpoint ~= nil then state.service.preserveCheckpoint = preserveCheckpoint == true end
-    if reason then state.service.reason = reason end
-  end
-  if state.checkpoint and not state.resumeToken then state.resumeToken = common.copy(state.checkpoint) end
-  if state.job and state.job.groupJobId then
-    state.assignmentResumeToken = assignmentResumeSnapshot(state.resumeToken or state.checkpoint or checkpointToken())
-  end
-  if resumeAfter and not isHome() and not state.checkpoint then installCheckpointToken(checkpointToken()) end
-  state.returnReason = reason or state.returnReason
-  state.lastReturnReason = reason or state.lastReturnReason
-  state.status, state.phase, state.request = "working", "service_requested", nil
-  saveState()
-end
-
-local function finishService()
-  local service = state.service or {}
-  local finalStatus = service.finalStatus or (service.resumeAfter and "working" or "paused")
-  local preserveCheckpoint = service.preserveCheckpoint == true
-  state.lastReturnReason = service.reason or state.returnReason or state.lastReturnReason
-  state.service, state.request, state.lastError = nil, nil, nil
-  state.stagedStop = false
-  state.stats.services = (state.stats.services or 0) + 1
-  if finalStatus == "complete" then
-    state.stats.jobsCompleted = (state.stats.jobsCompleted or 0) + 1
-    state.checkpoint = nil
-    -- Completion is terminal: do not leave a stale work-point token that
-    -- could be overlaid by a later pending snapshot or mistaken for a
-    -- resumable assignment.
-    state.resumeToken = nil
-    state.assignmentResumeToken = nil
-    state.status, state.phase = "complete", "home"
-    state.estimate = state.estimate or {}
-    state.estimate.actual = state.job and state.job.cursor or 0
-    state.estimate.variance = (state.estimate.actual or 0) - (tonumber(state.estimate.estimated) or (state.estimate.actual or 0))
-    state.report = {
-      jobId = state.job and state.job.id or nil,
-      assignmentId = state.job and state.job.assignmentId or nil,
-      groupJobId = state.job and state.job.groupJobId or nil,
-      group = state.group and common.copy(state.group) or nil,
-      reason = state.completionReason,
-      returnReason = state.lastReturnReason or state.returnReason,
-      ["return"] = state.serviceReturn and common.copy(state.serviceReturn) or nil,
-      completedAt = common.nowSeconds(),

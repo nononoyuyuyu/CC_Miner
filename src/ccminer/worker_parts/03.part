@@ -432,13 +432,16 @@ end
 local function discardCandidate(slot, name, totalSeal, policy, mode)
   if mode == "KEEP_ALL" then return false end
   if mode == "CUSTOM_ALLOWLIST" then
-    -- Explicit allowlists never override seal reserve protection.
-    -- Ores/raw materials, torches, and fuel remain hard protected even when
-    -- a broad allowlist is supplied.  Unknown mod items are discardable only
-    -- when their exact name is explicitly allowlisted.
-    if isSealItemName(name) or isTorchItemName(name) or isFuelItem(slot)
-      or isOreOrRawMaterial(name) then return false end
-    return explicitAllowlisted(name, policy)
+    -- Torches, fuel, ores and raw materials remain hard protected.  Seal
+    -- blocks may be selected, but the caller still enforces retainSealTarget.
+    -- Unknown mod items are discardable only when their exact name is explicitly allowlisted.
+    if isTorchItemName(name) or isFuelItem(slot) or isOreOrRawMaterial(name) then return false end
+    if not explicitAllowlisted(name, policy) then return false end
+    if isSealItemName(name) then
+      local keep = math.max(0, tonumber(policy.retainSealTarget) or 64)
+      return totalSeal > keep
+    end
+    return true
   end
   if discardProtectedItem(slot, name) then return false end
   if mode == "DISCARD_EXCESS_STONE" then
@@ -512,35 +515,89 @@ local function recycleRetainTarget()
   return math.max(0, math.floor(tonumber(target) or 64))
 end
 
+local function homeRetainCounts()
+  local policy = config.discard or {}
+  local lighting = config.lighting or {}
+  local materials = materialsConfig()
+  local sealRemaining = math.max(0, math.floor(tonumber(policy.retainSealTarget
+    or materials.retainSealTarget or config.sealTarget) or 64))
+  local torchRemaining = effectiveLighting() == "off" and 0
+    or math.max(0, math.floor(tonumber(lighting.target or lighting.torchTarget
+      or materials.torchTarget or config.torchTarget) or 32))
+  local keep = {}
+  local function reserveRole(role, predicate, remaining)
+    local order, seen = {}, {}
+    local sets = materialSlotSets()
+    for slot = 1, 16 do
+      if sets[role] and sets[role][slot] then order[#order + 1], seen[slot] = slot, true end
+    end
+    for slot = 1, 16 do if not seen[slot] then order[#order + 1] = slot end end
+    for _, slot in ipairs(order) do
+      local count, name = turtle.getItemCount(slot), itemName(slot)
+      if count > 0 and predicate(slot, name) and remaining > 0 then
+        local amount = math.min(count, remaining)
+        keep[slot], remaining = (keep[slot] or 0) + amount, remaining - amount
+      end
+    end
+  end
+  reserveRole("seal", function(_, name) return isSealItemName(name) end, sealRemaining)
+  reserveRole("torch", function(_, name) return isTorchItemName(name) end, torchRemaining)
+  for slot = 1, 16 do
+    if slotRoleContains(slot, "fuel") and isFuelItem(slot) then keep[slot] = turtle.getItemCount(slot)
+    elseif slotRoleContains(slot, "generic") then keep[slot] = turtle.getItemCount(slot) end
+  end
+  return keep
+end
+
 local function compressSealStacks()
+  local originalSlot = turtle.getSelectedSlot()
   local moved = 0
-  for destination = 1, 16 do
-    if not isReservedSlot(destination, "seal") and turtle.getItemCount(destination) > 0 and isSealItemName(itemName(destination)) then
-      local name = itemName(destination)
-      local space = turtle.getItemSpace(destination)
-      if space > 0 then
+  local function compactRole(role, predicate)
+    local sets = materialSlotSets()
+    local order, seen = {}, {}
+    for slot = 1, 16 do
+      if sets[role] and sets[role][slot] and not isReservedSlot(slot, role) then
+        order[#order + 1], seen[slot] = slot, true
+      end
+    end
+    for slot = 1, 16 do
+      if not seen[slot] and not isReservedSlot(slot, role) then order[#order + 1] = slot end
+    end
+    for _, destination in ipairs(order) do
+      -- Empty designated slots are filled first.  Older code only merged into
+      -- occupied slots, so the documented material slots often stayed empty.
+      if turtle.getItemCount(destination) == 0 and sets[role] and sets[role][destination] then
         for source = 1, 16 do
-          if source ~= destination and not isReservedSlot(source, "seal")
+          if source ~= destination and not isReservedSlot(source, role)
+            and turtle.getItemCount(source) > 0 and predicate(itemName(source)) then
+            turtle.select(source)
+            local before = turtle.getItemCount(source)
+            if turtle.transferTo(destination) then moved = moved + before - turtle.getItemCount(source) end
+            break
+          end
+        end
+      end
+      local name = itemName(destination)
+      if name and predicate(name) then
+        local space = turtle.getItemSpace(destination)
+        for source = 1, 16 do
+          if space <= 0 then break end
+          if source ~= destination and not isReservedSlot(source, role)
             and turtle.getItemCount(source) > 0 and itemName(source) == name then
             turtle.select(source)
             local before = turtle.getItemCount(source)
-            local ok = turtle.transferTo(destination, math.min(space, before))
-            local after = turtle.getItemCount(source)
-            if ok and after < before then
-              local amount = before - after
-              moved = moved + amount
+            if turtle.transferTo(destination, math.min(space, before)) then
+              moved = moved + before - turtle.getItemCount(source)
               space = turtle.getItemSpace(destination)
-              if space <= 0 then break end
             end
           end
         end
       end
     end
   end
-  if moved > 0 then
-    state.stats.compressions = (state.stats.compressions or 0) + 1
-    state.recycle.compressed = (state.recycle.compressed or 0) + moved
-  end
+  compactRole("seal", isSealItemName)
+  compactRole("torch", isTorchItemName)
+  turtle.select(originalSlot)
   return moved
 end
 
@@ -712,81 +769,64 @@ local function unloadAtHome()
   local discardedStacks, allDropped = 0, true
   local totalSeal = retainedCount
 
-  -- Drop each slot as a whole stack.  Protected/valuable/unknown items are
-  -- always routed to output, never the discard inventory.
+  -- Retain only the configured seal/torch targets plus fuel/generic reserve
+  -- slots.  The previous implementation retained every seal and torch stack,
+  -- so unloading often freed no slots and immediately triggered another trip.
+  local keepCounts = homeRetainCounts()
   for slot = 1, 16 do
     local count, name = turtle.getItemCount(slot), itemName(slot)
     if count > 0 then
-      local protected = discardProtectedItem(slot, name)
-      local keepReserved = isSealItemName(name) or isTorchItemName(name)
-        or (slotRoleContains(slot, "fuel") and isFuelItem(slot))
+      local keepCount = math.min(count, tonumber(keepCounts[slot]) or 0)
+      local removable = count - keepCount
       local candidate = discardEnabled and discardedStacks < maxStacks
-        and discardCandidate(slot, name, totalSeal, policy, mode)
-      if candidate and isSealItemName(name) and totalSeal - count < (tonumber(policy.retainSealTarget) or 64) then
-        candidate = false -- whole-stack semantics: never split below reserve
+        and removable > 0 and discardCandidate(slot, name, totalSeal, policy, mode)
+      if candidate and isSealItemName(name) then
+        removable = math.min(removable, math.max(0, totalSeal - (tonumber(policy.retainSealTarget) or 64)))
+        if removable <= 0 then candidate = false end
       end
-      if candidate and discardDrop then
+      if candidate and discardDrop and removable > 0 then
         if discardTargetDir ~= nil then turnTo(discardTargetDir) else turnTo(outRestore) end
         turtle.select(slot)
         discardStats.attempts = (discardStats.attempts or 0) + 1
         local before = turtle.getItemCount(slot)
         local prepared, prepareError = beginPhysicalAction("discard_home", {
-          slot = slot, item = name, count = before, direction = discardSide,
+          slot = slot, item = name, count = removable, direction = discardSide,
         }, poseCopy())
         if not prepared then
           allDropped = false
           discardStats.lastError = prepareError or "Could not journal discard action."
           break
         end
-        local dropped = discardDrop() -- no count argument: one complete stack
+        local dropped = discardDrop(removable)
         local after = turtle.getItemCount(slot)
-        if dropped and after == 0 then
+        local removed = before - after
+        if dropped and removed > 0 then
           commitPhysicalAction()
           discardedStacks = discardedStacks + 1
-          noteDiscard(name, before)
-          if isSealItemName(name) then totalSeal = totalSeal - before end
+          noteDiscard(name, removed)
+          if isSealItemName(name) then totalSeal = totalSeal - removed end
+          if removed < removable then allDropped = false end
         else
           cancelPhysicalAction()
           allDropped = false
           noteDiscardSkip(name, isUnknownModItem(name))
         end
-      elseif keepReserved then
-        -- Keep seal/torch/fuel material on the turtle.  It is never sent to
-        -- either output or discard, even when the output chest is available.
-      elseif not protected then
+      elseif removable > 0 then
         if outputTargetDir ~= nil then turnTo(outputTargetDir) else turnTo(outRestore) end
         turtle.select(slot)
         local before = turtle.getItemCount(slot)
         local prepared, prepareError = beginPhysicalAction("unload_home", {
-          slot = slot, item = name, count = before, direction = outputSide,
+          slot = slot, item = name, count = removable, direction = outputSide,
         }, poseCopy())
         if not prepared then
           allDropped = false
           discardStats.lastError = prepareError or "Could not journal output action."
           break
         end
-        local dropped = outDrop() -- output receives all non-discard items
-        if dropped and turtle.getItemCount(slot) == 0 then commitPhysicalAction()
+        local dropped = outDrop(removable)
+        local removed = before - turtle.getItemCount(slot)
+        if dropped and removed > 0 then commitPhysicalAction(); if removed < removable then allDropped = false end
         else cancelPhysicalAction(); allDropped = false end
-      else
-        -- Reserved seal/torch/fuel remain on the turtle.  Unknown and ore
-        -- stacks are retained in the output path when they are not reserved.
-          if not keepReserved then
-            if outputTargetDir ~= nil then turnTo(outputTargetDir) else turnTo(outRestore) end
-            turtle.select(slot)
-          local before = turtle.getItemCount(slot)
-          local prepared, prepareError = beginPhysicalAction("unload_home", {
-            slot = slot, item = name, count = before, direction = outputSide,
-          }, poseCopy())
-          if not prepared then
-            allDropped = false
-            discardStats.lastError = prepareError or "Could not journal output action."
-            break
-          end
-          local dropped = outDrop()
-          if dropped and turtle.getItemCount(slot) == 0 then commitPhysicalAction()
-          else cancelPhysicalAction(); allDropped = false end
-        end
       end
     end
   end

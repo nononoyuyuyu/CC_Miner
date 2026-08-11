@@ -1,3 +1,14 @@
+    end
+    if pinnedController > 0 and tonumber(sender) ~= pinnedController then
+      return false, "Remote console sender is not the pinned controller.", nil, nil
+    end
+    if remoteSession then
+      if tonumber(remoteSession.sender) ~= tonumber(sender) then
+        return false, "Remote console session is already open for another controller.", nil, nil
+      end
+      -- Re-opening from the pinned controller is idempotent.  This recovers
+      -- when the OPEN ACK was lost without making the operator wait for the
+      -- whole session timeout or issuing a second shell session.
       local existing = {
         action = "open",
         sessionId = remoteSession.sessionId,
@@ -97,7 +108,44 @@ local function applyControlCommand(command, payload, sender)
   if state.pendingAction and command ~= "rehome" and command ~= "ping" and command ~= "status" and command ~= "gps_fix" then
     return false, "Recovery required: return the turtle to its dock and use REHOME, or reboot with working GPS recovery."
   end
-  if command == "start" then
+  if command == "discard_config" then
+    if not isHome() then return false, "Discard settings can only be changed while the worker is at its dock." end
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output"
+      or state.status == "waiting_seal" or state.status == "waiting_torch" or state.service or state.request then
+      return false, "Stop the worker at its dock before changing discard settings."
+    end
+    local mode = tostring(payload.mode or "KEEP_ALL"):upper()
+    if mode ~= "KEEP_ALL" and mode ~= "DISCARD_EXCESS_STONE" and mode ~= "CUSTOM_ALLOWLIST" then
+      return false, "Unknown discard mode: " .. mode
+    end
+    if payload.allowlist ~= nil and type(payload.allowlist) ~= "table" then
+      return false, "Discard allowlist must be a list of complete item IDs."
+    end
+    local allowlist, seen = {}, {}
+    for _, raw in ipairs(payload.allowlist or {}) do
+      local name = tostring(raw)
+      if #name > 128 or not name:match("^[a-z0-9_.-]+:[a-z0-9_./-]+$") then
+        return false, "Invalid item ID in discard allowlist: " .. name
+      end
+      if not seen[name] then
+        if #allowlist >= 64 then return false, "Discard allowlist is limited to 64 item IDs." end
+        seen[name] = true
+        allowlist[#allowlist + 1] = name
+      end
+    end
+    local nextPolicy = common.copy(config.discard or {})
+    nextPolicy.mode, nextPolicy.allowlist = mode, allowlist
+    config.discard = nextPolicy
+    config.materials = config.materials or {}
+    config.materials.discard = common.copy(nextPolicy)
+    local saved, saveError = common.saveConfig(config)
+    if saved == false then return false, "Could not save discard settings: " .. tostring(saveError) end
+    state.discardStats = state.discardStats or {}
+    state.discardStats.mode = mode
+    state.discardStats.allowlist = common.copy(allowlist)
+    saveState("discard_config")
+    return true, ("Discard settings saved: %s (%d selected)."):format(mode, #allowlist)
+  elseif command == "start" then
     return startJob(payload)
   elseif command == "stop" then
     if not state.job then return false, "No active job." end
@@ -202,54 +250,3 @@ local function applyControlCommand(command, payload, sender)
     if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
       return false, "Worker is busy."
     end
-    state.job, state.checkpoint, state.resumeToken, state.assignmentResumeToken, state.service, state.request = nil, nil, nil, nil, nil, nil
-    state.group, state.dock = nil, nil
-    state.stagedStop = false
-    state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
-    saveState()
-    return true, "Job record cleared."
-  elseif command == "calibrate_gps" then
-    return calibrateGPS()
-  elseif command == "gps_fix" then
-    local fix, err = locateGPS()
-    saveState()
-    if not fix then return false, err end
-    local verified, verifyError = verifyGPS(true)
-    if not verified then return false, verifyError end
-    return true, ("GPS fix: %d,%d,%d"):format(fix.x, fix.y, fix.z)
-  elseif command == "rehome" then
-    if payload.confirm ~= "RESET" then return false, "Rehome requires confirm=RESET." end
-    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
-      return false, "Stop the worker before rehoming."
-    end
-    local calibration = gpsCalibration()
-    if calibration then
-      local fix, fixError = locateGPS()
-      if not fix then
-        return false, "GPS fix is required to verify the calibrated dock before REHOME: " .. tostring(fixError)
-      end
-      local expected = geo.localToWorld(calibration, { x = 0, y = 0, z = 0 })
-      if not geo.samePosition(fix, expected) then
-        return false, ("GPS says the turtle is at %d,%d,%d, not the calibrated dock %d,%d,%d."):format(
-          fix.x, fix.y, fix.z, expected.x, expected.y, expected.z
-        )
-      end
-    end
-    state.pose = { x = 0, y = 0, z = 0, dir = 0 }
-    state.job, state.checkpoint, state.resumeToken, state.assignmentResumeToken, state.service, state.request, state.pendingAction = nil, nil, nil, nil, nil, nil, nil
-    state.group, state.dock = nil, nil
-    state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
-    saveState()
-    return true, "Local position reset to home."
-  elseif command == "ping" or command == "status" then
-    return true, "Status sent."
-  end
-  return false, "Unknown command: " .. tostring(command)
-end
-
-local function handleMessage(sender, message)
-  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
-  if not valid then return end
-  if tonumber(config.controllerId or 0) > 0 and tonumber(sender) ~= tonumber(config.controllerId) then return end
-  if message.kind == "discover" then sendStatus(sender, message); return end
-  if message.kind ~= "command" then return end

@@ -1,3 +1,6 @@
+        chunkMode = job.chunkMode, name = job.name, profile = job.profile, waterMode = job.waterMode, lighting = common.copy(job.lighting or {}), workerId = assignment.workerId, targetWorkerId = assignment.workerId,
+        bay = assignment.bay, bayId = assignment.bayId, dock = common.copy(assignment.dock or {}), dockId = assignment.dockId, homeWorld = common.copy(assignment.homeWorld), maxDepth = assignment.maxDepth, facing = assignment.facing,
+        lease = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) },
         leases = { transit = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "transit", chunks = common.copy(assignment.transitKeys or {}) }, mine = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) } },
       }
       payload.command = "start"
@@ -151,9 +154,3 @@ local function reassignGroupAssignment(groupJobId, stoppedWorkerId, targetWorker
   if job.chunkMode == "world" and (not bay or not dock) then setNotice("Reassign target bay/dock metadata unavailable.", true); return false end
   if bay and bay.world then
     local pos = targetData.world or targetData.position
-    if not pos or tonumber(pos.x) ~= tonumber(bay.world.x) or tonumber(pos.y) ~= tonumber(bay.world.y) or tonumber(pos.z) ~= tonumber(bay.world.z) then setNotice("Reassign target is not at its bay pose.", true); return false end
-  end
-  local targetKey = tostring(targetWorkerId)
-  local existingTarget = job.assignments[targetKey]
-  local target = existingTarget and common.copy(existingTarget) or { workerId = tonumber(targetWorkerId) or targetWorkerId, groupJobId = job.groupJobId, parentJobId = job.groupJobId, jobId = job.groupJobId .. "/reassign-" .. targetKey, assignmentId = job.groupJobId .. ":reassign:" .. targetKey, chunkKeys = {}, transitKeys = {}, status = "pending_reassign" }
-  target.chunkKeys = common.copy(source.chunkKeys)

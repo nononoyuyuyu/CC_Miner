@@ -1,3 +1,13 @@
+  return name == "networkkey" or name == "password" or name == "passwd"
+    or name == "secret" or name == "token" or name == "nonce"
+    or name == "sessionid" or name == "apikey" or name == "auth"
+end
+
+local function remoteValueText(value, depth, field)
+  if remoteSensitiveKey(field) then return "[REDACTED]" end
+  depth = tonumber(depth) or 0
+  if value == nil then return "-" end
+  if type(value) == "string" then return remoteRedactText(value) end
   if type(value) == "number" or type(value) == "boolean" then return tostring(value) end
   if type(value) ~= "table" then return remoteRedactText(value) end
   if depth >= 3 then return "{...}" end
@@ -249,9 +259,3 @@ local function addHitbox(key, x1, y1, x2, y2, action)
     x1 = math.floor(x1), y1 = math.floor(y1), x2 = math.floor(x2), y2 = math.floor(y2), action = action,
   }
 end
-
-local function drawButton(key, x, y, width, label, action, enabled, selectedButton)
-  width = math.max(3, math.floor(width))
-  local background = colors and (selectedButton and colors.lightBlue or enabled == false and colors.gray or colors.blue) or nil
-  local foreground = colors and (enabled == false and colors.lightGray or colors.white) or nil
-  common.writeAt(x, y, common.center(label, width), foreground, background)

@@ -420,7 +420,44 @@ local function applyControlCommand(command, payload, sender)
   if state.pendingAction and command ~= "rehome" and command ~= "ping" and command ~= "status" and command ~= "gps_fix" then
     return false, "Recovery required: return the turtle to its dock and use REHOME, or reboot with working GPS recovery."
   end
-  if command == "start" then
+  if command == "discard_config" then
+    if not isHome() then return false, "Discard settings can only be changed while the worker is at its dock." end
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output"
+      or state.status == "waiting_seal" or state.status == "waiting_torch" or state.service or state.request then
+      return false, "Stop the worker at its dock before changing discard settings."
+    end
+    local mode = tostring(payload.mode or "KEEP_ALL"):upper()
+    if mode ~= "KEEP_ALL" and mode ~= "DISCARD_EXCESS_STONE" and mode ~= "CUSTOM_ALLOWLIST" then
+      return false, "Unknown discard mode: " .. mode
+    end
+    if payload.allowlist ~= nil and type(payload.allowlist) ~= "table" then
+      return false, "Discard allowlist must be a list of complete item IDs."
+    end
+    local allowlist, seen = {}, {}
+    for _, raw in ipairs(payload.allowlist or {}) do
+      local name = tostring(raw)
+      if #name > 128 or not name:match("^[a-z0-9_.-]+:[a-z0-9_./-]+$") then
+        return false, "Invalid item ID in discard allowlist: " .. name
+      end
+      if not seen[name] then
+        if #allowlist >= 64 then return false, "Discard allowlist is limited to 64 item IDs." end
+        seen[name] = true
+        allowlist[#allowlist + 1] = name
+      end
+    end
+    local nextPolicy = common.copy(config.discard or {})
+    nextPolicy.mode, nextPolicy.allowlist = mode, allowlist
+    config.discard = nextPolicy
+    config.materials = config.materials or {}
+    config.materials.discard = common.copy(nextPolicy)
+    local saved, saveError = common.saveConfig(config)
+    if saved == false then return false, "Could not save discard settings: " .. tostring(saveError) end
+    state.discardStats = state.discardStats or {}
+    state.discardStats.mode = mode
+    state.discardStats.allowlist = common.copy(allowlist)
+    saveState("discard_config")
+    return true, ("Discard settings saved: %s (%d selected)."):format(mode, #allowlist)
+  elseif command == "start" then
     return startJob(payload)
   elseif command == "stop" then
     if not state.job then return false, "No active job." end

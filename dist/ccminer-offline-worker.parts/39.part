@@ -1,3 +1,91 @@
+    turtle.select(slot)
+    local need = math.min(target - torchMaterialCount(), turtle.getItemSpace(slot))
+    if need <= 0 then need = 1 end
+    local sucked = runInventoryPhysicalAction("refill_torch_suck", {
+      slot = slot, count = need, direction = side,
+    }, function() return suckFunction(need) end)
+    if not sucked then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Torch inventory is empty."
+    end
+    if not isTorchItemName(itemName(slot)) then
+      runInventoryPhysicalAction("refill_torch_reject", {
+        slot = slot, item = itemName(slot), direction = side,
+      }, dropFunction)
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Torch inventory contains an unsupported item."
+    end
+    state.stats.torchRefills = (state.stats.torchRefills or 0) + 1
+  end
+  local restored, restoreError = restoreSideDirection(side, restoreDir)
+  turtle.select(originalSlot)
+  if not restored then return false, restoreError end
+  saveState("refill_torch_done")
+  return true
+end
+
+local function beginService(resumeAfter, finalStatus, reason, preserveCheckpoint)
+  if not state.service then
+    if not isHome() and not state.checkpoint then installCheckpointToken(checkpointToken()) end
+    state.serviceReturn = {}
+    state.service = {
+      resumeAfter = resumeAfter == true,
+      finalStatus = finalStatus or (resumeAfter and "working" or "paused"),
+      preserveCheckpoint = preserveCheckpoint == true,
+      reason = reason or "service",
+      startedAt = common.nowSeconds(),
+      returnDistance = 0,
+      returnStartedAt = nil,
+      returnEndedAt = nil,
+    }
+  else
+    if resumeAfter == false then state.service.resumeAfter = false end
+    if finalStatus then state.service.finalStatus = finalStatus end
+    if preserveCheckpoint ~= nil then state.service.preserveCheckpoint = preserveCheckpoint == true end
+    if reason then state.service.reason = reason end
+  end
+  if state.checkpoint and not state.resumeToken then state.resumeToken = common.copy(state.checkpoint) end
+  if state.job and state.job.groupJobId then
+    state.assignmentResumeToken = assignmentResumeSnapshot(state.resumeToken or state.checkpoint or checkpointToken())
+  end
+  if resumeAfter and not isHome() and not state.checkpoint then installCheckpointToken(checkpointToken()) end
+  state.returnReason = reason or state.returnReason
+  state.lastReturnReason = reason or state.lastReturnReason
+  state.status, state.phase, state.request = "working", "service_requested", nil
+  saveState()
+end
+
+local function finishService()
+  local service = state.service or {}
+  local finalStatus = service.finalStatus or (service.resumeAfter and "working" or "paused")
+  local preserveCheckpoint = service.preserveCheckpoint == true
+  state.lastReturnReason = service.reason or state.returnReason or state.lastReturnReason
+  state.service, state.request, state.lastError = nil, nil, nil
+  state.stagedStop = false
+  state.stats.services = (state.stats.services or 0) + 1
+  if finalStatus == "complete" then
+    state.stats.jobsCompleted = (state.stats.jobsCompleted or 0) + 1
+    state.checkpoint = nil
+    -- Completion is terminal: do not leave a stale work-point token that
+    -- could be overlaid by a later pending snapshot or mistaken for a
+    -- resumable assignment.
+    state.resumeToken = nil
+    state.assignmentResumeToken = nil
+    state.status, state.phase = "complete", "home"
+    state.estimate = state.estimate or {}
+    state.estimate.actual = state.job and state.job.cursor or 0
+    state.estimate.variance = (state.estimate.actual or 0) - (tonumber(state.estimate.estimated) or (state.estimate.actual or 0))
+    state.report = {
+      jobId = state.job and state.job.id or nil,
+      assignmentId = state.job and state.job.assignmentId or nil,
+      groupJobId = state.job and state.job.groupJobId or nil,
+      group = state.group and common.copy(state.group) or nil,
+      reason = state.completionReason,
+      returnReason = state.lastReturnReason or state.returnReason,
+      ["return"] = state.serviceReturn and common.copy(state.serviceReturn) or nil,
+      completedAt = common.nowSeconds(),
       elapsed = state.job and math.max(0, common.nowSeconds() - (state.job.startedAt or common.nowSeconds())) or 0,
       progress = state.job and { cursor = state.job.cursor or 0, total = state.job.total or 0 } or nil,
       stats = common.copy(state.stats),
@@ -156,94 +244,3 @@ local function continueService()
   end
   state.service.returnEndedAt = common.nowSeconds()
   state.service.returnSeconds = math.max(0, state.service.returnEndedAt - (state.service.returnStartedAt or state.service.returnEndedAt))
-  state.serviceReturn.endedAt = state.service.returnEndedAt
-  state.serviceReturn.seconds = state.service.returnSeconds
-  state.serviceReturn.distance = state.service.returnDistance or 0
-  state.timeMetrics = state.timeMetrics or {}
-  state.timeMetrics.returnSeconds = (state.timeMetrics.returnSeconds or 0) + state.service.returnSeconds
-  finishService()
-  return true
-end
-
-local function requiredDirectionTo(target)
-  local dx, dy, dz = target.x - state.pose.x, target.y - state.pose.y, target.z - state.pose.z
-  local manhattan = math.abs(dx) + math.abs(dy) + math.abs(dz)
-  if manhattan ~= 1 then return nil, "path_desync:" .. tostring(manhattan) end
-  if dy == 1 then return "up", nil, dy end
-  if dy == -1 then return "down", nil, dy end
-  if dx == 1 then return "forward", 1, 0 end
-  if dx == -1 then return "forward", 3, 0 end
-  if dz == 1 then return "forward", 0, 0 end
-  if dz == -1 then return "forward", 2, 0 end
-  return nil, "invalid_delta"
-end
-
-local function shouldService()
-  local _, empty = inventoryStats()
-  local materials, recycle = materialsConfig()
-  local reserveEmpty = profileReserveEmptySlots()
-  if empty <= reserveEmpty then return true, "inventory" end
-  local level = fuelLevel()
-  if level ~= "unlimited" then
-    local returnDistance, returnError = estimatedReturnDistance(state.pose)
-    if not returnDistance then
-      return true, "fuel_route:" .. tostring(returnError)
-    end
-    local nextCost = math.max(1, tonumber(config.nextSectionCost or config.serviceNextSectionCost) or 16)
-    if state.job then
-      local remaining = math.max(0, (state.job.total or 0) - (state.job.cursor or 0))
-      nextCost = math.min(nextCost + math.floor(remaining > 0 and math.sqrt(remaining) or 0), math.max(nextCost, remaining))
-    end
-    local needed = returnDistance + nextCost + profileFuelBuffer()
-    if tonumber(level or 0) <= needed then return true, "fuel" end
-  end
-  if (config.lavaMode or "seal") == "seal" and sealMaterialCount() <= (tonumber(config.sealReserve) or 8) then
-    return true, "seal"
-  end
-  local lightingMode = effectiveLighting()
-  if lightingMode ~= "off" and torchMaterialCount() <= (tonumber((config.lighting or {}).reserve) or tonumber((config.lighting or {}).torchReserve) or tonumber(config.torchReserve) or 4) then
-    return true, "torch"
-  end
-  local _, lightInterval = effectiveLighting()
-  if lightingMode ~= "off" and lightInterval > 0 then
-    local moves = tonumber(state.stats.moves) or 0
-    if moves > 0 and moves % lightInterval == 0 and torchMaterialCount() <= 0 then return true, "torch" end
-  end
-  -- compactEvery is intentionally handled by compressInventoryAtField()
-  -- from runMiningStep.  Returning home solely to merge stacks wastes fuel
-  -- and violates the local-compression contract.
-  return false
-end
-
-local function handlePendingRequest()
-  if state.request == "recall" or state.request == "return_home" then beginService(false, "paused", "recall", true); return true end
-  if state.request == "service" then beginService(false, "paused", "manual_service", true); return true end
-  if state.request == "abort" then beginService(false, "aborted", "abort", false); return true end
-  if state.request == "pause_now" then
-    state.request = nil
-    if state.stagedStop and type(state.stagedStop) == "table" then
-      state.stagedStop.reachedAt = common.nowSeconds()
-      state.stagedStop.boundary = "physical_safe"
-    end
-    state.status, state.phase = "paused", "paused"
-    saveState("pause_now_reached")
-    return true
-  end
-  return false
-end
-
-local function beginAutomaticService(reason)
-  beginService(true, "working", "automatic_" .. tostring(reason), false)
-  continueService()
-end
-
-local function handleMoveFailure(prefix, err, allowBedrock)
-  if err == "control_request" then return true end
-  if err == "seal_material" then beginAutomaticService("seal"); return true end
-  if err == "torch_material" then beginAutomaticService("torch"); return true end
-  if err == "torch_surface_unavailable" then
-    markBlocked(prefix .. ": no safe torch wall/floor surface was available.")
-    return true
-  end
-  if err == "inventory_full" then beginAutomaticService("inventory"); return true end
-  if err == "water_seal_limit" then

@@ -49,6 +49,20 @@ for _, item in ipairs({
 }) do
   marker(controller, item[1], item[2])
 end
+
+for _, item in ipairs({
+  { 'noticeState.renderMore = function(target, key)', "secondary command screen" },
+  { 'noticeState.openItems = function()', "inventory discard picker open" },
+  { 'noticeState.renderItems = function(target, key)', "inventory discard picker view" },
+  { 'sendCommand(id, "discard_config", { mode = form.mode, allowlist = allowlist })', "discard picker apply command" },
+  { 'elseif name == "more" then mode = "more"', "dashboard more action" },
+  { 'elseif mode == "items" then noticeState.renderItems(target, key)', "item picker render dispatch" },
+  { 'selectedButton and colors.yellow', "high contrast selected button" },
+  { 'enabled == false and colors.gray or colors.lightBlue', "high contrast enabled button" },
+  { 'noticeState.configureMonitor = function(device)', "monitor palette setup" },
+}) do
+  marker(controller, item[1], item[2])
+end
 local noticeStart = assert(controller:find("local function setNotice(text, isError)", 1, true))
 local noticeEnd = assert(controller:find("noticeState.dismiss = function()", noticeStart, true))
 local noticeBody = controller:sub(noticeStart, noticeEnd - 1)

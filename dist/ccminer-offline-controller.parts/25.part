@@ -1,3 +1,12 @@
+    dockId = options.dockId or previous.dockId,
+    bayId = options.bayId or previous.bayId,
+    -- Per-worker overrides are maps keyed by worker ID.  A shared dock/bay
+    -- remains a convenient default for legacy group registrations.
+    workerBays = common.copy(options.workerBays or previous.workerBays or {}),
+    workerDocks = common.copy(options.workerDocks or previous.workerDocks or {}),
+    mode = mode,
+    partition = partition,
+    staggerSeconds = math.max(0, tonumber(options.staggerSeconds or previous.staggerSeconds) or tonumber(db.groupScheduler.staggerSeconds) or 0),
     replenishConcurrency = math.max(1, math.floor(tonumber(options.replenishConcurrency or previous.replenishConcurrency) or tonumber(db.groupScheduler.replenishConcurrency) or 1)),
     updatedAt = common.nowSeconds(),
   }
@@ -196,8 +205,3 @@ local function updateGroupAggregate(groupJob)
     if status == "waiting_fuel" or status == "waiting_output" or status == "waiting_seal" or status == "waiting_torch" or status == "waiting_water" or status == "service" then aggregate.waiting = aggregate.waiting + 1 end
     if status == "working" or status == "mining" or status == "starting" then aggregate.active = aggregate.active + 1 end
     local fuel = data and tonumber(data.fuel or data.materials and data.materials.fuel)
-    if fuel and (aggregate.minFuel == nil or fuel < aggregate.minFuel) then aggregate.minFuel = fuel end
-    local progress = data and data.progress or {}
-    local cursor, total = tonumber(progress and progress.cursor or data and data.job and data.job.cursor), tonumber(progress and progress.total or data and data.job and data.job.total)
-    if cursor and total and total > 0 then weightedDone, weightedTotal = weightedDone + math.max(0, math.min(cursor, total)), weightedTotal + total end
-    local warning = data and (data.lastError or data.completionReason)

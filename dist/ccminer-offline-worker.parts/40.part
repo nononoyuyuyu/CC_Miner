@@ -1,3 +1,94 @@
+  state.serviceReturn.endedAt = state.service.returnEndedAt
+  state.serviceReturn.seconds = state.service.returnSeconds
+  state.serviceReturn.distance = state.service.returnDistance or 0
+  state.timeMetrics = state.timeMetrics or {}
+  state.timeMetrics.returnSeconds = (state.timeMetrics.returnSeconds or 0) + state.service.returnSeconds
+  finishService()
+  return true
+end
+
+local function requiredDirectionTo(target)
+  local dx, dy, dz = target.x - state.pose.x, target.y - state.pose.y, target.z - state.pose.z
+  local manhattan = math.abs(dx) + math.abs(dy) + math.abs(dz)
+  if manhattan ~= 1 then return nil, "path_desync:" .. tostring(manhattan) end
+  if dy == 1 then return "up", nil, dy end
+  if dy == -1 then return "down", nil, dy end
+  if dx == 1 then return "forward", 1, 0 end
+  if dx == -1 then return "forward", 3, 0 end
+  if dz == 1 then return "forward", 0, 0 end
+  if dz == -1 then return "forward", 2, 0 end
+  return nil, "invalid_delta"
+end
+
+local function shouldService()
+  local _, empty = inventoryStats()
+  local materials, recycle = materialsConfig()
+  local reserveEmpty = profileReserveEmptySlots()
+  if empty <= reserveEmpty then return true, "inventory" end
+  local level = fuelLevel()
+  if level ~= "unlimited" then
+    local returnDistance, returnError = estimatedReturnDistance(state.pose)
+    if not returnDistance then
+      return true, "fuel_route:" .. tostring(returnError)
+    end
+    local nextCost = math.max(1, tonumber(config.nextSectionCost or config.serviceNextSectionCost) or 16)
+    if state.job then
+      local remaining = math.max(0, (state.job.total or 0) - (state.job.cursor or 0))
+      nextCost = math.min(nextCost + math.floor(remaining > 0 and math.sqrt(remaining) or 0), math.max(nextCost, remaining))
+    end
+    local needed = returnDistance + nextCost + profileFuelBuffer()
+    if tonumber(level or 0) <= needed then return true, "fuel" end
+  end
+  if (config.lavaMode or "seal") == "seal" and sealMaterialCount() <= (tonumber(config.sealReserve) or 8) then
+    return true, "seal"
+  end
+  local lightingMode = effectiveLighting()
+  if lightingMode ~= "off" and torchMaterialCount() <= (tonumber((config.lighting or {}).reserve) or tonumber((config.lighting or {}).torchReserve) or tonumber(config.torchReserve) or 4) then
+    return true, "torch"
+  end
+  local _, lightInterval = effectiveLighting()
+  if lightingMode ~= "off" and lightInterval > 0 then
+    local moves = tonumber(state.stats.moves) or 0
+    if moves > 0 and moves % lightInterval == 0 and torchMaterialCount() <= 0 then return true, "torch" end
+  end
+  -- compactEvery is intentionally handled by compressInventoryAtField()
+  -- from runMiningStep.  Returning home solely to merge stacks wastes fuel
+  -- and violates the local-compression contract.
+  return false
+end
+
+local function handlePendingRequest()
+  if state.request == "recall" or state.request == "return_home" then beginService(false, "paused", "recall", true); return true end
+  if state.request == "service" then beginService(false, "paused", "manual_service", true); return true end
+  if state.request == "abort" then beginService(false, "aborted", "abort", false); return true end
+  if state.request == "pause_now" then
+    state.request = nil
+    if state.stagedStop and type(state.stagedStop) == "table" then
+      state.stagedStop.reachedAt = common.nowSeconds()
+      state.stagedStop.boundary = "physical_safe"
+    end
+    state.status, state.phase = "paused", "paused"
+    saveState("pause_now_reached")
+    return true
+  end
+  return false
+end
+
+local function beginAutomaticService(reason)
+  beginService(true, "working", "automatic_" .. tostring(reason), false)
+  continueService()
+end
+
+local function handleMoveFailure(prefix, err, allowBedrock)
+  if err == "control_request" then return true end
+  if err == "seal_material" then beginAutomaticService("seal"); return true end
+  if err == "torch_material" then beginAutomaticService("torch"); return true end
+  if err == "torch_surface_unavailable" then
+    markBlocked(prefix .. ": no safe torch wall/floor surface was available.")
+    return true
+  end
+  if err == "inventory_full" then beginAutomaticService("inventory"); return true end
+  if err == "water_seal_limit" then
     state.status, state.phase, state.lastError = "blocked", "water_seal_limit", prefix .. ": continuous water sealing limit reached."
     state.stats.waterBlocked = (state.stats.waterBlocked or 0) + 1
     saveState("water_seal_limit")
@@ -187,102 +278,3 @@ local function runChunkPlanStep(job)
     end
     local count = quarry.chunkCellCount(chunk)
     if route.localCursor >= count then
-      route.phase = "return"
-      saveState()
-      return
-    end
-    local target = quarry.chunkCell(chunk, route.localCursor, y)
-    if samePosePosition(state.pose, target) then
-      route.localCursor = route.localCursor + 1
-      job.cursor = (job.cursor or 0) + 1
-      if layerBoundary(job) then
-        local layerGPS, layerGPSError = verifyGPS(true)
-        if not layerGPS then markBlocked("GPS verification at recovered chunk layer boundary failed: " .. tostring(layerGPSError)); return end
-      end
-      saveState()
-      if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or ((route.localCursor >= count) and "row" or nil)) then return end
-      return
-    end
-    local direction, targetDir = requiredDirectionTo(target)
-    if not direction then
-      markBlocked(("Chunk cell path mismatch in %s at local cell %d."):format(chunk.key, route.localCursor))
-      return
-    end
-    if targetDir ~= nil then
-      local turned, turnError = turnTo(targetDir)
-      if not turned then markBlocked("Chunk turn failed: " .. tostring(turnError)); return end
-    end
-    local moved, moveError = moveOne(direction, "mining")
-    if not moved then
-      if handleMoveFailure("Chunk mining failed", moveError, false) then return end
-      markBlocked("Chunk mining failed: " .. tostring(moveError)); return
-    end
-    route.localCursor = route.localCursor + 1
-    job.cursor = (job.cursor or 0) + 1
-    if layerBoundary(job) then
-      local layerGPS, layerGPSError = verifyGPS(true)
-      if not layerGPS then markBlocked("GPS verification at chunk layer boundary failed: " .. tostring(layerGPSError)); return end
-    end
-    saveState()
-    if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or ((route.localCursor >= count) and "row" or nil)) then return end
-    return
-  end
-
-  if route.phase == "return" then
-    local ok, err = navigateTo(anchor, "inside", "mining")
-    if not ok then
-      if handleMoveFailure("Cannot return to chunk anchor", err, false) then return end
-      markBlocked("Cannot return to chunk anchor: " .. tostring(err)); return
-    end
-    route.phase, route.localCursor = "travel", 0
-    job.completedChunks = (job.completedChunks or 0) + 1
-    route.walkIndex = route.walkIndex + 1
-    route.currentKey = walkStep.key
-    saveState()
-    return
-  end
-
-  markBlocked("Unknown chunk route phase: " .. tostring(route.phase))
-end
-
-local function runMiningStep()
-  if handlePendingRequest() then return end
-  if state.service then continueService(); return end
-  if not state.job then
-    state.status = "idle"
-    state.phase = isHome() and "home" or "unknown_position"
-    saveState()
-    return
-  end
-
-  local compactEvery = profileCompactEvery()
-  local moves = tonumber(state.stats.moves) or 0
-  if compactEvery > 0 and moves > 0 and moves % math.floor(compactEvery) == 0
-    and tonumber(state.stats.lastCompressionMove or -1) ~= moves then
-    compressInventoryAtField()
-    state.stats.lastCompressionMove = moves
-    saveState("field_compress")
-  end
-
-  local discardOK, discardError = discardAtField()
-  if not discardOK and discardError then
-    state.lastError = tostring(discardError)
-  end
-
-  local serviceNeeded, reason = shouldService()
-  if serviceNeeded then beginAutomaticService(reason); return end
-  state.phase, state.status, state.lastError = "mining", "working", nil
-  if state.job.strategy == "chunk_plan" then runChunkPlanStep(state.job) else runSerpentineStep(state.job) end
-end
-
-local function displayLocalStatus()
-  common.clear(colors and colors.black or nil, colors and colors.white or nil)
-  print("CC Miner V4 Worker " .. common.VERSION)
-  print("ID: " .. os.getComputerID() .. "  " .. tostring(config.workerName))
-  print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
-  print(("Pose: x=%d y=%d z=%d d=%d"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir))
-  if state.gps and state.gps.lastFix then
-    print(("GPS: %d,%d,%d%s"):format(
-      state.gps.lastFix.x, state.gps.lastFix.y, state.gps.lastFix.z,
-      gpsCalibration() and " calibrated" or " uncalibrated"
-]] },

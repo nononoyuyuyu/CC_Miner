@@ -1,3 +1,63 @@
+        return tonumber(route.distance) + math.abs(dock.anchor.x) + math.abs(dock.anchor.z) + math.abs(tonumber(pose.y) or 0)
+      end
+    end
+  end
+  local dockKey = plan.dockKey or plan.entranceKey or plan.rootKey
+  local path, pathError = quarry.pathToRoot(plan, currentKey)
+  if not path or path[#path] ~= dockKey then path = dfsChunkPath(plan, currentKey, dockKey); pathError = pathError or "dfs_unavailable" end
+  if not path then return nil, pathError end
+
+  local current = plan.chunks[currentKey]
+  local total = math.abs(pose.x - current.anchor.x) + math.abs(pose.z - current.anchor.z)
+  for index = 2, #path do
+    local from, target = plan.chunks[path[index - 1]], plan.chunks[path[index]]
+    if not from or not target then return nil, "Chunk return path references a missing chunk." end
+    total = total + math.abs(from.anchor.x - target.anchor.x) + math.abs(from.anchor.z - target.anchor.z)
+  end
+  local root = plan.chunks[dockKey]
+  if not root then return nil, "Chunk return path has no entrance chunk." end
+  total = total + math.abs(tonumber(pose.y) or 0)
+  total = total + math.abs(root.anchor.x) + math.abs(root.anchor.z)
+  return total
+end
+
+local function firstEmptySlot()
+  for slot = 1, 16 do if not isReservedSlot(slot) and turtle.getItemCount(slot) == 0 then return slot end end
+  return nil
+end
+
+local function firstFuelSlot()
+  local materials = materialsConfig()
+  local preferred = materials.fuelReserveSlots or config.fuelReserveSlots
+  if type(preferred) == "table" then
+    for _, candidate in ipairs(preferred) do
+      local slot = tonumber(candidate)
+      if slot and not isReservedSlot(slot, "fuel") and turtle.getItemCount(slot) == 0 then return slot end
+    end
+  end
+  for slot = 1, 16 do
+    if not isReservedSlot(slot, "fuel") and turtle.getItemCount(slot) == 0 then return slot end
+  end
+  return nil
+end
+
+local function looksLikeInventoryBlock(data)
+  local name = string.lower(blockName(data))
+  if name == "minecraft:chest" or name == "minecraft:trapped_chest" or name == "minecraft:barrel" then return true end
+  return name:match("^minecraft:[%w_]+shulker_box$") ~= nil
+end
+
+local function discardPolicy()
+  local policy = config.discard or {}
+  local mode = tostring(policy.mode or policy.policy or "KEEP_ALL"):upper()
+  if mode ~= "KEEP_ALL" and mode ~= "DISCARD_EXCESS_STONE" and mode ~= "CUSTOM_ALLOWLIST" then mode = "KEEP_ALL" end
+  return policy, mode
+end
+
+local function isOreOrRawMaterial(name)
+  name = string.lower(tostring(name or ""))
+  -- Keep all ores/raw materials regardless of the selected allowlist.  The
+  -- broad suffix/prefix checks intentionally err on the side of retention
   -- for modded names (an unknown resource is safer in the output chest).
   return name:find("_ore", 1, true) ~= nil
     or name:find("ore_", 1, true) ~= nil
@@ -34,13 +94,16 @@ end
 local function discardCandidate(slot, name, totalSeal, policy, mode)
   if mode == "KEEP_ALL" then return false end
   if mode == "CUSTOM_ALLOWLIST" then
-    -- Explicit allowlists never override seal reserve protection.
-    -- Ores/raw materials, torches, and fuel remain hard protected even when
-    -- a broad allowlist is supplied.  Unknown mod items are discardable only
-    -- when their exact name is explicitly allowlisted.
-    if isSealItemName(name) or isTorchItemName(name) or isFuelItem(slot)
-      or isOreOrRawMaterial(name) then return false end
-    return explicitAllowlisted(name, policy)
+    -- Torches, fuel, ores and raw materials remain hard protected.  Seal
+    -- blocks may be selected, but the caller still enforces retainSealTarget.
+    -- Unknown mod items are discardable only when their exact name is explicitly allowlisted.
+    if isTorchItemName(name) or isFuelItem(slot) or isOreOrRawMaterial(name) then return false end
+    if not explicitAllowlisted(name, policy) then return false end
+    if isSealItemName(name) then
+      local keep = math.max(0, tonumber(policy.retainSealTarget) or 64)
+      return totalSeal > keep
+    end
+    return true
   end
   if discardProtectedItem(slot, name) then return false end
   if mode == "DISCARD_EXCESS_STONE" then
@@ -114,35 +177,89 @@ local function recycleRetainTarget()
   return math.max(0, math.floor(tonumber(target) or 64))
 end
 
+local function homeRetainCounts()
+  local policy = config.discard or {}
+  local lighting = config.lighting or {}
+  local materials = materialsConfig()
+  local sealRemaining = math.max(0, math.floor(tonumber(policy.retainSealTarget
+    or materials.retainSealTarget or config.sealTarget) or 64))
+  local torchRemaining = effectiveLighting() == "off" and 0
+    or math.max(0, math.floor(tonumber(lighting.target or lighting.torchTarget
+      or materials.torchTarget or config.torchTarget) or 32))
+  local keep = {}
+  local function reserveRole(role, predicate, remaining)
+    local order, seen = {}, {}
+    local sets = materialSlotSets()
+    for slot = 1, 16 do
+      if sets[role] and sets[role][slot] then order[#order + 1], seen[slot] = slot, true end
+    end
+    for slot = 1, 16 do if not seen[slot] then order[#order + 1] = slot end end
+    for _, slot in ipairs(order) do
+      local count, name = turtle.getItemCount(slot), itemName(slot)
+      if count > 0 and predicate(slot, name) and remaining > 0 then
+        local amount = math.min(count, remaining)
+        keep[slot], remaining = (keep[slot] or 0) + amount, remaining - amount
+      end
+    end
+  end
+  reserveRole("seal", function(_, name) return isSealItemName(name) end, sealRemaining)
+  reserveRole("torch", function(_, name) return isTorchItemName(name) end, torchRemaining)
+  for slot = 1, 16 do
+    if slotRoleContains(slot, "fuel") and isFuelItem(slot) then keep[slot] = turtle.getItemCount(slot)
+    elseif slotRoleContains(slot, "generic") then keep[slot] = turtle.getItemCount(slot) end
+  end
+  return keep
+end
+
 local function compressSealStacks()
+  local originalSlot = turtle.getSelectedSlot()
   local moved = 0
-  for destination = 1, 16 do
-    if not isReservedSlot(destination, "seal") and turtle.getItemCount(destination) > 0 and isSealItemName(itemName(destination)) then
-      local name = itemName(destination)
-      local space = turtle.getItemSpace(destination)
-      if space > 0 then
+  local function compactRole(role, predicate)
+    local sets = materialSlotSets()
+    local order, seen = {}, {}
+    for slot = 1, 16 do
+      if sets[role] and sets[role][slot] and not isReservedSlot(slot, role) then
+        order[#order + 1], seen[slot] = slot, true
+      end
+    end
+    for slot = 1, 16 do
+      if not seen[slot] and not isReservedSlot(slot, role) then order[#order + 1] = slot end
+    end
+    for _, destination in ipairs(order) do
+      -- Empty designated slots are filled first.  Older code only merged into
+      -- occupied slots, so the documented material slots often stayed empty.
+      if turtle.getItemCount(destination) == 0 and sets[role] and sets[role][destination] then
         for source = 1, 16 do
-          if source ~= destination and not isReservedSlot(source, "seal")
+          if source ~= destination and not isReservedSlot(source, role)
+            and turtle.getItemCount(source) > 0 and predicate(itemName(source)) then
+            turtle.select(source)
+            local before = turtle.getItemCount(source)
+            if turtle.transferTo(destination) then moved = moved + before - turtle.getItemCount(source) end
+            break
+          end
+        end
+      end
+      local name = itemName(destination)
+      if name and predicate(name) then
+        local space = turtle.getItemSpace(destination)
+        for source = 1, 16 do
+          if space <= 0 then break end
+          if source ~= destination and not isReservedSlot(source, role)
             and turtle.getItemCount(source) > 0 and itemName(source) == name then
             turtle.select(source)
             local before = turtle.getItemCount(source)
-            local ok = turtle.transferTo(destination, math.min(space, before))
-            local after = turtle.getItemCount(source)
-            if ok and after < before then
-              local amount = before - after
-              moved = moved + amount
+            if turtle.transferTo(destination, math.min(space, before)) then
+              moved = moved + before - turtle.getItemCount(source)
               space = turtle.getItemSpace(destination)
-              if space <= 0 then break end
             end
           end
         end
       end
     end
   end
-  if moved > 0 then
-    state.stats.compressions = (state.stats.compressions or 0) + 1
-    state.recycle.compressed = (state.recycle.compressed or 0) + moved
-  end
+  compactRole("seal", isSealItemName)
+  compactRole("torch", isTorchItemName)
+  turtle.select(originalSlot)
   return moved
 end
 
@@ -159,131 +276,3 @@ local function compressInventoryAtField()
         local space = turtle.getItemSpace(destination)
         if space > 0 then
           for source = 1, 16 do
-            if source ~= destination and not isReservedSlot(source)
-              and turtle.getItemCount(source) > 0 and itemName(source) == name then
-              turtle.select(source)
-              local before = turtle.getItemCount(source)
-              local ok = turtle.transferTo(destination, math.min(space, before))
-              local after = turtle.getItemCount(source)
-              if ok and after < before then
-                local amount = before - after
-                moved = moved + amount
-                space = turtle.getItemSpace(destination)
-                if space <= 0 then break end
-              end
-            end
-          end
-        end
-      end
-    end
-  end
-  turtle.select(originalSlot)
-  if moved > 0 then
-    state.stats.compressions = (state.stats.compressions or 0) + 1
-    state.recycle = state.recycle or {}
-    state.recycle.compressed = (state.recycle.compressed or 0) + moved
-    state.recycle.lastAt = common.nowSeconds()
-  end
-  state.stats.lastCompressionAt = common.nowSeconds()
-  return moved
-end
-
-local function updateRecycleInventoryState()
-  local held, byName = 0, {}
-  for slot = 1, 16 do
-    local name = itemName(slot)
-    if name and isSealItemName(name) then
-      local count = turtle.getItemCount(slot)
-      held = held + count
-      byName[name] = (byName[name] or 0) + count
-    end
-  end
-  state.recycle = state.recycle or {}
-  state.recycle.held, state.recycle.byName = held, byName
-  state.recycle.cap = recycleRetainTarget()
-  state.recycle.overflow = math.max(0, held - state.recycle.cap)
-  return held
-end
-
-local function inventoryPresent(side, inspectFunction)
-  if peripheral and peripheral.hasType then
-    local ok, result = pcall(peripheral.hasType, side, "inventory")
-    if ok and result == true then return true end
-  end
-  local wrapped = peripheral and peripheral.wrap(side) or nil
-  if wrapped and (type(wrapped.list) == "function" or type(wrapped.size) == "function") then return true end
-  if inspectFunction then
-    local ok, present, data = pcall(inspectFunction)
-    if ok and present and looksLikeInventoryBlock(data) then return true end
-  end
-  return false
-end
-
-local function sideFunctions(side)
-  local restoreDir = state.pose.dir
-  if side == "front" then
-    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
-  elseif side == "back" then
-    local ok, err = turnTo(2)
-    if not ok then return nil, nil, nil, restoreDir, err end
-    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
-  elseif side == "right" then
-    local ok, err = turnTo(1)
-    if not ok then return nil, nil, nil, restoreDir, err end
-    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
-  elseif side == "left" then
-    local ok, err = turnTo(3)
-    if not ok then return nil, nil, nil, restoreDir, err end
-    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
-  elseif side == "top" then
-    return turtle.inspectUp, turtle.suckUp, turtle.dropUp, restoreDir
-  elseif side == "bottom" then
-    return turtle.inspectDown, turtle.suckDown, turtle.dropDown, restoreDir
-  end
-  return nil, nil, nil, restoreDir, "Unsupported inventory side: " .. tostring(side)
-end
-
-local function restoreSideDirection(side, restoreDir)
-  if side == "front" or side == "back" or side == "right" or side == "left" then return turnTo(restoreDir) end
-  return true
-end
-
-local function runInventoryPhysicalAction(kind, details, action)
-  local prepared, prepareError = beginPhysicalAction(kind, details, poseCopy())
-  if not prepared then return false, prepareError end
-  local ok, result = pcall(action)
-  if not ok then
-    -- Leave pendingAction intact: an exception leaves inventory outcome
-    -- ambiguous and boot recovery must stop for manual revalidation.
-    return false, tostring(result)
-  end
-  commitPhysicalAction()
-  return result == true, result
-end
-
-local function unloadAtHome()
-  state.phase, state.status = "unloading", "working"
-  saveState("unload_start")
-  local originalSlot = turtle.getSelectedSlot()
-  local outputSide = config.outputSide or "back"
-  local outInspect, _, outDrop, outRestore, sideError = sideFunctions(outputSide)
-  if not outInspect then turtle.select(originalSlot); return false, sideError end
-  local outCheck = (outputSide == "top" and "top") or (outputSide == "bottom" and "bottom") or "front"
-  if not inventoryPresent(outCheck, outInspect) then
-    restoreSideDirection(outputSide, outRestore)
-    turtle.select(originalSlot)
-    return false, "Output inventory missing on configured side " .. outputSide .. "."
-  end
-
-  local policy, mode = discardPolicy()
-  local discardStats = discardStatsTable()
-  discardStats.lastError = nil
-  local _, emptySlots = inventoryStats()
-  local trigger = tonumber(policy.triggerEmptySlots) or 3
-  local discardEnabled = mode ~= "KEEP_ALL" and emptySlots <= trigger
-  local discardSide = policy.direction or "back"
-  if discardSide == "up" then discardSide = "top" end
-  if discardSide == "down" then discardSide = "bottom" end
-  local outputTargetDir = sideTargetDirection(outRestore, outputSide)
-  local discardTargetDir = sideTargetDirection(outRestore, discardSide)
-  local discardInspect, _, discardDrop, discardRestore

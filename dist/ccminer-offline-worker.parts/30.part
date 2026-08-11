@@ -1,3 +1,14 @@
+        workerId = payload.workerId or assignment.workerId,
+        groupJobId = job.groupJobId,
+        bottomY = job.bottomY or targetY,
+        y = job.bottomY or targetY or 0,
+        referenceCalibration = assignmentCatalog.calibrationSeed,
+        workerCalibration = gpsCalibration(),
+        dockPose = { x = 0, y = 0, z = 1 },
+      }
+      local ok, assignedPlan = pcall(quarry.buildAssignedChunkPlan,
+        assignmentCatalog, assignmentChunks, assignmentOptions)
+      if not ok or type(assignedPlan) ~= "table" or type(assignedPlan.chunks) ~= "table" then
         return nil, tostring(ok and assignedPlan or assignedPlan or "assigned plan failed")
       end
       plan = assignedPlan
@@ -194,7 +205,7 @@ local function calibrateGPS()
   end
   if fuelLevel() ~= "unlimited" and tonumber(fuelLevel() or 0) < 2 then return false, "At least 2 fuel is required." end
 ]] },
-  { source = [[src/ccminer/worker_parts/02.part]], target = [[worker_parts/02.part]], digest = [[28cfdb6c1ce7f0e600023f64c443c0ed8baa55ee58e8ab3ef66d6588037180a1]], content = [[  local blocked = turtle.inspect()
+  { source = [[src/ccminer/worker_parts/02.part]], target = [[worker_parts/02.part]], digest = [[411ecbd29950440ec96808a7a93ffd0668a38b498f5f29679c855491231148ee]], content = [[  local blocked = turtle.inspect()
   if blocked then return false, "The block directly in front of the dock must be empty for calibration." end
 
   state.status, state.phase, state.lastError = "calibrating", "gps_calibration", nil
@@ -235,20 +246,3 @@ local function calibrateGPS()
   local calibration, calibrationError = geo.calibrationFromFixes(homeFix, forwardFix)
   if not calibration then
     cancelPhysicalAction()
-    state.status, state.phase, state.lastError = "blocked", "gps_error", calibrationError
-    saveState()
-    return false, calibrationError
-  end
-  config.gps = config.gps or {}
-  config.gps.enabled = true
-  config.gps.calibration = calibration
-  local saved, saveError = common.saveConfig(config)
-  if not saved then
-    cancelPhysicalAction()
-    state.status, state.phase = "blocked", "gps_error"
-    state.lastError = "Could not save GPS calibration: " .. tostring(saveError)
-    saveState()
-    return false, state.lastError
-  end
-  state.gps.available = true
-  state.gps.lastFix = homeFix

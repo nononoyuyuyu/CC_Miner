@@ -45,6 +45,16 @@ local function processChar(character)
   elseif mode == "group_info" then
     if character == "b" or character == "q" then mode = "groups"; invalidate() end
     return
+  elseif mode == "more" then
+    if character == "i" then dashboardAction("items")()
+    elseif character == "b" or character == "q" then mode = "dashboard"; invalidate() end
+    return
+  elseif mode == "items" then
+    if character == "1" and noticeState.discardDraft then noticeState.discardDraft.mode = "KEEP_ALL"; invalidate()
+    elseif character == "2" and noticeState.discardDraft then noticeState.discardDraft.mode = "DISCARD_EXCESS_STONE"; invalidate()
+    elseif character == "3" and noticeState.discardDraft then noticeState.discardDraft.mode = "CUSTOM_ALLOWLIST"; invalidate()
+    elseif character == "b" or character == "q" then mode = "more"; invalidate() end
+    return
   end
   if mode ~= "dashboard" then return end
   local id = selectedWorker()
@@ -63,6 +73,7 @@ local function processChar(character)
   elseif character == "t" then dashboardAction("report")()
   elseif character == "l" then dashboardAction("gps")()
   elseif character == "v" then dashboardAction("groups")()
+  elseif character == "m" then dashboardAction("more")()
   elseif character == "q" then running = false end
 end
 
@@ -413,7 +424,7 @@ if #args > 0 and commandLineMode() then return end
       monitors = common.findPeripherals("monitor")
       speakers = common.findPeripherals("speaker")
       redstoneDevices = common.findPeripherals("redstoneIntegrator")
-      for _, entry in ipairs(monitors) do if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end end
+      for _, entry in ipairs(monitors) do noticeState.configureMonitor(entry.device) end
       renderCache = {}; dirty = true
     end
   end

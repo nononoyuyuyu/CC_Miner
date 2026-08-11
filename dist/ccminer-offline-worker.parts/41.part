@@ -1,3 +1,102 @@
+      route.phase = "return"
+      saveState()
+      return
+    end
+    local target = quarry.chunkCell(chunk, route.localCursor, y)
+    if samePosePosition(state.pose, target) then
+      route.localCursor = route.localCursor + 1
+      job.cursor = (job.cursor or 0) + 1
+      if layerBoundary(job) then
+        local layerGPS, layerGPSError = verifyGPS(true)
+        if not layerGPS then markBlocked("GPS verification at recovered chunk layer boundary failed: " .. tostring(layerGPSError)); return end
+      end
+      saveState()
+      if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or ((route.localCursor >= count) and "row" or nil)) then return end
+      return
+    end
+    local direction, targetDir = requiredDirectionTo(target)
+    if not direction then
+      markBlocked(("Chunk cell path mismatch in %s at local cell %d."):format(chunk.key, route.localCursor))
+      return
+    end
+    if targetDir ~= nil then
+      local turned, turnError = turnTo(targetDir)
+      if not turned then markBlocked("Chunk turn failed: " .. tostring(turnError)); return end
+    end
+    local moved, moveError = moveOne(direction, "mining")
+    if not moved then
+      if handleMoveFailure("Chunk mining failed", moveError, false) then return end
+      markBlocked("Chunk mining failed: " .. tostring(moveError)); return
+    end
+    route.localCursor = route.localCursor + 1
+    job.cursor = (job.cursor or 0) + 1
+    if layerBoundary(job) then
+      local layerGPS, layerGPSError = verifyGPS(true)
+      if not layerGPS then markBlocked("GPS verification at chunk layer boundary failed: " .. tostring(layerGPSError)); return end
+    end
+    saveState()
+    if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or ((route.localCursor >= count) and "row" or nil)) then return end
+    return
+  end
+
+  if route.phase == "return" then
+    local ok, err = navigateTo(anchor, "inside", "mining")
+    if not ok then
+      if handleMoveFailure("Cannot return to chunk anchor", err, false) then return end
+      markBlocked("Cannot return to chunk anchor: " .. tostring(err)); return
+    end
+    route.phase, route.localCursor = "travel", 0
+    job.completedChunks = (job.completedChunks or 0) + 1
+    route.walkIndex = route.walkIndex + 1
+    route.currentKey = walkStep.key
+    saveState()
+    return
+  end
+
+  markBlocked("Unknown chunk route phase: " .. tostring(route.phase))
+end
+
+local function runMiningStep()
+  if handlePendingRequest() then return end
+  if state.service then continueService(); return end
+  if not state.job then
+    state.status = "idle"
+    state.phase = isHome() and "home" or "unknown_position"
+    saveState()
+    return
+  end
+
+  local compactEvery = profileCompactEvery()
+  local moves = tonumber(state.stats.moves) or 0
+  if compactEvery > 0 and moves > 0 and moves % math.floor(compactEvery) == 0
+    and tonumber(state.stats.lastCompressionMove or -1) ~= moves then
+    compressInventoryAtField()
+    state.stats.lastCompressionMove = moves
+    saveState("field_compress")
+  end
+
+  local discardOK, discardError = discardAtField()
+  if not discardOK and discardError then
+    state.lastError = tostring(discardError)
+  end
+
+  local serviceNeeded, reason = shouldService()
+  if serviceNeeded then beginAutomaticService(reason); return end
+  state.phase, state.status, state.lastError = "mining", "working", nil
+  if state.job.strategy == "chunk_plan" then runChunkPlanStep(state.job) else runSerpentineStep(state.job) end
+end
+
+local function displayLocalStatus()
+  common.clear(colors and colors.black or nil, colors and colors.white or nil)
+  print("CC Miner V4 Worker " .. common.VERSION)
+  print("ID: " .. os.getComputerID() .. "  " .. tostring(config.workerName))
+  print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
+  print(("Pose: x=%d y=%d z=%d d=%d"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir))
+  if state.gps and state.gps.lastFix then
+    print(("GPS: %d,%d,%d%s"):format(
+      state.gps.lastFix.x, state.gps.lastFix.y, state.gps.lastFix.z,
+      gpsCalibration() and " calibrated" or " uncalibrated"
+]] },
   { source = [[src/ccminer/worker_parts/05.part]], target = [[worker_parts/05.part]], digest = [[7807e70cc70294234d8716894ee8580dd4b068ac3c3a829759a736bc524d06ed]], content = [[    ))
   else
     print("GPS: " .. (gpsCalibration() and "no fix" or "not calibrated"))
@@ -160,96 +259,3 @@ local function preflight()
   state.stats = common.merge(common.defaultState().stats, state.stats)
   state.gps = common.merge(common.defaultState().gps, state.gps)
   if state.job and not state.job.strategy then state.job.strategy = "serpentine" end
-  if state.job and state.job.strategy == "chunk_plan" and not state.job.chunkPlan then
-    local plan, planError = quarry.buildChunkPlan(state.job, gpsCalibration())
-    if plan then state.job.chunkPlan = plan else state.lastError = planError end
-  end
-
-  if state.pendingAction then
-    local resolved, resolveError = tryResolvePendingAction()
-    if not resolved then
-      local pending = state.pendingAction
-      state.status, state.phase, state.request, state.service = "blocked", "recovery_required", nil, nil
-      state.lastError = ("Power loss occurred during '%s' from x=%s y=%s z=%s dir=%s. GPS recovery failed: %s. Return the turtle to its dock, face the quarry, then use REHOME."):format(
-        tostring(pending.kind or "unknown"), tostring(pending.poseBefore and pending.poseBefore.x or "?"),
-        tostring(pending.poseBefore and pending.poseBefore.y or "?"), tostring(pending.poseBefore and pending.poseBefore.z or "?"),
-        tostring(pending.poseBefore and pending.poseBefore.dir or "?"), tostring(resolveError)
-      )
-      common.log("ERROR", state.lastError)
-    end
-  elseif stateError then
-    state.status, state.phase = "blocked", "state_corrupt"
-    state.lastError = tostring(stateError)
-  elseif gpsCalibration() then
-    local fix, fixError = locateGPS()
-    if fix then
-      local expected = geo.localToWorld(gpsCalibration(), state.pose)
-      if not geo.samePosition(fix, expected) then
-        if not state.job and state.status ~= "working" then
-          local corrected = geo.worldToLocal(gpsCalibration(), fix, state.pose.dir)
-          state.pose = poseCopy(corrected)
-          state.gps.corrections = (state.gps.corrections or 0) + 1
-          common.log("WARN", "GPS corrected idle local coordinates at boot.")
-        else
-          state.status, state.phase = "blocked", "gps_drift"
-          state.lastError = ("Boot GPS mismatch: expected %d,%d,%d, located %d,%d,%d."):format(
-            expected.x, expected.y, expected.z, fix.x, fix.y, fix.z
-          )
-        end
-      end
-    elseif gpsConfig().required then
-      state.status, state.phase = "blocked", "gps_error"
-      state.lastError = "Required GPS fix failed at boot: " .. tostring(fixError)
-    end
-  elseif gpsConfig().required then
-    state.status, state.phase = "blocked", "gps_error"
-    state.lastError = "GPS is required but no calibration is stored."
-  end
-
-  saveState()
-  displayLocalStatus()
-  heartbeat(true)
-end
-
-preflight()
-
-while true do
-  drainNetwork(12)
-  if state.request and state.status ~= "working" then state.status = "working" end
-  if state.status == "working" then
-    if state.request then handlePendingRequest() end
-    if state.service then continueService() else runMiningStep() end
-  elseif state.status == "waiting_output" or state.status == "waiting_fuel" or state.status == "waiting_seal" or state.status == "waiting_torch" then
-    if state.service then
-      continueService()
-      if state.status == "waiting_output" or state.status == "waiting_fuel" or state.status == "waiting_seal" or state.status == "waiting_torch" then sleep(3) end
-    else
-      markBlocked("Service state is missing while waiting.")
-    end
-  else
-    pollNetwork(0.5)
-  end
-  heartbeat(false)
-  if state.status ~= "working" then displayLocalStatus() end
-end
-]] },
-}
-local FILE_COUNT = 13
-local WORKER_PARTS = {[[worker_parts/01.part]], [[worker_parts/02.part]], [[worker_parts/03.part]], [[worker_parts/04.part]], [[worker_parts/05.part]]}
-local CONTROLLER_PARTS = {}
-local ENTRYPOINT = [[worker.lua]]
-local UPDATE_SENTINEL = [[-- CC Miner V4 update-incomplete sentinel for worker
-error("CC Miner runtime update is incomplete. Re-transfer the offline bundle and run update-low-space.", 0)
-]]
-local LOW_SPACE_STEPS = {
-  { kind = "runtime", index = 1 },
-  { kind = "runtime", index = 2 },
-  { kind = "runtime", index = 3 },
-  { kind = "runtime", index = 4 },
-  { kind = "runtime", index = 5 },
-  { kind = "runtime", index = 6 },
-  { kind = "runtime", index = 7 },
-  { kind = "runtime", index = 9 },
-  { kind = "runtime", index = 10 },
-  { kind = "runtime", index = 11 },
-  { kind = "runtime", index = 12 },

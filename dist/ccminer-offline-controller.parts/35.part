@@ -1,3 +1,20 @@
+    return false
+  end
+  db.lastDraft = persistentDraft(draft)
+  db.lastPreset = draft.profile or db.lastPreset
+  if draft.queueIndex and db.queue[draft.queueIndex] then
+    db.queue[draft.queueIndex].awaiting = { workerId = assignments[1].workerId, jobId = assignments[1].jobId, sentAt = common.nowSeconds() }
+    db.queue[draft.queueIndex].retryAt = common.nowSeconds() + 10
+  end
+  saveControllerDb()
+  mode, draft = "dashboard", nil
+  setNotice(("Job sent to %d worker%s."):format(#assignments, #assignments == 1 and "" or "s"), false)
+  return true
+end
+
+local function queueDraft()
+  if not draft then return false end
+  if config.queueEnabled == false then setNotice("Queue is disabled by controller configuration.", true); return false end
   local previousQueueing = draft.queueing
   draft.queueing = true
   local result = computePreflight()
@@ -207,6 +224,10 @@ local function dashboardAction(name)
       invalidate()
     elseif name == "info" then
       if id then mode = "info" else setNotice("No worker selected.", true) end
+    elseif name == "more" then mode = "more"
+    elseif name == "items" then
+      if id and noticeState.openItems then noticeState.openItems()
+      else setNotice("Select a worker before opening item settings.", true) end
     elseif name == "remote" then
       if id then
         setNotice(("Remote console is CLI-only: ccm remote %s [-- <command...>]"):format(tostring(id)), false)
@@ -220,14 +241,3 @@ local function dashboardAction(name)
     elseif name == "report" then mode = "report"
     elseif name == "last_error" then noticeState.showLast()
     elseif name == "stop" then if id then mode = "stop_menu" else setNotice("No worker selected.", true) end
-    elseif name == "pause" or name == "resume" or name == "recall" or name == "service" then sendCommand(id, name)
-    elseif name == "abort" then
-      if id then confirmState = { command = "stop", payload = { mode = "abort" }, message = "Abort the active job and return home?" }; mode = "confirm" end
-    elseif name == "clear" then
-      if id then confirmState = { command = "clear", message = "Clear the completed or aborted job record?" }; mode = "confirm" end
-    elseif name == "rehome" then
-      if id then confirmState = { command = "rehome", payload = { confirm = "RESET" }, twoStep = true, message = "REHOME RESET clears the active job. Press YES twice only when the turtle is physically in its dock." }; mode = "confirm" end
-    elseif name == "gps" then
-      if id then confirmState = { command = "calibrate_gps", message = "GPS calibration moves forward one block and back. Is the dock front clear?" }; mode = "confirm" end
-    elseif name == "quit" then running = false end
-    invalidate()

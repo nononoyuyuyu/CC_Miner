@@ -1,3 +1,86 @@
+      if cursor >= endBlock then return "complete" elseif cursor > startBlock then return "working" end
+    end
+  end
+  if progress.cursor == nil and job.cursor == nil then return "unknown" end
+  return "queued"
+end
+
+local progressColors = { unknown = "gray", queued = "blue", working = "yellow", complete = "green", excluded = "red", blocked = "red", service = "orange" }
+local function renderProgress(target, key)
+  local width, height = target.getSize()
+  local id, worker = selectedWorker()
+  local data = worker and worker.data or {}
+  writeHeader("WORK PROGRESS MAP", target)
+  common.writeAt(1, 2, common.fit(("#%s %s %s"):format(tostring(id or "-"), worker and workerLabel(worker, id) or "-", progressText(data)), width), colors and colors.lightGray or nil)
+  local job = data.job
+  if not job then
+    common.writeAt(1, 4, common.fit("No active job (old worker may only expose status).", width), colors and colors.yellow or nil)
+  else
+    local chunkMode = job.chunkMode == "world" and "world" or "local"
+    local calibration = data.gps and data.gps.calibration
+    local catalog, catalogError = quarry.buildCatalog(job.width, job.length, chunkMode, calibration)
+    if not catalog then
+      common.writeAt(1, 4, common.fit("Chunk map unavailable: " .. tostring(catalogError), width), colors and colors.yellow or nil)
+      buttonRow(key, math.max(1, height - 2), width, { { "BACK", function() mode = "dashboard" end } })
+      noticeLine(target, height)
+      return
+    end
+    local excludedSet = {}
+    for _, exclusion in ipairs(type(job.excludedChunks) == "table" and job.excludedChunks or {}) do
+      if type(exclusion) == "table" and tonumber(exclusion.cx) and tonumber(exclusion.cz) then
+        local exclusionKey = quarry.chunkKey(chunkMode, math.floor(exclusion.cx), math.floor(exclusion.cz))
+        excludedSet[exclusionKey] = true
+      elseif type(exclusion) == "string" then excludedSet[exclusion] = true end
+    end
+    local byCoordinate, xValues, zValues = chunkGrid(catalog)
+    local cellWidth = width >= 48 and 2 or 1
+    local cols = common.clamp(math.floor((width - 3) / cellWidth), 1, math.max(1, #xValues))
+    local rows = common.clamp(height - 8, 1, math.max(1, #zValues))
+    for row = 0, rows - 1 do
+      local cz = zValues[row + 1]
+      for col = 0, cols - 1 do
+        local cx = xValues[col + 1]
+        local chunk = cx and cz and byCoordinate[tostring(cx) .. ":" .. tostring(cz)] or nil
+        if chunk then
+        local state = progressChunkState(data, chunk, row * cols + col + 1, excludedSet)
+        local bg = colors and colors[progressColors[state] or "gray"] or nil
+        local glyph = ({ unknown = "?", queued = "Q", working = "W", complete = "+", excluded = "X", blocked = "B", service = "S" })[state] or "?"
+        local px, py = 2 + col * cellWidth, 4 + row
+        common.writeAt(px, py, common.center(glyph, cellWidth), colors and colors.white or nil, bg)
+        end
+      end
+    end
+    common.writeAt(1, math.max(3, height - 5), common.fit("? unknown Q queued W working + complete X excluded B blocked S service (one tile=one chunk)", width), colors and colors.lightGray or nil)
+  end
+  buttonRow(key, math.max(1, height - 2), width, {
+    { "STOP", function() mode = "stop_menu" end }, { "REFRESH", function() invalidate() end }, { "BACK", function() mode = "dashboard" end },
+  })
+  noticeLine(target, height)
+end
+
+local function renderStopMenu(target, key)
+  local width, height = target.getSize()
+  writeHeader("STAGED STOP", target, colors and colors.orange or nil)
+  common.writeAt(1, 2, common.fit("Select a boundary; payload is command=stop, mode=...", width), colors and colors.lightGray or nil)
+  local id = selectedWorker()
+  local function action(stopMode, message)
+    return function() setNotice(message, false); stageStop(id, stopMode); mode = "dashboard" end
+  end
+  buttonRow(key, 4, width, { { "PAUSE NOW", action("pause_now", "Pause requested now.") }, { "FINISH ROW", action("finish_row", "Finish current row then stop.") } })
+  buttonRow(key, 5, width, { { "FINISH LAYER", action("finish_layer", "Finish current layer then stop.") }, { "RETURN HOME", action("return_home", "Return-home stop requested.") } })
+  buttonRow(key, math.max(6, height - 3), width, { { "ABORT", action("abort", "Abort requested.") }, { "BACK", function() mode = "dashboard" end } })
+  noticeLine(target, height)
+end
+
+local function renderRecovery(target, key)
+  local width, height = target.getSize()
+  local id, worker = selectedWorker()
+  local data = worker and worker.data or {}
+  writeHeader("RECOVERY WIZARD", target, colors and colors.red or nil)
+  local explanation = data.lastError or (data.pendingAction and ("Pending action: " .. tostring(data.pendingAction.kind)) or "Worker needs recovery.")
+  common.writeAt(1, 2, common.fit("State: " .. tostring(data.status or "unknown") .. " / " .. tostring(data.phase or "-"), width), colors and colors.yellow or nil)
+  common.writeAt(1, 3, common.fit(explanation, width), colors and colors.white or nil)
+  buttonRow(key, 5, width, { { "GPS FIX", function() recoveryAction("gps_fix") end }, { "RETRY", function() recoveryAction("retry") end }, { "RESUME", function() recoveryAction("resume") end } })
   buttonRow(key, 6, width, { { "RETURN", function() recoveryAction("return") end }, { "REHOME RESET", function() recoveryAction("rehome") end }, { "BACK", function() mode = "dashboard" end } })
   noticeLine(target, height)
 end
@@ -98,101 +181,3 @@ local function renderOne(target, key)
   local signature = screenSignature(target, key)
   if renderCache[key] == signature and not dirty then return end
   common.withTerm(target, function()
-    common.clear(colors and colors.black or nil, colors and colors.white or nil)
-    if mode == "dashboard" then renderDashboard(target, key)
-    elseif mode == "groups" then renderGroups(target, key)
-    elseif mode == "group_info" then renderGroupInfo(target, key)
-    elseif mode == "group_dimensions" or mode == "group_job" then renderGroupDimensions(target, key)
-    elseif mode == "job_dimensions" then renderDimensions(target, key)
-    elseif mode == "job_grid" or mode == "job_chunks" then renderGrid(target, key)
-    elseif mode == "preflight" then renderPreflight(target, key)
-    elseif mode == "progress" then renderProgress(target, key)
-    elseif mode == "stop_menu" then renderStopMenu(target, key)
-    elseif mode == "recovery" then renderRecovery(target, key)
-    elseif mode == "info" then renderInfo(target, key)
-    elseif mode == "report" then renderReport(target, key)
-    elseif mode == "confirm" then renderConfirm(target, key)
-    elseif mode == "error_detail" then renderErrorDetail(target, key)
-    else mode = "dashboard"; renderDashboard(target, key) end
-  end)
-  renderCache[key] = signature
-end
-
-local function render()
-  if not dirty then return end
-  renderOne(term.current(), "term")
-  for _, entry in ipairs(monitors) do renderOne(entry.device, entry.name) end
-  dirty = false
-end
-
-local function handlePointer(key, x, y)
-  local boxes = hitboxes[key] or {}
-  for index = #boxes, 1, -1 do
-    local box = boxes[index]
-    if x >= box.x1 and x <= box.x2 and y >= box.y1 and y <= box.y2 then box.action(); invalidate(); return true end
-  end
-  return false
-end
-]] },
-  { source = [[src/ccminer/controller_parts/03.part]], target = [[controller_parts/03.part]], digest = [[ed58e408499ddb24b3c076ccdca6b3e0e0c0f384ca10bd9a43ddbba0971e561c]], content = [[-- CC Miner V4 - keyboard/CLI compatibility and event loop.
-
-local function processChar(character)
-  character = string.lower(character or "")
-  if mode == "job_dimensions" then
-    if character:match("%d") or character == "-" then draftDigit(character) end
-    return
-  elseif mode == "group_dimensions" or mode == "group_job" then
-    if character:match("%d") or character == "-" then groupDraftDigit(character)
-    elseif character == "p" then
-      local gid = selectedGroupRecord()
-      if gid and groupDraft then commitGroupDraftField(); groupDraft.preflight = computeGroupPreflight(gid, groupDraft); invalidate() end
-    elseif character == "s" then
-      local gid = selectedGroupRecord()
-      if gid and groupDraft then commitGroupDraftField(); local result = groupDraft.preflight or computeGroupPreflight(gid, groupDraft); groupDraft.preflight = result; if result and not result.fatal then startGroup(gid, groupDraft) end; invalidate() end
-    elseif character == "b" or character == "q" then mode = "groups"; invalidate() end
-    return
-  elseif mode == "confirm" then
-    if character == "y" then
-      if confirmState and confirmState.twoStep and not confirmState.armed then
-        confirmState.armed = true; confirmState.message = "FINAL confirmation: press Y again to send REHOME RESET."; invalidate(); return
-      end
-      local id = selectedWorker()
-      if confirmState and id then
-        if confirmState.command == "stop" then stageStop(id, (confirmState.payload or {}).mode or "abort") else sendCommand(id, confirmState.command, confirmState.payload) end
-      end
-      confirmState, mode = nil, "dashboard"
-    elseif character == "n" then confirmState, mode = nil, "dashboard"; setNotice("Cancelled.", false) end
-    return
-  elseif mode == "error_detail" then
-    if character == "o" or character == "b" or character == "q" then noticeState.dismiss() end
-    return
-  elseif mode == "job_grid" then
-    if character == "a" then allGrid(true) elseif character == "c" then allGrid(false) elseif character == "i" then invertGrid() elseif character == "r" then draft.rectMode = not draft.rectMode; draft.rectStart = nil; invalidate() end
-    return
-  elseif mode == "groups" then
-    local ids = orderedGroupIds()
-    if character == "s" then groupAction("start")()
-    elseif character == "p" then groupAction("pause")()
-    elseif character == "r" then groupAction("resume")()
-    elseif character == "h" then groupAction("return")()
-    elseif character == "v" then mode = "group_info"; invalidate()
-    end
-    return
-  elseif mode == "group_info" then
-    if character == "b" or character == "q" then mode = "groups"; invalidate() end
-    return
-  end
-  if mode ~= "dashboard" then return end
-  local id = selectedWorker()
-  if character == "d" then discover()
-  elseif character == "n" then dashboardAction("new")()
-  elseif character == "p" then sendCommand(id, "pause")
-  elseif character == "r" then sendCommand(id, "resume")
-  elseif character == "h" then sendCommand(id, "recall")
-  elseif character == "s" then dashboardAction("stop")()
-  elseif character == "x" then dashboardAction("abort")()
-  elseif character == "c" then dashboardAction("clear")()
-  elseif character == "i" then dashboardAction("info")()
-  elseif character == "g" then dashboardAction("progress")()
-  elseif character == "o" then dashboardAction("remote")()
-  elseif character == "e" then dashboardAction("recovery")()

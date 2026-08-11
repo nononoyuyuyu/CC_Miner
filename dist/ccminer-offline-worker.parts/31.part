@@ -1,3 +1,20 @@
+    state.status, state.phase, state.lastError = "blocked", "gps_error", calibrationError
+    saveState()
+    return false, calibrationError
+  end
+  config.gps = config.gps or {}
+  config.gps.enabled = true
+  config.gps.calibration = calibration
+  local saved, saveError = common.saveConfig(config)
+  if not saved then
+    cancelPhysicalAction()
+    state.status, state.phase = "blocked", "gps_error"
+    state.lastError = "Could not save GPS calibration: " .. tostring(saveError)
+    saveState()
+    return false, state.lastError
+  end
+  state.gps.available = true
+  state.gps.lastFix = homeFix
   state.gps.lastFixAt = common.nowSeconds()
   state.gps.lastError = nil
   state.status, state.phase, state.lastError = "idle", "home", nil
@@ -252,14 +269,3 @@ local function remoteConsoleAction(sender, payload)
     local pinnedController = tonumber(config.controllerId or 0) or 0
     if config.remoteConsole.allowShell == true and pinnedController <= 0 then
       return false, "Arbitrary remote shell requires a pinned controllerId.", nil, nil
-    end
-    if pinnedController > 0 and tonumber(sender) ~= pinnedController then
-      return false, "Remote console sender is not the pinned controller.", nil, nil
-    end
-    if remoteSession then
-      if tonumber(remoteSession.sender) ~= tonumber(sender) then
-        return false, "Remote console session is already open for another controller.", nil, nil
-      end
-      -- Re-opening from the pinned controller is idempotent.  This recovers
-      -- when the OPEN ACK was lost without making the operator wait for the
-      -- whole session timeout or issuing a second shell session.

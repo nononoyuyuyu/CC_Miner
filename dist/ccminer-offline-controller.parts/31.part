@@ -1,3 +1,10 @@
+    bottomY = bottomY,
+    targetY = bottomY,
+    mode = group and group.mode or "world",
+    partition = group and group.partition or (config.group and config.group.partitionMode) or "stripe",
+    lighting = normalizedLighting and normalizedLighting(previous.lighting) or common.copy(previous.lighting or { mode = "safe", interval = 10 }),
+    waterMode = normalizedWaterMode and normalizedWaterMode(previous.waterMode) or tostring(previous.waterMode or "seal"),
+    profile = normalizedProfile and normalizedProfile(previous.profile) or tostring(previous.profile or "balanced"),
     name = previous.name or (group and group.name and ("Group " .. tostring(group.name)) or "Group Quarry"),
   }
 end
@@ -163,8 +170,3 @@ local function computeGroupPreflight(groupId, value)
         check("bay pose:#" .. tostring(id), "bad", "bay world pose unavailable", true)
       elseif workerBay.world then
         local pos = data.world or data.position
-        local match = pos and tonumber(pos.x) == tonumber(workerBay.world.x) and tonumber(pos.y) == tonumber(workerBay.world.y) and tonumber(pos.z) == tonumber(workerBay.world.z)
-        if match then check("bay pose:#" .. tostring(id), "ok", "world pose verified", false) else check("bay pose:#" .. tostring(id), "bad", "worker is not at bay world pose", true) end
-        local facing = data.facing or data.pose and data.pose.dir
-        if facing == nil then check("bay facing:#" .. tostring(id), "bad", "worker facing unavailable", true)
-        elseif workerBay.facing ~= nil and tostring(facing) ~= tostring(workerBay.facing) then check("bay facing:#" .. tostring(id), "bad", "facing mismatch", true)

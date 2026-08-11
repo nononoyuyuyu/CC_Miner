@@ -242,7 +242,7 @@ local program, compileError = loader(table.concat(source), "@/ccminer/worker.ass
 if not program then error("Cannot assemble worker: " .. tostring(compileError), 0) end
 return program(...)
 ]] },
-  { source = [[src/ccminer/worker_parts/01.part]], target = [[worker_parts/01.part]], digest = [[93a3c5d046c2fdc5273de5223a2e83d0718e842b19bc025264ad7526a42703a3]], content = [[-- CC Miner V4 - autonomous quarry worker
+  { source = [[src/ccminer/worker_parts/01.part]], target = [[worker_parts/01.part]], digest = [[4c12338582680376e4df81af2ab9a15a3f965a6fa219bae8f37c9581fd49e02a]], content = [[-- CC Miner V4 - autonomous quarry worker
 -- Home=(0,0,0), forward=+Z, right=+X, down=-Y.
 
 local common = dofile("/ccminer/lib/common.lua")

@@ -1,3 +1,54 @@
+    state.job, state.checkpoint, state.resumeToken, state.assignmentResumeToken, state.service, state.request = nil, nil, nil, nil, nil, nil
+    state.group, state.dock = nil, nil
+    state.stagedStop = false
+    state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
+    saveState()
+    return true, "Job record cleared."
+  elseif command == "calibrate_gps" then
+    return calibrateGPS()
+  elseif command == "gps_fix" then
+    local fix, err = locateGPS()
+    saveState()
+    if not fix then return false, err end
+    local verified, verifyError = verifyGPS(true)
+    if not verified then return false, verifyError end
+    return true, ("GPS fix: %d,%d,%d"):format(fix.x, fix.y, fix.z)
+  elseif command == "rehome" then
+    if payload.confirm ~= "RESET" then return false, "Rehome requires confirm=RESET." end
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+      return false, "Stop the worker before rehoming."
+    end
+    local calibration = gpsCalibration()
+    if calibration then
+      local fix, fixError = locateGPS()
+      if not fix then
+        return false, "GPS fix is required to verify the calibrated dock before REHOME: " .. tostring(fixError)
+      end
+      local expected = geo.localToWorld(calibration, { x = 0, y = 0, z = 0 })
+      if not geo.samePosition(fix, expected) then
+        return false, ("GPS says the turtle is at %d,%d,%d, not the calibrated dock %d,%d,%d."):format(
+          fix.x, fix.y, fix.z, expected.x, expected.y, expected.z
+        )
+      end
+    end
+    state.pose = { x = 0, y = 0, z = 0, dir = 0 }
+    state.job, state.checkpoint, state.resumeToken, state.assignmentResumeToken, state.service, state.request, state.pendingAction = nil, nil, nil, nil, nil, nil, nil
+    state.group, state.dock = nil, nil
+    state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
+    saveState()
+    return true, "Local position reset to home."
+  elseif command == "ping" or command == "status" then
+    return true, "Status sent."
+  end
+  return false, "Unknown command: " .. tostring(command)
+end
+
+local function handleMessage(sender, message)
+  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
+  if not valid then return end
+  if tonumber(config.controllerId or 0) > 0 and tonumber(sender) ~= tonumber(config.controllerId) then return end
+  if message.kind == "discover" then sendStatus(sender, message); return end
+  if message.kind ~= "command" then return end
   if tonumber(message.target) ~= tonumber(os.getComputerID()) then return end
   if commandSeen(message.id) then
     sendAck(sender, message, true, "Duplicate command ignored; previous result retained.")
@@ -246,63 +297,3 @@ local function isGravityBlock(data)
   end
   return false
 end
-
-local function tryPlaceTorchWall(relativeDir)
-  local originalDir = state.pose.dir
-  local originalSlot = turtle.getSelectedSlot()
-  local targetDir = (originalDir + relativeDir) % 4
-  local turned, turnError = turnTo(targetDir)
-  if not turned then return false, turnError end
-
-  local function restoreContext(reason)
-    turtle.select(originalSlot)
-    local restored, restoreError = turnTo(originalDir)
-    if not restored then return false, restoreError end
-    return false, reason
-  end
-
-  local present, data = turtle.inspect()
-  if present then
-    if relativeDir ~= 1 and relativeDir ~= 3 then return restoreContext("occupied") end
-    local protected, name = isProtected(data)
-    if protected or isInventoryBlock("front", data) or isLava(data) or isWater(data) or isGravityBlock(data) then
-      return restoreContext("occupied")
-    end
-    local _, emptySlots = inventoryStats()
-    if emptySlots <= 0 then return restoreContext("inventory_full") end
-    -- In a normal 1x1 tunnel, carve a one-block niche only from an ordinary
-    -- solid side block.  The dig and subsequent place are separately journaled
-    -- so a power loss can be re-inspected idempotently.
-    turtle.select(originalSlot)
-    local prepared, prepareError = beginPhysicalAction("dig_torch_niche_forward", {
-      block = name, side = relativeDir,
-    }, poseCopy())
-    if not prepared then return restoreContext(prepareError) end
-    local dug, digError = turtle.dig()
-    if not dug then
-      cancelPhysicalAction()
-      return restoreContext(digError or "torch_niche_dig_failed")
-    end
-    state.stats.blocksDug = (state.stats.blocksDug or 0) + 1
-    noteMinedMaterial(name)
-    state.fluidSealRun = 0
-    state.fluidSealMarker = nil
-    commitPhysicalAction()
-    local slot = selectTorchMaterial()
-    if not slot then return restoreContext("torch_material") end
-    local placedPrepared, placedPrepareError = beginPhysicalAction("torch_niche_forward", {
-      side = relativeDir, material = itemName(slot),
-    }, poseCopy())
-    if not placedPrepared then return restoreContext(placedPrepareError) end
-    local placed, placeError = turtle.place()
-    if not placed then
-      cancelPhysicalAction()
-      return restoreContext(placeError or "torch_niche_place_failed")
-    end
-    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
-    state.lighting.placed = (state.lighting.placed or 0) + 1
-    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
-    commitPhysicalAction()
-    turtle.select(originalSlot)
-    local restored, restoreError = turnTo(originalDir)
-    if not restored then return false, restoreError end

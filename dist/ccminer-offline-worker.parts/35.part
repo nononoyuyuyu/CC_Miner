@@ -1,3 +1,66 @@
+
+local function moveY(targetY, context)
+  while state.pose.y < targetY do
+    local ok, err = moveOne("up", context)
+    if not ok then return false, err end
+  end
+  while state.pose.y > targetY do
+    local ok, err = moveOne("down", context)
+    if not ok then return false, err end
+  end
+  return true
+end
+
+local function navigateTo(target, route, context)
+  target = target or { x = 0, y = 0, z = 0 }
+  local ok, err
+  if route == "home" then
+    ok, err = moveY(target.y or 0, context); if not ok then return false, err end
+    ok, err = moveX(target.x or 0, context); if not ok then return false, err end
+    ok, err = moveZ(target.z or 0, context); if not ok then return false, err end
+  elseif route == "inside" then
+    ok, err = moveX(target.x or 0, context); if not ok then return false, err end
+    ok, err = moveZ(target.z or 0, context); if not ok then return false, err end
+    ok, err = moveY(target.y or 0, context); if not ok then return false, err end
+  else
+    ok, err = moveZ(target.z or 0, context); if not ok then return false, err end
+    ok, err = moveX(target.x or 0, context); if not ok then return false, err end
+    ok, err = moveY(target.y or 0, context); if not ok then return false, err end
+  end
+  return true
+end
+
+local function chunkAnchor(plan, key, y)
+  local chunk = plan and plan.chunks and plan.chunks[key]
+  if not chunk then return nil, "Unknown chunk " .. tostring(key) end
+  return { x = chunk.anchor.x, y = y, z = chunk.anchor.z }
+end
+
+local function serviceDockAnchor(plan, y)
+  local key = plan and (plan.dockKey or plan.entranceKey or plan.rootKey)
+  if not key then return nil, "Service plan has no dock chunk." end
+  local anchor, err = chunkAnchor(plan, key, y)
+  if not anchor then return nil, err end
+  anchor.chunkKey = key
+  return anchor, key
+end
+
+local function moveBetweenChunkAnchors(plan, fromKey, toKey, y, context)
+  local from = plan.chunks[fromKey]
+  local target, err = chunkAnchor(plan, toKey, y)
+  if not from or not target then return false, err or "Missing chunk anchor." end
+  local adjacent = false
+  for _, key in ipairs(from.neighbors or {}) do if key == toKey then adjacent = true; break end end
+  if not adjacent then return false, "Chunk route is not adjacent: " .. tostring(fromKey) .. " -> " .. tostring(toKey) end
+  return navigateTo(target, "inside", context)
+end
+
+local function normalizeWaypoint(value, fallbackY)
+  if type(value) ~= "table" then return nil end
+  local pose = value.pose or value.position or value.target or value
+  if type(pose) ~= "table" then return nil end
+  local x, z = tonumber(pose.x), tonumber(pose.z)
+  if not x or not z then return nil end
   return { x = x, y = tonumber(pose.y) or tonumber(fallbackY) or 0, z = z,
     dir = pose.dir ~= nil and ((tonumber(pose.dir) or 0) % 4) or nil }
 end
@@ -203,63 +266,3 @@ local function estimatedReturnDistance(pose)
       local dockPose = { x = dock.anchor.x, y = pose.y, z = dock.anchor.z }
       local ok, route = pcall(quarry.shortestServiceRoute, plan, pose, dockPose, { allowFallback = true })
       if ok and type(route) == "table" and tonumber(route.distance) then
-        return tonumber(route.distance) + math.abs(dock.anchor.x) + math.abs(dock.anchor.z) + math.abs(tonumber(pose.y) or 0)
-      end
-    end
-  end
-  local dockKey = plan.dockKey or plan.entranceKey or plan.rootKey
-  local path, pathError = quarry.pathToRoot(plan, currentKey)
-  if not path or path[#path] ~= dockKey then path = dfsChunkPath(plan, currentKey, dockKey); pathError = pathError or "dfs_unavailable" end
-  if not path then return nil, pathError end
-
-  local current = plan.chunks[currentKey]
-  local total = math.abs(pose.x - current.anchor.x) + math.abs(pose.z - current.anchor.z)
-  for index = 2, #path do
-    local from, target = plan.chunks[path[index - 1]], plan.chunks[path[index]]
-    if not from or not target then return nil, "Chunk return path references a missing chunk." end
-    total = total + math.abs(from.anchor.x - target.anchor.x) + math.abs(from.anchor.z - target.anchor.z)
-  end
-  local root = plan.chunks[dockKey]
-  if not root then return nil, "Chunk return path has no entrance chunk." end
-  total = total + math.abs(tonumber(pose.y) or 0)
-  total = total + math.abs(root.anchor.x) + math.abs(root.anchor.z)
-  return total
-end
-
-local function firstEmptySlot()
-  for slot = 1, 16 do if not isReservedSlot(slot) and turtle.getItemCount(slot) == 0 then return slot end end
-  return nil
-end
-
-local function firstFuelSlot()
-  local materials = materialsConfig()
-  local preferred = materials.fuelReserveSlots or config.fuelReserveSlots
-  if type(preferred) == "table" then
-    for _, candidate in ipairs(preferred) do
-      local slot = tonumber(candidate)
-      if slot and not isReservedSlot(slot, "fuel") and turtle.getItemCount(slot) == 0 then return slot end
-    end
-  end
-  for slot = 1, 16 do
-    if not isReservedSlot(slot, "fuel") and turtle.getItemCount(slot) == 0 then return slot end
-  end
-  return nil
-end
-
-local function looksLikeInventoryBlock(data)
-  local name = string.lower(blockName(data))
-  if name == "minecraft:chest" or name == "minecraft:trapped_chest" or name == "minecraft:barrel" then return true end
-  return name:match("^minecraft:[%w_]+shulker_box$") ~= nil
-end
-
-local function discardPolicy()
-  local policy = config.discard or {}
-  local mode = tostring(policy.mode or policy.policy or "KEEP_ALL"):upper()
-  if mode ~= "KEEP_ALL" and mode ~= "DISCARD_EXCESS_STONE" and mode ~= "CUSTOM_ALLOWLIST" then mode = "KEEP_ALL" end
-  return policy, mode
-end
-
-local function isOreOrRawMaterial(name)
-  name = string.lower(tostring(name or ""))
-  -- Keep all ores/raw materials regardless of the selected allowlist.  The
-  -- broad suffix/prefix checks intentionally err on the side of retention

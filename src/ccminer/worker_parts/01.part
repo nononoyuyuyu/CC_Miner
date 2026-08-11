@@ -911,6 +911,22 @@ end
 
 local function statusPayload()
   local used, empty, items = inventoryStats()
+  local inventorySlots = {}
+  for slot = 1, 16 do
+    local count = turtle.getItemCount(slot)
+    if count > 0 then
+      local name = itemName(slot) or "unknown"
+      inventorySlots[#inventorySlots + 1] = {
+        slot = slot,
+        name = name,
+        count = count,
+        seal = isSealItemName(name) == true,
+        torch = isTorchItemName(name) == true,
+        fuel = isFuelItem(slot) == true,
+        reserved = isReservedSlot(slot) == true,
+      }
+    end
+  end
   local profile = effectiveProfile()
   local remoteActive = remoteSession ~= nil
     and common.nowSeconds() < tonumber(remoteSession.expiresAt or 0)
@@ -1032,6 +1048,7 @@ local function statusPayload()
       stateJournal = true,
       completionReport = true,
       discardPolicy = true,
+      discardConfig = true,
       shortestServiceRoute = type(quarry.shortestServiceRoute) == "function",
       edgeTransition = type(quarry.edgeTransition) == "function",
       groupAssignment = true,
@@ -1042,6 +1059,12 @@ local function statusPayload()
     inventoryUsed = used,
     inventoryEmpty = empty,
     inventoryItems = items,
+    inventory = {
+      used = used,
+      empty = empty,
+      items = items,
+      slots = inventorySlots,
+    },
     remoteConsole = {
       enabled = config.remoteConsole.enabled == true,
       allowShell = config.remoteConsole.allowShell == true,

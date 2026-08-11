@@ -1,3 +1,10 @@
+  if tostring(wireCommand or ""):lower() ~= "remote_console" then return false end
+  local action = remoteAckField(payload, result, "action")
+    or remoteAckField(payload, result, "remoteAction")
+  if action ~= nil and tostring(action):lower() ~= tostring(pending.action):lower() then return false end
+  local sessionId = remoteAckField(payload, result, "sessionId")
+  local nonce = remoteAckField(payload, result, "nonce")
+  -- The worker creates fresh session credentials on OPEN and returns them in
   -- the result table.  Subsequent actions must echo those credentials exactly;
   -- the controller's provisional values are only an anti-collision hint.
   if pending.action ~= "open" then
@@ -206,13 +213,3 @@ end
 
 local function remoteSensitiveKey(key)
   local name = tostring(key or ""):lower():gsub("[^%a%d]", "")
-  return name == "networkkey" or name == "password" or name == "passwd"
-    or name == "secret" or name == "token" or name == "nonce"
-    or name == "sessionid" or name == "apikey" or name == "auth"
-end
-
-local function remoteValueText(value, depth, field)
-  if remoteSensitiveKey(field) then return "[REDACTED]" end
-  depth = tonumber(depth) or 0
-  if value == nil then return "-" end
-  if type(value) == "string" then return remoteRedactText(value) end

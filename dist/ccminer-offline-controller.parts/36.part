@@ -1,3 +1,14 @@
+    elseif name == "pause" or name == "resume" or name == "recall" or name == "service" then sendCommand(id, name)
+    elseif name == "abort" then
+      if id then confirmState = { command = "stop", payload = { mode = "abort" }, message = "Abort the active job and return home?" }; mode = "confirm" end
+    elseif name == "clear" then
+      if id then confirmState = { command = "clear", message = "Clear the completed or aborted job record?" }; mode = "confirm" end
+    elseif name == "rehome" then
+      if id then confirmState = { command = "rehome", payload = { confirm = "RESET" }, twoStep = true, message = "REHOME RESET clears the active job. Press YES twice only when the turtle is physically in its dock." }; mode = "confirm" end
+    elseif name == "gps" then
+      if id then confirmState = { command = "calibrate_gps", message = "GPS calibration moves forward one block and back. Is the dock front clear?" }; mode = "confirm" end
+    elseif name == "quit" then running = false end
+    invalidate()
   end
 end
 
@@ -28,7 +39,7 @@ local function sortingTick()
   end
 end
 ]] },
-  { source = [[src/ccminer/controller_parts/02.part]], target = [[controller_parts/02.part]], digest = [[016d8225951b66c802fd7687a03a31348d89d045e497e8d8ae9cf2df6cbe382b]], content = [[-- CC Miner V4 - adaptive touch views.  Every view has a keyboard fallback and
+  { source = [[src/ccminer/controller_parts/02.part]], target = [[controller_parts/02.part]], digest = [[f87dffacffe3d6dd969681595eec255a5ffbe4aafcd455951a824695eab6a3eb]], content = [[-- CC Miner V4 - adaptive touch views.  Every view has a keyboard fallback and
 -- uses bounded hitboxes, so a 20x8 monitor remains operable.
 
 local fieldOrder = { "width", "length", "depth", "targetY" }
@@ -195,7 +206,7 @@ local function renderDashboard(target, key)
   common.writeAt(1, 2, common.fit(("Controller #%d | Workers %d/%d | Q%d H%d"):format(os.getComputerID(), online, #ids, #db.queue, #db.history), width), colors and colors.lightGray or nil)
   local headerY = 4
   common.writeAt(1, headerY, common.fit(width >= 48 and " ID    NAME           STATUS       PROGRESS       FUEL" or " ID NAME      STATUS   PROGRESS", width), colors and colors.yellow or nil)
-  local maxRows = math.max(1, height - 10)
+  local maxRows = math.max(1, height - 7)
   if #ids == 0 then
     common.writeAt(2, headerY + 2, common.fit("No workers. DISCOVER (D).", math.max(1, width - 2)), colors and colors.lightGray or nil)
   else
@@ -217,33 +228,17 @@ local function renderDashboard(target, key)
       addHitbox(key, 1, y, width, y, function() selected = index; invalidate() end)
     end
   end
-  local bottom = math.max(1, height - 4)
+  local bottom = math.max(1, height - 2)
   buttonRow(key, bottom, width, {
     { "DISCOVER", dashboardAction("discover") }, { "NEW JOB", dashboardAction("new") },
-    { "PROGRESS", dashboardAction("progress") }, { "INFO", dashboardAction("info") },
-    { "REMOTE", dashboardAction("remote") },
+    { "PROGRESS", dashboardAction("progress") }, { "MORE", dashboardAction("more") },
   })
   buttonRow(key, bottom + 1, width, {
-    { "STOP", dashboardAction("stop") }, { "RECOVERY", dashboardAction("recovery") },
-    { "REPORT", dashboardAction("report") }, { "GPS", dashboardAction("gps") },
-  })
-  buttonRow(key, bottom + 2, width, {
     { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
-    { "RECALL", dashboardAction("recall") }, { "SERVICE", dashboardAction("service") },
-  })
-  buttonRow(key, bottom + 3, width, {
-    { "ABORT", dashboardAction("abort") }, { "CLEAR", dashboardAction("clear") },
-    { "REHOME", dashboardAction("rehome") }, { "LAST ERR", dashboardAction("last_error") },
-  })
-  -- Group controls are additive; the legacy single-worker rows above remain
-  -- unchanged so old monitors and keyboard shortcuts continue to work.
-  buttonRow(key, math.max(1, bottom - 1), width, {
-    { "GROUPS", dashboardAction("groups") }, { "G START", dashboardAction("group_start") },
-    { "G PAUSE", dashboardAction("group_pause") }, { "G RETURN", dashboardAction("group_return") },
+    { "RETURN", dashboardAction("recall") }, { "STOP", dashboardAction("stop") },
   })
   local groupIds = orderedGroupIds()
   if #groupIds > 0 then
-    local gy = math.max(2, bottom - 2)
+    local gy = 3
     local gid, g = selectedGroupRecord()
     local gj = gid and activeGroupJob(gid) or nil
-    local aggregate = gj and (gj.aggregate or updateGroupAggregate(gj)) or nil

@@ -1,15 +1,22 @@
+
+local function drawButton(key, x, y, width, label, action, enabled, selectedButton)
+  width = math.max(3, math.floor(width))
+  local background = colors and (selectedButton and colors.yellow or enabled == false and colors.gray or colors.lightBlue) or nil
+  local foreground = colors and (enabled == false and colors.lightGray or colors.black) or nil
+  common.writeAt(x, y, common.center(label, width), foreground, background)
   if enabled ~= false and action then addHitbox(key, x, y, x + width - 1, y, action) end
 end
 
 local function buttonRow(key, y, width, definitions)
   if width < 1 or y < 1 then return end
   local count = math.max(1, #definitions)
-  local base = math.max(1, math.floor(width / count))
+  local gap = width >= count * 5 + count - 1 and 1 or 0
+  local base = math.max(1, math.floor((width - gap * (count - 1)) / count))
   local x = 1
   for index, definition in ipairs(definitions) do
     local buttonWidth = index == count and (width - x + 1) or base
     drawButton(key, x, y, buttonWidth, definition[1], definition[2], definition[3] ~= false, definition[4])
-    x = x + buttonWidth
+    x = x + buttonWidth + gap
   end
 end
 
@@ -219,11 +226,3 @@ local function computePreflight()
   if fuel and fuel >= requiredFuel then
     check("worker fuel", "ok", ("available %s / need %d"):format(tostring(fuel), requiredFuel), false)
   elseif fuel then
-    check("worker fuel", "warn", ("available %s / need %d (dock refill expected)"):format(tostring(fuel), requiredFuel), false)
-  else
-    check("worker fuel", "warn", ("unknown / need %d"):format(requiredFuel), false)
-  end
-  if data.inventoryEmpty ~= nil then
-    check("inventory", tonumber(data.inventoryEmpty) > 0 and "ok" or "warn", tostring(data.inventoryEmpty or 0) .. " empty", false)
-  else check("inventory", "warn", "unknown", false) end
-  local seal = tonumber(data.materials and (data.materials.sealCount or data.materials.seal) or data.seal and data.seal.count)
