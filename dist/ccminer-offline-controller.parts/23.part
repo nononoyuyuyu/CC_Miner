@@ -123,7 +123,7 @@ local program, compileError = loader(table.concat(source), "@/ccminer/controller
 if not program then error("Cannot assemble controller: " .. tostring(compileError), 0) end
 return program(...)
 ]] },
-  { source = [[src/ccminer/controller_parts/01.part]], target = [[controller_parts/01.part]], digest = [[0caa3572228e32c837909be2fb0f9a2af9b9b6f37d6e4e20503c7d3c15728471]], content = [[-- CC Miner V4 - controller state, persistence and job orchestration.
+  { source = [[src/ccminer/controller_parts/01.part]], target = [[controller_parts/01.part]], digest = [[5db9ec338ee5e58605fa07d1506af1b77c22c1b82584983a147887fb794f00fe]], content = [[-- CC Miner V4 - controller state, persistence and job orchestration.
 -- The controller is deliberately tolerant of V2 worker payloads.  New
 -- fields are additive and every command has a legacy equivalent where one
 -- exists.

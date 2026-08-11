@@ -53,6 +53,8 @@ local function processChar(character)
     return
   elseif mode == "workers" then
     if character == "d" then discover()
+    elseif character == "g" then noticeState.groupSelectMode = not noticeState.groupSelectMode; if not noticeState.groupSelectMode then noticeState.groupSelection = {} end; invalidate()
+    elseif character == "c" and noticeState.groupSelectMode then noticeState.createGroupFromWorkers()
     elseif character == "n" then noticeState.workerPage = (tonumber(noticeState.workerPage) or 1) + 1; invalidate()
     elseif character == "p" then noticeState.workerPage = math.max(1, (tonumber(noticeState.workerPage) or 1) - 1); invalidate()
     elseif character == "b" or character == "q" then mode = "dashboard"; invalidate() end
@@ -92,6 +94,7 @@ local function processKey(keyCode)
       running = false
     else
       mode, draft, confirmState = "dashboard", nil, nil
+      noticeState.groupSelectMode, noticeState.groupSelection = false, {}
       invalidate()
     end
     return
@@ -114,6 +117,9 @@ local function processKey(keyCode)
     local ids = orderedIds()
     if keys and keyCode == keys.up then selected = math.max(1, selected - 1); invalidate()
     elseif keys and keyCode == keys.down then selected = math.min(math.max(1, #ids), selected + 1); invalidate()
+    elseif keys and keyCode == keys.space and noticeState.groupSelectMode then
+      local id = ids[selected]
+      if id then noticeState.groupSelection[tostring(id)] = not noticeState.groupSelection[tostring(id)] or nil; invalidate() end
     elseif keys and keyCode == keys.enter then mode = "dashboard"; invalidate()
     elseif keys and keyCode == keys.backspace then mode = "dashboard"; invalidate() end
   elseif mode == "groups" then

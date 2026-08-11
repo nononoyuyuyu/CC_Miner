@@ -1,7 +1,95 @@
+        { ("Inventory: %s used / %s empty / %s items"):format(tostring(data.inventoryUsed or "-"), tostring(data.inventoryEmpty or "-"), tostring(data.inventoryItems or "-")), colors and colors.white or nil },
+        { ("Materials: seal %s  |  torches %s"):format(tostring(materials.sealCount or data.seal and data.seal.count or "-"), tostring(materials.torchCount or data.lighting and data.lighting.torchCount or "-")), colors and colors.lightGray or nil },
+        { ("GPS: %s  |  Home: %s"):format(gps.calibrated and "calibrated" or "not used", data.atHome and "yes" or "no"), colors and colors.lightGray or nil },
+      }
+      if data.job then lines[#lines + 1] = { ("Job: %s  |  %sx%sx%s"):format(tostring(data.job.name or data.job.id or "active"), tostring(data.job.width or "-"), tostring(data.job.length or "-"), tostring(data.job.depth or "-")), colors and colors.cyan or nil } end
+      if data.lastError then lines[#lines + 1] = { "Last error: " .. tostring(data.lastError), colors and colors.red or nil } end
+    else
+      lines = {
+        { "NO WORKER SELECTED", colors and colors.yellow or nil },
+        { "Open WORKERS, touch DISCOVER, then select one worker.", colors and colors.white or nil },
+      }
+    end
+    for y = 3, cardBottom do
+      local entry = lines[y - 2]
+      common.writeAt(1, y, common.fit(entry and entry[1] or "", width), entry and entry[2] or (colors and colors.white or nil), colors and colors.gray or nil)
+    end
+  end
+  buttonRow(key, firstRow, width, {
+    { "WORKERS", dashboardAction("workers") }, { "NEW JOB", dashboardAction("new") },
+    { "PROGRESS", dashboardAction("progress") }, { "MORE", dashboardAction("more") },
+  }, true)
+  buttonRow(key, secondRow, width, {
+    { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
+    { "RETURN", dashboardAction("recall") }, { "STOP", dashboardAction("stop") },
+  }, true)
+  local groupIds = orderedGroupIds()
+  if #groupIds > 0 and height >= 12 then
+    local gy = 5
+    local gid, g = selectedGroupRecord()
+    local gj = gid and activeGroupJob(gid) or nil
+    local aggregate = gj and (gj.aggregate or updateGroupAggregate(gj)) or nil
     local line = ("Group %s %s %d workers %s%% minFuel=%s ACK=%s/%s"):format(tostring(gid), groupName(g, gid), #(groupWorkerIds(g)), tostring(aggregate and aggregate.percent or 0), tostring(aggregate and aggregate.minFuel or "-"), tostring(aggregate and aggregate.acks or 0), tostring(aggregate and aggregate.ackTotal or #groupWorkerIds(g)))
-    common.writeAt(1, gy, common.fit(line, width), colors and colors.cyan or nil)
+    common.writeAt(1, gy, common.fit(line, width), colors and colors.cyan or nil, colors and colors.gray or nil)
   end
   noticeLine(target, height)
+end
+
+noticeState.createGroupFromWorkers = function()
+  local ids = {}
+  for id, chosen in pairs(noticeState.groupSelection or {}) do
+    if chosen then ids[#ids + 1] = tonumber(id) or id end
+  end
+  table.sort(ids, function(a, b) return tostring(a) < tostring(b) end)
+  if #ids < 2 then setNotice("Select at least two workers for a group.", true); return end
+  local workerBays, workerDocks, resources = {}, {}, {}
+  for _, id in ipairs(ids) do
+    local data = workerData(id) or {}
+    local calibration = data.gps and data.gps.calibration
+    local home = calibration and calibration.home
+    local forward = calibration and calibration.forward
+    if not (data.gps and data.gps.calibrated and type(home) == "table"
+      and tonumber(home.x) and tonumber(home.y) and tonumber(home.z) and type(forward) == "table") then
+      setNotice("Group creation needs GPS CAL on every selected worker. Missing on #" .. tostring(id) .. ".", true)
+      return
+    end
+    local facing
+    if tonumber(forward.x) == 0 and tonumber(forward.z) == 1 then facing = 0
+    elseif tonumber(forward.x) == 1 and tonumber(forward.z) == 0 then facing = 1
+    elseif tonumber(forward.x) == 0 and tonumber(forward.z) == -1 then facing = 2
+    elseif tonumber(forward.x) == -1 and tonumber(forward.z) == 0 then facing = 3 end
+    if facing == nil then setNotice("Worker #" .. tostring(id) .. " has an invalid GPS direction.", true); return end
+    resources[tostring(id)] = {
+      world = { x = home.x, y = home.y, z = home.z },
+      facing = facing, maxDepth = data.dock and data.dock.maxDepth or nil,
+    }
+  end
+  -- Validate every selected worker before writing any registry entries.  This
+  -- avoids leaving half-created docks when a later worker still needs GPS CAL.
+  for _, id in ipairs(ids) do
+    local dockId, bayId = "worker-" .. tostring(id) .. "-dock", "worker-" .. tostring(id) .. "-bay"
+    local resource = resources[tostring(id)]
+    local dockOK, dockError = registerDock(dockId, resource)
+    if not dockOK then setNotice("Could not register dock for #" .. tostring(id) .. ": " .. tostring(dockError), true); return end
+    local bayOK, bayError = registerBay(bayId, resource)
+    if not bayOK then setNotice("Could not register bay for #" .. tostring(id) .. ": " .. tostring(bayError), true); return end
+    workerDocks[tostring(id)], workerBays[tostring(id)] = dockId, bayId
+  end
+  local number = 1
+  while groupRecord("group-" .. tostring(number)) do number = number + 1 end
+  local groupId = "group-" .. tostring(number)
+  local ok, result = registerGroup(groupId, ids, {
+    name = "Group " .. tostring(number), mode = "world",
+    partition = config.group and config.group.partitionMode or "stripe",
+    workerBays = workerBays, workerDocks = workerDocks,
+  })
+  if not ok then setNotice("Could not create group: " .. tostring(result), true); return end
+  local groupIds = orderedGroupIds()
+  for index, value in ipairs(groupIds) do if tostring(value) == groupId then selectedGroup = index end end
+  noticeState.groupSelectMode, noticeState.groupSelection = false, {}
+  mode = "groups"
+  setNotice(("Created %s with %d workers. Open START to choose its mining area."):format(groupId, #ids), false)
+  invalidate()
 end
 
 noticeState.renderWorkers = function(target, key)
@@ -12,7 +100,11 @@ noticeState.renderWorkers = function(target, key)
   local pages = math.max(1, math.ceil(#ids / rowsPerPage))
   noticeState.workerPage = common.clamp(tonumber(noticeState.workerPage) or 1, 1, pages)
   local first = (noticeState.workerPage - 1) * rowsPerPage + 1
-  common.writeAt(1, 2, common.fit(("Page %d/%d | %d workers | selected #%s"):format(noticeState.workerPage, pages, #ids, tostring(selectedWorker() or "-")), width), colors and colors.lightGray or nil)
+  local selectionCount = common.tableCount(noticeState.groupSelection or {})
+  local summary = noticeState.groupSelectMode
+    and ("GROUP SELECT | Page %d/%d | chosen %d"):format(noticeState.workerPage, pages, selectionCount)
+    or ("Page %d/%d | %d workers | selected #%s"):format(noticeState.workerPage, pages, #ids, tostring(selectedWorker() or "-"))
+  common.writeAt(1, 2, common.fit(summary, width), noticeState.groupSelectMode and (colors and colors.yellow or nil) or (colors and colors.lightGray or nil))
   if #ids == 0 then
     common.writeAt(1, 3, common.fit("No workers found. Touch DISCOVER.", width), colors and colors.yellow or nil)
   end
@@ -22,18 +114,37 @@ noticeState.renderWorkers = function(target, key)
     if not id then break end
     local worker, data = workers[id], workers[id].data or {}
     local status = statusOf(worker)
+    local chosen = noticeState.groupSelection[tostring(id)] == true
+    local markerText = noticeState.groupSelectMode and (chosen and "X" or " ") or (index == selected and ">" or " ")
     local line = width >= 48
-      and ("%s#%-4s %-14s %-12s %-16s F=%s"):format(index == selected and ">" or " ", tostring(id), common.fit(workerLabel(worker, id), 14), common.fit(status, 12), common.fit(progressText(data), 16), tostring(data.fuel or "-"))
-      or ("%s#%-3s %-9s %-8s %s"):format(index == selected and ">" or " ", tostring(id), common.fit(workerLabel(worker, id), 9), common.fit(status, 8), progressText(data))
+      and ("%s#%-4s %-14s %-12s %-16s F=%s"):format(markerText, tostring(id), common.fit(workerLabel(worker, id), 14), common.fit(status, 12), common.fit(progressText(data), 16), tostring(data.fuel or "-"))
+      or ("%s#%-3s %-9s %-8s %s"):format(markerText, tostring(id), common.fit(workerLabel(worker, id), 9), common.fit(status, 8), progressText(data))
     local y = 2 + row
-    common.writeAt(1, y, common.fit(line, width), index == selected and (colors and colors.black or nil) or common.statusColor(status), index == selected and (colors and colors.white or nil) or (colors and colors.black or nil))
-    addHitbox(key, 1, y, width, y, function() selected = index; invalidate() end)
+    local highlighted = chosen or (not noticeState.groupSelectMode and index == selected)
+    common.writeAt(1, y, common.fit(line, width), highlighted and (colors and colors.black or nil) or common.statusColor(status), highlighted and (colors and (chosen and colors.yellow or colors.white) or nil) or (colors and colors.black or nil))
+    addHitbox(key, 1, y, width, y, function()
+      if noticeState.groupSelectMode then noticeState.groupSelection[tostring(id)] = not chosen or nil
+      else selected = index end
+      invalidate()
+    end)
   end
-  buttonRow(key, height - 1, width, {
-    { "PREV", function() noticeState.workerPage = math.max(1, noticeState.workerPage - 1); invalidate() end, noticeState.workerPage > 1 },
-    { "NEXT", function() noticeState.workerPage = math.min(pages, noticeState.workerPage + 1); invalidate() end, noticeState.workerPage < pages },
-    { "DISCOVER", dashboardAction("discover") }, { "BACK", function() mode = "dashboard"; invalidate() end },
-  }, true)
+  if noticeState.groupSelectMode then
+    buttonRow(key, height - 1, width, {
+      { "PREV", function() noticeState.workerPage = math.max(1, noticeState.workerPage - 1); invalidate() end, noticeState.workerPage > 1 },
+      { "NEXT", function() noticeState.workerPage = math.min(pages, noticeState.workerPage + 1); invalidate() end, noticeState.workerPage < pages },
+      { "CREATE", noticeState.createGroupFromWorkers, selectionCount >= 2 },
+      { "CLEAR", function() noticeState.groupSelection = {}; invalidate() end },
+      { "CANCEL", function() noticeState.groupSelectMode = false; noticeState.groupSelection = {}; invalidate() end },
+    }, true)
+  else
+    buttonRow(key, height - 1, width, {
+      { "PREV", function() noticeState.workerPage = math.max(1, noticeState.workerPage - 1); invalidate() end, noticeState.workerPage > 1 },
+      { "NEXT", function() noticeState.workerPage = math.min(pages, noticeState.workerPage + 1); invalidate() end, noticeState.workerPage < pages },
+      { "DISCOVER", dashboardAction("discover") },
+      { "GROUP", function() noticeState.groupSelectMode = true; noticeState.groupSelection = {}; invalidate() end, #ids >= 2 },
+      { "BACK", function() mode = "dashboard"; invalidate() end },
+    }, true)
+  end
   noticeLine(target, height)
 end
 
@@ -90,129 +201,3 @@ noticeState.renderItems = function(target, key)
   local form = noticeState.discardDraft
   writeHeader("AUTO DISCARD ITEMS", target)
   if not id or not form or tonumber(form.workerId) ~= tonumber(id) then
-    common.writeAt(1, 3, common.fit("Select a worker and reopen ITEMS.", width), colors and colors.red or nil)
-    drawButton(key, 1, height - 1, width, "BACK", function() mode = "more"; invalidate() end, true)
-    return
-  end
-  local byName = {}
-  for _, item in ipairs((data.inventory and data.inventory.slots) or {}) do
-    local name = tostring(item.name or "")
-    if name ~= "" then
-      local row = byName[name] or { name = name, count = 0, locked = false, reserve = false }
-      row.count = row.count + (tonumber(item.count) or 0)
-      row.locked = row.locked or item.torch == true or item.fuel == true
-      row.reserve = row.reserve or item.seal == true
-      byName[name] = row
-    end
-  end
-  for name in pairs(form.selected or {}) do byName[name] = byName[name] or { name = name, count = 0 } end
-  local items = {}
-  for _, item in pairs(byName) do items[#items + 1] = item end
-  table.sort(items, function(a, b) return a.name < b.name end)
-  local modes = {
-    { "KEEP", "KEEP_ALL" }, { "STONE", "DISCARD_EXCESS_STONE" }, { "CHOOSE", "CUSTOM_ALLOWLIST" },
-  }
-  common.writeAt(1, 2, common.fit("Touch item names, then APPLY. [LOCK] cannot be discarded.", width), colors and colors.lightGray or nil)
-  local modeButtons = {}
-  for _, entry in ipairs(modes) do
-    local label, value = entry[1], entry[2]
-    modeButtons[#modeButtons + 1] = { label, function() form.mode = value; invalidate() end, true, form.mode == value }
-  end
-  local expanded = height >= 14
-  local modeY = expanded and 4 or 3
-  buttonRow(key, modeY, width, modeButtons, expanded)
-  local roomy = height >= 12
-  local listStart, itemStep = expanded and 7 or roomy and 5 or 4, expanded and 3 or roomy and 2 or 1
-  local summaryY, controlsY, backY
-  if expanded then summaryY, controlsY, backY = height - 6, height - 3, height - 1
-  elseif roomy then summaryY, controlsY, backY = height - 5, height - 3, height - 1
-  else summaryY, controlsY, backY = height - 3, height - 2, height - 1 end
-  local lastItemY = summaryY - (expanded and 2 or roomy and 2 or 1)
-  local rows = math.max(1, math.floor((lastItemY - listStart) / itemStep) + 1)
-  local pages = math.max(1, math.ceil(#items / rows))
-  form.page = common.clamp(tonumber(form.page) or 1, 1, pages)
-  local first = (form.page - 1) * rows + 1
-  for row = 1, rows do
-    local item = items[first + row - 1]
-    if not item then break end
-    local suffix = item.locked and " [LOCK]" or item.reserve and " [RESERVE]" or ""
-    local label = ("%s x%d%s"):format(item.name, item.count, suffix)
-    local enabled = not item.locked
-    drawButton(key, 1, listStart + (row - 1) * itemStep, width, label, function()
-      form.selected[item.name] = not form.selected[item.name] or nil
-      if form.selected[item.name] then form.mode = "CUSTOM_ALLOWLIST" end
-      invalidate()
-    end, enabled, form.selected[item.name] == true, expanded)
-  end
-  common.writeAt(1, summaryY, common.fit(("Page %d/%d | selected %d"):format(form.page, pages, common.tableCount(form.selected)), width), colors and colors.lightGray or nil)
-  buttonRow(key, controlsY, width, {
-    { "PREV", function() form.page = math.max(1, form.page - 1); invalidate() end, form.page > 1 },
-    { "NEXT", function() form.page = math.min(pages, form.page + 1); invalidate() end, form.page < pages },
-    { "APPLY", function()
-      local allowlist = {}
-      for name, chosen in pairs(form.selected) do if chosen then allowlist[#allowlist + 1] = name end end
-      table.sort(allowlist)
-      sendCommand(id, "discard_config", { mode = form.mode, allowlist = allowlist })
-      setNotice("Discard settings sent to worker #" .. tostring(id) .. ".", false)
-    end },
-  }, expanded)
-  drawButton(key, 1, backY, width, "BACK", function() mode = "more"; invalidate() end, true, false, expanded)
-end
-
-local function groupAction(groupCommandName)
-  return function()
-    local gid = selectedGroupRecord()
-    if not gid then setNotice("No group selected.", true); return end
-    if groupCommandName == "start" then
-      groupDraft = groupDraftDefaults(groupRecord(gid))
-      groupDraft.selectedField = "width"
-      groupDraft.buffer = tostring(groupDraft.width or 1)
-      groupDraft.preflight = nil
-      mode = "group_dimensions"
-    else
-      groupCommand(gid, groupCommandName)
-    end
-    invalidate()
-  end
-end
-
-local function groupAssignmentCount(result)
-  local count = 0
-  for _, assignment in pairs(result and result.assignments or {}) do if type(assignment) == "table" then count = count + 1 end end
-  return count
-end
-
-local function renderGroupDimensions(target, key)
-  local width, height = target.getSize()
-  local gid, group = selectedGroupRecord()
-  writeHeader("GROUP JOB / DIMENSIONS", target, colors and colors.cyan or nil)
-  if not gid or not group then
-    common.writeAt(1, 3, common.fit("No group selected.", width), colors and colors.yellow or nil)
-    buttonRow(key, math.max(1, height - 2), width, { { "BACK", function() mode = "groups" end } })
-    noticeLine(target, height)
-    return
-  end
-  groupDraft = groupDraft or groupDraftDefaults(group)
-  local ids = groupWorkerIds(group)
-  local worldMode = groupDraftWorldMode()
-  common.writeAt(1, 2, common.fit(("Group %s (%s) | workers=%d | %s | partition=%s"):format(groupName(group, gid), tostring(gid), #ids, worldMode and "WORLD" or "LOCAL", tostring(groupDraft.partition or group.partition or "stripe")), width), colors and colors.lightGray or nil)
-  common.writeAt(1, 3, common.fit(worldMode and "BOTTOM Y is absolute; each worker reports HOME Y/LAYERS." or "LOCAL uses DEPTH; multi-worker automatic splitting is disabled.", width), colors and colors.lightGray or nil)
-  local visibleFields = groupFieldOrder()
-  local fieldWidth = math.min(32, math.max(14, math.floor(width * 0.52)))
-  local rows = math.min(#visibleFields, math.max(1, math.floor((height - 13) / 2)))
-  for index = 1, rows do
-    local field = visibleFields[index]
-    local y = 4 + (index - 1) * 2
-    local active = groupDraft.selectedField == field
-    local shown = active and groupDraft.buffer or tostring(groupDraft[field] or 0)
-    common.writeAt(1, y, common.fit(fieldLabels[field], fieldWidth - 2), active and (colors and colors.black or nil) or (colors and colors.white or nil), active and (colors and colors.yellow or nil) or (colors and colors.black or nil))
-    drawButton(key, 1, y + 1, 3, "-", function() adjustGroupDraft(field, -1) end, true)
-    drawButton(key, 5, y + 1, math.max(5, fieldWidth - 11), shown, function() chooseGroupDraftField(field) end, true, active)
-    drawButton(key, fieldWidth - 5, y + 1, 3, "+", function() adjustGroupDraft(field, 1) end, true)
-  end
-  local keypadX = math.min(width - 12, fieldWidth + 2)
-  local keypadWidth = math.max(12, width - keypadX + 1)
-  local cellWidth = math.max(4, math.floor(keypadWidth / 3))
-  local labels = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "CLR", "0", "<" }
-  for index, label in ipairs(labels) do
-    local row = math.floor((index - 1) / 3)

@@ -10,6 +10,8 @@
 <p>すべてのタートルで、同じ面配置を使います。AとBのチェストを入れ替えないでください。</p>
 <div class="diagram" role="img" aria-label="複数台でも各採掘タートルが個別に持つ六面配置"><p class="diagram-title">各タートルに1組ずつ作る</p><div class="face-map"><div class="face blank" aria-hidden="true"></div><div class="face top">上面<small>このタートル専用の燃料</small></div><div class="face blank" aria-hidden="true"></div><div class="face left">左面<small>このタートル専用のたいまつ</small></div><div class="face front">正面<small>このタートルの採掘口</small></div><div class="face right">右面<small>このタートル専用の穴埋め材</small></div><div class="face back">背面<small>このタートル専用の搬出</small></div><div class="face bottom">底面<small>同じ高さの床</small></div><div class="face blank" aria-hidden="true"></div></div><p class="diagram-alt">複数台でも、上面、左面、正面、右面、背面、底面の配置は1台のときと同じです。チェストはタートルごとに専用です。</p></div>
 <h2 id="register">置き場とまとめ操作を登録する</h2>
+<h3>モニターから簡単に作る</h3><ol class="steps"><li><div><h3>全ワーカーでGPS CALを終える</h3><p>グループ採掘では各ワーカーの絶対位置が必要です。</p></div></li><li><div><h3>WORKERS → GROUPを押す</h3><p>一覧の表示がGROUP SELECTへ変わります。</p></div></li><li><div><h3>2台以上をタッチする</h3><p>選んだ行は黄色になり、先頭にXが付きます。PREVとNEXTで別ページのワーカーも追加できます。</p></div></li><li><div><h3>CREATEを押す</h3><p>Group 1、Group 2のような名前で作られます。各ワーカーのGPS情報から専用ドックとベイも登録します。</p></div></li><li><div><h3>STARTで範囲を決める</h3><p>作成後はGROUPS画面へ移ります。STARTを押し、採掘範囲を入力します。</p></div></li></ol>
+<div class="callout warn"><strong>GPSなしでは作成できません：</strong>1台だけの通常採掘にはGPSは不要ですが、複数台で範囲を安全に分けるグループ採掘にはGPS校正が必要です。</div>
 <p>次の例では、採掘タートルの番号が101と102です。座標や番号は自分のものへ置き換えます。コマンドが長いため、まず1行ずつ登録して確認します。</p>
 <p class="command-title">全体を管理する場所を登録</p><pre><code>ccm dock register dock-a 100 64 100 east 64</code></pre>
 <p class="command-title">タートル101の置き場を登録</p><pre><code>ccm bay register bay-a 100 64 100 east 64</code></pre>

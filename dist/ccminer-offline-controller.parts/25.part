@@ -1,3 +1,4 @@
+    id = groupId,
     name = tostring(options.name or previous.name or groupId),
     workerIds = common.copy(ids),
     dockId = options.dockId or previous.dockId,

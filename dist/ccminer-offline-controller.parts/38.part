@@ -1,3 +1,129 @@
+    common.writeAt(1, 3, common.fit("Select a worker and reopen ITEMS.", width), colors and colors.red or nil)
+    drawButton(key, 1, height - 1, width, "BACK", function() mode = "more"; invalidate() end, true)
+    return
+  end
+  local byName = {}
+  for _, item in ipairs((data.inventory and data.inventory.slots) or {}) do
+    local name = tostring(item.name or "")
+    if name ~= "" then
+      local row = byName[name] or { name = name, count = 0, locked = false, reserve = false }
+      row.count = row.count + (tonumber(item.count) or 0)
+      row.locked = row.locked or item.torch == true or item.fuel == true
+      row.reserve = row.reserve or item.seal == true
+      byName[name] = row
+    end
+  end
+  for name in pairs(form.selected or {}) do byName[name] = byName[name] or { name = name, count = 0 } end
+  local items = {}
+  for _, item in pairs(byName) do items[#items + 1] = item end
+  table.sort(items, function(a, b) return a.name < b.name end)
+  local modes = {
+    { "KEEP", "KEEP_ALL" }, { "STONE", "DISCARD_EXCESS_STONE" }, { "CHOOSE", "CUSTOM_ALLOWLIST" },
+  }
+  common.writeAt(1, 2, common.fit("Touch item names, then APPLY. [LOCK] cannot be discarded.", width), colors and colors.lightGray or nil)
+  local modeButtons = {}
+  for _, entry in ipairs(modes) do
+    local label, value = entry[1], entry[2]
+    modeButtons[#modeButtons + 1] = { label, function() form.mode = value; invalidate() end, true, form.mode == value }
+  end
+  local expanded = height >= 14
+  local modeY = expanded and 4 or 3
+  buttonRow(key, modeY, width, modeButtons, expanded)
+  local roomy = height >= 12
+  local listStart, itemStep = expanded and 7 or roomy and 5 or 4, expanded and 3 or roomy and 2 or 1
+  local summaryY, controlsY, backY
+  if expanded then summaryY, controlsY, backY = height - 6, height - 3, height - 1
+  elseif roomy then summaryY, controlsY, backY = height - 5, height - 3, height - 1
+  else summaryY, controlsY, backY = height - 3, height - 2, height - 1 end
+  local lastItemY = summaryY - (expanded and 2 or roomy and 2 or 1)
+  local rows = math.max(1, math.floor((lastItemY - listStart) / itemStep) + 1)
+  local pages = math.max(1, math.ceil(#items / rows))
+  form.page = common.clamp(tonumber(form.page) or 1, 1, pages)
+  local first = (form.page - 1) * rows + 1
+  for row = 1, rows do
+    local item = items[first + row - 1]
+    if not item then break end
+    local suffix = item.locked and " [LOCK]" or item.reserve and " [RESERVE]" or ""
+    local label = ("%s x%d%s"):format(item.name, item.count, suffix)
+    local enabled = not item.locked
+    drawButton(key, 1, listStart + (row - 1) * itemStep, width, label, function()
+      form.selected[item.name] = not form.selected[item.name] or nil
+      if form.selected[item.name] then form.mode = "CUSTOM_ALLOWLIST" end
+      invalidate()
+    end, enabled, form.selected[item.name] == true, expanded)
+  end
+  common.writeAt(1, summaryY, common.fit(("Page %d/%d | selected %d"):format(form.page, pages, common.tableCount(form.selected)), width), colors and colors.lightGray or nil)
+  buttonRow(key, controlsY, width, {
+    { "PREV", function() form.page = math.max(1, form.page - 1); invalidate() end, form.page > 1 },
+    { "NEXT", function() form.page = math.min(pages, form.page + 1); invalidate() end, form.page < pages },
+    { "APPLY", function()
+      local allowlist = {}
+      for name, chosen in pairs(form.selected) do if chosen then allowlist[#allowlist + 1] = name end end
+      table.sort(allowlist)
+      sendCommand(id, "discard_config", { mode = form.mode, allowlist = allowlist })
+      setNotice("Discard settings sent to worker #" .. tostring(id) .. ".", false)
+    end },
+  }, expanded)
+  drawButton(key, 1, backY, width, "BACK", function() mode = "more"; invalidate() end, true, false, expanded)
+end
+
+local function groupAction(groupCommandName)
+  return function()
+    local gid = selectedGroupRecord()
+    if not gid then setNotice("No group selected.", true); return end
+    if groupCommandName == "start" then
+      groupDraft = groupDraftDefaults(groupRecord(gid))
+      groupDraft.selectedField = "width"
+      groupDraft.buffer = tostring(groupDraft.width or 1)
+      groupDraft.preflight = nil
+      mode = "group_dimensions"
+    else
+      groupCommand(gid, groupCommandName)
+    end
+    invalidate()
+  end
+end
+
+local function groupAssignmentCount(result)
+  local count = 0
+  for _, assignment in pairs(result and result.assignments or {}) do if type(assignment) == "table" then count = count + 1 end end
+  return count
+end
+
+local function renderGroupDimensions(target, key)
+  local width, height = target.getSize()
+  local gid, group = selectedGroupRecord()
+  writeHeader("GROUP JOB / DIMENSIONS", target, colors and colors.cyan or nil)
+  if not gid or not group then
+    common.writeAt(1, 3, common.fit("No group selected.", width), colors and colors.yellow or nil)
+    buttonRow(key, math.max(1, height - 2), width, { { "BACK", function() mode = "groups" end } })
+    noticeLine(target, height)
+    return
+  end
+  groupDraft = groupDraft or groupDraftDefaults(group)
+  local ids = groupWorkerIds(group)
+  local worldMode = groupDraftWorldMode()
+  common.writeAt(1, 2, common.fit(("Group %s (%s) | workers=%d | %s | partition=%s"):format(groupName(group, gid), tostring(gid), #ids, worldMode and "WORLD" or "LOCAL", tostring(groupDraft.partition or group.partition or "stripe")), width), colors and colors.lightGray or nil)
+  common.writeAt(1, 3, common.fit(worldMode and "BOTTOM Y is absolute; each worker reports HOME Y/LAYERS." or "LOCAL uses DEPTH; multi-worker automatic splitting is disabled.", width), colors and colors.lightGray or nil)
+  local visibleFields = groupFieldOrder()
+  local fieldWidth = math.min(32, math.max(14, math.floor(width * 0.52)))
+  local rows = math.min(#visibleFields, math.max(1, math.floor((height - 13) / 2)))
+  for index = 1, rows do
+    local field = visibleFields[index]
+    local y = 4 + (index - 1) * 2
+    local active = groupDraft.selectedField == field
+    local shown = active and groupDraft.buffer or tostring(groupDraft[field] or 0)
+    common.writeAt(1, y, common.fit(fieldLabels[field], fieldWidth - 2), active and (colors and colors.black or nil) or (colors and colors.white or nil), active and (colors and colors.yellow or nil) or (colors and colors.black or nil))
+    drawButton(key, 1, y + 1, 3, "-", function() adjustGroupDraft(field, -1) end, true)
+    drawButton(key, 5, y + 1, math.max(5, fieldWidth - 11), shown, function() chooseGroupDraftField(field) end, true, active)
+    drawButton(key, fieldWidth - 5, y + 1, 3, "+", function() adjustGroupDraft(field, 1) end, true)
+  end
+  local keypadX = math.min(width - 12, fieldWidth + 2)
+  local keypadWidth = math.max(12, width - keypadX + 1)
+  local cellWidth = math.max(4, math.floor(keypadWidth / 3))
+  local labels = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "CLR", "0", "<" }
+  for index, label in ipairs(labels) do
+    local row = math.floor((index - 1) / 3)
     local column = (index - 1) % 3
     local x, y = keypadX + column * cellWidth, 4 + row * 2
     if y <= height - 8 then
@@ -57,81 +183,4 @@ local function renderGroups(target, key)
   common.writeAt(1, 2, common.fit(("Groups %d | selected=%d"):format(#ids, selectedGroup), width), colors and colors.lightGray or nil)
   local maxRows = math.max(1, height - (verticalStep == 2 and 11 or 9))
   if #ids == 0 then
-    common.writeAt(2, 4, common.fit("No groups. Register: group register <id> <workers> [name dock bay mode partition]", width), colors and colors.yellow or nil)
-    common.writeAt(2, 5, common.fit("Per-bay maps: worker=bay,worker=bay (dock map follows).", width), colors and colors.lightGray or nil)
-  else
-    local first = selectedGroup > maxRows and selectedGroup - maxRows + 1 or 1
-    for row = 1, maxRows do
-      local index = first + row - 1
-      local gid = ids[index]
-      if not gid then break end
-      local group = groupRecord(gid)
-      local job = activeGroupJob(gid)
-      local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, online = 0, total = #groupWorkerIds(group), minFuel = nil, warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
-      local warning = aggregate.warnings and aggregate.warnings[1] or "-"
-      local line = ("%s%-12s %-10s W=%d/%d P=%3d%% F=%s ACK=%d/%d %s"):format(index == selectedGroup and ">" or " ", common.fit(groupName(group, gid), 12), tostring(job and job.status or "idle"), aggregate.online or 0, aggregate.total or 0, aggregate.percent or 0, tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0, common.fit(warning, math.max(1, width - 70)))
-      local y = 3 + row
-      common.writeAt(1, y, common.fit(line, width), index == selectedGroup and (colors and colors.black or nil) or colors and colors.white or nil, index == selectedGroup and (colors and colors.white or nil) or nil)
-      addHitbox(key, 1, y, width, y, function() selectedGroup = index; invalidate() end)
-    end
-  end
-  local bottom = math.max(1, height - verticalStep * 2 - 1)
-  buttonRow(key, bottom, width, { { "START", groupAction("start") }, { "PAUSE", groupAction("pause") }, { "RESUME", groupAction("resume") }, { "RETURN", groupAction("return") } }, verticalStep == 2)
-  buttonRow(key, bottom + verticalStep, width, { { "SERVICE", groupAction("service") }, { "ABORT", groupAction("abort") }, { "CLEAR", groupAction("clear") }, { "DRILLDOWN", function() mode = "group_info"; invalidate() end } }, verticalStep == 2)
-  buttonRow(key, bottom + verticalStep * 2, width, { { "BACK", function() mode = "dashboard" end }, { "REFRESH", function() local gid = selectedGroupRecord(); local job = gid and activeGroupJob(gid); if job then updateGroupAggregate(job) end; invalidate() end } }, verticalStep == 2)
-  noticeLine(target, height)
-end
-
-local function renderGroupInfo(target, key)
-  local width, height = target.getSize()
-  local gid, group = selectedGroupRecord()
-  local job = gid and activeGroupJob(gid) or nil
-  writeHeader("GROUP DRILLDOWN", target, colors and colors.cyan or nil)
-  if not gid or not group then
-    common.writeAt(1, 3, common.fit("No group selected.", width), colors and colors.yellow or nil)
-  else
-    local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, minFuel = nil, warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
-    common.writeAt(1, 2, common.fit(("%s (%s) mode=%s partition=%s"):format(groupName(group, gid), tostring(gid), tostring(group.mode or "world"), tostring(group.partition or "stripe")), width), colors and colors.lightGray or nil)
-    common.writeAt(1, 3, common.fit(("GROUP %s%% | BOTTOM Y=%s | minFuel=%s | ACK %d/%d | warnings=%d"):format(tostring(aggregate.percent or 0), tostring(job and job.bottomY or "-"), tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0, #(aggregate.warnings or {})), width), colors and colors.cyan or nil)
-    local row = 5
-    for _, workerId in ipairs(groupWorkerIds(group)) do
-      if row >= height - 5 then break end
-      local worker = workers[workerId]
-      local data = worker and worker.data or {}
-      local assignment = job and job.assignments and (job.assignments[tostring(workerId)] or job.assignments[workerId]) or nil
-      local status = assignment and assignment.status or statusOf(worker)
-      local homeY = assignment and assignment.homeY or data.homeY or data.gps and data.gps.calibration and data.gps.calibration.home and data.gps.calibration.home.y or "-"
-      local layers = assignment and assignment.layers or data.job and data.job.depth or "-"
-      local progress = worker and progressText(data) or "-"
-      local line = ("#%-4s %-12s %-12s %s HOME Y=%s LAYERS=%s"):format(tostring(workerId), common.fit(workerLabel(worker, workerId), 12), common.fit(status, 12), common.fit(progress, 14), tostring(homeY), tostring(layers))
-      common.writeAt(1, row, common.fit(line, width), status == "blocked" and colors and colors.red or colors and colors.white or nil)
-      row = row + 1
-      if assignment and (status == "blocked" or status == "offline" or status == "failed") then
-        common.writeAt(3, row, common.fit("REMAIN " .. tostring(#(assignment.chunkKeys or {})) .. " chunks; use REASSIGN", math.max(1, width - 3)), colors and colors.yellow or nil)
-        addHitbox(key, 1, row, width, row, function() if job then reassignGroupAssignment(job.groupJobId, workerId) end end)
-        row = row + 1
-      end
-    end
-    local reason = job and (job.returnReason or job.completionReason) or nil
-    local report = job and (job.report or job.metrics) or nil
-    if reason then common.writeAt(1, math.max(4, height - 5), common.fit("RETURN: " .. tostring(reason), width), colors and colors.yellow or nil) end
-    if report then
-      local discard = report.discard or report.discardCount or "-"
-      if type(discard) == "table" then discard = tostring(discard.count or discard.total or common.tableCount(discard)) end
-      common.writeAt(1, math.max(4, height - 4), common.fit(("METRICS blocks=%s fuel=%s discard=%s"):format(tostring(report.blocks or report.totalBlocks or "-"), tostring(report.fuel or "-"), tostring(discard)), width), colors and colors.lightGray or nil)
-    end
-    if aggregate.warnings and #aggregate.warnings > 0 then common.writeAt(1, math.max(4, height - 3), common.fit("WARN: " .. table.concat(aggregate.warnings, "; "), width), colors and colors.orange or nil) end
-  end
-  buttonRow(key, math.max(1, height - 1), width, { { "BACK", function() mode = "groups" end }, { "REFRESH", function() local id = selectedGroupRecord(); local job = id and activeGroupJob(id); if job then updateGroupAggregate(job) end; invalidate() end } })
-  noticeLine(target, height)
-end
-
-local function renderDimensions(target, key)
-  local width, height = target.getSize()
-  local id, worker = draftWorker()
-  local worldMode = draftCalibration() ~= nil
-  local visibleFields = currentFieldOrder()
-  writeHeader("NEW JOB - SETTINGS", target)
-  common.writeAt(1, 2, common.fit(("Worker #%s %s | %s mode"):format(tostring(id or "-"), worker and workerLabel(worker, id) or "offline", worldMode and "WORLD" or "LOCAL"), width), colors and colors.lightGray or nil)
-  common.writeAt(1, 3, common.fit(worldMode and "Fields + keypad. BOTTOM Y derives LAYERS from each worker HOME Y." or "Fields + keypad. GRID tiles are chunks; local jobs omit BOTTOM Y.", width), colors and colors.lightGray or nil)
-  local fieldWidth = math.min(32, math.max(14, math.floor(width * 0.52)))
+    common.writeAt(2, 4, common.fit("No groups. Open WORKERS, touch GROUP, then select at least two workers.", width), colors and colors.yellow or nil)

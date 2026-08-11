@@ -114,6 +114,10 @@ end
 local function writeHeader(title, target, background)
   local width = target.getSize()
   common.writeAt(1, 1, common.center(title, width), colors and colors.black or nil, background or (colors and colors.cyan or nil))
+  -- Each screen body starts from a known palette.  Without this reset, the
+  -- cyan header background leaked into every following line which omitted an
+  -- explicit background colour.
+  common.setColors(colors and colors.black or nil, colors and colors.white or nil)
 end
 
 local function noticeLine(target, y)
@@ -122,7 +126,7 @@ local function noticeLine(target, y)
   if y < 1 then return end
   local noticeColor = noticeIsError and (colors and colors.red or nil) or (colors and colors.lime or nil)
   local prefix = noticeIsError and "ERROR - open LAST ERR: " or ""
-  common.writeAt(1, y, common.fit(prefix .. notice, width), noticeColor)
+  common.writeAt(1, y, common.fit(prefix .. notice, width), noticeColor, colors and colors.black or nil)
 end
 
 local function wrapNotice(text, width)
@@ -167,13 +171,34 @@ local function renderDashboard(target, key)
   common.writeAt(1, 2, common.fit(("Controller #%d | Workers %d/%d | selected #%s"):format(os.getComputerID(), online, #ids, tostring(id or "-")), width), colors and colors.lightGray or nil)
   local secondRow = math.max(7, height - 1)
   local firstRow = secondRow - 3
-  if id and firstRow >= 5 then
-    common.writeAt(1, 3, common.fit(("Selected #%s %s | %s | %s"):format(tostring(id), workerLabel(worker, id), statusOf(worker), progressText(data)), width), colors and colors.white or nil)
-    if height >= 10 then
-      common.writeAt(1, 4, common.fit(("Fuel %s | Inventory %s used / %s empty"):format(tostring(data.fuel or "-"), tostring(data.inventoryUsed or "-"), tostring(data.inventoryEmpty or "-")), width), colors and colors.lightGray or nil)
+  local cardBottom = firstRow - 2
+  if cardBottom >= 3 then
+    local lines = {}
+    if id then
+      local progress = data.progress or {}
+      local materials = data.materials or {}
+      local gps = data.gps or {}
+      lines = {
+        { ("SELECTED WORKER  #%s  %s"):format(tostring(id), workerLabel(worker, id)), colors and colors.yellow or nil },
+        { ("Status: %s  |  Phase: %s  |  Profile: %s"):format(statusOf(worker), tostring(data.phase or "-"), tostring(data.effectiveProfile or data.profile or "-")), colors and colors.white or nil },
+        { "Progress: " .. progressText(data), colors and colors.lime or nil },
+        { ("Fuel: %s / %s"):format(tostring(data.fuel or "-"), tostring(data.fuelLimit or "-")), colors and colors.white or nil },
+        { ("Inventory: %s used / %s empty / %s items"):format(tostring(data.inventoryUsed or "-"), tostring(data.inventoryEmpty or "-"), tostring(data.inventoryItems or "-")), colors and colors.white or nil },
+        { ("Materials: seal %s  |  torches %s"):format(tostring(materials.sealCount or data.seal and data.seal.count or "-"), tostring(materials.torchCount or data.lighting and data.lighting.torchCount or "-")), colors and colors.lightGray or nil },
+        { ("GPS: %s  |  Home: %s"):format(gps.calibrated and "calibrated" or "not used", data.atHome and "yes" or "no"), colors and colors.lightGray or nil },
+      }
+      if data.job then lines[#lines + 1] = { ("Job: %s  |  %sx%sx%s"):format(tostring(data.job.name or data.job.id or "active"), tostring(data.job.width or "-"), tostring(data.job.length or "-"), tostring(data.job.depth or "-")), colors and colors.cyan or nil } end
+      if data.lastError then lines[#lines + 1] = { "Last error: " .. tostring(data.lastError), colors and colors.red or nil } end
+    else
+      lines = {
+        { "NO WORKER SELECTED", colors and colors.yellow or nil },
+        { "Open WORKERS, touch DISCOVER, then select one worker.", colors and colors.white or nil },
+      }
     end
-  elseif not id and firstRow >= 5 then
-    common.writeAt(1, 3, common.fit("No worker selected. Open WORKERS and DISCOVER.", width), colors and colors.yellow or nil)
+    for y = 3, cardBottom do
+      local entry = lines[y - 2]
+      common.writeAt(1, y, common.fit(entry and entry[1] or "", width), entry and entry[2] or (colors and colors.white or nil), colors and colors.gray or nil)
+    end
   end
   buttonRow(key, firstRow, width, {
     { "WORKERS", dashboardAction("workers") }, { "NEW JOB", dashboardAction("new") },
@@ -190,9 +215,66 @@ local function renderDashboard(target, key)
     local gj = gid and activeGroupJob(gid) or nil
     local aggregate = gj and (gj.aggregate or updateGroupAggregate(gj)) or nil
     local line = ("Group %s %s %d workers %s%% minFuel=%s ACK=%s/%s"):format(tostring(gid), groupName(g, gid), #(groupWorkerIds(g)), tostring(aggregate and aggregate.percent or 0), tostring(aggregate and aggregate.minFuel or "-"), tostring(aggregate and aggregate.acks or 0), tostring(aggregate and aggregate.ackTotal or #groupWorkerIds(g)))
-    common.writeAt(1, gy, common.fit(line, width), colors and colors.cyan or nil)
+    common.writeAt(1, gy, common.fit(line, width), colors and colors.cyan or nil, colors and colors.gray or nil)
   end
   noticeLine(target, height)
+end
+
+noticeState.createGroupFromWorkers = function()
+  local ids = {}
+  for id, chosen in pairs(noticeState.groupSelection or {}) do
+    if chosen then ids[#ids + 1] = tonumber(id) or id end
+  end
+  table.sort(ids, function(a, b) return tostring(a) < tostring(b) end)
+  if #ids < 2 then setNotice("Select at least two workers for a group.", true); return end
+  local workerBays, workerDocks, resources = {}, {}, {}
+  for _, id in ipairs(ids) do
+    local data = workerData(id) or {}
+    local calibration = data.gps and data.gps.calibration
+    local home = calibration and calibration.home
+    local forward = calibration and calibration.forward
+    if not (data.gps and data.gps.calibrated and type(home) == "table"
+      and tonumber(home.x) and tonumber(home.y) and tonumber(home.z) and type(forward) == "table") then
+      setNotice("Group creation needs GPS CAL on every selected worker. Missing on #" .. tostring(id) .. ".", true)
+      return
+    end
+    local facing
+    if tonumber(forward.x) == 0 and tonumber(forward.z) == 1 then facing = 0
+    elseif tonumber(forward.x) == 1 and tonumber(forward.z) == 0 then facing = 1
+    elseif tonumber(forward.x) == 0 and tonumber(forward.z) == -1 then facing = 2
+    elseif tonumber(forward.x) == -1 and tonumber(forward.z) == 0 then facing = 3 end
+    if facing == nil then setNotice("Worker #" .. tostring(id) .. " has an invalid GPS direction.", true); return end
+    resources[tostring(id)] = {
+      world = { x = home.x, y = home.y, z = home.z },
+      facing = facing, maxDepth = data.dock and data.dock.maxDepth or nil,
+    }
+  end
+  -- Validate every selected worker before writing any registry entries.  This
+  -- avoids leaving half-created docks when a later worker still needs GPS CAL.
+  for _, id in ipairs(ids) do
+    local dockId, bayId = "worker-" .. tostring(id) .. "-dock", "worker-" .. tostring(id) .. "-bay"
+    local resource = resources[tostring(id)]
+    local dockOK, dockError = registerDock(dockId, resource)
+    if not dockOK then setNotice("Could not register dock for #" .. tostring(id) .. ": " .. tostring(dockError), true); return end
+    local bayOK, bayError = registerBay(bayId, resource)
+    if not bayOK then setNotice("Could not register bay for #" .. tostring(id) .. ": " .. tostring(bayError), true); return end
+    workerDocks[tostring(id)], workerBays[tostring(id)] = dockId, bayId
+  end
+  local number = 1
+  while groupRecord("group-" .. tostring(number)) do number = number + 1 end
+  local groupId = "group-" .. tostring(number)
+  local ok, result = registerGroup(groupId, ids, {
+    name = "Group " .. tostring(number), mode = "world",
+    partition = config.group and config.group.partitionMode or "stripe",
+    workerBays = workerBays, workerDocks = workerDocks,
+  })
+  if not ok then setNotice("Could not create group: " .. tostring(result), true); return end
+  local groupIds = orderedGroupIds()
+  for index, value in ipairs(groupIds) do if tostring(value) == groupId then selectedGroup = index end end
+  noticeState.groupSelectMode, noticeState.groupSelection = false, {}
+  mode = "groups"
+  setNotice(("Created %s with %d workers. Open START to choose its mining area."):format(groupId, #ids), false)
+  invalidate()
 end
 
 noticeState.renderWorkers = function(target, key)
@@ -203,7 +285,11 @@ noticeState.renderWorkers = function(target, key)
   local pages = math.max(1, math.ceil(#ids / rowsPerPage))
   noticeState.workerPage = common.clamp(tonumber(noticeState.workerPage) or 1, 1, pages)
   local first = (noticeState.workerPage - 1) * rowsPerPage + 1
-  common.writeAt(1, 2, common.fit(("Page %d/%d | %d workers | selected #%s"):format(noticeState.workerPage, pages, #ids, tostring(selectedWorker() or "-")), width), colors and colors.lightGray or nil)
+  local selectionCount = common.tableCount(noticeState.groupSelection or {})
+  local summary = noticeState.groupSelectMode
+    and ("GROUP SELECT | Page %d/%d | chosen %d"):format(noticeState.workerPage, pages, selectionCount)
+    or ("Page %d/%d | %d workers | selected #%s"):format(noticeState.workerPage, pages, #ids, tostring(selectedWorker() or "-"))
+  common.writeAt(1, 2, common.fit(summary, width), noticeState.groupSelectMode and (colors and colors.yellow or nil) or (colors and colors.lightGray or nil))
   if #ids == 0 then
     common.writeAt(1, 3, common.fit("No workers found. Touch DISCOVER.", width), colors and colors.yellow or nil)
   end
@@ -213,18 +299,37 @@ noticeState.renderWorkers = function(target, key)
     if not id then break end
     local worker, data = workers[id], workers[id].data or {}
     local status = statusOf(worker)
+    local chosen = noticeState.groupSelection[tostring(id)] == true
+    local markerText = noticeState.groupSelectMode and (chosen and "X" or " ") or (index == selected and ">" or " ")
     local line = width >= 48
-      and ("%s#%-4s %-14s %-12s %-16s F=%s"):format(index == selected and ">" or " ", tostring(id), common.fit(workerLabel(worker, id), 14), common.fit(status, 12), common.fit(progressText(data), 16), tostring(data.fuel or "-"))
-      or ("%s#%-3s %-9s %-8s %s"):format(index == selected and ">" or " ", tostring(id), common.fit(workerLabel(worker, id), 9), common.fit(status, 8), progressText(data))
+      and ("%s#%-4s %-14s %-12s %-16s F=%s"):format(markerText, tostring(id), common.fit(workerLabel(worker, id), 14), common.fit(status, 12), common.fit(progressText(data), 16), tostring(data.fuel or "-"))
+      or ("%s#%-3s %-9s %-8s %s"):format(markerText, tostring(id), common.fit(workerLabel(worker, id), 9), common.fit(status, 8), progressText(data))
     local y = 2 + row
-    common.writeAt(1, y, common.fit(line, width), index == selected and (colors and colors.black or nil) or common.statusColor(status), index == selected and (colors and colors.white or nil) or (colors and colors.black or nil))
-    addHitbox(key, 1, y, width, y, function() selected = index; invalidate() end)
+    local highlighted = chosen or (not noticeState.groupSelectMode and index == selected)
+    common.writeAt(1, y, common.fit(line, width), highlighted and (colors and colors.black or nil) or common.statusColor(status), highlighted and (colors and (chosen and colors.yellow or colors.white) or nil) or (colors and colors.black or nil))
+    addHitbox(key, 1, y, width, y, function()
+      if noticeState.groupSelectMode then noticeState.groupSelection[tostring(id)] = not chosen or nil
+      else selected = index end
+      invalidate()
+    end)
   end
-  buttonRow(key, height - 1, width, {
-    { "PREV", function() noticeState.workerPage = math.max(1, noticeState.workerPage - 1); invalidate() end, noticeState.workerPage > 1 },
-    { "NEXT", function() noticeState.workerPage = math.min(pages, noticeState.workerPage + 1); invalidate() end, noticeState.workerPage < pages },
-    { "DISCOVER", dashboardAction("discover") }, { "BACK", function() mode = "dashboard"; invalidate() end },
-  }, true)
+  if noticeState.groupSelectMode then
+    buttonRow(key, height - 1, width, {
+      { "PREV", function() noticeState.workerPage = math.max(1, noticeState.workerPage - 1); invalidate() end, noticeState.workerPage > 1 },
+      { "NEXT", function() noticeState.workerPage = math.min(pages, noticeState.workerPage + 1); invalidate() end, noticeState.workerPage < pages },
+      { "CREATE", noticeState.createGroupFromWorkers, selectionCount >= 2 },
+      { "CLEAR", function() noticeState.groupSelection = {}; invalidate() end },
+      { "CANCEL", function() noticeState.groupSelectMode = false; noticeState.groupSelection = {}; invalidate() end },
+    }, true)
+  else
+    buttonRow(key, height - 1, width, {
+      { "PREV", function() noticeState.workerPage = math.max(1, noticeState.workerPage - 1); invalidate() end, noticeState.workerPage > 1 },
+      { "NEXT", function() noticeState.workerPage = math.min(pages, noticeState.workerPage + 1); invalidate() end, noticeState.workerPage < pages },
+      { "DISCOVER", dashboardAction("discover") },
+      { "GROUP", function() noticeState.groupSelectMode = true; noticeState.groupSelection = {}; invalidate() end, #ids >= 2 },
+      { "BACK", function() mode = "dashboard"; invalidate() end },
+    }, true)
+  end
   noticeLine(target, height)
 end
 
@@ -466,8 +571,8 @@ local function renderGroups(target, key)
   common.writeAt(1, 2, common.fit(("Groups %d | selected=%d"):format(#ids, selectedGroup), width), colors and colors.lightGray or nil)
   local maxRows = math.max(1, height - (verticalStep == 2 and 11 or 9))
   if #ids == 0 then
-    common.writeAt(2, 4, common.fit("No groups. Register: group register <id> <workers> [name dock bay mode partition]", width), colors and colors.yellow or nil)
-    common.writeAt(2, 5, common.fit("Per-bay maps: worker=bay,worker=bay (dock map follows).", width), colors and colors.lightGray or nil)
+    common.writeAt(2, 4, common.fit("No groups. Open WORKERS, touch GROUP, then select at least two workers.", width), colors and colors.yellow or nil)
+    common.writeAt(2, 5, common.fit("All selected workers need GPS CAL. CREATE registers their individual dock and bay automatically.", width), colors and colors.lightGray or nil)
   else
     local first = selectedGroup > maxRows and selectedGroup - maxRows + 1 or 1
     for row = 1, maxRows do

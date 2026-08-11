@@ -28,6 +28,8 @@ noticeState.remoteSession = nil
 noticeState.remoteApi = {}
 noticeState.workerPage = 1
 noticeState.morePage = 1
+noticeState.groupSelectMode = false
+noticeState.groupSelection = {}
 noticeState.configureMonitor = function(device)
   if not device then return end
   if device.setTextScale then pcall(device.setTextScale, config.monitorTextScale or 0.5) end
@@ -284,4 +286,3 @@ local function registerGroup(groupId, workerIds, options)
   mapOK, mapError = validateResourceMap(options.workerDocks or previous.workerDocks, "worker_dock")
   if not mapOK then return false, mapError end
   local group = {
-    id = groupId,

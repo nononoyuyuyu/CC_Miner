@@ -1,3 +1,6 @@
+      else setNotice("Select a worker before opening item settings.", true) end
+    elseif name == "remote" then
+      if id then
         setNotice(("Remote console is CLI-only: ccm remote %s [-- <command...>]"):format(tostring(id)), false)
       else
         setNotice("Select a worker, then use ccm remote <workerId> in the terminal.", true)
@@ -50,7 +53,7 @@ local function sortingTick()
   end
 end
 ]] },
-  { source = [[src/ccminer/controller_parts/02.part]], target = [[controller_parts/02.part]], digest = [[fb7cc72a36358a2a4c835a4bd85439332fa2728dd14d3ca58c6a8beeb897a085]], content = [[-- CC Miner V4 - adaptive touch views.  Every view has a keyboard fallback and
+  { source = [[src/ccminer/controller_parts/02.part]], target = [[controller_parts/02.part]], digest = [[67ba75395eb326bcfa082094473643916b9675630ff1f77c45fb4c45fc3b13a9]], content = [[-- CC Miner V4 - adaptive touch views.  Every view has a keyboard fallback and
 -- uses bounded hitboxes, so a 20x8 monitor remains operable.
 
 local fieldOrder = { "width", "length", "depth", "targetY" }
@@ -166,6 +169,10 @@ end
 local function writeHeader(title, target, background)
   local width = target.getSize()
   common.writeAt(1, 1, common.center(title, width), colors and colors.black or nil, background or (colors and colors.cyan or nil))
+  -- Each screen body starts from a known palette.  Without this reset, the
+  -- cyan header background leaked into every following line which omitted an
+  -- explicit background colour.
+  common.setColors(colors and colors.black or nil, colors and colors.white or nil)
 end
 
 local function noticeLine(target, y)
@@ -174,7 +181,7 @@ local function noticeLine(target, y)
   if y < 1 then return end
   local noticeColor = noticeIsError and (colors and colors.red or nil) or (colors and colors.lime or nil)
   local prefix = noticeIsError and "ERROR - open LAST ERR: " or ""
-  common.writeAt(1, y, common.fit(prefix .. notice, width), noticeColor)
+  common.writeAt(1, y, common.fit(prefix .. notice, width), noticeColor, colors and colors.black or nil)
 end
 
 local function wrapNotice(text, width)
@@ -219,25 +226,15 @@ local function renderDashboard(target, key)
   common.writeAt(1, 2, common.fit(("Controller #%d | Workers %d/%d | selected #%s"):format(os.getComputerID(), online, #ids, tostring(id or "-")), width), colors and colors.lightGray or nil)
   local secondRow = math.max(7, height - 1)
   local firstRow = secondRow - 3
-  if id and firstRow >= 5 then
-    common.writeAt(1, 3, common.fit(("Selected #%s %s | %s | %s"):format(tostring(id), workerLabel(worker, id), statusOf(worker), progressText(data)), width), colors and colors.white or nil)
-    if height >= 10 then
-      common.writeAt(1, 4, common.fit(("Fuel %s | Inventory %s used / %s empty"):format(tostring(data.fuel or "-"), tostring(data.inventoryUsed or "-"), tostring(data.inventoryEmpty or "-")), width), colors and colors.lightGray or nil)
-    end
-  elseif not id and firstRow >= 5 then
-    common.writeAt(1, 3, common.fit("No worker selected. Open WORKERS and DISCOVER.", width), colors and colors.yellow or nil)
-  end
-  buttonRow(key, firstRow, width, {
-    { "WORKERS", dashboardAction("workers") }, { "NEW JOB", dashboardAction("new") },
-    { "PROGRESS", dashboardAction("progress") }, { "MORE", dashboardAction("more") },
-  }, true)
-  buttonRow(key, secondRow, width, {
-    { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
-    { "RETURN", dashboardAction("recall") }, { "STOP", dashboardAction("stop") },
-  }, true)
-  local groupIds = orderedGroupIds()
-  if #groupIds > 0 and height >= 12 then
-    local gy = 5
-    local gid, g = selectedGroupRecord()
-    local gj = gid and activeGroupJob(gid) or nil
-    local aggregate = gj and (gj.aggregate or updateGroupAggregate(gj)) or nil
+  local cardBottom = firstRow - 2
+  if cardBottom >= 3 then
+    local lines = {}
+    if id then
+      local progress = data.progress or {}
+      local materials = data.materials or {}
+      local gps = data.gps or {}
+      lines = {
+        { ("SELECTED WORKER  #%s  %s"):format(tostring(id), workerLabel(worker, id)), colors and colors.yellow or nil },
+        { ("Status: %s  |  Phase: %s  |  Profile: %s"):format(statusOf(worker), tostring(data.phase or "-"), tostring(data.effectiveProfile or data.profile or "-")), colors and colors.white or nil },
+        { "Progress: " .. progressText(data), colors and colors.lime or nil },
+        { ("Fuel: %s / %s"):format(tostring(data.fuel or "-"), tostring(data.fuelLimit or "-")), colors and colors.white or nil },

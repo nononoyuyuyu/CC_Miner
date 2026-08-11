@@ -1,3 +1,177 @@
+    elseif sub == "delete" or sub == "remove" then local keep = {}; for _, preset in ipairs(db.presets) do if tostring(preset.name) ~= tostring(args[3]) then keep[#keep + 1] = preset end end; db.presets = keep; saveControllerDb(); print("Preset removed.")
+    else print("Usage: preset list|save|use|delete <name>") end
+    return true
+  elseif command == "report" or command == "history" then printHistory(); return true
+  elseif command == "doctor" then
+    print("CC Miner controller doctor")
+    print("network=" .. tostring(networkReady) .. " modems=" .. tostring(#(modemNames or {})))
+    print("db=" .. tostring(dbError and ("WARN " .. dbError) or "ok") .. " path=" .. DB_PATH)
+    print("workers=" .. tostring(#orderedIds()) .. " leases=" .. tostring(#(db.leases or {})) .. " queue=" .. tostring(#db.queue))
+    print("sorting=" .. tostring(config.sorting and config.sorting.enabled == true and "enabled" or "off"))
+    return true
+  end
+  return false
+end
+
+if #args > 0 and commandLineMode() then return end
+
+(function()
+  discover()
+  local refreshTimer = os.startTimer(1)
+  while running do
+    render()
+    local event, a, b, c = os.pullEvent()
+    if event == "rednet_message" and c == common.PROTOCOL then
+      handleMessage(a, b)
+    elseif event == "char" then
+      processChar(a)
+    elseif event == "key" then
+      processKey(a)
+    elseif event == "mouse_click" then
+      handlePointer("term", b, c)
+    elseif event == "monitor_touch" then
+      if config.touchEnabled ~= false then handlePointer(a, b, c) end
+    elseif event == "timer" then
+      if alertTimers[a] then
+        local alertOutput = alertTimers[a]; alertTimers[a] = nil
+        if alertOutput.global and redstone and redstone.setOutput then pcall(redstone.setOutput, alertOutput.side or "back", false) end
+        if alertOutput.relay and alertOutput.relay.setOutput then pcall(alertOutput.relay.setOutput, alertOutput.side or "back", false) end
+        for _, relay in ipairs(alertOutput.relays or {}) do if relay and relay.setOutput then pcall(relay.setOutput, alertOutput.side or "back", false) end end
+      elseif a == refreshTimer then
+        dispatchQueue()
+        groupSchedulerTick()
+        sortingTick()
+        if common.nowSeconds() - lastDiscovery >= (config.discoverySeconds or 5) then discover() end
+        dirty = true
+        refreshTimer = os.startTimer(1)
+      end
+    elseif event == "term_resize" or event == "monitor_resize" or event == "peripheral" or event == "peripheral_detach" then
+      monitors = common.findPeripherals("monitor")
+      speakers = common.findPeripherals("speaker")
+      redstoneDevices = common.findPeripherals("redstoneIntegrator")
+      for _, entry in ipairs(monitors) do noticeState.configureMonitor(entry.device) end
+      renderCache = {}; dirty = true
+    end
+  end
+
+  common.clear(colors and colors.black or nil, colors and colors.white or nil)
+  print("CC Miner controller stopped. Run 'ccm dashboard' to reopen it.")
+end)()
+]] },
+}
+local FILE_COUNT = 10
+local WORKER_PARTS = {}
+local CONTROLLER_PARTS = {[[controller_parts/01.part]], [[controller_parts/02.part]], [[controller_parts/03.part]]}
+local ENTRYPOINT = [[controller.lua]]
+local UPDATE_SENTINEL = [[-- CC Miner V4 update-incomplete sentinel for controller
+error("CC Miner runtime update is incomplete. Re-transfer the offline bundle and run update-low-space.", 0)
+]]
+local LOW_SPACE_STEPS = {
+  { kind = "runtime", index = 1 },
+  { kind = "runtime", index = 2 },
+  { kind = "runtime", index = 3 },
+  { kind = "runtime", index = 4 },
+  { kind = "runtime", index = 5 },
+  { kind = "runtime", index = 6 },
+  { kind = "runtime", index = 8 },
+  { kind = "runtime", index = 9 },
+  { kind = "runtime", index = 10 },
+  { kind = "obsolete", target = [[lib/geo.lua]] },
+  { kind = "obsolete", target = [[worker.lua]] },
+  { kind = "obsolete", target = [[worker_parts/01.part]] },
+  { kind = "obsolete", target = [[worker_parts/02.part]] },
+  { kind = "obsolete", target = [[worker_parts/03.part]] },
+  { kind = "obsolete", target = [[worker_parts/04.part]] },
+  { kind = "obsolete", target = [[worker_parts/05.part]] },
+  { kind = "obsolete", target = [[gps_host.lua]] },
+}
+
+local function fail(message)
+  error(tostring(message), 0)
+end
+local function ensureDir(path)
+  if not path or path == "" or fs.exists(path) then return end
+  local parent = fs.getDir(path)
+  if parent and parent ~= "" and parent ~= path then ensureDir(parent) end
+  fs.makeDir(path)
+end
+local function readFile(path)
+  if not fs.exists(path) or fs.isDir(path) then return nil end
+  local handle = fs.open(path, "rb")
+  if not handle then return nil end
+  local text = handle.readAll(); handle.close(); return text
+end
+local function writeFile(path, text)
+  ensureDir(fs.getDir(path))
+  local handle = fs.open(path, "wb")
+  if not handle then return false, "Cannot write " .. path end
+  local ok, writeError = pcall(handle.write, text or "")
+  handle.close()
+  if not ok then return false, tostring(writeError) end
+  return true
+end
+local function digest(text)
+  if not textutils or type(textutils.sha256) ~= "function" then
+    return nil, "textutils.sha256 is required for strict offline bundle verification."
+  end
+  local ok, value = pcall(textutils.sha256, text or "")
+  if not ok or type(value) ~= "string" then return nil, tostring(value or "sha256 failed") end
+  return string.lower(value)
+end
+local function compileText(label, text)
+  local loader = loadstring or load
+  local compiled, compileError = loader(text, "@" .. label)
+  if not compiled then return false, tostring(compileError) end
+  return true
+end
+local function validateEmbedded()
+  if #files ~= FILE_COUNT then fail("Embedded runtime file count is invalid for role " .. ROLE) end
+  local seen = {}
+  local aggregate = {
+    "ccminer-offline-role", "\0", VERSION, "\0", tostring(SCHEMA), "\0", ROLE, "\0", tostring(#files), "\0",
+  }
+  for index, file in ipairs(files) do
+    if type(file.target) ~= "string" or type(file.content) ~= "string" or seen[file.target] then
+      fail("Embedded runtime order/target is invalid at index " .. tostring(index))
+    end
+    seen[file.target] = true
+    local actual, digestError = digest(file.content)
+    if not actual then fail(digestError) end
+    if actual ~= string.lower(file.digest or "") then
+      fail("Embedded runtime digest mismatch: " .. tostring(file.target))
+    end
+    aggregate[#aggregate + 1] = file.source; aggregate[#aggregate + 1] = "\0"
+    aggregate[#aggregate + 1] = file.target; aggregate[#aggregate + 1] = "\0"
+    aggregate[#aggregate + 1] = file.digest; aggregate[#aggregate + 1] = "\0"
+    aggregate[#aggregate + 1] = file.content; aggregate[#aggregate + 1] = "\0"
+  end
+  local aggregateDigest, aggregateError = digest(table.concat(aggregate))
+  if not aggregateDigest then fail(aggregateError) end
+  if aggregateDigest ~= string.lower(SOURCE_DIGEST) then
+    fail("Embedded role source digest mismatch for " .. ROLE)
+  end
+  return true
+end
+local function validateParts(label, targets)
+  if #targets == 0 then return true end
+  local source = {}
+  for index, target in ipairs(targets) do
+    local found
+    for _, file in ipairs(files) do if file.target == target then found = file.content; break end end
+    if not found then fail("Embedded runtime part is missing: " .. target) end
+    source[index] = found
+  end
+  local ok, compileError = compileText(label .. ".assembled.lua", table.concat(source))
+  if not ok then fail("Assembled source failed syntax validation: " .. label .. ": " .. compileError) end
+end
+local function validateAll()
+  validateEmbedded()
+  for _, file in ipairs(files) do
+    if not file.target:match("%.part$") then
+      local ok, compileError = compileText(file.target, file.content)
+      if not ok then fail("Embedded file failed syntax validation: " .. file.target .. ": " .. compileError) end
+    end
+  end
   validateParts("worker", WORKER_PARTS)
   validateParts("controller", CONTROLLER_PARTS)
 end
@@ -93,171 +267,3 @@ if action == "update" then
   ensureDir(TEMP)
   for index, file in ipairs(files) do
     write(("[%d/%d] %s ... "):format(index, #files, file.target))
-    local ok, writeError = writeFile(TEMP .. "/" .. file.target, file.content)
-    if not ok then fs.delete(TEMP); fail(writeError) end
-    print("OK")
-  end
-  validateAll()
-end
-
-local preserved = {
-  { ROOT .. "/config.db", TEMP .. "/config.db" },
-  { ROOT .. "/config.db.bak", TEMP .. "/config.db.bak" },
-  { ROOT .. "/data/state.db", TEMP .. "/data/state.db" },
-  { ROOT .. "/data/state.db.bak", TEMP .. "/data/state.db.bak" },
-  { ROOT .. "/data/state.pending", TEMP .. "/data/state.pending" },
-  { ROOT .. "/data/state.journal", TEMP .. "/data/state.journal" },
-  { ROOT .. "/data/state.checkpoint.db", TEMP .. "/data/state.checkpoint.db" },
-  { ROOT .. "/data/controller.db", TEMP .. "/data/controller.db" },
-  { ROOT .. "/controller.db", TEMP .. "/controller.db" },
-  { ROOT .. "/data/ccminer.log", TEMP .. "/data/ccminer.log" },
-  { ROOT .. "/data/ccminer.log.1", TEMP .. "/data/ccminer.log.1" },
-}
-if action == "update" then
-  for _, pair in ipairs(preserved) do
-    local ok, copyError = copyIfPresent(pair[1], pair[2])
-    if not ok then fs.delete(TEMP); fail("Cannot preserve existing data: " .. tostring(copyError)) end
-  end
-end
-
-local function parseMarker(text)
-  if not text then return nil end
-  local version = text:match("version=([^\r\n]+)")
-  local schema = tonumber(text:match("schema=(%d+)"))
-  local role = text:match("role=([^\r\n]+)")
-  local state = text:match("state=([^\r\n]+)")
-  local nextIndex = tonumber(text:match("next=(%d+)"))
-  if not version or not schema or not role or not state or not nextIndex then return nil end
-  return { version = version, schema = schema, role = role, state = state, next = nextIndex }
-end
-local function markerRead()
-  local markerText = readFile(LOW_SPACE_MARKER)
-  local marker = parseMarker(markerText)
-  if marker then return marker, nil end
-  local backupPath, tempPath = LOW_SPACE_MARKER .. ".bak", LOW_SPACE_MARKER .. ".tmp"
-  local tempText = readFile(tempPath)
-  local temp = parseMarker(tempText)
-  if tempText and not temp then
-    return nil, "Recovery marker temporary file is corrupt; refusing to guess update progress."
-  end
-  local backupText = readFile(backupPath)
-  local backup = parseMarker(backupText)
-  if backup then
-    local restored, restoreError = atomicWrite(LOW_SPACE_MARKER, backupText)
-    if not restored then return nil, "Recovery marker backup is valid but could not be restored: " .. tostring(restoreError) end
-    local recovered = parseMarker(readFile(LOW_SPACE_MARKER))
-    if not recovered then return nil, "Recovery marker backup restore could not be verified." end
-    return recovered, nil
-  end
-  if temp then
-    local restored, restoreError = atomicWrite(LOW_SPACE_MARKER, tempText)
-    if not restored then return nil, "Recovery marker temporary file is valid but could not be restored: " .. tostring(restoreError) end
-    local recovered = parseMarker(readFile(LOW_SPACE_MARKER))
-    if not recovered then return nil, "Recovery marker temporary restore could not be verified." end
-    return recovered, nil
-  end
-  if markerText then return nil, "Recovery marker is corrupt and no valid atomic backup remains." end
-  if backupText then return nil, "Recovery marker backup is corrupt and cannot be trusted." end
-  return nil, nil
-end
-local function markerWrite(state, nextIndex)
-  local text = table.concat({
-    "version=" .. VERSION,
-    "schema=" .. tostring(SCHEMA),
-    "role=" .. ROLE,
-    "state=" .. tostring(state),
-    "next=" .. tostring(nextIndex or 1),
-    "",
-  }, "\n")
-  return atomicWrite(LOW_SPACE_MARKER, text)
-end
-local function clearMarker()
-  for _, suffix in ipairs({ "", ".tmp", ".bak" }) do
-    local path = LOW_SPACE_MARKER .. suffix
-    if fs.exists(path) then pcall(fs.delete, path) end
-    if fs.exists(path) then return false, "Cannot clear recovery marker artifact: " .. path end
-  end
-  return true
-end
-local function lowSpaceFailure(message)
-  printError("LOW-SPACE INSTALL/UPDATE PAUSED")
-  local retryAction = action == ROLE and ROLE or "update-low-space"
-  fail(tostring(message) .. "\nRecovery marker: " .. LOW_SPACE_MARKER
-    .. "\nRe-transfer ccminer-offline-" .. ROLE .. ".lua and its parts, then rerun " .. retryAction .. ".")
-end
-local function embeddedEntrypoint()
-  for _, file in ipairs(files) do
-    if file.target == ENTRYPOINT then return file.content end
-  end
-  lowSpaceFailure("Embedded role loader is missing: " .. ENTRYPOINT)
-end
-local function ensureUpdateSentinel()
-  local path = ROOT .. "/" .. ENTRYPOINT
-  if readFile(path) ~= UPDATE_SENTINEL then
-    local wrote, writeError = atomicWrite(path, UPDATE_SENTINEL)
-    if not wrote then lowSpaceFailure("Cannot install the update-incomplete sentinel: " .. tostring(writeError)) end
-  end
-  if readFile(path) ~= UPDATE_SENTINEL then
-    lowSpaceFailure("Update-incomplete sentinel could not be verified; runtime was not started.")
-  end
-end
-local function applyLowSpaceStep(step)
-  if step.kind == "runtime" then
-    local file = files[step.index]
-    if not file then return false, "Low-space runtime step has an invalid file index." end
-    local wrote, writeError = atomicWrite(ROOT .. "/" .. file.target, file.content)
-    if not wrote then return false, "Cannot atomically install " .. file.target .. ": " .. tostring(writeError) end
-    return true
-  end
-  if step.kind == "obsolete" then
-    local basePath = ROOT .. "/" .. step.target
-    for _, suffix in ipairs({ "", ".tmp", ".bak" }) do
-      local path = basePath .. suffix
-      if fs.exists(path) then pcall(fs.delete, path) end
-      if fs.exists(path) then return false, "Cannot remove obsolete runtime target: " .. path end
-    end
-    return true
-  end
-  return false, "Unknown low-space update step: " .. tostring(step.kind)
-end
-local function lowSpaceUpdate()
-  -- Everything is already in memory from the verified role bundle.  There is
-  -- deliberately no /ccminer.update staging tree in this path.  The runtime
-  -- entrypoint is first replaced by a fail-closed sentinel, so a power loss
-  -- cannot boot a mixed set of files.  The final entrypoint is committed only
-  -- after every non-loader write and obsolete-role deletion has completed.
-  validateLowSpaceStage()
-  ensureUpdateSentinel()
-  local marker, markerReadError = markerRead()
-  if markerReadError then lowSpaceFailure(markerReadError) end
-  if marker then
-    if marker.version ~= VERSION or marker.schema ~= SCHEMA or marker.role ~= ROLE then
-      lowSpaceFailure("Recovery marker does not match this role bundle.")
-    end
-    if marker.state ~= "ready" and marker.state ~= "committing" and marker.state ~= "final-ready" then
-      lowSpaceFailure("Recovery marker has an unknown state: " .. tostring(marker.state))
-    end
-  else
-    local marked, markerError = markerWrite("ready", 1)
-    if not marked then lowSpaceFailure("Cannot create recovery marker: " .. tostring(markerError)) end
-    marker, markerReadError = markerRead()
-    if markerReadError or not marker then
-      lowSpaceFailure(markerReadError or "Recovery marker was written but could not be read back.")
-    end
-  end
-  local first
-  if marker.state == "final-ready" then
-    -- final-ready explicitly skips every non-loader step on resume.
-    first = #LOW_SPACE_STEPS + 1
-  else
-    first = math.max(1, math.min(#LOW_SPACE_STEPS + 1, marker.next or 1))
-  end
-  local marked, markerError = markerWrite("ready", first)
-  if not marked then lowSpaceFailure("Cannot mark validated runtime: " .. tostring(markerError)) end
-  for index = first, #LOW_SPACE_STEPS do
-    local step = LOW_SPACE_STEPS[index]
-    marked, markerError = markerWrite("committing", index)
-    if not marked then lowSpaceFailure("Cannot record commit progress for step " .. tostring(index) .. ": " .. tostring(markerError)) end
-    local applied, applyError = applyLowSpaceStep(step)
-    if not applied then lowSpaceFailure(applyError) end
-    marked, markerError = markerWrite("committing", index + 1)
