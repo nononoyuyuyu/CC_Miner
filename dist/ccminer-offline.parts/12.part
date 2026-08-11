@@ -1,0 +1,261 @@
+    config.fuelTarget = common.promptNumber("Fuel target", config.fuelTarget or 12000, 500, 100000)
+    config.reserveEmptySlots = common.promptNumber("Reserved empty slots", config.reserveEmptySlots or 3, 1, 8)
+    local lavaChoice = common.prompt("Lava behavior (seal/stop)", config.lavaMode or "seal", function(value)
+      value = string.lower(value)
+      return value == "seal" or value == "stop", "Enter seal or stop."
+    end)
+    config.lavaMode = string.lower(lavaChoice)
+    if config.lavaMode == "seal" then
+      config.sealSide = common.prompt("Seal-block chest side (right/left)", config.sealSide or "right", function(value)
+        value = string.lower(value)
+        return value == "right" or value == "left", "Enter right or left."
+      end):lower()
+      config.sealTarget = common.promptNumber("Seal-block target count", config.sealTarget or 64, 16, 512)
+      config.sealReserve = common.promptNumber("Return when seal blocks reach", config.sealReserve or 8, 1, math.min(64, config.sealTarget - 1))
+    end
+    config.gps = config.gps or common.defaultWorkerConfig().gps
+    config.gps.enabled = common.promptYesNo("Use GPS when available", config.gps.enabled ~= false)
+    if config.gps.enabled then
+      config.gps.required = common.promptYesNo("Require GPS for mining", config.gps.required == true)
+    else
+      config.gps.required = false
+    end
+    config.attackEntities = common.promptYesNo("Attack blocking entities", config.attackEntities == true)
+    config.outputSide, config.fuelSide = "back", "top"
+    if os.setComputerLabel then os.setComputerLabel(config.workerName) end
+  else
+    config = common.merge(common.defaultControllerConfig(), current and current.role == "controller" and current or {})
+    config.role, config.networkKey = "controller", key
+    config.controllerName = common.prompt("Controller name", config.controllerName or common.safeComputerLabel("Control"), function(value)
+      return #value >= 1 and #value <= 20, "Use 1 to 20 characters."
+    end)
+    config.monitorTextScale = tonumber(common.prompt("Monitor text scale", config.monitorTextScale or 0.5, function(value)
+      local number = tonumber(value)
+      if not number or number < 0.5 or number > 5 or number * 2 ~= math.floor(number * 2) then
+        return false, "Use 0.5, 1.0, 1.5 ... 5.0."
+      end
+      return true
+    end))
+    config.touchEnabled = common.promptYesNo("Enable monitor touch controls", config.touchEnabled ~= false)
+    if os.setComputerLabel then os.setComputerLabel(config.controllerName) end
+  end
+end
+
+local ok, err = common.saveConfig(config)
+if not ok then error("Cannot save configuration: " .. tostring(err), 0) end
+
+if requestedRole == "worker" and (not fs.exists(common.STATE_PATH) or not current or current.role ~= "worker") then
+  common.saveTable(common.STATE_PATH, common.defaultState())
+end
+
+local startupMarker = "-- CC_MINER_V2_STARTUP"
+local existingStartup = fs.exists("/startup.lua") and common.readAll("/startup.lua") or nil
+if existingStartup and not existingStartup:find(startupMarker, 1, true) then
+  local backupOk, backupError = common.writeAllAtomic("/startup.user.lua", existingStartup)
+  if not backupOk then error("Cannot preserve existing startup.lua: " .. tostring(backupError), 0) end
+end
+
+local startup = startupMarker .. [[
+if fs.exists("/startup.user.lua") then
+  local ok, err = pcall(function() shell.run("/startup.user.lua") end)
+  if not ok then printError("User startup failed: " .. tostring(err)) end
+end
+shell.run("/ccminer/boot.lua")
+]]
+local startupOk, startupError = common.writeAllAtomic("/startup.lua", startup)
+if not startupOk then error("Cannot install startup.lua: " .. tostring(startupError), 0) end
+local commandOk, commandError = common.writeAllAtomic("/ccm.lua", [[
+shell.run("/ccminer/command.lua", ...)
+]])
+if not commandOk then error("Cannot install ccm.lua: " .. tostring(commandError), 0) end
+
+common.clear(colors and colors.black or nil, colors and colors.white or nil)
+print("SETUP COMPLETE")
+print("")
+print("Role: " .. requestedRole)
+if requestedRole == "worker" then
+  print("Output chest: BEHIND the turtle")
+  print("Fuel chest: ABOVE the turtle")
+  if config.lavaMode == "seal" then print("Seal-block chest: " .. string.upper(config.sealSide) .. " of the turtle") end
+  print("Turtle front: quarry entrance")
+  if config.gps.enabled then print("After GPS hosts are online: controller -> GPS CAL") end
+elseif requestedRole == "controller" then
+  print("Attach a wireless modem and optional Advanced Monitor.")
+  print("Monitor touches and terminal mouse clicks are enabled.")
+else
+  print(("GPS host coordinates: %d, %d, %d"):format(config.x, config.y, config.z))
+  print("Keep this computer and its wireless modem chunk-loaded.")
+end
+print("")
+print("Reboot with: reboot")
+]=] },
+  { target = [[boot.lua]], content = [[-- CC Miner V2 boot dispatcher
+
+local common = dofile("/ccminer/lib/common.lua")
+local config, err = common.loadConfig()
+if not config or not config.role then
+  printError(err or "CC Miner is not configured.")
+  print("Run: ccm setup")
+  return
+end
+
+local programs = {
+  worker = "/ccminer/worker.lua",
+  controller = "/ccminer/controller.lua",
+  gps = "/ccminer/gps_host.lua",
+}
+local program = programs[config.role]
+if not program then error("Unknown CC Miner role: " .. tostring(config.role), 0) end
+
+if config.role ~= "worker" then
+  local ok, runError = pcall(dofile, program)
+  if not ok then common.log("ERROR", config.role .. " stopped: " .. tostring(runError)); printError(runError) end
+  return
+end
+
+while true do
+  local ok, runError = pcall(dofile, program)
+  if ok then return end
+  local text = tostring(runError)
+  common.log("ERROR", "Worker crashed: " .. text)
+  printError("CC Miner worker stopped: " .. text)
+  if text == "Terminated" or text:find("Terminated", 1, true) then
+    print("Worker stopped locally. Run 'reboot' to restart.")
+    return
+  end
+  print("Restarting worker in 5 seconds...")
+  sleep(5)
+end
+]] },
+  { target = [[command.lua]], content = [[-- CC Miner V2 local command launcher
+
+local args = { ... }
+local common = dofile("/ccminer/lib/common.lua")
+local command = string.lower(tostring(args[1] or "help"))
+
+local function printHelp()
+  print("CC Miner V2 " .. common.VERSION)
+  print("")
+  print("ccm help | version | status | logs")
+  print("ccm setup [worker|controller|gps]")
+  print("ccm dashboard | discover")
+  print("ccm update")
+  print("ccm rehome RESET                 Local worker recovery")
+  print("")
+  print("Controller CLI:")
+  print("ccm start <id> <W> <L> <D>")
+  print("ccm pause|resume|recall|service|abort|clear <id>")
+  print("ccm gps <id>                    Request GPS fix")
+  print("ccm calibrate <id>              Calibrate worker GPS")
+  print("ccm rehome <id> RESET")
+end
+
+local function forwardController()
+  local forwarded = {}
+  for index = 1, #args do forwarded[index] = args[index] end
+  local unpackArguments = table.unpack or unpack
+  shell.run("/ccminer/controller.lua", unpackArguments(forwarded))
+end
+
+if command == "help" or command == "?" then
+  printHelp()
+elseif command == "version" then
+  print("CC Miner V2 " .. common.VERSION)
+elseif command == "setup" then
+  shell.run("/ccminer/setup.lua", args[2])
+elseif command == "dashboard" then
+  shell.run("/ccminer/controller.lua")
+elseif command == "discover" then
+  shell.run("/ccminer/controller.lua", "discover")
+elseif command == "rehome" then
+  local config, configError = common.loadConfig()
+  if not config then
+    printError(configError or "Not configured.")
+  elseif config.role == "worker" then
+    if args[2] ~= "RESET" then
+      printError("Place the turtle in its dock facing the quarry, then run: ccm rehome RESET")
+    else
+      local calibration = config.gps and config.gps.calibration or nil
+      if calibration and gps and gps.locate then
+        local x, y, z = gps.locate(2, false)
+        if x and (common.round(x) ~= calibration.home.x or common.round(y) ~= calibration.home.y or common.round(z) ~= calibration.home.z) then
+          printError("GPS position does not match the calibrated dock. Rehome was cancelled.")
+          return
+        end
+      end
+      local previous = common.loadTable(common.STATE_PATH, common.defaultState())
+      local reset = common.defaultState()
+      if previous and previous.stats then reset.stats = previous.stats end
+      local ok, err = common.saveTable(common.STATE_PATH, reset)
+      if not ok then printError("Cannot reset worker state: " .. tostring(err))
+      else print("Worker coordinates and job were reset to home. Run: reboot") end
+    end
+  elseif config.role == "controller" then
+    if not tonumber(args[2]) or args[3] ~= "RESET" then printError("Usage: ccm rehome <id> RESET") else forwardController() end
+  else
+    printError("Rehome is not available for role " .. tostring(config.role))
+  end
+elseif command == "start" or command == "pause" or command == "resume" or command == "recall"
+  or command == "service" or command == "abort" or command == "clear" or command == "gps" or command == "calibrate" then
+  local config = common.loadConfig()
+  if not config or config.role ~= "controller" then printError("Run this command on the controller computer.") else forwardController() end
+elseif command == "status" then
+  local config, configError = common.loadConfig()
+  if not config then printError(configError or "Not configured."); return end
+  print("CC Miner V2 " .. common.VERSION)
+  print("Role: " .. tostring(config.role))
+  print("Computer ID: " .. tostring(os.getComputerID()))
+  print("Label: " .. tostring(os.getComputerLabel and os.getComputerLabel() or "-"))
+  if config.networkKey then print("Network key: " .. tostring(config.networkKey)) end
+  if config.role == "worker" then
+    local state, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
+    if stateError then printError(stateError) end
+    print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
+    if state.pose then print(("Pose: x=%s y=%s z=%s dir=%s"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir)) end
+    print("GPS calibrated: " .. tostring(config.gps and config.gps.calibration ~= nil))
+    print("Lava mode: " .. tostring(config.lavaMode))
+    if state.job then print(("Job: %s %s/%s [%s]"):format(tostring(state.job.name), tostring(state.job.cursor), tostring(state.job.total), tostring(state.job.strategy))) end
+    if state.lastError then print("Error: " .. tostring(state.lastError)) end
+  elseif config.role == "gps" then
+    print(("Coordinates: %s, %s, %s"):format(config.x, config.y, config.z))
+  end
+elseif command == "logs" then
+  if not fs.exists(common.LOG_PATH) then print("No log file yet."); return end
+  local handle = fs.open(common.LOG_PATH, "r")
+  local lines = {}
+  while true do
+    local line = handle.readLine()
+    if not line then break end
+    lines[#lines + 1] = line
+    if #lines > 30 then table.remove(lines, 1) end
+  end
+  handle.close()
+  for _, line in ipairs(lines) do print(line) end
+elseif command == "update" then
+  if not http then printError("HTTP API is disabled."); return end
+  shell.run("wget", "run", "https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua", "update")
+else
+  printError("Unknown command: " .. command)
+  printHelp()
+end
+]] },
+}
+
+local function ensureDir(path)
+  if not path or path == "" or fs.exists(path) then return end
+  local parent = fs.getDir(path)
+  if parent and parent ~= "" then ensureDir(parent) end
+  fs.makeDir(path)
+end
+local function readFile(path)
+  if not fs.exists(path) or fs.isDir(path) then return nil end
+  local handle = fs.open(path, "r")
+  if not handle then return nil end
+  local text = handle.readAll(); handle.close(); return text
+end
+local function writeFile(path, text)
+  ensureDir(fs.getDir(path))
+  local handle = fs.open(path, "w")
+  if not handle then return false, "Cannot write " .. path end
+  handle.write(text); handle.close(); return true
+end

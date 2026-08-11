@@ -1,0 +1,61 @@
+      print(("#%s %-16s %-14s %s GPS=%s seal=%s"):format(
+        id, workerLabel(workers[id], id), statusOf(workers[id]), progressText(data),
+        data.gps and data.gps.calibrated and "ready" or "no", data.seal and data.seal.count or "-"
+      ))
+    end
+    return true
+  elseif command == "start" then
+    local id, width, length, depth = tonumber(args[2]), tonumber(args[3]), tonumber(args[4]), tonumber(args[5])
+    if not id or not width or not length or not depth then
+      print("Usage: controller.lua start <id> <width> <length> <depth>")
+      return true
+    end
+    sendCommand(id, "start", { width = width, length = length, depth = depth, name = "CLI Quarry", chunkMode = "local", excludedChunks = {} })
+    pumpFor(2); print(notice); return true
+  elseif command == "pause" or command == "resume" or command == "recall" or command == "service" or command == "abort" or command == "clear" then
+    local id = tonumber(args[2])
+    if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
+    sendCommand(id, command); pumpFor(2); print(notice); return true
+  elseif command == "gps" or command == "calibrate" then
+    local id = tonumber(args[2])
+    if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
+    sendCommand(id, command == "gps" and "gps_fix" or "calibrate_gps")
+    pumpFor(3); print(notice); return true
+  elseif command == "rehome" then
+    local id = tonumber(args[2])
+    if not id or args[3] ~= "RESET" then print("Usage: controller.lua rehome <id> RESET"); return true end
+    sendCommand(id, "rehome", { confirm = "RESET" }); pumpFor(2); print(notice); return true
+  end
+  return false
+end
+
+if #args > 0 and commandLineMode() then return end
+
+discover()
+local refreshTimer = os.startTimer(1)
+while running do
+  render()
+  local event, a, b, c = os.pullEvent()
+  if event == "rednet_message" and c == common.PROTOCOL then
+    handleMessage(a, b)
+  elseif event == "char" then
+    processChar(a)
+  elseif event == "key" then
+    processKey(a)
+  elseif event == "mouse_click" then
+    handlePointer("term", b, c)
+  elseif event == "monitor_touch" then
+    if config.touchEnabled ~= false then handlePointer(a, b, c) end
+  elseif event == "timer" and a == refreshTimer then
+    if common.nowSeconds() - lastDiscovery >= (config.discoverySeconds or 5) then discover() end
+    refreshTimer = os.startTimer(1)
+  elseif event == "term_resize" or event == "monitor_resize" or event == "peripheral" or event == "peripheral_detach" then
+    monitors = common.findPeripherals("monitor")
+    for _, entry in ipairs(monitors) do
+      if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end
+    end
+  end
+end
+
+common.clear(colors and colors.black or nil, colors and colors.white or nil)
+print("CC Miner controller stopped. Run 'ccm dashboard' to reopen it.")

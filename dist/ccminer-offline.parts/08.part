@@ -1,0 +1,290 @@
+  job.total = tonumber(job.total) or (job.width * job.length * job.depth)
+  if job.cursor >= job.total then completeJob(state.completionReason or "completed"); return end
+
+  local target = quarry.cellForJob(job, job.cursor)
+  if samePosePosition(state.pose, target) then
+    -- GPS recovery may prove that an interrupted move completed before the
+    -- cursor update was persisted. Treat the occupied cell as completed.
+    job.cursor = job.cursor + 1
+    saveState()
+    return
+  end
+
+  local direction, targetDir, verticalDelta = requiredDirectionTo(target)
+  if not direction then
+    markBlocked("Quarry path/state mismatch at cell " .. tostring(job.cursor) .. ": " .. tostring(targetDir))
+    return
+  end
+  if targetDir ~= nil then
+    local ok, err = turnTo(targetDir)
+    if not ok then markBlocked("Turn failed: " .. tostring(err)); return end
+  end
+  local ok, err = moveOne(direction, "mining")
+  if not ok then
+    if handleMoveFailure("Mining stopped at cell " .. tostring(job.cursor), err, verticalDelta == -1) then return end
+    markBlocked("Mining stopped at cell " .. tostring(job.cursor) .. ": " .. tostring(err))
+    return
+  end
+  job.cursor = job.cursor + 1
+  saveState()
+  heartbeat(false)
+end
+
+local function runChunkPlanStep(job)
+  local plan, route = job.chunkPlan, job.route
+  if not plan or not route then markBlocked("Chunk plan state is missing."); return end
+  route.layer = tonumber(route.layer) or 0
+  route.walkIndex = tonumber(route.walkIndex) or 1
+  route.localCursor = tonumber(route.localCursor) or 0
+  route.phase = route.phase or "travel"
+
+  if route.walkIndex > #plan.walk then
+    if route.layer + 1 >= job.depth then completeJob("completed"); return end
+    local ok, err = moveOne("down", "mining")
+    if not ok then
+      if handleMoveFailure("Cannot descend to the next layer", err, true) then return end
+      markBlocked("Cannot descend to the next layer: " .. tostring(err))
+      return
+    end
+    route.layer = route.layer + 1
+    route.walkIndex, route.localCursor, route.phase = 1, 0, "travel"
+    route.currentKey = plan.rootKey
+    saveState()
+    return
+  end
+
+  local walkStep = plan.walk[route.walkIndex]
+  local chunk = plan.chunks[walkStep.key]
+  if not chunk then markBlocked("Chunk plan references an unknown chunk: " .. tostring(walkStep.key)); return end
+  local y = -route.layer
+  local anchor = { x = chunk.anchor.x, y = y, z = chunk.anchor.z }
+
+  if route.phase == "travel" then
+    local ok, err
+    if samePosePosition(state.pose, anchor) then
+      ok = true
+    elseif route.currentKey and route.currentKey ~= walkStep.key then
+      ok, err = moveBetweenChunkAnchors(plan, route.currentKey, walkStep.key, y, "mining")
+    else
+      ok, err = navigateTo(anchor, "inside", "mining")
+    end
+    if not ok then
+      if handleMoveFailure("Chunk transit failed", err, false) then return end
+      markBlocked("Chunk transit failed: " .. tostring(err)); return
+    end
+    route.currentKey = walkStep.key
+    if walkStep.first then
+      route.phase, route.localCursor = "mine", 0
+    else
+      route.walkIndex = route.walkIndex + 1
+    end
+    saveState()
+    return
+  end
+
+  if route.phase == "mine" then
+    local count = quarry.chunkCellCount(chunk)
+    if route.localCursor >= count then
+      route.phase = "return"
+      saveState()
+      return
+    end
+    local target = quarry.chunkCell(chunk, route.localCursor, y)
+    if samePosePosition(state.pose, target) then
+      route.localCursor = route.localCursor + 1
+      job.cursor = (job.cursor or 0) + 1
+      saveState()
+      return
+    end
+    local direction, targetDir = requiredDirectionTo(target)
+    if not direction then
+      markBlocked(("Chunk cell path mismatch in %s at local cell %d."):format(chunk.key, route.localCursor))
+      return
+    end
+    if targetDir ~= nil then
+      local turned, turnError = turnTo(targetDir)
+      if not turned then markBlocked("Chunk turn failed: " .. tostring(turnError)); return end
+    end
+    local moved, moveError = moveOne(direction, "mining")
+    if not moved then
+      if handleMoveFailure("Chunk mining failed", moveError, false) then return end
+      markBlocked("Chunk mining failed: " .. tostring(moveError)); return
+    end
+    route.localCursor = route.localCursor + 1
+    job.cursor = (job.cursor or 0) + 1
+    saveState()
+    return
+  end
+
+  if route.phase == "return" then
+    local ok, err = navigateTo(anchor, "inside", "mining")
+    if not ok then
+      if handleMoveFailure("Cannot return to chunk anchor", err, false) then return end
+      markBlocked("Cannot return to chunk anchor: " .. tostring(err)); return
+    end
+    route.phase, route.localCursor = "travel", 0
+    route.walkIndex = route.walkIndex + 1
+    route.currentKey = walkStep.key
+    saveState()
+    return
+  end
+
+  markBlocked("Unknown chunk route phase: " .. tostring(route.phase))
+end
+
+local function runMiningStep()
+  if handlePendingRequest() then return end
+  if state.service then continueService(); return end
+  if not state.job then
+    state.status = "idle"
+    state.phase = isHome() and "home" or "unknown_position"
+    saveState()
+    return
+  end
+
+  local serviceNeeded, reason = shouldService()
+  if serviceNeeded then beginAutomaticService(reason); return end
+  state.phase, state.status, state.lastError = "mining", "working", nil
+  if state.job.strategy == "chunk_plan" then runChunkPlanStep(state.job) else runSerpentineStep(state.job) end
+end
+
+local function displayLocalStatus()
+  common.clear(colors and colors.black or nil, colors and colors.white or nil)
+  print("CC Miner V2 Worker " .. common.VERSION)
+  print("ID: " .. os.getComputerID() .. "  " .. tostring(config.workerName))
+  print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
+  print(("Pose: x=%d y=%d z=%d d=%d"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir))
+  if state.gps and state.gps.lastFix then
+    print(("GPS: %d,%d,%d%s"):format(
+      state.gps.lastFix.x, state.gps.lastFix.y, state.gps.lastFix.z,
+      gpsCalibration() and " calibrated" or " uncalibrated"
+]] },
+  { target = [[worker_parts/05.part]], content = [[    ))
+  else
+    print("GPS: " .. (gpsCalibration() and "no fix" or "not calibrated"))
+  end
+  print("Fuel: " .. tostring(fuelLevel()) .. " / " .. tostring(fuelLimit()))
+  local used, empty, items = inventoryStats()
+  print(("Inventory: %d used, %d empty, %d items"):format(used, empty, items))
+  print(("Lava seal: %d/%d (%s)"):format(sealMaterialCount(), tonumber(config.sealTarget) or 64, config.lavaMode or "seal"))
+  if state.job then
+    print(("Job: %s %dx%dx%d [%s]"):format(
+      tostring(state.job.name), state.job.width, state.job.length, state.job.depth, state.job.strategy or "serpentine"
+    ))
+    print(("Progress: %d/%d (%d%%)"):format(
+      state.job.cursor or 0, state.job.total or 0, common.percent(state.job.cursor or 0, state.job.total or 0)
+    ))
+  else
+    print("Job: none")
+  end
+  if state.lastError then print("Error: " .. common.fit(state.lastError, 50)) end
+  print("")
+  print("Remote control active. Hold Ctrl+T to stop locally.")
+end
+
+local function tryResolvePendingAction()
+  local pending = state.pendingAction
+  if not pending then return true end
+  local kind = tostring(pending.kind or "")
+  if common.startsWith(kind, "turn_") or kind == "gps_calibration" then return false, "GPS cannot determine the result of " .. kind end
+  if gpsConfig().autoResolvePending == false or not gpsCalibration() then return false, "GPS pending-action recovery is unavailable." end
+  local fix, fixError = locateGPS()
+  if not fix then return false, fixError end
+  local resolved, resolveError = geo.resolvePending(pending, fix, gpsCalibration())
+  if not resolved then return false, resolveError end
+  state.pose = poseCopy(resolved.pose)
+  state.pendingAction = nil
+  if resolved.outcome == "after" and common.startsWith(kind, "move_") then
+    state.stats.moves = (state.stats.moves or 0) + 1
+  end
+  state.stats.gpsRecoveries = (state.stats.gpsRecoveries or 0) + 1
+  state.gps.corrections = (state.gps.corrections or 0) + 1
+  common.log("WARN", "GPS resolved pending action " .. kind .. " as " .. resolved.outcome)
+  saveState()
+  return true
+end
+
+local function preflight()
+  if not os.getComputerLabel or not os.getComputerLabel() then
+    if os.setComputerLabel then os.setComputerLabel(config.workerName) end
+  end
+  local opened, names = protocol.open()
+  networkReady = opened
+  if not opened then
+    common.log("ERROR", "No wireless modem found.")
+    printError("No wireless modem found. Equip one on the turtle.")
+  else
+    common.log("INFO", "Wireless modem opened: " .. table.concat(names, ","))
+  end
+
+  state.pose = poseCopy(state.pose)
+  state.stats = common.merge(common.defaultState().stats, state.stats)
+  state.gps = common.merge(common.defaultState().gps, state.gps)
+  if state.job and not state.job.strategy then state.job.strategy = "serpentine" end
+  if state.job and state.job.strategy == "chunk_plan" and not state.job.chunkPlan then
+    local plan, planError = quarry.buildChunkPlan(state.job, gpsCalibration())
+    if plan then state.job.chunkPlan = plan else state.lastError = planError end
+  end
+
+  if state.pendingAction then
+    local resolved, resolveError = tryResolvePendingAction()
+    if not resolved then
+      local pending = state.pendingAction
+      state.status, state.phase, state.request, state.service = "blocked", "recovery_required", nil, nil
+      state.lastError = ("Power loss occurred during '%s' from x=%s y=%s z=%s dir=%s. GPS recovery failed: %s. Return the turtle to its dock, face the quarry, then use REHOME."):format(
+        tostring(pending.kind or "unknown"), tostring(pending.poseBefore and pending.poseBefore.x or "?"),
+        tostring(pending.poseBefore and pending.poseBefore.y or "?"), tostring(pending.poseBefore and pending.poseBefore.z or "?"),
+        tostring(pending.poseBefore and pending.poseBefore.dir or "?"), tostring(resolveError)
+      )
+      common.log("ERROR", state.lastError)
+    end
+  elseif gpsCalibration() then
+    local fix, fixError = locateGPS()
+    if fix then
+      local expected = geo.localToWorld(gpsCalibration(), state.pose)
+      if not geo.samePosition(fix, expected) then
+        if not state.job and state.status ~= "working" then
+          local corrected = geo.worldToLocal(gpsCalibration(), fix, state.pose.dir)
+          state.pose = poseCopy(corrected)
+          state.gps.corrections = (state.gps.corrections or 0) + 1
+          common.log("WARN", "GPS corrected idle local coordinates at boot.")
+        else
+          state.status, state.phase = "blocked", "gps_drift"
+          state.lastError = ("Boot GPS mismatch: expected %d,%d,%d, located %d,%d,%d."):format(
+            expected.x, expected.y, expected.z, fix.x, fix.y, fix.z
+          )
+        end
+      end
+    elseif gpsConfig().required then
+      state.status, state.phase = "blocked", "gps_error"
+      state.lastError = "Required GPS fix failed at boot: " .. tostring(fixError)
+    end
+  elseif gpsConfig().required then
+    state.status, state.phase = "blocked", "gps_error"
+    state.lastError = "GPS is required but no calibration is stored."
+  end
+
+  saveState()
+  displayLocalStatus()
+  heartbeat(true)
+end
+
+preflight()
+
+while true do
+  drainNetwork(12)
+  if state.request and state.status ~= "working" then state.status = "working" end
+  if state.status == "working" then
+    if state.request then handlePendingRequest() end
+    if state.service then continueService() else runMiningStep() end
+  elseif state.status == "waiting_output" or state.status == "waiting_fuel" or state.status == "waiting_seal" then
+    if state.service then
+      continueService()
+      if state.status == "waiting_output" or state.status == "waiting_fuel" or state.status == "waiting_seal" then sleep(3) end
+    else
+      markBlocked("Service state is missing while waiting.")
+    end
+  else
+    pollNetwork(0.5)
+  end
+  heartbeat(false)

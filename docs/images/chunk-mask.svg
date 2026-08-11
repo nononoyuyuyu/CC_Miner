@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="650" viewBox="0 0 1100 650" role="img" aria-labelledby="title desc">
+  <title id="title">チャンク除外マスク例</title>
+  <desc id="desc">入口チャンクを残し、中央チャンクを除外した連結採掘領域</desc>
+  <defs><style>.h{font:700 30px sans-serif;fill:#0f172a}.l{font:600 21px sans-serif;fill:#0f172a}.s{font:17px sans-serif;fill:#334155}.chunk{stroke:#334155;stroke-width:4}.route{stroke:#dc2626;stroke-width:8;fill:none;stroke-linecap:round;stroke-linejoin:round}</style></defs>
+  <rect width="1100" height="650" fill="#fff"/>
+  <text x="550" y="52" text-anchor="middle" class="h">チャンク除外マスク — 例</text>
+  <text x="550" y="86" text-anchor="middle" class="s">白=採掘、灰=除外。残るチャンクが入口から連結している場合だけジョブを受理します。</text>
+  <g transform="translate(280,140)" data-grid-cell="160" data-grid-origin-x="280" data-grid-origin-y="140">
+    <rect class="chunk" x="0" y="0" width="160" height="160" fill="#dcfce7"/><text x="80" y="78" text-anchor="middle" class="l">入口</text><text x="80" y="108" text-anchor="middle" class="s">変更不可</text>
+    <rect class="chunk" x="160" y="0" width="160" height="160" fill="#fff"/><rect class="chunk" x="320" y="0" width="160" height="160" fill="#fff"/>
+    <rect class="chunk" x="0" y="160" width="160" height="160" fill="#fff"/><rect class="chunk" x="160" y="160" width="160" height="160" fill="#94a3b8"/><text x="240" y="248" text-anchor="middle" class="l" fill="#fff">除外</text><rect class="chunk" x="320" y="160" width="160" height="160" fill="#fff"/>
+    <rect class="chunk" x="0" y="320" width="160" height="160" fill="#fff"/><rect class="chunk" x="160" y="320" width="160" height="160" fill="#fff"/><rect class="chunk" x="320" y="320" width="160" height="160" fill="#fff"/>
+    <path class="route" d="M80 80 L240 80 L400 80 L400 240 L400 400 L240 400 L80 400 L80 240 L80 80"/>
+  </g>
+  <text x="550" y="590" text-anchor="middle" class="l">除外チャンクへ移動・採掘・帰還経路のいずれでも侵入しません。</text>
+  <text x="550" y="622" text-anchor="middle" class="s">GPS校正済みならワールドチャンク座標、未校正なら採掘原点基準の16×16区画を表示します。</text>
+</svg>

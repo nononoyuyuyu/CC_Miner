@@ -1,38 +1,46 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="650" viewBox="0 0 1100 650" role="img" aria-labelledby="title desc">
   <title id="title">採掘ドック側面配置図</title>
-  <desc id="desc">燃料チェストをタートルの上、搬出チェストを後ろに配置</desc>
+  <desc id="desc">140ピクセルを1ブロックとして全ブロックをグリッドへ揃えた側面配置</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#334155"/></marker>
-    <style>.b{stroke:#334155;stroke-width:3}.h{font:700 30px sans-serif;fill:#0f172a}.l{font:600 21px sans-serif;fill:#0f172a}.s{font:17px sans-serif;fill:#334155}.a{stroke:#334155;stroke-width:4;marker-end:url(#arrow)}</style>
+    <style>.grid{stroke:#cbd5e1;stroke-width:2}.grid-block{stroke:#334155;stroke-width:3}.h{font:700 30px sans-serif;fill:#0f172a}.l{font:600 21px sans-serif;fill:#0f172a}.s{font:17px sans-serif;fill:#334155}.white{fill:#fff}.a{stroke:#334155;stroke-width:4;marker-end:url(#arrow)}</style>
   </defs>
   <rect width="1100" height="650" fill="#fff"/>
   <text x="550" y="52" text-anchor="middle" class="h">採掘ドック — 側面図</text>
-  <line x1="90" y1="510" x2="1010" y2="510" stroke="#64748b" stroke-width="7"/>
-  <text x="90" y="548" class="s">床面</text>
+  <text x="550" y="84" text-anchor="middle" class="s">各正方形は140×140ピクセルで、隣接ブロック間に半マスのずれや隙間はありません。</text>
 
-  <rect class="b" x="430" y="360" width="140" height="140" fill="#f59e0b"/>
-  <text x="500" y="418" text-anchor="middle" class="l">採掘</text>
-  <text x="500" y="449" text-anchor="middle" class="l">タートル</text>
-  <path d="M545 430 L575 415 L575 445 Z" fill="#1d4ed8"/>
+  <g id="block-grid" data-grid-cell="140" data-grid-origin-x="120" data-grid-origin-y="220">
+    <rect x="120" y="220" width="840" height="280" fill="#f8fafc" stroke="#94a3b8" stroke-width="3"/>
+    <g class="grid">
+      <path d="M120 220V500 M260 220V500 M400 220V500 M540 220V500 M680 220V500 M820 220V500 M960 220V500"/>
+      <path d="M120 220H960 M120 360H960 M120 500H960"/>
+    </g>
 
-  <rect class="b" x="430" y="200" width="140" height="140" fill="#fde68a"/>
-  <text x="500" y="258" text-anchor="middle" class="l">燃料</text>
-  <text x="500" y="289" text-anchor="middle" class="l">チェスト</text>
+    <rect class="grid-block" data-col="2" data-row="1" x="400" y="360" width="140" height="140" fill="#f59e0b"/>
+    <text x="470" y="418" text-anchor="middle" class="l">採掘</text>
+    <text x="470" y="449" text-anchor="middle" class="l">タートル</text>
+    <path d="M515 430 L540 415 L540 445 Z" fill="#1d4ed8"/>
 
-  <rect class="b" x="270" y="360" width="140" height="140" fill="#a16207"/>
-  <text x="340" y="418" text-anchor="middle" class="l" fill="#fff">搬出</text>
-  <text x="340" y="449" text-anchor="middle" class="l" fill="#fff">チェスト</text>
+    <rect class="grid-block" data-col="2" data-row="0" x="400" y="220" width="140" height="140" fill="#fde68a"/>
+    <text x="470" y="278" text-anchor="middle" class="l">燃料</text>
+    <text x="470" y="309" text-anchor="middle" class="l">チェスト</text>
 
-  <rect class="b" x="590" y="360" width="330" height="140" fill="#dbeafe" stroke-dasharray="10 7"/>
-  <text x="755" y="418" text-anchor="middle" class="l">採掘開始ブロック</text>
-  <text x="755" y="452" text-anchor="middle" class="s">タートルの正面1マス目から</text>
+    <rect class="grid-block" data-col="1" data-row="1" x="260" y="360" width="140" height="140" fill="#a16207"/>
+    <text x="330" y="418" text-anchor="middle" class="l white">搬出</text>
+    <text x="330" y="449" text-anchor="middle" class="l white">チェスト</text>
 
-  <path class="a" d="M500 350 L500 340"/>
-  <text x="610" y="285" class="s">上から燃料を吸入</text>
-  <path class="a" d="M420 430 L410 430"/>
-  <text x="165" y="330" class="s">帰還時に180°回転して搬出</text>
-  <path class="a" d="M580 430 L650 430"/>
+    <rect class="grid-block" data-col="3" data-row="1" x="540" y="360" width="140" height="140" fill="#dbeafe"/>
+    <text x="610" y="418" text-anchor="middle" class="l">採掘開始</text>
+    <text x="610" y="452" text-anchor="middle" class="s">正面1マス目</text>
 
-  <text x="550" y="595" text-anchor="middle" class="l">重要: チェストの位置を入れ替えないでください。</text>
-  <text x="550" y="625" text-anchor="middle" class="s">燃料チェストには燃料だけを入れ、搬出チェストには空き容量を確保します。</text>
+    <path class="a" d="M470 350 L470 330"/>
+    <text x="560" y="292" class="s">上から燃料を吸入</text>
+    <path class="a" d="M390 430 L350 430"/>
+    <path class="a" d="M550 430 L610 430"/>
+  </g>
+
+  <line x1="120" y1="500" x2="960" y2="500" stroke="#64748b" stroke-width="7"/>
+  <text x="120" y="538" class="s">床面</text>
+  <text x="550" y="585" text-anchor="middle" class="l">封鎖材チェストは上面図の右側に置くため、この断面には表示していません。</text>
+  <text x="550" y="620" text-anchor="middle" class="s">燃料チェストには燃料だけ、封鎖材チェストには設定済みの固体ブロックだけを入れます。</text>
 </svg>

@@ -1,0 +1,410 @@
+-- CC Miner V2 - autonomous quarry worker
+-- Home=(0,0,0), forward=+Z, right=+X, down=-Y.
+
+local common = dofile("/ccminer/lib/common.lua")
+local protocol = dofile("/ccminer/lib/protocol.lua")
+local quarry = dofile("/ccminer/lib/quarry.lua")
+local geo = dofile("/ccminer/lib/geo.lua")
+
+if not turtle then error("worker.lua must run on a turtle", 0) end
+
+local config, configError = common.loadConfig()
+if not config or config.role ~= "worker" then
+  error(configError or "Worker configuration not found. Run: ccm setup worker", 0)
+end
+
+local rawState, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
+local state = common.merge(common.defaultState(), rawState)
+if stateError then common.log("WARN", stateError) end
+
+local lastHeartbeat = 0
+local networkReady = false
+local pollNetwork
+
+local function saveState()
+  state.schema = common.SCHEMA
+  state.version = common.VERSION
+  state.updatedAt = common.nowSeconds()
+  local ok, err = common.saveTable(common.STATE_PATH, state)
+  if not ok then
+    common.log("ERROR", "State save failed: " .. tostring(err))
+    error("State save failed: " .. tostring(err), 0)
+  end
+end
+
+local function poseCopy(pose)
+  pose = pose or state.pose or {}
+  return {
+    x = tonumber(pose.x) or 0,
+    y = tonumber(pose.y) or 0,
+    z = tonumber(pose.z) or 0,
+    dir = (tonumber(pose.dir) or 0) % 4,
+  }
+end
+
+local function samePosePosition(a, b)
+  return tonumber(a and a.x) == tonumber(b and b.x)
+    and tonumber(a and a.y) == tonumber(b and b.y)
+    and tonumber(a and a.z) == tonumber(b and b.z)
+end
+
+local function beginPhysicalAction(kind, details, poseAfter)
+  if state.pendingAction then
+    return false, "An unresolved physical action is already recorded. Rehome the turtle before continuing."
+  end
+  state.pendingAction = {
+    kind = tostring(kind or "unknown"),
+    poseBefore = poseCopy(),
+    poseAfter = poseAfter and poseCopy(poseAfter) or nil,
+    details = details or {},
+    startedAt = common.nowSeconds(),
+  }
+  saveState()
+  return true
+end
+
+local function cancelPhysicalAction()
+  state.pendingAction = nil
+  saveState()
+end
+
+local function commitPhysicalAction()
+  state.pendingAction = nil
+  saveState()
+end
+
+local function isHome()
+  return state.pose.x == 0 and state.pose.y == 0 and state.pose.z == 0
+end
+
+local function distance(a, b)
+  a, b = a or state.pose, b or { x = 0, y = 0, z = 0 }
+  return math.abs((a.x or 0) - (b.x or 0))
+    + math.abs((a.y or 0) - (b.y or 0))
+    + math.abs((a.z or 0) - (b.z or 0))
+end
+
+local function inventoryStats()
+  local used, empty, items = 0, 0, 0
+  for slot = 1, 16 do
+    local count = turtle.getItemCount(slot)
+    if count > 0 then used, items = used + 1, items + count else empty = empty + 1 end
+  end
+  return used, empty, items
+end
+
+local function fuelLevel()
+  local ok, level = pcall(turtle.getFuelLevel)
+  if not ok then return 0 end
+  return level
+end
+
+local function fuelLimit()
+  local ok, limit = pcall(turtle.getFuelLimit)
+  if not ok then return 0 end
+  return limit
+end
+
+local function itemName(slot)
+  if turtle.getItemCount(slot) <= 0 then return nil end
+  local ok, detail = pcall(turtle.getItemDetail, slot)
+  if not ok or type(detail) ~= "table" then return nil end
+  return detail.name
+end
+
+local function isSealItemName(name)
+  return name and config.sealBlocks and config.sealBlocks[name] == true
+end
+
+local function sealMaterialCount()
+  local count = 0
+  for slot = 1, 16 do
+    if isSealItemName(itemName(slot)) then count = count + turtle.getItemCount(slot) end
+  end
+  return count
+end
+
+local function selectSealMaterial()
+  for slot = 1, 16 do
+    if isSealItemName(itemName(slot)) and turtle.getItemCount(slot) > 0 then
+      turtle.select(slot)
+      return slot
+    end
+  end
+  return nil
+end
+
+local function gpsConfig()
+  config.gps = config.gps or {}
+  return config.gps
+end
+
+local function gpsCalibration()
+  local gpsSettings = gpsConfig()
+  if geo.validCalibration(gpsSettings.calibration) then return gpsSettings.calibration end
+  return nil
+end
+
+local function gpsSummary()
+  local calibration = gpsCalibration()
+  return {
+    enabled = gpsConfig().enabled ~= false,
+    required = gpsConfig().required == true,
+    available = state.gps and state.gps.available == true,
+    calibrated = calibration ~= nil,
+    calibration = calibration and common.copy(calibration) or nil,
+    lastFix = state.gps and common.copy(state.gps.lastFix) or nil,
+    lastFixAt = state.gps and state.gps.lastFixAt or nil,
+    lastError = state.gps and state.gps.lastError or nil,
+    corrections = state.gps and state.gps.corrections or 0,
+  }
+end
+
+local function jobSnapshot()
+  if not state.job then return nil end
+  local route = state.job.route
+  return {
+    id = state.job.id,
+    name = state.job.name,
+    kind = state.job.kind,
+    strategy = state.job.strategy,
+    width = state.job.width,
+    length = state.job.length,
+    depth = state.job.depth,
+    cursor = state.job.cursor or 0,
+    total = state.job.total or 0,
+    percent = common.percent(state.job.cursor or 0, state.job.total or 0),
+    startedAt = state.job.startedAt,
+    chunkMode = state.job.chunkMode,
+    excludedChunks = state.job.excludedChunks and #state.job.excludedChunks or 0,
+    currentLayer = route and ((route.layer or 0) + 1) or nil,
+  }
+end
+
+local function statusPayload()
+  local used, empty, items = inventoryStats()
+  return {
+    id = os.getComputerID(),
+    label = config.workerName or common.safeComputerLabel("Miner"),
+    status = state.status,
+    phase = state.phase,
+    pose = poseCopy(),
+    atHome = isHome(),
+    world = state.gps and common.copy(state.gps.lastFix) or nil,
+    gps = gpsSummary(),
+    seal = {
+      mode = config.lavaMode or "seal",
+      count = sealMaterialCount(),
+      target = tonumber(config.sealTarget) or 64,
+      reserve = tonumber(config.sealReserve) or 8,
+    },
+    capabilities = {
+      gps = true,
+      gpsCalibration = true,
+      lavaSeal = true,
+      chunkExclusions = true,
+      touchController = true,
+    },
+    job = jobSnapshot(),
+    fuel = fuelLevel(),
+    fuelLimit = fuelLimit(),
+    inventoryUsed = used,
+    inventoryEmpty = empty,
+    inventoryItems = items,
+    lastError = state.lastError,
+    completionReason = state.completionReason,
+    recoveryRequired = state.pendingAction ~= nil,
+    pendingAction = state.pendingAction and {
+      kind = state.pendingAction.kind,
+      startedAt = state.pendingAction.startedAt,
+    } or nil,
+    request = state.request,
+    stats = common.copy(state.stats),
+    version = common.VERSION,
+    updatedAt = state.updatedAt,
+  }
+end
+
+local function sendStatus(target, request)
+  if not networkReady then return false end
+  local message = protocol.message("status", config.networkKey, statusPayload(), target)
+  if request and request.id then message.replyTo = request.id end
+  if target then return protocol.send(target, message) end
+  return protocol.broadcast(message)
+end
+
+local function sendAck(target, request, ok, text)
+  return protocol.reply(target, config.networkKey, request, "ack", {
+    ok = ok == true,
+    message = tostring(text or ""),
+    status = statusPayload(),
+  })
+end
+
+local function markBlocked(message)
+  state.status = "blocked"
+  state.phase = state.pendingAction and "recovery_required" or "blocked"
+  state.lastError = tostring(message or "Unknown error")
+  common.log("ERROR", state.lastError)
+  saveState()
+  sendStatus()
+end
+
+local function commandSeen(id)
+  if not id then return false end
+  state.recentCommands = state.recentCommands or {}
+  for _, existing in ipairs(state.recentCommands) do if existing == id then return true end end
+  state.recentCommands[#state.recentCommands + 1] = id
+  while #state.recentCommands > 32 do table.remove(state.recentCommands, 1) end
+  return false
+end
+
+local function locateGPS()
+  state.gps = state.gps or common.defaultState().gps
+  if gpsConfig().enabled == false then
+    state.gps.available = false
+    state.gps.lastError = "GPS is disabled in configuration."
+    return nil, state.gps.lastError
+  end
+  if not gps or type(gps.locate) ~= "function" then
+    state.gps.available = false
+    state.gps.lastError = "GPS API is unavailable."
+    return nil, state.gps.lastError
+  end
+  local ok, x, y, z = pcall(gps.locate, tonumber(gpsConfig().timeout) or 2, false)
+  if not ok or x == nil then
+    state.gps.available = false
+    state.gps.lastError = ok and "No GPS fix received." or tostring(x)
+    return nil, state.gps.lastError
+  end
+  local fix, fixError = geo.integerFix(x, y, z, 0.35)
+  if not fix then
+    state.gps.available = false
+    state.gps.lastError = fixError
+    return nil, fixError
+  end
+  state.gps.available = true
+  state.gps.lastFix = fix
+  state.gps.lastFixAt = common.nowSeconds()
+  state.gps.lastError = nil
+  state.stats.gpsFixes = (state.stats.gpsFixes or 0) + 1
+  return fix
+end
+
+local function verifyGPS(force)
+  local calibration = gpsCalibration()
+  if not calibration then
+    if gpsConfig().required then return false, "GPS is required but the worker is not calibrated." end
+    return true
+  end
+  local interval = math.max(1, tonumber(gpsConfig().verifyEveryMoves) or 16)
+  if not force and ((state.stats.moves or 0) % interval ~= 0) then return true end
+  local fix, fixError = locateGPS()
+  if not fix then
+    if gpsConfig().required then return false, "Required GPS fix failed: " .. tostring(fixError) end
+    return true
+  end
+  local expected = geo.localToWorld(calibration, state.pose)
+  if not geo.samePosition(fix, expected) then
+    return false, ("GPS drift: expected world %d,%d,%d but located %d,%d,%d."):format(
+      expected.x, expected.y, expected.z, fix.x, fix.y, fix.z
+    )
+  end
+  return true
+end
+
+local function validateJob(payload)
+  payload = payload or {}
+  local width, length, depth = tonumber(payload.width), tonumber(payload.length), tonumber(payload.depth)
+  if not width or width ~= math.floor(width) then return nil, "Width must be a whole number." end
+  if not length or length ~= math.floor(length) then return nil, "Length must be a whole number." end
+  if not depth or depth ~= math.floor(depth) then return nil, "Depth must be a whole number." end
+  if width < 1 or width > config.maxWidth then return nil, "Width out of range (1-" .. config.maxWidth .. ")." end
+  if length < 1 or length > config.maxLength then return nil, "Length out of range (1-" .. config.maxLength .. ")." end
+  if depth < 1 or depth > config.maxDepth then return nil, "Depth out of range (1-" .. config.maxDepth .. ")." end
+  local fullVolume = width * length * depth
+  if fullVolume > config.maxVolume then return nil, "Volume exceeds limit " .. tostring(config.maxVolume) .. "." end
+
+  local exclusions = {}
+  for _, exclusion in ipairs(payload.excludedChunks or {}) do
+    if type(exclusion) == "table" and tonumber(exclusion.cx) and tonumber(exclusion.cz) then
+      exclusions[#exclusions + 1] = {
+        mode = exclusion.mode == "world" and "world" or "local",
+        cx = math.floor(exclusion.cx),
+        cz = math.floor(exclusion.cz),
+      }
+    end
+  end
+  if #exclusions > 512 then return nil, "Too many excluded chunks." end
+
+  local chunkMode = payload.chunkMode == "world" and "world" or "local"
+  if chunkMode == "world" and not gpsCalibration() then
+    return nil, "World-aligned chunk exclusion requires GPS calibration."
+  end
+
+  local job = {
+    kind = "quarry",
+    id = tostring(payload.jobId or ("job-" .. common.nowMillis())),
+    name = tostring(payload.name or "Quarry"),
+    width = width,
+    length = length,
+    depth = depth,
+    cursor = 0,
+    startedAt = common.nowSeconds(),
+    excludedChunks = exclusions,
+    chunkMode = chunkMode,
+  }
+
+  if #exclusions > 0 then
+    local plan, planError = quarry.buildChunkPlan(job, gpsCalibration())
+    if not plan then return nil, planError end
+    job.strategy = "chunk_plan"
+    job.chunkPlan = plan
+    job.total = plan.columns * depth
+    job.route = { layer = 0, walkIndex = 1, phase = "travel", localCursor = 0 }
+  else
+    job.strategy = "serpentine"
+    job.total = fullVolume
+  end
+  if job.total <= 0 then return nil, "The exclusion mask leaves no blocks to mine." end
+  return job
+end
+
+local function startJob(payload)
+  if state.pendingAction then return false, "Recovery is required after an interrupted physical action." end
+  if not isHome() then return false, "Worker is not at home. Recall or physically recover it first." end
+  if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
+    return false, "Worker is busy."
+  end
+  local job, err = validateJob(payload)
+  if not job then return false, err end
+  state.job = job
+  state.checkpoint = nil
+  state.service = {
+    resumeAfter = true,
+    finalStatus = "working",
+    preserveCheckpoint = false,
+    reason = "job_start",
+    startedAt = common.nowSeconds(),
+  }
+  state.request = nil
+  state.status = "working"
+  state.phase = "starting_service"
+  state.lastError = nil
+  state.completionReason = nil
+  state.pose = { x = 0, y = 0, z = 0, dir = state.pose.dir or 0 }
+  saveState()
+  common.log("INFO", ("Job started: %s %dx%dx%d strategy=%s exclusions=%d"):format(
+    job.id, job.width, job.length, job.depth, job.strategy, #job.excludedChunks
+  ))
+  return true, "Job accepted."
+end
+
+local function calibrateGPS()
+  if state.pendingAction then return false, "Resolve the pending physical action first." end
+  if not isHome() or state.pose.dir ~= 0 then return false, "Place the turtle at home facing the quarry before GPS calibration." end
+  if state.job then return false, "Clear the active job before GPS calibration." end
+  if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
+    return false, "Worker must be stopped before GPS calibration."
+  end
+  if fuelLevel() ~= "unlimited" and tonumber(fuelLevel() or 0) < 2 then return false, "At least 2 fuel is required." end

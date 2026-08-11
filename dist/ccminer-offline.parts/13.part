@@ -1,0 +1,92 @@
+local function copyIfPresent(source, target)
+  local text = readFile(source)
+  if text then return writeFile(target, text) end
+  return true
+end
+local function compileFile(target)
+  local compiled, compileError = loadfile(TEMP .. "/" .. target)
+  if not compiled then
+    fs.delete(TEMP)
+    error("Embedded file failed syntax validation: " .. target .. ": " .. tostring(compileError), 0)
+  end
+end
+local function compileParts(label, targets)
+  local source = {}
+  for index, target in ipairs(targets) do
+    local text = readFile(TEMP .. "/" .. target)
+    if not text then fs.delete(TEMP); error("Embedded runtime part is missing: " .. target, 0) end
+    source[index] = text
+  end
+  local loader = loadstring or load
+  local compiled, compileError = loader(table.concat(source), "@" .. label .. ".assembled.lua")
+  if not compiled then
+    fs.delete(TEMP)
+    error("Assembled source failed syntax validation: " .. label .. ": " .. tostring(compileError), 0)
+  end
+end
+local function usage()
+  print("CC Miner V2 offline installer " .. VERSION)
+  print("  ccminer-offline.lua worker")
+  print("  ccminer-offline.lua controller")
+  print("  ccminer-offline.lua gps")
+  print("  ccminer-offline.lua update")
+end
+
+if action == "" then action = turtle and "worker" or "controller" end
+if action ~= "worker" and action ~= "controller" and action ~= "gps" and action ~= "update" then usage(); return end
+if action == "worker" and not turtle then error("Worker installation requires a turtle.", 0) end
+if action == "update" and not fs.exists(ROOT .. "/config.db") then error("No existing installation found.", 0) end
+
+term.clear(); term.setCursorPos(1, 1)
+print("CC MINER V2 OFFLINE " .. string.upper(action)); print("")
+if fs.exists(TEMP) then fs.delete(TEMP) end
+ensureDir(TEMP)
+for index, file in ipairs(files) do
+  write(("[%d/%d] %s ... "):format(index, #files, file.target))
+  local ok, err = writeFile(TEMP .. "/" .. file.target, file.content)
+  if not ok then fs.delete(TEMP); printError("FAILED"); error(err, 0) end
+  print("OK")
+end
+
+for _, target in ipairs({
+  "lib/common.lua", "lib/protocol.lua", "lib/geo.lua", "lib/quarry.lua",
+  "worker.lua", "controller.lua", "gps_host.lua", "setup.lua", "boot.lua", "command.lua",
+}) do
+  compileFile(target)
+end
+compileParts("worker", {
+  "worker_parts/01.part", "worker_parts/02.part", "worker_parts/03.part",
+  "worker_parts/04.part", "worker_parts/05.part",
+})
+compileParts("controller", {
+  "controller_parts/01.part", "controller_parts/02.part", "controller_parts/03.part",
+})
+
+local preserved = {
+  { ROOT .. "/config.db", TEMP .. "/config.db" },
+  { ROOT .. "/config.db.bak", TEMP .. "/config.db.bak" },
+  { ROOT .. "/data/state.db", TEMP .. "/data/state.db" },
+  { ROOT .. "/data/state.db.bak", TEMP .. "/data/state.db.bak" },
+  { ROOT .. "/data/ccminer.log", TEMP .. "/data/ccminer.log" },
+  { ROOT .. "/data/ccminer.log.1", TEMP .. "/data/ccminer.log.1" },
+}
+for _, pair in ipairs(preserved) do
+  local ok, err = copyIfPresent(pair[1], pair[2])
+  if not ok then fs.delete(TEMP); error("Cannot preserve existing data: " .. tostring(err), 0) end
+end
+if fs.exists(BACKUP) then fs.delete(BACKUP) end
+if fs.exists(ROOT) then fs.move(ROOT, BACKUP) end
+local moved, moveError = pcall(fs.move, TEMP, ROOT)
+if not moved then
+  if fs.exists(ROOT) then fs.delete(ROOT) end
+  if fs.exists(BACKUP) then fs.move(BACKUP, ROOT) end
+  error("Install swap failed: " .. tostring(moveError), 0)
+end
+print("")
+if action == "update" then
+  print("Offline update installed: " .. VERSION); print("Previous files: /ccminer.backup"); print("Run: reboot")
+else
+  local setupOk = shell.run(ROOT .. "/setup.lua", action)
+  if not setupOk then printError("Setup did not complete. Run: " .. ROOT .. "/setup.lua " .. action)
+  else print(""); print("Installation complete. Run: reboot") end
+end

@@ -9,19 +9,34 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-RUNTIME_SOURCES = [
-    "src/ccminer/lib/common.lua",
-    "src/ccminer/lib/protocol.lua",
-    "src/ccminer/lib/quarry.lua",
-    "src/ccminer/worker.lua",
-    "src/ccminer/controller.lua",
-    "src/ccminer/setup.lua",
-    "src/ccminer/boot.lua",
-    "src/ccminer/command.lua",
+RUNTIME_FILES = [
+    ("src/ccminer/lib/common.lua", "lib/common.lua"),
+    ("src/ccminer/lib/protocol.lua", "lib/protocol.lua"),
+    ("src/ccminer/lib/geo.lua", "lib/geo.lua"),
+    ("src/ccminer/lib/quarry.lua", "lib/quarry.lua"),
+    ("src/ccminer/worker.lua", "worker.lua"),
+    ("src/ccminer/worker_parts/01.part", "worker_parts/01.part"),
+    ("src/ccminer/worker_parts/02.part", "worker_parts/02.part"),
+    ("src/ccminer/worker_parts/03.part", "worker_parts/03.part"),
+    ("src/ccminer/worker_parts/04.part", "worker_parts/04.part"),
+    ("src/ccminer/worker_parts/05.part", "worker_parts/05.part"),
+    ("src/ccminer/controller.lua", "controller.lua"),
+    ("src/ccminer/controller_parts/01.part", "controller_parts/01.part"),
+    ("src/ccminer/controller_parts/02.part", "controller_parts/02.part"),
+    ("src/ccminer/controller_parts/03.part", "controller_parts/03.part"),
+    ("src/ccminer/gps_host.lua", "gps_host.lua"),
+    ("src/ccminer/setup.lua", "setup.lua"),
+    ("src/ccminer/boot.lua", "boot.lua"),
+    ("src/ccminer/command.lua", "command.lua"),
 ]
+RUNTIME_SOURCES = [source for source, _ in RUNTIME_FILES]
+WORKER_PARTS = [ROOT / f"src/ccminer/worker_parts/{index:02d}.part" for index in range(1, 6)]
+CONTROLLER_PARTS = [ROOT / f"src/ccminer/controller_parts/{index:02d}.part" for index in range(1, 4)]
+OFFLINE_PART_LIMIT = 12_000
 
 
 def fail(message: str) -> None:
@@ -45,8 +60,31 @@ def run(command: list[str]) -> None:
     subprocess.run(command, cwd=ROOT, check=True)
 
 
+def concatenate(paths: list[Path]) -> str:
+    missing = [str(path.relative_to(ROOT)) for path in paths if not path.is_file()]
+    if missing:
+        fail("missing source parts: " + ", ".join(missing))
+    return "".join(path.read_text(encoding="utf-8") for path in paths)
+
+
+def offline_parts() -> list[Path]:
+    parts_dir = ROOT / "dist/ccminer-offline.parts"
+    return sorted(parts_dir.glob("*.part")) if parts_dir.is_dir() else []
+
+
 def check_lua_syntax(lua: str) -> None:
     files = sorted(ROOT.rglob("*.lua"))
+    generated: list[Path] = []
+    for label, source in [
+        ("worker-assembled", concatenate(WORKER_PARTS)),
+        ("controller-assembled", concatenate(CONTROLLER_PARTS)),
+        ("offline-installer-assembled", concatenate(offline_parts())),
+    ]:
+        handle = tempfile.NamedTemporaryFile("w", suffix=f"-{label}.lua", encoding="utf-8", delete=False)
+        with handle:
+            handle.write(source)
+        generated.append(Path(handle.name))
+
     checker = """
 local failed = false
 for i = 1, #arg do
@@ -60,11 +98,14 @@ if failed then os.exit(1) end
 """
     with tempfile.NamedTemporaryFile("w", suffix=".lua", encoding="utf-8", delete=False) as handle:
         handle.write(checker)
-        checker_path = handle.name
+        checker_path = Path(handle.name)
     try:
-        run([lua, checker_path, *[str(path.relative_to(ROOT)) for path in files]])
+        arguments = [str(path.relative_to(ROOT)) for path in files] + [str(path) for path in generated]
+        run([lua, str(checker_path), *arguments])
     finally:
-        Path(checker_path).unlink(missing_ok=True)
+        checker_path.unlink(missing_ok=True)
+        for path in generated:
+            path.unlink(missing_ok=True)
 
 
 def check_runtime_lists() -> None:
@@ -101,7 +142,7 @@ def check_github_scope() -> None:
         "raw.githubusercontent.com/nononoyuyuyu/CC_Miner",
     )
     url_pattern = re.compile(r"https?://[^\s)\]>'\"]+")
-    text_extensions = {".md", ".lua", ".py", ".yml", ".yaml", ".txt"}
+    text_extensions = {".md", ".lua", ".part", ".py", ".yml", ".yaml", ".txt"}
     for path in ROOT.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in text_extensions:
             continue
@@ -112,20 +153,97 @@ def check_github_scope() -> None:
                     fail(f"out-of-scope GitHub URL in {path.relative_to(ROOT)}: {url}")
 
 
+def check_feature_markers() -> None:
+    worker = concatenate(WORKER_PARTS)
+    controller = concatenate(CONTROLLER_PARTS)
+    setup = (ROOT / "src/ccminer/setup.lua").read_text(encoding="utf-8")
+    required = {
+        "worker GPS locate": (worker, "gps.locate"),
+        "worker GPS pending recovery": (worker, "tryResolvePendingAction"),
+        "worker lava sealing": (worker, "sealLava"),
+        "worker seal refill state": (worker, "waiting_seal"),
+        "worker chunk strategy": (worker, '"chunk_plan"'),
+        "controller monitor touch": (controller, 'event == "monitor_touch"'),
+        "controller terminal click": (controller, 'event == "mouse_click"'),
+        "controller keypad": (controller, '"CLR", "0", "<"'),
+        "controller chunk mask": (controller, '"CHUNK MASK"'),
+        "controller GPS calibration": (controller, '"calibrate_gps"'),
+        "GPS setup role": (setup, 'requestedRole == "gps"'),
+    }
+    for label, (text, marker) in required.items():
+        if marker not in text:
+            fail(f"missing feature marker: {label}")
+
+
+def almost_integer(value: float, tolerance: float = 1e-8) -> bool:
+    return abs(value - round(value)) <= tolerance
+
+
+def check_svg_grids() -> None:
+    namespace = {"svg": "http://www.w3.org/2000/svg"}
+    checked = 0
+    for relative in ["docs/images/base-layout-top.svg", "docs/images/dock-side.svg"]:
+        path = ROOT / relative
+        root = ET.parse(path).getroot()
+        groups = root.findall(".//svg:g[@id='block-grid']", namespace)
+        if len(groups) != 1:
+            fail(f"{relative} must contain exactly one g#block-grid")
+        group = groups[0]
+        cell = float(group.attrib["data-grid-cell"])
+        origin_x = float(group.attrib.get("data-grid-origin-x", "0"))
+        origin_y = float(group.attrib.get("data-grid-origin-y", "0"))
+        blocks = [element for element in group.findall(".//svg:rect", namespace) if "grid-block" in element.attrib.get("class", "").split()]
+        if not blocks:
+            fail(f"{relative} has no grid-block rectangles")
+        for block in blocks:
+            x = float(block.attrib["x"])
+            y = float(block.attrib["y"])
+            width = float(block.attrib["width"])
+            height = float(block.attrib["height"])
+            if not almost_integer(width / cell) or not almost_integer(height / cell):
+                fail(f"{relative} block size is not an integer grid multiple: {block.attrib}")
+            x_aligned = almost_integer(x / cell) or almost_integer((x - origin_x) / cell)
+            y_aligned = almost_integer(y / cell) or almost_integer((y - origin_y) / cell)
+            if not x_aligned or not y_aligned:
+                fail(f"{relative} block origin is off-grid: {block.attrib}")
+            if "data-col" in block.attrib:
+                col = int(block.attrib["data-col"])
+                expected = {col * cell, origin_x + col * cell}
+                if not any(abs(x - candidate) <= 1e-8 for candidate in expected):
+                    fail(f"{relative} data-col disagrees with x: {block.attrib}")
+            if "data-row" in block.attrib:
+                row = int(block.attrib["data-row"])
+                expected = {row * cell, origin_y + row * cell}
+                if not any(abs(y - candidate) <= 1e-8 for candidate in expected):
+                    fail(f"{relative} data-row disagrees with y: {block.attrib}")
+            checked += 1
+    print(f"SVG grid alignment passed ({checked} block rectangles).")
+
+
 def check_bundle() -> None:
-    bundle = ROOT / "dist/ccminer-offline.lua"
-    if not bundle.is_file():
-        fail("offline bundle was not generated")
-    size = bundle.stat().st_size
-    if size <= 1000:
-        fail("offline bundle is unexpectedly small")
-    if size > 900_000:
-        fail(f"offline bundle is too large for comfortable ComputerCraft transfer: {size}")
-    content = bundle.read_text(encoding="utf-8")
-    for source in RUNTIME_SOURCES:
-        target = source.removeprefix("src/ccminer/")
+    loader = ROOT / "dist/ccminer-offline.lua"
+    parts = offline_parts()
+    if not loader.is_file() or not parts:
+        fail("split offline bundle was not generated")
+    names = [path.name for path in parts]
+    expected = [f"{index:02d}.part" for index in range(1, len(parts) + 1)]
+    if names != expected:
+        fail(f"offline parts are not contiguous: {names}")
+    loader_text = loader.read_text(encoding="utf-8")
+    for path in parts:
+        size = path.stat().st_size
+        if size <= 0 or size > OFFLINE_PART_LIMIT:
+            fail(f"offline part has invalid size ({size}): {path.relative_to(ROOT)}")
+        if path.name not in loader_text:
+            fail(f"offline loader does not reference {path.name}")
+    content = concatenate(parts)
+    size = len(content.encode("utf-8"))
+    if size <= 1_000 or size > 900_000:
+        fail(f"assembled offline installer has unexpected size: {size}")
+    for _, target in RUNTIME_FILES:
         if target not in content:
             fail(f"offline bundle is missing target {target}")
+    print(f"Split offline bundle passed ({len(parts)} parts, {size} assembled bytes).")
 
 
 def main() -> None:
@@ -133,12 +251,15 @@ def main() -> None:
     lua = find_lua()
     check_lua_syntax(lua)
     run([lua, "tests/test_quarry.lua", str(ROOT)])
+    run([lua, "tests/test_geo.lua", str(ROOT)])
     run([lua, "tests/test_common.lua", str(ROOT)])
     check_runtime_lists()
     check_markdown_links()
     check_github_scope()
+    check_feature_markers()
+    check_svg_grids()
     check_bundle()
-    print("All CC Miner V2 checks passed.")
+    print("All CC Miner V2.1 checks passed.")
 
 
 if __name__ == "__main__":

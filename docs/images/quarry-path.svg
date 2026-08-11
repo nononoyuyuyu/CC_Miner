@@ -6,8 +6,7 @@
     <style>.h{font:700 30px sans-serif;fill:#0f172a}.l{font:600 21px sans-serif;fill:#0f172a}.s{font:17px sans-serif;fill:#334155}.grid{stroke:#cbd5e1;stroke-width:2}.path{stroke:#dc2626;stroke-width:7;fill:none;stroke-linecap:round;stroke-linejoin:round;marker-end:url(#arrow)}.down{stroke:#7c3aed;stroke-width:6;stroke-dasharray:10 7;marker-end:url(#arrow)}</style>
   </defs>
   <rect width="1200" height="700" fill="#fff"/>
-  <text x="600" y="52" text-anchor="middle" class="h">クアリー採掘経路</text>
-
+  <text x="600" y="52" text-anchor="middle" class="h">クアリー採掘経路（除外なし）</text>
   <g transform="translate(100,130)">
     <text x="210" y="-28" text-anchor="middle" class="l">第1層（Y=0）</text>
     <rect x="0" y="0" width="420" height="300" fill="#f8fafc" stroke="#334155" stroke-width="3"/>
@@ -15,7 +14,6 @@
     <path class="path" d="M35 270 L385 270 L385 210 L35 210 L35 150 L385 150 L385 90 L35 90 L35 30 L385 30"/>
     <circle cx="35" cy="270" r="12" fill="#16a34a"/><text x="35" y="296" text-anchor="middle" class="s">開始</text>
   </g>
-
   <g transform="translate(680,260)">
     <text x="210" y="-28" text-anchor="middle" class="l">第2層（Y=-1）</text>
     <rect x="0" y="0" width="420" height="300" fill="#f8fafc" stroke="#334155" stroke-width="3"/>
@@ -23,9 +21,8 @@
     <path class="path" d="M385 30 L35 30 L35 90 L385 90 L385 150 L35 150 L35 210 L385 210 L385 270 L35 270"/>
     <circle cx="35" cy="270" r="12" fill="#2563eb"/><text x="35" y="296" text-anchor="middle" class="s">層終点</text>
   </g>
-
   <path class="down" d="M485 160 C610 170,630 230,680 290" fill="none"/>
   <text x="605" y="177" text-anchor="middle" class="l" fill="#7c3aed">1ブロック下降</text>
-  <text x="600" y="640" text-anchor="middle" class="l">層ごとに経路を反転するため、全セルが途切れず隣接します。</text>
-  <text x="600" y="673" text-anchor="middle" class="s">状態ファイルには現在セルと向きを保存し、補給後は同じ地点へ復帰します。</text>
+  <text x="600" y="640" text-anchor="middle" class="l">除外が無いジョブでは、全セルを一度ずつ通る高速経路を使います。</text>
+  <text x="600" y="673" text-anchor="middle" class="s">除外がある場合はチャンク単位の連結DFS経路へ自動切り替えします。</text>
 </svg>

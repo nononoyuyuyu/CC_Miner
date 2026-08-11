@@ -8,13 +8,17 @@ if not config or not config.role then
   return
 end
 
-local program = config.role == "worker" and "/ccminer/worker.lua" or "/ccminer/controller.lua"
-if config.role == "controller" then
+local programs = {
+  worker = "/ccminer/worker.lua",
+  controller = "/ccminer/controller.lua",
+  gps = "/ccminer/gps_host.lua",
+}
+local program = programs[config.role]
+if not program then error("Unknown CC Miner role: " .. tostring(config.role), 0) end
+
+if config.role ~= "worker" then
   local ok, runError = pcall(dofile, program)
-  if not ok then
-    common.log("ERROR", "Controller stopped: " .. tostring(runError))
-    printError(runError)
-  end
+  if not ok then common.log("ERROR", config.role .. " stopped: " .. tostring(runError)); printError(runError) end
   return
 end
 

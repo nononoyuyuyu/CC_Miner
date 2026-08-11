@@ -1,0 +1,261 @@
+  if current ~= "" then lines[#lines + 1] = current end
+  local startY = math.max(3, math.floor((height - #lines) / 2) - 1)
+  for index, line in ipairs(lines) do common.writeAt(3, startY + index - 1, common.fit(line, lineWidth), colors and colors.white or nil) end
+  buttonRow(key, height - 2, width, {
+    { "YES", function()
+      local id = selectedWorker()
+      if confirmState and id then sendCommand(id, confirmState.command, confirmState.payload) end
+      confirmState, mode = nil, "dashboard"
+    end },
+    { "NO", function() confirmState, mode = nil, "dashboard"; setNotice("Cancelled.", false) end },
+  })
+end
+
+local function renderOne(target, key)
+  resetHitboxes(key)
+  common.withTerm(target, function()
+    common.clear(colors and colors.black or nil, colors and colors.white or nil)
+    if mode == "dashboard" then renderDashboard(target, key)
+    elseif mode == "job_dimensions" then renderDimensions(target, key)
+    elseif mode == "job_chunks" then renderChunks(target, key)
+    elseif mode == "info" then renderInfo(target, key)
+    elseif mode == "confirm" then renderConfirm(target, key)
+    else mode = "dashboard"; renderDashboard(target, key) end
+  end)
+end
+
+local function render()
+  renderOne(term.current(), "term")
+  for _, entry in ipairs(monitors) do renderOne(entry.device, entry.name) end
+end
+
+local function handlePointer(key, x, y)
+  local boxes = hitboxes[key] or {}
+  for index = #boxes, 1, -1 do
+    local box = boxes[index]
+    if x >= box.x1 and x <= box.x2 and y >= box.y1 and y <= box.y2 then
+      box.action()
+      return true
+    end
+  end
+  return false
+end
+
+local function processChar(character)
+  character = string.lower(character or "")
+  if mode == "job_dimensions" then
+    if character:match("%d") then draftDigit(character) end
+    return
+  elseif mode == "confirm" then
+    if character == "y" then
+      local id = selectedWorker()
+      if confirmState and id then sendCommand(id, confirmState.command, confirmState.payload) end
+      confirmState, mode = nil, "dashboard"
+    elseif character == "n" then
+      confirmState, mode = nil, "dashboard"
+      setNotice("Cancelled.", false)
+    end
+    return
+  end
+  if mode ~= "dashboard" then return end
+  local id = selectedWorker()
+  if character == "d" then discover()
+  elseif character == "n" then dashboardAction("new")()
+  elseif character == "p" then sendCommand(id, "pause")
+  elseif character == "r" then sendCommand(id, "resume")
+  elseif character == "h" then sendCommand(id, "recall")
+  elseif character == "s" then sendCommand(id, "service")
+  elseif character == "x" then dashboardAction("abort")()
+  elseif character == "c" then dashboardAction("clear")()
+  elseif character == "i" then dashboardAction("info")()
+  elseif character == "g" then dashboardAction("rehome")()
+  elseif character == "l" then dashboardAction("gps")()
+  elseif character == "q" then running = false end
+end
+
+local function processKey(keyCode)
+  if keys and keyCode == keys.escape then
+    if mode == "dashboard" then running = false else mode, draft, confirmState = "dashboard", nil, nil end
+    return
+  end
+  if mode == "dashboard" then
+    local ids = orderedIds()
+    if keys and keyCode == keys.up then selected = math.max(1, selected - 1)
+    elseif keys and keyCode == keys.down then selected = math.min(math.max(1, #ids), selected + 1)
+    elseif keys and keyCode == keys.enter then mode = "info" end
+  elseif mode == "job_dimensions" then
+    if keys and keyCode == keys.backspace then draftBackspace()
+    elseif keys and keyCode == keys.tab then
+      local position = 1
+      for index, field in ipairs(fieldOrder) do if field == draft.selectedField then position = index end end
+      chooseDraftField(fieldOrder[position % #fieldOrder + 1])
+    elseif keys and keyCode == keys.enter then commitDraftField(); mode = "job_chunks" end
+  elseif mode == "job_chunks" then
+    if keys and keyCode == keys.left then draft.chunkPage = math.max(1, (draft.chunkPage or 1) - 1)
+    elseif keys and keyCode == keys.right then draft.chunkPage = (draft.chunkPage or 1) + 1
+    elseif keys and keyCode == keys.enter then startDraft(true) end
+  elseif mode == "info" then
+    mode = "dashboard"
+  elseif mode == "confirm" then
+    if keys and keyCode == keys.n then confirmState, mode = nil, "dashboard" end
+  end
+end
+
+local function pumpFor(seconds)
+  local deadline = common.nowSeconds() + (seconds or 1)
+  while common.nowSeconds() <= deadline do
+    local sender, message = protocol.receive(0.25)
+    if sender then handleMessage(sender, message) end
+  end
+end
+
+local function commandLineMode()
+  local command = string.lower(args[1] or "")
+  if command == "discover" or command == "status" then
+    discover(); pumpFor(3)
+    local ids = orderedIds()
+    if #ids == 0 then print("No workers found."); return true end
+    for _, id in ipairs(ids) do
+      local data = workers[id].data or {}
+]] },
+  { target = [[controller_parts/03.part]], content = [[      print(("#%s %-16s %-14s %s GPS=%s seal=%s"):format(
+        id, workerLabel(workers[id], id), statusOf(workers[id]), progressText(data),
+        data.gps and data.gps.calibrated and "ready" or "no", data.seal and data.seal.count or "-"
+      ))
+    end
+    return true
+  elseif command == "start" then
+    local id, width, length, depth = tonumber(args[2]), tonumber(args[3]), tonumber(args[4]), tonumber(args[5])
+    if not id or not width or not length or not depth then
+      print("Usage: controller.lua start <id> <width> <length> <depth>")
+      return true
+    end
+    sendCommand(id, "start", { width = width, length = length, depth = depth, name = "CLI Quarry", chunkMode = "local", excludedChunks = {} })
+    pumpFor(2); print(notice); return true
+  elseif command == "pause" or command == "resume" or command == "recall" or command == "service" or command == "abort" or command == "clear" then
+    local id = tonumber(args[2])
+    if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
+    sendCommand(id, command); pumpFor(2); print(notice); return true
+  elseif command == "gps" or command == "calibrate" then
+    local id = tonumber(args[2])
+    if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
+    sendCommand(id, command == "gps" and "gps_fix" or "calibrate_gps")
+    pumpFor(3); print(notice); return true
+  elseif command == "rehome" then
+    local id = tonumber(args[2])
+    if not id or args[3] ~= "RESET" then print("Usage: controller.lua rehome <id> RESET"); return true end
+    sendCommand(id, "rehome", { confirm = "RESET" }); pumpFor(2); print(notice); return true
+  end
+  return false
+end
+
+if #args > 0 and commandLineMode() then return end
+
+discover()
+local refreshTimer = os.startTimer(1)
+while running do
+  render()
+  local event, a, b, c = os.pullEvent()
+  if event == "rednet_message" and c == common.PROTOCOL then
+    handleMessage(a, b)
+  elseif event == "char" then
+    processChar(a)
+  elseif event == "key" then
+    processKey(a)
+  elseif event == "mouse_click" then
+    handlePointer("term", b, c)
+  elseif event == "monitor_touch" then
+    if config.touchEnabled ~= false then handlePointer(a, b, c) end
+  elseif event == "timer" and a == refreshTimer then
+    if common.nowSeconds() - lastDiscovery >= (config.discoverySeconds or 5) then discover() end
+    refreshTimer = os.startTimer(1)
+  elseif event == "term_resize" or event == "monitor_resize" or event == "peripheral" or event == "peripheral_detach" then
+    monitors = common.findPeripherals("monitor")
+    for _, entry in ipairs(monitors) do
+      if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end
+    end
+  end
+end
+
+common.clear(colors and colors.black or nil, colors and colors.white or nil)
+print("CC Miner controller stopped. Run 'ccm dashboard' to reopen it.")
+]] },
+  { target = [[gps_host.lua]], content = [[-- CC Miner V2 - managed GPS host launcher.
+
+local common = dofile("/ccminer/lib/common.lua")
+local config, err = common.loadConfig()
+if not config or config.role ~= "gps" then error(err or "GPS host is not configured. Run: ccm setup gps", 0) end
+
+if os.setComputerLabel then os.setComputerLabel(config.gpsName or common.safeComputerLabel("GPS")) end
+local opened = common.openWirelessModems()
+if #opened == 0 then error("No wireless modem found. Attach a wireless modem to this GPS host.", 0) end
+
+common.clear(colors and colors.black or nil, colors and colors.white or nil)
+print("CC Miner V2 GPS Host " .. common.VERSION)
+print("Name: " .. tostring(config.gpsName))
+print(("Coordinates: %d, %d, %d"):format(config.x, config.y, config.z))
+print("Modem: " .. table.concat(opened, ", "))
+print("")
+print("Hosting GPS. Keep this chunk loaded.")
+common.log("INFO", ("GPS host started at %d,%d,%d"):format(config.x, config.y, config.z))
+
+local ok = shell.run("gps", "host", tostring(config.x), tostring(config.y), tostring(config.z))
+if not ok then error("The built-in GPS host program exited unexpectedly.", 0) end
+]] },
+  { target = [[setup.lua]], content = [=[-- CC Miner V2 - interactive configuration
+
+local args = { ... }
+local common = dofile("/ccminer/lib/common.lua")
+local current = common.loadConfig()
+local requestedRole = string.lower(tostring(args[1] or (current and current.role) or ""))
+
+if requestedRole ~= "worker" and requestedRole ~= "controller" and requestedRole ~= "gps" then
+  common.clear(colors and colors.black or nil, colors and colors.white or nil)
+  print("CC MINER V2 SETUP")
+  print("")
+  print("1. Worker (mining turtle)")
+  print("2. Controller (computer + touch monitor)")
+  print("3. GPS host (computer + wireless modem)")
+  print("")
+  local choice = common.promptNumber("Role", turtle and 1 or 2, 1, 3)
+  requestedRole = choice == 1 and "worker" or choice == 2 and "controller" or "gps"
+end
+
+if requestedRole == "worker" and not turtle then error("Worker role can only be configured on a turtle.", 0) end
+if requestedRole == "gps" and turtle then print("Warning: use a stationary computer for a GPS host.") end
+
+common.clear(colors and colors.black or nil, colors and colors.white or nil)
+print("CC MINER V2 SETUP - " .. string.upper(requestedRole))
+print("")
+
+local config
+if requestedRole == "gps" then
+  config = common.merge(common.defaultGPSConfig(), current and current.role == "gps" and current or {})
+  config.role = "gps"
+  config.gpsName = common.prompt("GPS host name", config.gpsName or common.safeComputerLabel("GPS"), function(value)
+    return #value >= 1 and #value <= 20, "Use 1 to 20 characters."
+  end)
+  print("Enter the WORLD coordinates of the wireless modem block.")
+  print("GPS needs at least four hosts at different 3D positions.")
+  config.x = common.promptNumber("World X", config.x or 0, -30000000, 30000000)
+  config.y = common.promptNumber("World Y", config.y or 0, -2048, 2048)
+  config.z = common.promptNumber("World Z", config.z or 0, -30000000, 30000000)
+  if os.setComputerLabel then os.setComputerLabel(config.gpsName) end
+else
+  print("All workers and the controller must use the SAME network key.")
+  print("Use only ASCII letters, numbers, '-' and '_'.")
+  print("")
+  local previousKey = current and current.networkKey
+  if previousKey == "CHANGE_ME" then previousKey = nil end
+  local key = common.prompt("Network key", previousKey or "ASTRAL-MINE-01", function(value)
+    if #value < 8 or #value > 40 then return false, "Use 8 to 40 characters." end
+    if value:find("[^%w_-]") then return false, "Use only letters, numbers, '-' and '_'." end
+    return true
+  end)
+
+  if requestedRole == "worker" then
+    config = common.merge(common.defaultWorkerConfig(), current and current.role == "worker" and current or {})
+    config.role, config.networkKey = "worker", key
+    config.workerName = common.prompt("Worker name", config.workerName or common.safeComputerLabel("Miner"), function(value)
+      return #value >= 1 and #value <= 20, "Use 1 to 20 characters."
+    end)
