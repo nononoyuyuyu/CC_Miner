@@ -1,3 +1,6 @@
+    x1 = math.floor(x1), y1 = math.floor(y1), x2 = math.floor(x2), y2 = math.floor(y2), action = action,
+  }
+end
 
 local function drawButton(key, x, y, width, label, action, enabled, selectedButton, expandUp)
   width = math.max(3, math.floor(width))
@@ -228,4 +231,3 @@ local function computePreflight()
   local poseDir = tonumber(data.pose and data.pose.dir)
   check("facing", poseDir == 0 and "ok" or "bad", poseDir == 0 and "facing quarry" or (poseDir and ("direction=" .. tostring(poseDir)) or "direction unknown"), poseDir ~= 0)
   local recoveryRequired = data.recoveryRequired == true or data.pendingAction ~= nil
-  check("recovery", recoveryRequired and "bad" or "ok", recoveryRequired and "pending physical recovery" or "ready", recoveryRequired)

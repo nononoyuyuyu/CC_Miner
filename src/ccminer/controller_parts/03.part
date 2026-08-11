@@ -47,6 +47,14 @@ local function processChar(character)
     return
   elseif mode == "more" then
     if character == "i" then dashboardAction("items")()
+    elseif character == "n" then noticeState.morePage = 2; invalidate()
+    elseif character == "p" then noticeState.morePage = 1; invalidate()
+    elseif character == "b" or character == "q" then mode = "dashboard"; invalidate() end
+    return
+  elseif mode == "workers" then
+    if character == "d" then discover()
+    elseif character == "n" then noticeState.workerPage = (tonumber(noticeState.workerPage) or 1) + 1; invalidate()
+    elseif character == "p" then noticeState.workerPage = math.max(1, (tonumber(noticeState.workerPage) or 1) - 1); invalidate()
     elseif character == "b" or character == "q" then mode = "dashboard"; invalidate() end
     return
   elseif mode == "items" then
@@ -74,6 +82,7 @@ local function processChar(character)
   elseif character == "l" then dashboardAction("gps")()
   elseif character == "v" then dashboardAction("groups")()
   elseif character == "m" then dashboardAction("more")()
+  elseif character == "w" then dashboardAction("workers")()
   elseif character == "q" then running = false end
 end
 
@@ -101,6 +110,12 @@ local function processKey(keyCode)
     end
   elseif mode == "error_detail" then
     if keys and (keyCode == keys.enter or keyCode == keys.backspace or keyCode == keys.escape) then noticeState.dismiss() end
+  elseif mode == "workers" then
+    local ids = orderedIds()
+    if keys and keyCode == keys.up then selected = math.max(1, selected - 1); invalidate()
+    elseif keys and keyCode == keys.down then selected = math.min(math.max(1, #ids), selected + 1); invalidate()
+    elseif keys and keyCode == keys.enter then mode = "dashboard"; invalidate()
+    elseif keys and keyCode == keys.backspace then mode = "dashboard"; invalidate() end
   elseif mode == "groups" then
     local ids = orderedGroupIds()
     if keys and keyCode == keys.up then selectedGroup = math.max(1, selectedGroup - 1); invalidate()

@@ -1,3 +1,6 @@
+
+local function remoteSensitiveKey(key)
+  local name = tostring(key or ""):lower():gsub("[^%a%d]", "")
   return name == "networkkey" or name == "password" or name == "passwd"
     or name == "secret" or name == "token" or name == "nonce"
     or name == "sessionid" or name == "apikey" or name == "auth"
@@ -256,6 +259,3 @@ end
 local function addHitbox(key, x1, y1, x2, y2, action)
   hitboxes[key] = hitboxes[key] or {}
   hitboxes[key][#hitboxes[key] + 1] = {
-    x1 = math.floor(x1), y1 = math.floor(y1), x2 = math.floor(x2), y2 = math.floor(y2), action = action,
-  }
-end

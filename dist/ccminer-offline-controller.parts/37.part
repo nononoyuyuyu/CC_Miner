@@ -1,41 +1,68 @@
-  buttonRow(key, bottom, width, {
-    { "DISCOVER", dashboardAction("discover") }, { "NEW JOB", dashboardAction("new") },
-    { "PROGRESS", dashboardAction("progress") }, { "MORE", dashboardAction("more") },
-  }, verticalStep == 2)
-  buttonRow(key, bottom + verticalStep, width, {
-    { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
-    { "RETURN", dashboardAction("recall") }, { "STOP", dashboardAction("stop") },
-  }, verticalStep == 2)
-  local groupIds = orderedGroupIds()
-  if #groupIds > 0 then
-    local gy = 3
-    local gid, g = selectedGroupRecord()
-    local gj = gid and activeGroupJob(gid) or nil
-    local aggregate = gj and (gj.aggregate or updateGroupAggregate(gj)) or nil
     local line = ("Group %s %s %d workers %s%% minFuel=%s ACK=%s/%s"):format(tostring(gid), groupName(g, gid), #(groupWorkerIds(g)), tostring(aggregate and aggregate.percent or 0), tostring(aggregate and aggregate.minFuel or "-"), tostring(aggregate and aggregate.acks or 0), tostring(aggregate and aggregate.ackTotal or #groupWorkerIds(g)))
     common.writeAt(1, gy, common.fit(line, width), colors and colors.cyan or nil)
   end
   noticeLine(target, height)
 end
 
+noticeState.renderWorkers = function(target, key)
+  local width, height = target.getSize()
+  local ids = orderedIds()
+  writeHeader("WORKERS", target)
+  local rowsPerPage = math.max(1, height - 5)
+  local pages = math.max(1, math.ceil(#ids / rowsPerPage))
+  noticeState.workerPage = common.clamp(tonumber(noticeState.workerPage) or 1, 1, pages)
+  local first = (noticeState.workerPage - 1) * rowsPerPage + 1
+  common.writeAt(1, 2, common.fit(("Page %d/%d | %d workers | selected #%s"):format(noticeState.workerPage, pages, #ids, tostring(selectedWorker() or "-")), width), colors and colors.lightGray or nil)
+  if #ids == 0 then
+    common.writeAt(1, 3, common.fit("No workers found. Touch DISCOVER.", width), colors and colors.yellow or nil)
+  end
+  for row = 1, rowsPerPage do
+    local index = first + row - 1
+    local id = ids[index]
+    if not id then break end
+    local worker, data = workers[id], workers[id].data or {}
+    local status = statusOf(worker)
+    local line = width >= 48
+      and ("%s#%-4s %-14s %-12s %-16s F=%s"):format(index == selected and ">" or " ", tostring(id), common.fit(workerLabel(worker, id), 14), common.fit(status, 12), common.fit(progressText(data), 16), tostring(data.fuel or "-"))
+      or ("%s#%-3s %-9s %-8s %s"):format(index == selected and ">" or " ", tostring(id), common.fit(workerLabel(worker, id), 9), common.fit(status, 8), progressText(data))
+    local y = 2 + row
+    common.writeAt(1, y, common.fit(line, width), index == selected and (colors and colors.black or nil) or common.statusColor(status), index == selected and (colors and colors.white or nil) or (colors and colors.black or nil))
+    addHitbox(key, 1, y, width, y, function() selected = index; invalidate() end)
+  end
+  buttonRow(key, height - 1, width, {
+    { "PREV", function() noticeState.workerPage = math.max(1, noticeState.workerPage - 1); invalidate() end, noticeState.workerPage > 1 },
+    { "NEXT", function() noticeState.workerPage = math.min(pages, noticeState.workerPage + 1); invalidate() end, noticeState.workerPage < pages },
+    { "DISCOVER", dashboardAction("discover") }, { "BACK", function() mode = "dashboard"; invalidate() end },
+  }, true)
+  noticeLine(target, height)
+end
+
 noticeState.renderMore = function(target, key)
   local width, height = target.getSize()
-  local verticalStep = height >= 10 and 2 or 1
-  local firstRow = 4
   writeHeader("MORE COMMANDS", target)
-  common.writeAt(1, 2, common.fit("Less-used commands are kept here.", width), colors and colors.lightGray or nil)
-  buttonRow(key, firstRow, width, {
-    { "INFO", dashboardAction("info") }, { "ITEMS", dashboardAction("items") },
-    { "REPORT", dashboardAction("report") }, { "RECOVERY", dashboardAction("recovery") },
-  }, verticalStep == 2)
-  buttonRow(key, firstRow + verticalStep, width, {
-    { "GROUPS", dashboardAction("groups") }, { "REMOTE", dashboardAction("remote") },
-    { "GPS", dashboardAction("gps") }, { "LAST ERR", dashboardAction("last_error") },
-  }, verticalStep == 2)
-  buttonRow(key, firstRow + verticalStep * 2, width, {
-    { "SERVICE", dashboardAction("service") }, { "CLEAR", dashboardAction("clear") },
-    { "REHOME", dashboardAction("rehome") }, { "BACK", function() mode = "dashboard"; invalidate() end },
-  }, verticalStep == 2)
+  noticeState.morePage = common.clamp(tonumber(noticeState.morePage) or 1, 1, 2)
+  common.writeAt(1, 2, common.fit(("Page %d/2 | large buttons are always enabled"):format(noticeState.morePage), width), colors and colors.lightGray or nil)
+  local secondRow = math.max(7, height - 1)
+  local firstRow = secondRow - 3
+  if noticeState.morePage == 1 then
+    buttonRow(key, firstRow, width, {
+      { "INFO", dashboardAction("info") }, { "ITEMS", dashboardAction("items") },
+      { "REPORT", dashboardAction("report") }, { "RECOVERY", dashboardAction("recovery") },
+    }, true)
+    buttonRow(key, secondRow, width, {
+      { "GROUPS", dashboardAction("groups") }, { "REMOTE", dashboardAction("remote") },
+      { "GPS", dashboardAction("gps") }, { "NEXT", function() noticeState.morePage = 2; invalidate() end },
+    }, true)
+  else
+    buttonRow(key, firstRow, width, {
+      { "SERVICE", dashboardAction("service") }, { "CLEAR", dashboardAction("clear") },
+      { "REHOME", dashboardAction("rehome") }, { "LAST ERR", dashboardAction("last_error") },
+    }, true)
+    buttonRow(key, secondRow, width, {
+      { "PREV", function() noticeState.morePage = 1; invalidate() end },
+      { "WORKERS", dashboardAction("workers") }, { "BACK", function() mode = "dashboard"; invalidate() end },
+    }, true)
+  end
   noticeLine(target, height)
 end
 
@@ -189,32 +216,3 @@ local function renderGroupDimensions(target, key)
   local labels = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "CLR", "0", "<" }
   for index, label in ipairs(labels) do
     local row = math.floor((index - 1) / 3)
-    local column = (index - 1) % 3
-    local x, y = keypadX + column * cellWidth, 4 + row * 2
-    if y <= height - 8 then
-      local action
-      if label == "CLR" then action = function() groupDraft.buffer = "0" end
-      elseif label == "<" then action = groupDraftBackspace
-      else local digit = label; action = function() groupDraftDigit(digit) end end
-      drawButton(key, x, y, math.max(3, cellWidth - 1), label, action, true)
-      addHitbox(key, x, y, x + math.max(2, cellWidth - 2), math.min(height - 8, y + 1), action)
-    end
-  end
-  local summaryY = math.max(8, height - 10)
-  local homeBits = {}
-  for _, id in ipairs(ids) do
-    local data = workerData(id) or {}
-    local homeY = data.homeY or data.gps and data.gps.calibration and data.gps.calibration.home and data.gps.calibration.home.y or "-"
-    homeBits[#homeBits + 1] = "#" .. tostring(id) .. " HOME=" .. tostring(homeY)
-  end
-  common.writeAt(1, summaryY, common.fit(table.concat(homeBits, " "), width), colors and colors.lightGray or nil)
-  local result = groupDraft.preflight
-  if result then
-    local assignmentText = (result.fatal and "PREFLIGHT BLOCKED" or "PREFLIGHT OK") .. " assignments=" .. tostring(groupAssignmentCount(result)) .. "/" .. tostring(#ids) .. " chunks=" .. tostring(result.selectedChunks or 0)
-    common.writeAt(1, summaryY + 1, common.fit(assignmentText, width), result.fatal and (colors and colors.red or nil) or (colors and colors.lime or nil))
-    local row = summaryY + 2
-    for _, id in ipairs(ids) do
-      if row >= height - 5 then break end
-      local assignment = result.assignments and (result.assignments[tostring(id)] or result.assignments[id]) or nil
-      local chunks = assignment and #(assignment.chunkKeys or {}) or 0
-      local homeY = assignment and assignment.homeY or (workerData(id) or {}).homeY or "-"

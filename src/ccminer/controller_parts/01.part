@@ -167,6 +167,8 @@ local sortingWarned = false
 -- more top-level locals (CC Lua caps a chunk at 200 active locals).
 noticeState.remoteSession = nil
 noticeState.remoteApi = {}
+noticeState.workerPage = 1
+noticeState.morePage = 1
 noticeState.configureMonitor = function(device)
   if not device then return end
   if device.setTextScale then pcall(device.setTextScale, config.monitorTextScale or 0.5) end
@@ -2705,7 +2707,8 @@ local function dashboardAction(name)
       invalidate()
     elseif name == "info" then
       if id then mode = "info" else setNotice("No worker selected.", true) end
-    elseif name == "more" then mode = "more"
+    elseif name == "workers" then mode = "workers"; noticeState.workerPage = 1
+    elseif name == "more" then mode = "more"; noticeState.morePage = 1
     elseif name == "items" then
       if id and noticeState.openItems then noticeState.openItems()
       else setNotice("Select a worker before opening item settings.", true) end

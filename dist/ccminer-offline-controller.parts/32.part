@@ -1,3 +1,7 @@
+            else check("bay cell:#" .. tostring(id), "ok", "forward entrance is inside its bay chunk", false) end
+          end
+        end
+      end
       if not workerBay then
         check("bay:#" .. tostring(id), "bad", "registered bay metadata unavailable", true)
       elseif not workerBay.world then

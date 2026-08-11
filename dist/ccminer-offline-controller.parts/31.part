@@ -1,3 +1,5 @@
+  local firstData = workerIds[1] and workerData(workerIds[1]) or nil
+  local calibration = firstData and firstData.gps and firstData.gps.calibration
   local homeY = calibration and calibration.home and tonumber(calibration.home.y) or tonumber(firstData and firstData.homeY)
   local depth = tonumber(previous.depth) or 16
   local bottomY = tonumber(previous.bottomY or previous.targetY)
@@ -169,7 +171,3 @@ local function computeGroupPreflight(groupId, value)
               end
             end
             if not forwardCell then check("bay cell:#" .. tostring(id), "bad", "worker forward entrance is outside its bay chunk cells", true)
-            else check("bay cell:#" .. tostring(id), "ok", "forward entrance is inside its bay chunk", false) end
-          end
-        end
-      end

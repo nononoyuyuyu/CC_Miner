@@ -1,3 +1,4 @@
+    local fuel = data and tonumber(data.fuel or data.materials and data.materials.fuel)
     if fuel and (aggregate.minFuel == nil or fuel < aggregate.minFuel) then aggregate.minFuel = fuel end
     local progress = data and data.progress or {}
     local cursor, total = tonumber(progress and progress.cursor or data and data.job and data.job.cursor), tonumber(progress and progress.total or data and data.job and data.job.total)
@@ -244,5 +245,3 @@ noticeState.remoteApi.ackMatches = function(sender, message, payload)
   -- Supported workers always set replyTo, so a missing value fails closed.
   if pending.messageId and (not message
     or tostring(message.replyTo or "") ~= tostring(pending.messageId)) then return false end
-  local result = type(payload.result) == "table" and payload.result or nil
-  local wireCommand = payload.command

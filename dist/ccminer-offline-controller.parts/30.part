@@ -1,3 +1,4 @@
+  check("recovery", recoveryRequired and "bad" or "ok", recoveryRequired and "pending physical recovery" or "ready", recoveryRequired)
   local unfinished = data.job ~= nil and workerStatus ~= "complete" and workerStatus ~= "completed" and workerStatus ~= "aborted"
   check("existing job", unfinished and "bad" or "ok", unfinished and "abort or clear the unfinished job first" or "clear", unfinished)
   if fuel and fuel >= requiredFuel then
@@ -207,5 +208,3 @@ end
 local function groupDraftDefaults(group)
   local previous = db.lastDraft or {}
   local workerIds = groupWorkerIds(group)
-  local firstData = workerIds[1] and workerData(workerIds[1]) or nil
-  local calibration = firstData and firstData.gps and firstData.gps.calibration

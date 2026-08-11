@@ -1,3 +1,33 @@
+  local rows = math.min(#visibleFields, math.max(1, math.floor((height - 8) / 2)))
+  for index = 1, rows do
+    local field = visibleFields[index]
+    local y = 4 + (index - 1) * 2
+    local active = draft.selectedField == field
+    local shown = active and draft.buffer or tostring(draft[field])
+    common.writeAt(1, y, common.fit(fieldLabels[field], fieldWidth - 2), active and (colors and colors.black or nil) or (colors and colors.white or nil), active and (colors and colors.yellow or nil) or (colors and colors.black or nil))
+    drawButton(key, 1, y + 1, 3, "-", function() adjustDraft(field, -1) end, true)
+    drawButton(key, 5, y + 1, math.max(5, fieldWidth - 11), shown, function() chooseDraftField(field) end, true, active)
+    drawButton(key, fieldWidth - 5, y + 1, 3, "+", function() adjustDraft(field, 1) end, true)
+  end
+  local keypadX = math.min(width - 12, fieldWidth + 2)
+  local keypadWidth = math.max(12, width - keypadX + 1)
+  local cellWidth = math.max(4, math.floor(keypadWidth / 3))
+  local labels = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "CLR", "0", "<" }
+  for index, label in ipairs(labels) do
+    local row = math.floor((index - 1) / 3)
+    local column = (index - 1) % 3
+    local x, y = keypadX + column * cellWidth, 4 + row * 2
+    if y <= height - 3 then
+      local action
+      if label == "CLR" then action = function() draft.buffer = "0" end
+      elseif label == "<" then action = draftBackspace
+      else local digit = label; action = function() draftDigit(digit) end end
+      drawButton(key, x, y, math.max(3, cellWidth - 1), label, action, true)
+      addHitbox(key, x, y, x + math.max(2, cellWidth - 2), math.min(height - 3, y + 1), action)
+    end
+  end
+  local summaryY = math.max(4, height - 5)
+  local shownDepth = draft.depth
   if worldMode then local derived = effectiveJobDepth("world", draftCalibration()); shownDepth = derived or shownDepth end
   local volume = (tonumber(draft.width) or 1) * (tonumber(draft.length) or 1) * (tonumber(shownDepth) or 1)
   local profileInfo = profileParameters(draft.profile, draft.lighting)
@@ -149,25 +179,3 @@ local function renderChunks(target, key)
   -- is the primary selector; chunk rows remain useful on tiny monitors.
   renderGrid(target, key)
 end
-
-local function renderPreflight(target, key)
-  local width, height = target.getSize()
-  local result = draft and draft.preflight or computePreflight()
-  writeHeader("START PREFLIGHT", target, colors and colors.orange or nil)
-  if not result then
-    common.writeAt(1, 3, common.fit("Preflight unavailable.", width), colors and colors.red or nil)
-  else
-    common.writeAt(1, 2, common.fit(("cells=%s blocks=%s fuel~%s chunks=%d/%d exclusions=%d"):format(common.humanNumber(result.cells or 0), common.humanNumber(result.blocks or 0), tostring(result.fuel), result.selectedChunks or 0, result.totalChunks or result.chunks or 0, result.exclusions or 0), width), colors and colors.lightGray or nil)
-    common.writeAt(1, 3, common.fit(("profile=%s torchInterval=%s requested=%s fuelMargin=%.1fx"):format(tostring(result.profile or "invalid"), tostring(result.effectiveInterval or "-"), tostring(result.requestedInterval or "-"), tonumber(result.fuelMultiplier) or 1), width), colors and colors.lightGray or nil)
-    local max = math.max(1, height - 7)
-    for index, check in ipairs(result.checks or {}) do
-      if index > max then break end
-      local line = ("[%s] %-13s %s"):format(statusGlyph(check.state), check.name, tostring(check.detail or ""))
-      local fg = check.state == "bad" and (colors and colors.red or nil) or check.state == "warn" and (colors and colors.yellow or nil) or (colors and colors.lime or nil)
-      common.writeAt(1, 3 + index, common.fit(line, width), fg)
-    end
-  end
-  local canStart = result and not result.fatal
-  buttonRow(key, math.max(1, height - 2), width, {
-    { "START", function() if canStart then startDraft() end end, canStart },
-    { "QUEUE", function() queueDraft() end, canStart and config.queueEnabled ~= false },

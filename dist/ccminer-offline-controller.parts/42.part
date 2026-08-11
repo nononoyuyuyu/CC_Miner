@@ -1,3 +1,63 @@
+    elseif keys and keyCode == keys.backspace then mode = "dashboard"; invalidate() end
+  elseif mode == "groups" then
+    local ids = orderedGroupIds()
+    if keys and keyCode == keys.up then selectedGroup = math.max(1, selectedGroup - 1); invalidate()
+    elseif keys and keyCode == keys.down then selectedGroup = math.min(math.max(1, #ids), selectedGroup + 1); invalidate()
+    elseif keys and keyCode == keys.enter then mode = "group_info"; invalidate()
+    elseif keys and keyCode == keys.backspace then mode = "dashboard"; invalidate() end
+  elseif mode == "group_info" then
+    if keys and (keyCode == keys.enter or keyCode == keys.backspace) then mode = "groups"; invalidate() end
+  elseif mode == "group_dimensions" or mode == "group_job" then
+    if keys and keyCode == keys.backspace then
+      groupDraftBackspace(); invalidate()
+    elseif keys and keyCode == keys.tab then
+      local position = 1
+      local fields = groupFieldOrder()
+      for index, field in ipairs(fields) do if field == (groupDraft and groupDraft.selectedField) then position = index end end
+      chooseGroupDraftField(fields[position % #fields + 1]); invalidate()
+    elseif keys and keyCode == keys.enter then
+      local gid = selectedGroupRecord()
+      if gid and groupDraft then commitGroupDraftField(); groupDraft.preflight = computeGroupPreflight(gid, groupDraft); invalidate() end
+    elseif keys and keyCode == keys.left then
+      adjustGroupDraft(groupDraft and groupDraft.selectedField or "width", -1); invalidate()
+    elseif keys and keyCode == keys.right then
+      adjustGroupDraft(groupDraft and groupDraft.selectedField or "width", 1); invalidate()
+    end
+  elseif mode == "job_dimensions" then
+    if keys and keyCode == keys.backspace then
+      draftBackspace()
+      invalidate()
+    elseif keys and keyCode == keys.tab then
+      local position = 1
+      local fields = currentFieldOrder()
+      for index, field in ipairs(fields) do
+        if field == draft.selectedField then position = index end
+      end
+      chooseDraftField(fields[position % #fields + 1])
+      invalidate()
+    elseif keys and keyCode == keys.enter then
+      commitDraftField()
+      mode = "job_grid"
+      invalidate()
+    elseif keys and keyCode == keys.left then
+      adjustDraft(draft.selectedField or "width", -1)
+      invalidate()
+    elseif keys and keyCode == keys.right then
+      adjustDraft(draft.selectedField or "width", 1)
+      invalidate()
+    end
+  elseif mode == "job_grid" or mode == "job_chunks" then
+    if keys and keyCode == keys.left then
+      draft.gridPageX = math.max(1, (draft.gridPageX or 1) - 1)
+      invalidate()
+    elseif keys and keyCode == keys.right then
+      draft.gridPageX = (draft.gridPageX or 1) + 1
+      invalidate()
+    elseif keys and keyCode == keys.up then
+      draft.gridPageZ = math.max(1, (draft.gridPageZ or 1) - 1)
+      invalidate()
+    elseif keys and keyCode == keys.down then
+      draft.gridPageZ = (draft.gridPageZ or 1) + 1
       invalidate()
     elseif keys and keyCode == keys.enter then
       local result = computePreflight()
@@ -167,36 +227,3 @@ local function commandLineMode()
     if #ids == 0 then print("No workers found."); return true end
     for _, id in ipairs(ids) do
       local data = workers[id].data or {}
-      print(("#%s %-16s %-14s %s GPS=%s seal=%s"):format(id, workerLabel(workers[id], id), statusOf(workers[id]), progressText(data), data.gps and data.gps.calibrated and "ready" or "no", data.seal and data.seal.count or "-"))
-    end
-    return true
-  elseif command == "start" then
-    local id, width, length, depth = tonumber(args[2]), tonumber(args[3]), tonumber(args[4]), tonumber(args[5])
-    if not id or not width or not length or not depth then print("Usage: controller.lua start <id> <width> <length> <depth>"); return true end
-    discover(); pumpFor(1)
-    draft = makeCliDraft(id, width, length, depth)
-    local result = computePreflight()
-    if result and not result.fatal then startDraft() else print("Preflight blocked: " .. tostring(result and result.planError or "unavailable")) end
-    pumpFor(2); print(notice); draft = nil; mode = "dashboard"; return true
-  elseif command == "stop" then
-    local id, stopMode = tonumber(args[2]), string.lower(args[3] or "pause_now")
-    local validModes = { pause_now = true, finish_row = true, finish_layer = true, return_home = true, abort = true }
-    if not id or not validModes[stopMode] then print("Usage: controller.lua stop <id> pause_now|finish_row|finish_layer|return_home|abort"); return true end
-    stageStop(id, stopMode); pumpFor(2); print(notice); return true
-  elseif command == "pause" or command == "resume" or command == "recall" or command == "service" or command == "abort" or command == "clear" then
-    local id = tonumber(args[2]); if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
-    sendCommand(id, command); pumpFor(2); print(notice); return true
-  elseif command == "gps" or command == "calibrate" then
-    local id = tonumber(args[2]); if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
-    sendCommand(id, command == "gps" and "gps_fix" or "calibrate_gps"); pumpFor(3); print(notice); return true
-  elseif command == "rehome" then
-    local id = tonumber(args[2]); if not id or args[3] ~= "RESET" then print("Usage: controller.lua rehome <id> RESET"); return true end
-    sendCommand(id, "rehome", { confirm = "RESET" }); pumpFor(2); print(notice); return true
-  elseif command == "queue" then
-    local sub = string.lower(args[2] or "list")
-    if sub == "list" then printQueue()
-    elseif config.queueEnabled == false then print("Queue is disabled by controller configuration.")
-    elseif sub == "clear" then db.queue = {}; saveControllerDb(); print("Queue cleared.")
-    elseif sub == "remove" or sub == "delete" then local index = tonumber(args[3]); if index and db.queue[index] then table.remove(db.queue, index); saveControllerDb(); print("Queue item removed.") else print("Usage: queue remove <index>") end
-    elseif sub == "add" then
-      local id, width, length, depth = tonumber(args[3]), tonumber(args[4]), tonumber(args[5]), tonumber(args[6])

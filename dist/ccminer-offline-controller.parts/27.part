@@ -1,3 +1,5 @@
+  local result = type(payload.result) == "table" and payload.result or nil
+  local wireCommand = payload.command
   if tostring(wireCommand or ""):lower() ~= "remote_console" then return false end
   local action = remoteAckField(payload, result, "action")
     or remoteAckField(payload, result, "remoteAction")
@@ -210,6 +212,3 @@ local function remoteRedactText(value)
   end
   return text
 end
-
-local function remoteSensitiveKey(key)
-  local name = tostring(key or ""):lower():gsub("[^%a%d]", "")

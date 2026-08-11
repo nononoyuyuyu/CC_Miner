@@ -1,3 +1,5 @@
+    name = tostring(options.name or previous.name or groupId),
+    workerIds = common.copy(ids),
     dockId = options.dockId or previous.dockId,
     bayId = options.bayId or previous.bayId,
     -- Per-worker overrides are maps keyed by worker ID.  A shared dock/bay
@@ -204,4 +206,3 @@ local function updateGroupAggregate(groupJob)
     if status == "blocked" then aggregate.blocked = aggregate.blocked + 1 end
     if status == "waiting_fuel" or status == "waiting_output" or status == "waiting_seal" or status == "waiting_torch" or status == "waiting_water" or status == "service" then aggregate.waiting = aggregate.waiting + 1 end
     if status == "working" or status == "mining" or status == "starting" then aggregate.active = aggregate.active + 1 end
-    local fuel = data and tonumber(data.fuel or data.materials and data.materials.fuel)

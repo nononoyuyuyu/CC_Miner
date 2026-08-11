@@ -52,6 +52,13 @@ end
 
 for _, item in ipairs({
   { 'noticeState.renderMore = function(target, key)', "secondary command screen" },
+  { 'noticeState.renderWorkers = function(target, key)', "paged worker list screen" },
+  { 'local rowsPerPage = math.max(1, height - 5)', "worker page capacity" },
+  { 'noticeState.workerPage = common.clamp', "worker page bounds" },
+  { '{ "PREV", function() noticeState.workerPage', "worker previous page" },
+  { '{ "NEXT", function() noticeState.workerPage', "worker next page" },
+  { 'noticeState.morePage = common.clamp', "paged secondary controls" },
+  { '{ "WORKERS", dashboardAction("workers") }', "dashboard worker list button" },
   { 'noticeState.openItems = function()', "inventory discard picker open" },
   { 'noticeState.renderItems = function(target, key)', "inventory discard picker view" },
   { 'sendCommand(id, "discard_config", { mode = form.mode, allowlist = allowlist })', "discard picker apply command" },
@@ -64,6 +71,7 @@ for _, item in ipairs({
   { 'if expandUp == true and y > 1 then', "button upper padding row" },
   { 'string.rep(" ", width), foreground, background', "button upper background fill" },
   { 'expandUp == true and math.max(1, y - 1) or y', "expanded button hitbox" },
+  { '}, true)', "unconditional large main button rows" },
   { 'noticeState.configureMonitor = function(device)', "monitor palette setup" },
   { 'local verticalStep = height >= 10 and 2 or 1', "responsive vertical button spacing" },
   { 'local listStart, itemStep = expanded and 7 or roomy and 5 or 4, expanded and 3 or roomy and 2 or 1', "spaced item rows" },

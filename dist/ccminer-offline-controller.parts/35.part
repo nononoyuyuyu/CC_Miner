@@ -233,11 +233,10 @@ local function dashboardAction(name)
       invalidate()
     elseif name == "info" then
       if id then mode = "info" else setNotice("No worker selected.", true) end
-    elseif name == "more" then mode = "more"
+    elseif name == "workers" then mode = "workers"; noticeState.workerPage = 1
+    elseif name == "more" then mode = "more"; noticeState.morePage = 1
     elseif name == "items" then
       if id and noticeState.openItems then noticeState.openItems()
       else setNotice("Select a worker before opening item settings.", true) end
     elseif name == "remote" then
       if id then
-        setNotice(("Remote console is CLI-only: ccm remote %s [-- <command...>]"):format(tostring(id)), false)
-      else
