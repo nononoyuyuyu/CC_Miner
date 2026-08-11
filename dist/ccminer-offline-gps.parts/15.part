@@ -1,0 +1,11 @@
+  fail("Install swap failed; previous installation was restored: " .. tostring(moveError))
+end
+print("")
+if action == "update" then
+  print("Offline update installed: " .. VERSION .. " (schema " .. SCHEMA .. ")")
+  print("Previous files: /ccminer.backup"); print("Run: reboot")
+else
+  local setupOk = shell.run(ROOT .. "/setup.lua", ROLE)
+  if not setupOk then printError("Setup did not complete. Run: " .. ROOT .. "/setup.lua " .. ROLE)
+  else print(""); print("Installation complete. Run: reboot") end
+end

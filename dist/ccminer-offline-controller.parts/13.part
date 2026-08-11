@@ -1,0 +1,280 @@
+        reportError("Usage: ccm " .. command .. " list|register <id> <x> <y> <z> [facing] [maxDepth]")
+      else
+        -- Registry validation and coordinate normalization stay in the
+        -- controller.  Preserve every argument so legacy and extended
+        -- register forms remain compatible.
+        forwardController()
+      end
+    elseif command == "stop" then
+      local mode = string.lower(tostring(args[3] or ""))
+      local stopModes = {
+        now = "pause_now", row = "finish_row", layer = "finish_layer", home = "return_home",
+        pause_now = "pause_now", finish_row = "finish_row", finish_layer = "finish_layer",
+        return_home = "return_home", abort = "abort",
+      }
+      local controllerMode = stopModes[mode]
+      local valid = controllerMode ~= nil
+      if not tonumber(args[2]) or not valid then
+        reportError("Usage: ccm stop <id> <now|row|layer|home|abort>")
+      else
+        local forwarded = {}
+        for index = 1, #args do forwarded[index] = args[index] end
+        forwarded[3] = controllerMode
+        forwardController(forwarded)
+      end
+    else
+      forwardController()
+    end
+  end
+elseif command == "status" then
+  local config, configError = common.loadConfig()
+  if not config then reportError(configError or "Not configured."); return end
+  print("CC Miner " .. tostring(common.VERSION or ""))
+  print("Role: " .. tostring(config.role))
+  print("Computer ID: " .. tostring(os.getComputerID()))
+  print("Label: " .. tostring(os.getComputerLabel and os.getComputerLabel() or "-"))
+  if type(config.networkKey) == "string" and config.networkKey ~= "" then print("Network key: configured (masked)") else print("Network key: not configured") end
+  printStatusFeature("Profile", config.profile)
+  printStatusFeature("Lighting", config.lighting, config.lightMode)
+  printStatusFeature("Water", config.water, config.waterMode)
+  printStatusFeature("Materials", config.materials)
+  printStatusFeature("Staged stop", config.stagedStop)
+  if config.role == "worker" then
+    local state, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
+    if stateError then reportError(stateError) end
+    print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
+    if state.pose then print(("Pose: x=%s y=%s z=%s dir=%s"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir)) end
+    print("GPS calibrated: " .. tostring(config.gps and config.gps.calibration ~= nil))
+    print("Lava mode: " .. tostring(config.lavaMode))
+    printStatusFeature("Lighting", state.lighting, config.lighting or config.lightMode)
+    printStatusFeature("Water", state.water, config.water or config.waterMode)
+    printStatusFeature("Profile", state.profile, config.profile)
+    printStatusFeature("Materials", state.materials, config.materials)
+    printStatusFeature("Staged stop", state.stagedStop, config.stagedStop)
+    if state.job then print(("Job: %s %s/%s [%s]"):format(tostring(state.job.name), tostring(state.job.cursor), tostring(state.job.total), tostring(state.job.strategy))) end
+    printOperationalFields(state, config)
+    if state.lastError then print("Error: " .. tostring(state.lastError)) end
+  elseif config.role == "gps" then
+    print(("Coordinates: %s, %s, %s"):format(config.x, config.y, config.z))
+  end
+elseif command == "logs" then
+  if not fs.exists(common.LOG_PATH) then print("No log file yet."); return end
+  local handle = fs.open(common.LOG_PATH, "r")
+  local lines = {}
+  while true do
+    local line = handle.readLine()
+    if not line then break end
+    lines[#lines + 1] = line
+    if #lines > 30 then table.remove(lines, 1) end
+  end
+  handle.close()
+  for _, line in ipairs(lines) do print(line) end
+elseif command == "update" then
+  if not http then reportError("HTTP API is disabled."); return end
+  shell.run("wget", "run", "https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua", "update")
+else
+  reportError("Unknown command: " .. command)
+  printHelp()
+end
+]] },
+  { source = [[src/ccminer/lib/quarry.lua]], target = [[lib/quarry.lua]], digest = [[f731d69df70b013baf8e62f6d47d838f291b41743e286fbc460e2b1e2c7d3340]], content = [=[-- CC Miner V4 - deterministic quarry paths, chunk plans, and helpers.
+
+local M = {}
+
+-- The guards are deliberately conservative.  A quarry larger than these limits
+-- is not useful in a single in-memory plan and would make an accidental UI/API
+-- call allocate an unexpectedly large table.
+local MAX_DIMENSION = 4096
+local MAX_COLUMNS = 1024 * 1024
+local MAX_BLOCKS = 16 * 1024 * 1024
+local MAX_CHUNKS = 65536
+local MAX_WORKERS = 128
+local MAX_SELECTION_CELLS = 262144
+
+M.MAX_DIMENSION = MAX_DIMENSION
+M.MAX_COLUMNS = MAX_COLUMNS
+M.MAX_BLOCKS = MAX_BLOCKS
+M.MAX_CHUNKS = MAX_CHUNKS
+M.MAX_WORKERS = MAX_WORKERS
+
+local function numberValue(value)
+  local number = tonumber(value)
+  if not number or number ~= number or number == math.huge or number == -math.huge then
+    return nil
+  end
+  return number
+end
+
+local function integerValue(value, minimum, maximum)
+  local number = numberValue(value)
+  if not number or number % 1 ~= 0 then return nil end
+  if minimum and number < minimum then return nil end
+  if maximum and number > maximum then return nil end
+  return number
+end
+
+local function dimensions(width, length, depth)
+  width = integerValue(width, 1, MAX_DIMENSION)
+  length = integerValue(length, 1, MAX_DIMENSION)
+  if not width or not length then return nil, "invalid_dimensions" end
+  local columns = width * length
+  if columns > MAX_COLUMNS then return nil, "quarry_too_large" end
+  if depth ~= nil then
+    depth = integerValue(depth, 1, MAX_DIMENSION)
+    if not depth then return nil, "invalid_dimensions" end
+    if columns * depth > MAX_BLOCKS then return nil, "quarry_too_large" end
+  end
+  return width, length, depth, columns
+end
+
+function M.total(width, length, depth)
+  local validWidth, validLength, validDepth, columns = dimensions(width, length, depth)
+  if not validWidth then return nil, validLength end
+  if not validDepth then return nil, "invalid_dimensions" end
+  return columns * validDepth
+end
+
+-- Fast continuous serpentine path used when no chunk is excluded.
+function M.cell(width, length, depth, index)
+  local validWidth, validLength, validDepth, totalColumns = dimensions(width, length, depth)
+  if not validWidth then return nil, validLength end
+  if not validDepth then return nil, "invalid_dimensions" end
+  index = integerValue(index, 0)
+  if not index or index >= totalColumns * validDepth then return nil, "index_out_of_range" end
+  local perLayer = validWidth * validLength
+  local layer = math.floor(index / perLayer)
+  local offset = index % perLayer
+  if layer % 2 == 1 then offset = perLayer - 1 - offset end
+  local row = math.floor(offset / validLength)
+  local column = offset % validLength
+  local z = row % 2 == 0 and (column + 1) or (validLength - column)
+  return { x = row, y = -layer, z = z }
+end
+
+function M.cellForJob(job, index)
+  if type(job) ~= "table" then return nil, "invalid_job" end
+  return M.cell(job.width, job.length, job.depth, index)
+end
+
+local function validCalibration(calibration)
+  if type(calibration) ~= "table" or type(calibration.home) ~= "table" or type(calibration.forward) ~= "table" then
+    return false
+  end
+  local fx, fz = numberValue(calibration.forward.x), numberValue(calibration.forward.z)
+  local hx, hy, hz = numberValue(calibration.home.x), numberValue(calibration.home.y), numberValue(calibration.home.z)
+  return fx ~= nil and fz ~= nil and hx ~= nil and hy ~= nil and hz ~= nil
+    and math.abs(fx) + math.abs(fz) == 1
+end
+
+local function localToWorld(calibration, x, z)
+  local forward = { x = numberValue(calibration.forward.x), z = numberValue(calibration.forward.z) }
+  local homeX, homeZ = numberValue(calibration.home.x), numberValue(calibration.home.z)
+  local rightX, rightZ = -forward.z, forward.x
+  return homeX + rightX * x + forward.x * z,
+    homeZ + rightZ * x + forward.z * z
+end
+
+-- Inverse of localToWorld for worker-local rebasing.  GPS calibrations are
+-- cardinal (one-block forward/right vectors), so the result remains integral
+-- for integral world positions while still accepting numeric coordinates for
+-- diagnostics.
+local function worldToLocalXZ(calibration, worldX, worldZ)
+  if not validCalibration(calibration) then return nil, nil, "gps_not_calibrated" end
+  worldX, worldZ = numberValue(worldX), numberValue(worldZ)
+  if not worldX or not worldZ then return nil, nil, "invalid_world_position" end
+  local forwardX, forwardZ = numberValue(calibration.forward.x), numberValue(calibration.forward.z)
+  local homeX, homeZ = numberValue(calibration.home.x), numberValue(calibration.home.z)
+  local dx, dz = worldX - homeX, worldZ - homeZ
+  local rightX, rightZ = -forwardZ, forwardX
+  return dx * rightX + dz * rightZ, dx * forwardX + dz * forwardZ
+end
+
+M.worldToLocalXZ = worldToLocalXZ
+function M.inverseWorldToLocal(calibration, worldX, worldZ)
+  if type(worldX) == "table" then worldZ, worldX = worldX.z, worldX.x end
+  local localX, localZ, inverseError = worldToLocalXZ(calibration, worldX, worldZ)
+  if not localX then return nil, inverseError end
+  return { x = localX, z = localZ }
+end
+function M.referenceLocalToWorld(calibration, x, z)
+  if not validCalibration(calibration) then return nil, "gps_not_calibrated" end
+  x, z = numberValue(x), numberValue(z)
+  if not x or not z then return nil, "invalid_position" end
+  local worldX, worldZ = localToWorld(calibration, x, z)
+  return { x = worldX, z = worldZ }
+end
+M.worldToLocal = M.inverseWorldToLocal
+
+local function chunkKey(mode, cx, cz)
+  return (mode == "world" and "W:" or "L:") .. tostring(cx) .. ":" .. tostring(cz)
+end
+
+M.chunkKey = chunkKey
+
+function M.chunkForCell(mode, calibration, x, z)
+  x, z = numberValue(x), numberValue(z)
+  if not x or not z then return nil, nil, "invalid_position" end
+  if mode == "world" then
+    if not validCalibration(calibration) then return nil, nil, "gps_not_calibrated" end
+    local wx, wz = localToWorld(calibration, x, z)
+    return math.floor(wx / 16), math.floor(wz / 16)
+  end
+  return math.floor(x / 16), math.floor((z - 1) / 16)
+end
+
+local function chunkComparator(a, b)
+  if a.cz ~= b.cz then return a.cz < b.cz end
+  if a.cx ~= b.cx then return a.cx < b.cx end
+  return tostring(a.key) < tostring(b.key)
+end
+
+function M.buildCatalog(width, length, mode, calibration)
+  local validWidth, validLength, _, columns = dimensions(width, length)
+  if not validWidth then return nil, validLength end
+  mode = mode == "world" and "world" or "local"
+  if mode == "world" and not validCalibration(calibration) then return nil, "gps_not_calibrated" end
+
+  local byKey, catalogSize = {}, 0
+  for x = 0, validWidth - 1 do
+    for z = 1, validLength do
+      local cx, cz, err = M.chunkForCell(mode, calibration, x, z)
+      if not cx then return nil, err end
+      local key = chunkKey(mode, cx, cz)
+      local chunk = byKey[key]
+      if not chunk then
+        catalogSize = catalogSize + 1
+        if catalogSize > MAX_CHUNKS then return nil, "too_many_chunks" end
+        chunk = {
+          key = key,
+          mode = mode,
+          cx = cx,
+          cz = cz,
+          minX = x,
+          maxX = x,
+          minZ = z,
+          maxZ = z,
+          cells = 0,
+        }
+        byKey[key] = chunk
+      end
+      if x < chunk.minX then chunk.minX = x end
+      if x > chunk.maxX then chunk.maxX = x end
+      if z < chunk.minZ then chunk.minZ = z end
+      if z > chunk.maxZ then chunk.maxZ = z end
+      chunk.cells = chunk.cells + 1
+    end
+  end
+
+  local catalog = {}
+  for _, chunk in pairs(byKey) do catalog[#catalog + 1] = chunk end
+  table.sort(catalog, chunkComparator)
+  return catalog
+end
+
+local function exclusionSet(exclusions, mode)
+  local set = {}
+  if exclusions == nil then return set end
+  if type(exclusions) ~= "table" then return nil, "invalid_exclusions" end
+  local seen = 0
+  for _, item in ipairs(exclusions) do
+    seen = seen + 1

@@ -1,0 +1,289 @@
+  if command == "start" then
+    return startJob(payload)
+  elseif command == "stop" then
+    if not state.job then return false, "No active job." end
+    local mode = tostring(payload.mode or "pause_now")
+    local allowed = {
+      pause_now = true, finish_row = true, finish_layer = true,
+      return_home = true, abort = true,
+    }
+    if not allowed[mode] then return false, "Unknown staged stop mode: " .. mode end
+    state.stagedStop = {
+      mode = mode,
+      requestedAt = common.nowSeconds(),
+      requestedBy = payload.requestedBy and tostring(payload.requestedBy) or nil,
+      source = "stop",
+    }
+    if mode == "pause_now" then
+      state.request = "pause_now"
+      if state.status ~= "working" then state.status = "working" end
+    elseif mode == "return_home" or mode == "abort" then
+      state.request = mode
+      if mode == "abort" then state.completionReason = "aborted" end
+      if state.status ~= "working" then state.status = "working" end
+    elseif state.status ~= "working" then
+      state.status = "working"
+    end
+    saveState("stop_" .. mode)
+    return true, "Staged stop accepted: " .. mode
+  elseif command == "pause" then
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+      state.stagedStop = { mode = "pause_now", requestedAt = common.nowSeconds(), source = "pause" }
+      state.request = "pause_now"
+      if state.status ~= "working" then state.status = "working" end
+      saveState("pause")
+      return true, "Pause accepted; stopping at the next safe boundary."
+    end
+    return false, "Worker is not running."
+  elseif command == "resume" then
+    if state.status == "paused" or state.status == "blocked" then
+      if state.status == "blocked" then
+        local criticalPhase = {
+          state_corrupt = true,
+          gps_drift = true,
+          recovery_required = true,
+          gps_error = true,
+        }
+        if criticalPhase[tostring(state.phase or "")] then
+          return false, "Cannot resume from " .. tostring(state.phase) .. "; resolve GPS/state recovery or use REHOME first."
+        end
+      end
+      state.lastError = nil
+      state.stagedStop = false
+      if state.service then
+        state.status, state.phase = "working", "service_requested"
+      elseif isHome() and state.checkpoint and state.job then
+        state.service = { resumeAfter = true, finalStatus = "working", preserveCheckpoint = false, reason = "resume" }
+        state.status, state.phase = "working", "resume_service"
+      else
+        state.status, state.phase = "working", "mining"
+      end
+      state.request = nil
+      saveState("resume", true)
+      return true, "Resume accepted."
+    elseif state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+      state.status = "working"
+      saveState()
+      return true, "Service retry accepted."
+    end
+    return false, "Worker is not paused or blocked."
+  elseif command == "recall" then
+    if not state.job then return false, "No active job." end
+    state.request = "recall"
+    state.stagedStop = { mode = "return_home", requestedAt = common.nowSeconds(), source = "recall" }
+    if state.status ~= "working" then state.status = "working" end
+    saveState()
+    return true, "Recall accepted. Worker will return and pause."
+  elseif command == "service" then
+    if not state.job then return false, "No active job." end
+    state.request = "service"
+    if state.status ~= "working" then state.status = "working" end
+    saveState()
+    return true, "Service return accepted."
+  elseif command == "abort" then
+    if not state.job then return false, "No job to abort." end
+    state.request = "abort"
+    state.completionReason = "aborted"
+    state.stagedStop = { mode = "abort", requestedAt = common.nowSeconds(), source = "abort" }
+    if state.status ~= "working" then state.status = "working" end
+    saveState()
+    return true, "Abort accepted. Worker will return home."
+  elseif command == "clear" then
+    if state.pendingAction then return false, "Cannot clear while physical position is uncertain." end
+    if not isHome() then return false, "Worker must be at home." end
+    if state.job and state.status ~= "complete" and state.status ~= "aborted" then
+      return false, "Cannot clear an unfinished job; ABORT it first."
+    end
+    if not state.job and state.status ~= "idle" then
+      return false, "No clearable job record exists in the current state."
+    end
+    if state.service or state.request then
+      return false, "Cannot clear while service or a control request is pending."
+    end
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+      return false, "Worker is busy."
+    end
+    state.job, state.checkpoint, state.resumeToken, state.assignmentResumeToken, state.service, state.request = nil, nil, nil, nil, nil, nil
+    state.group, state.dock = nil, nil
+    state.stagedStop = false
+    state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
+    saveState()
+    return true, "Job record cleared."
+  elseif command == "calibrate_gps" then
+    return calibrateGPS()
+  elseif command == "gps_fix" then
+    local fix, err = locateGPS()
+    saveState()
+    if not fix then return false, err end
+    local verified, verifyError = verifyGPS(true)
+    if not verified then return false, verifyError end
+    return true, ("GPS fix: %d,%d,%d"):format(fix.x, fix.y, fix.z)
+  elseif command == "rehome" then
+    if payload.confirm ~= "RESET" then return false, "Rehome requires confirm=RESET." end
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+      return false, "Stop the worker before rehoming."
+    end
+    local calibration = gpsCalibration()
+    if calibration then
+      local fix, fixError = locateGPS()
+      if not fix then
+        return false, "GPS fix is required to verify the calibrated dock before REHOME: " .. tostring(fixError)
+      end
+      local expected = geo.localToWorld(calibration, { x = 0, y = 0, z = 0 })
+      if not geo.samePosition(fix, expected) then
+        return false, ("GPS says the turtle is at %d,%d,%d, not the calibrated dock %d,%d,%d."):format(
+          fix.x, fix.y, fix.z, expected.x, expected.y, expected.z
+        )
+      end
+    end
+    state.pose = { x = 0, y = 0, z = 0, dir = 0 }
+    state.job, state.checkpoint, state.resumeToken, state.assignmentResumeToken, state.service, state.request, state.pendingAction = nil, nil, nil, nil, nil, nil, nil
+    state.group, state.dock = nil, nil
+    state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
+    saveState()
+    return true, "Local position reset to home."
+  elseif command == "ping" or command == "status" then
+    return true, "Status sent."
+  end
+  return false, "Unknown command: " .. tostring(command)
+end
+
+local function handleMessage(sender, message)
+  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
+  if not valid then return end
+  if tonumber(config.controllerId or 0) > 0 and tonumber(sender) ~= tonumber(config.controllerId) then return end
+  if message.kind == "discover" then sendStatus(sender, message); return end
+  if message.kind ~= "command" then return end
+  if tonumber(message.target) ~= tonumber(os.getComputerID()) then return end
+  if commandSeen(message.id) then
+    sendAck(sender, message, true, "Duplicate command ignored; previous result retained.")
+    return
+  end
+  local payload = message.payload
+  local command = tostring(payload.command or "")
+  local ok, text = applyControlCommand(command, payload)
+  sendAck(sender, message, ok, text)
+  if command == "status" or command == "ping" or command == "gps_fix" then sendStatus(sender, message) end
+end
+
+pollNetwork = function(timeout)
+  if not networkReady then return false end
+  local sender, message = protocol.receive(timeout)
+  if not sender then return false end
+  handleMessage(sender, message)
+  return true
+end
+
+local function drainNetwork(limit)
+  for _ = 1, limit or 8 do if not pollNetwork(0) then break end end
+end
+
+local function heartbeat(force)
+  local now = common.nowSeconds()
+  if force or now - lastHeartbeat >= (config.heartbeatSeconds or 2) then
+    sendStatus()
+    lastHeartbeat = now
+  end
+end
+
+local function turnRight()
+  local after = poseCopy()
+  after.dir = (after.dir + 1) % 4
+  local prepared, prepareError = beginPhysicalAction("turn_right", nil, after)
+  if not prepared then return false, prepareError end
+  local ok, err = turtle.turnRight()
+  if not ok then cancelPhysicalAction(); return false, err or "Turn right failed." end
+  state.pose.dir = after.dir
+  state.stats.turns = (state.stats.turns or 0) + 1
+  commitPhysicalAction()
+  heartbeat(false)
+  drainNetwork(2)
+  return true
+end
+
+local function turnLeft()
+  local after = poseCopy()
+  after.dir = (after.dir + 3) % 4
+  local prepared, prepareError = beginPhysicalAction("turn_left", nil, after)
+  if not prepared then return false, prepareError end
+  local ok, err = turtle.turnLeft()
+  if not ok then cancelPhysicalAction(); return false, err or "Turn left failed." end
+  state.pose.dir = after.dir
+  state.stats.turns = (state.stats.turns or 0) + 1
+  commitPhysicalAction()
+  heartbeat(false)
+  drainNetwork(2)
+  return true
+end
+
+local function turnTo(targetDir)
+  targetDir = targetDir % 4
+  local diff = (targetDir - state.pose.dir) % 4
+  if diff == 1 then return turnRight() end
+  if diff == 2 then
+    local ok, err = turnRight()
+    if not ok then return false, err end
+    return turnRight()
+  end
+  if diff == 3 then return turnLeft() end
+  return true
+end
+
+local movement = {
+  forward = {
+    move = turtle.forward, inspect = turtle.inspect, dig = turtle.dig,
+    place = turtle.place, attack = turtle.attack, side = "front",
+  },
+  up = {
+    move = turtle.up, inspect = turtle.inspectUp, dig = turtle.digUp,
+    place = turtle.placeUp, attack = turtle.attackUp, side = "top",
+  },
+  down = {
+    move = turtle.down, inspect = turtle.inspectDown, dig = turtle.digDown,
+    place = turtle.placeDown, attack = turtle.attackDown, side = "bottom",
+  },
+}
+
+local function blockName(data)
+  return type(data) == "table" and tostring(data.name or "unknown") or "unknown"
+end
+
+local function isProtected(data)
+  local name = blockName(data)
+  return config.protectedBlocks and config.protectedBlocks[name] == true, name
+end
+
+local function isLava(data)
+  return string.lower(blockName(data)):find("lava", 1, true) ~= nil
+end
+
+local function isWater(data)
+  local name = string.lower(blockName(data))
+  return name:find("water", 1, true) ~= nil
+end
+
+local function waterMode()
+  local mode = state.job and state.job.waterMode
+  if not mode then mode = config.waterMode or (config.water and config.water.mode) or state.water.mode end
+  mode = tostring(mode or "ignore")
+  if mode ~= "ignore" and mode ~= "stop" and mode ~= "seal" then mode = "ignore" end
+  return mode
+end
+
+local function maxContinuousSeal()
+  return profileMaxContinuousSeal()
+end
+
+local function isInventoryBlock(side, data)
+  if peripheral and peripheral.hasType then
+    local ok, result = pcall(peripheral.hasType, side, "inventory")
+    if ok and result == true then return true end
+  end
+  local wrapped = peripheral and peripheral.wrap(side) or nil
+  if wrapped and (type(wrapped.list) == "function" or type(wrapped.size) == "function") then return true end
+  local name = string.lower(blockName(data))
+  for _, marker in ipairs({ "chest", "barrel", "shulker_box", "drawer", "crate", "vault" }) do
+    if name:find(marker, 1, true) then return true end
+  end
+  return false
+end

@@ -1,0 +1,274 @@
+      if cx and cz then key = chunkKey(plan.mode, cx, cz) end
+    end
+  else
+    key = value
+  end
+  if key == nil then return nil, "invalid_chunk" end
+  key = tostring(key)
+  if not plan.chunks[key] then return nil, "unknown_chunk:" .. key end
+  return key
+end
+
+function M.edgeTransition(plan, fromKey, toKey, y)
+  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
+  local from, fromError = normalizePlanKey(plan, fromKey)
+  if not from then return nil, fromError end
+  local to, toError = normalizePlanKey(plan, toKey)
+  if not to then return nil, toError end
+  local pointY = numberValue(y)
+  if y ~= nil and not pointY then return nil, "invalid_y" end
+  if from == to then return nil, "chunks_not_adjacent" end
+  local left, right = plan.chunks[from], plan.chunks[to]
+  local fromPoint, toPoint = edgeTransitionPoints(left, right, pointY or 0)
+  if not fromPoint then return nil, "chunks_not_adjacent" end
+  return {
+    from = { x = fromPoint.x, y = fromPoint.y, z = fromPoint.z },
+    to = { x = toPoint.x, y = toPoint.y, z = toPoint.z },
+    -- Numeric entries keep older worker adapters (which consumed a waypoint
+    -- array) compatible.  They are independent point tables, never aliases of
+    -- the named fields.
+    [1] = { x = fromPoint.x, y = fromPoint.y, z = fromPoint.z, kind = "from" },
+    [2] = { x = toPoint.x, y = toPoint.y, z = toPoint.z, kind = "to" },
+    fromKey = from,
+    toKey = to,
+    distance = math.abs(toPoint.x - fromPoint.x) + math.abs(toPoint.y - fromPoint.y) + math.abs(toPoint.z - fromPoint.z),
+  }
+end
+
+M.chunkTransition = M.edgeTransition
+M.neighborTransition = M.edgeTransition
+M.transitionPoint = M.edgeTransition
+
+local function routePointForChunk(chunk, y)
+  local pointY = numberValue(y) or 0
+  -- Integer midpoint keeps a route interior to the chunk for both odd and
+  -- even dimensions.  It is deliberately not the historical min corner.
+  return {
+    x = math.floor((chunk.minX + chunk.maxX) / 2),
+    y = pointY,
+    z = math.floor((chunk.minZ + chunk.maxZ) / 2),
+  }
+end
+
+local function normalizeRoutePose(plan, value, defaultKey, defaultY)
+  local key, point
+  if value == nil then
+    key = defaultKey
+  elseif type(value) == "string" or type(value) == "number" then
+    key = tostring(value)
+  elseif type(value) == "table" then
+    key = value.chunkKey or value.chunk or value.key
+    if key == nil and value.cx ~= nil and value.cz ~= nil then
+      local cx, cz = integerValue(value.cx), integerValue(value.cz)
+      if cx and cz then key = chunkKey(plan.mode, cx, cz) end
+    end
+    local nested = value.point or value.pose or value.position
+    local source = type(nested) == "table" and nested or value
+    local x, z = numberValue(source.x), numberValue(source.z)
+    local y = numberValue(source.y)
+    if x and z then point = { x = x, y = y or (numberValue(defaultY) or 0), z = z } end
+    if key == nil and x and z then key = M.findChunk(plan, x, z) end
+  end
+  if key == nil then return nil, nil, "invalid_pose" end
+  key = tostring(key)
+  local chunk = plan.chunks[key]
+  if not chunk then return nil, nil, "unknown_chunk:" .. key end
+  if point == nil then point = routePointForChunk(chunk, defaultY) end
+  if not contains(chunk, point.x, point.z) then
+    return nil, nil, "pose_outside_chunk"
+  end
+  return key, point
+end
+
+local function parentFallbackPath(plan, fromKey, toKey)
+  local fromRoot, fromError = M.pathFromRoot(plan, fromKey)
+  if not fromRoot then return nil, fromError end
+  local toRoot, toError = M.pathFromRoot(plan, toKey)
+  if not toRoot then return nil, toError end
+  local index = {}
+  for i, key in ipairs(fromRoot) do index[key] = i end
+  local commonFrom, commonTo
+  for i = #toRoot, 1, -1 do
+    if index[toRoot[i]] then commonFrom, commonTo = index[toRoot[i]], i; break end
+  end
+  if not commonFrom then return nil, "root_not_reached" end
+  local path = {}
+  -- pathFromRoot is ordered root -> node.  Walk the source node back to the
+  -- common ancestor, then continue down the target branch.
+  for i = #fromRoot, commonFrom, -1 do path[#path + 1] = fromRoot[i] end
+  for i = commonTo + 1, #toRoot do path[#path + 1] = toRoot[i] end
+  return path
+end
+
+local function appendRouteWaypoint(list, key, point, kind)
+  list[#list + 1] = {
+    chunkKey = tostring(key),
+    key = tostring(key),
+    x = point.x,
+    y = point.y,
+    z = point.z,
+    kind = kind,
+  }
+end
+
+function M.shortestServiceRoute(plan, fromPose, toPose, options)
+  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
+  options = type(options) == "table" and options or {}
+  local routeY = options.y
+  if routeY == nil and type(fromPose) == "table" then routeY = fromPose.y end
+  if routeY == nil and type(toPose) == "table" then routeY = toPose.y end
+  routeY = numberValue(routeY) or 0
+  if fromPose == nil and plan.rootKey and plan.chunks[plan.rootKey] and contains(plan.chunks[plan.rootKey], 0, 1) then
+    fromPose = { chunkKey = plan.rootKey, x = 0, y = routeY, z = 1 }
+  end
+  local fromKey, fromPoint, fromError = normalizeRoutePose(plan, fromPose, plan.rootKey, routeY)
+  if not fromKey then return nil, fromError end
+  local toKey, toPoint, toError = normalizeRoutePose(plan, toPose, nil, routeY)
+  if not toKey then return nil, toError end
+
+  local chunkKeys, pathError = shortestPathInternal(plan.chunks, fromKey, toKey)
+  local fallback = false
+  if not chunkKeys and options.allowFallback ~= false then
+    chunkKeys, pathError = parentFallbackPath(plan, fromKey, toKey)
+    fallback = chunkKeys ~= nil
+  end
+  if not chunkKeys then return nil, pathError or "chunks_disconnected" end
+
+  local waypoints, distance = {}, 0
+  local previousPoint = { x = fromPoint.x, y = fromPoint.y, z = fromPoint.z }
+  appendRouteWaypoint(waypoints, fromKey, previousPoint, "start")
+  for index = 1, #chunkKeys - 1 do
+    local leftKey, rightKey = chunkKeys[index], chunkKeys[index + 1]
+    local transition, transitionError = M.edgeTransition(plan, leftKey, rightKey, routeY)
+    if not transition then return nil, transitionError end
+    distance = distance + math.abs(previousPoint.x - transition.from.x)
+      + math.abs(previousPoint.y - transition.from.y)
+      + math.abs(previousPoint.z - transition.from.z)
+    appendRouteWaypoint(waypoints, leftKey, transition.from, "transition_from")
+    distance = distance + math.abs(transition.to.x - transition.from.x)
+      + math.abs(transition.to.y - transition.from.y)
+      + math.abs(transition.to.z - transition.from.z)
+    appendRouteWaypoint(waypoints, rightKey, transition.to, "transition_to")
+    previousPoint = { x = transition.to.x, y = transition.to.y, z = transition.to.z }
+  end
+  distance = distance + math.abs(previousPoint.x - toPoint.x)
+    + math.abs(previousPoint.y - toPoint.y)
+    + math.abs(previousPoint.z - toPoint.z)
+  appendRouteWaypoint(waypoints, toKey, toPoint, "target")
+  local normalizedKeys = (function()
+    local copy = {}; for i, key in ipairs(chunkKeys) do copy[i] = tostring(key) end; return copy
+  end)()
+  local function copyKeys()
+    local copy = {}; for i, key in ipairs(normalizedKeys) do copy[i] = key end; return copy
+  end
+  return {
+    chunkKeys = normalizedKeys,
+    -- Compatibility names are independent arrays; never alias chunkKeys in a
+    -- table persisted through CC's serializer.
+    keys = copyKeys(),
+    path = copyKeys(),
+    transitKeys = copyKeys(),
+    waypoints = waypoints,
+    distance = distance,
+    fallback = fallback,
+  }
+end
+
+M.serviceRoute = M.shortestServiceRoute
+M.shortestRoute = M.shortestServiceRoute
+M.chunkServiceRoute = M.shortestServiceRoute
+M.shortestServicePath = M.shortestServiceRoute
+
+-- A checkpoint helper used by resume/return callers.  It intentionally has the
+-- same result shape as shortestServiceRoute so callers can persist it without a
+-- second schema.  The root is always selected from the plan, not from a
+-- mutable worker pose.
+function M.checkpointWaypoints(plan, target, options)
+  if type(plan) ~= "table" then return nil, "invalid_chunk_plan" end
+  options = type(options) == "table" and options or {}
+  local rootPose = options.rootPose
+  if type(rootPose) ~= "table" then
+    rootPose = { chunkKey = plan.rootKey }
+    local rootChunk = plan.chunks and plan.chunks[plan.rootKey]
+    -- The quarry entrance is the stable root checkpoint.  If a custom plan
+    -- does not contain the canonical (0,1) entrance, the route helper falls
+    -- back to an interior midpoint instead of inventing a corner detour.
+    if rootChunk and contains(rootChunk, 0, 1) then rootPose.x, rootPose.z = 0, 1 end
+  end
+  return M.shortestServiceRoute(plan, rootPose, target, options)
+end
+
+M.rootTargetWaypoints = M.checkpointWaypoints
+M.safeWaypoints = M.checkpointWaypoints
+M.buildCheckpointRoute = M.checkpointWaypoints
+M.safeCheckpoint = M.checkpointWaypoints
+M.rootToTargetCheckpoint = M.checkpointWaypoints
+
+local function estimateOptions(job, options)
+  options = type(options) == "table" and options or {}
+  local interval = options.torchInterval or options.lightInterval
+    or options.torchEvery or options.torchEveryCells
+    or (type(job) == "table" and (job.torchInterval or job.lightInterval or job.torchEvery or job.torchEveryCells))
+    or 16
+  interval = integerValue(interval, 1, MAX_BLOCKS) or 16
+  return interval
+end
+
+-- Estimate a job without returning a per-cell table.  The fields intentionally
+-- carry both descriptive and compact aliases so callers can migrate gradually.
+function M.estimateJob(job, calibration, options)
+  if type(job) ~= "table" then return nil, "invalid_job" end
+  if type(calibration) == "table" and not validCalibration(calibration) and calibration.home == nil and calibration.forward == nil and options == nil then
+    options, calibration = calibration, nil
+  end
+  local validWidth, validLength, validDepth, columns = dimensions(job.width, job.length, job.depth)
+  if not validWidth then return nil, validLength end
+  if not validDepth then return nil, "invalid_dimensions" end
+  local plan, planError = M.buildChunkPlan(job, calibration)
+  if not plan then return nil, planError end
+  local selectedColumns = plan.columns
+  local totalCells = selectedColumns * validDepth
+  if totalCells > MAX_BLOCKS then return nil, "quarry_too_large" end
+  local interval = estimateOptions(job, options)
+  local selectedChunks = plan.selectedChunks or 0
+  local baseMovement = totalCells
+  local transitionMovement = math.max(0, selectedChunks - 1)
+  if selectedChunks > 1 then baseMovement = baseMovement + transitionMovement end
+
+  local endpoint
+  local noExclusions = (plan.excludedCount or 0) == 0
+  if selectedChunks == 0 then
+    endpoint = { x = 0, y = 0, z = 0 }
+  elseif selectedChunks == plan.catalogCount and plan.mode == "local" and noExclusions then
+    endpoint = M.cell(validWidth, validLength, validDepth, totalCells - 1)
+  else
+    local lastKey = plan.optimizedRoute[#plan.optimizedRoute]
+    local lastChunk = plan.chunks[lastKey]
+    endpoint = M.chunkCell(lastChunk, M.chunkCellCount(lastChunk) - 1, -(validDepth - 1))
+  end
+  endpoint = endpoint or { x = 0, y = 0, z = 0 }
+  local returnMovement = math.abs(endpoint.x) + math.abs(endpoint.y) + math.abs(endpoint.z)
+  local minimumFuel = baseMovement + returnMovement
+  local estimatedTorches = math.ceil(totalCells / interval)
+  return {
+    width = validWidth,
+    length = validLength,
+    depth = validDepth,
+    totalColumns = selectedColumns,
+    columns = selectedColumns,
+    surfaceCells = selectedColumns,
+    columnCells = selectedColumns,
+    minedCells = totalCells,
+    totalCells = totalCells,
+    cells = totalCells,
+    cellCount = totalCells,
+    totalBlocks = totalCells,
+    blocks = totalCells,
+    blockCount = totalCells,
+    total = totalCells,
+    baseMovement = baseMovement,
+    baseMoves = baseMovement,
+    baseDistance = baseMovement,
+    estimatedMovement = baseMovement,
+    transitionMovement = transitionMovement,
+    returnMovement = returnMovement,

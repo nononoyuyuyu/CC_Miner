@@ -1,0 +1,230 @@
+
+  -- Shared catalogs are expressed in the reference worker's local frame.
+  -- Rebase every catalog rectangle through world coordinates before building
+  -- the worker-local graph; this handles both offsets and cardinal rotations.
+  local referenceCalibration = options.referenceCalibration
+  if not referenceCalibration and type(catalog) == "table" then
+    referenceCalibration = catalog.referenceCalibration or catalog.calibrationSeed or catalog.calibration
+    if not referenceCalibration and type(catalog.catalog) == "table" then
+      referenceCalibration = catalog.catalog.referenceCalibration or catalog.catalog.calibrationSeed or catalog.catalog.calibration
+    end
+  end
+  local workerCalibration = options.workerCalibration or options.calibration
+  if workerCalibration and not referenceCalibration then return nil, "reference_calibration_required" end
+  if referenceCalibration and not validCalibration(referenceCalibration) then return nil, "invalid_reference_calibration" end
+  if workerCalibration and not validCalibration(workerCalibration) then return nil, "invalid_worker_calibration" end
+  local referenceRootKey = options.referenceRootKey or (type(catalog) == "table" and catalog.rootKey)
+  if not referenceRootKey and type(catalog) == "table" and type(catalog.catalog) == "table" then
+    referenceRootKey = catalog.catalog.rootKey
+  end
+  if referenceRootKey ~= nil then referenceRootKey = tostring(referenceRootKey) end
+  if not referenceRootKey then
+    for _, key in ipairs(sourceKeys) do
+      if contains(sourceChunks[key], 0, 1) then referenceRootKey = key; break end
+    end
+  end
+  local function rebaseBounds(chunk)
+    if not workerCalibration then return true end
+    local minX, maxX, minZ, maxZ = chunk.minX, chunk.maxX, chunk.minZ, chunk.maxZ
+    local corners = {
+      { x = minX, z = minZ }, { x = minX, z = maxZ },
+      { x = maxX, z = minZ }, { x = maxX, z = maxZ },
+    }
+    local rebasedMinX, rebasedMaxX, rebasedMinZ, rebasedMaxZ
+    for _, corner in ipairs(corners) do
+      local worldX, worldZ = localToWorld(referenceCalibration, corner.x, corner.z)
+      local localX, localZ, rebaseError = worldToLocalXZ(workerCalibration, worldX, worldZ)
+      if not localX or not localZ then return nil, rebaseError or "invalid_rebase" end
+      if localX % 1 ~= 0 or localZ % 1 ~= 0 then return nil, "non_integral_rebase" end
+      rebasedMinX = rebasedMinX and math.min(rebasedMinX, localX) or localX
+      rebasedMaxX = rebasedMaxX and math.max(rebasedMaxX, localX) or localX
+      rebasedMinZ = rebasedMinZ and math.min(rebasedMinZ, localZ) or localZ
+      rebasedMaxZ = rebasedMaxZ and math.max(rebasedMaxZ, localZ) or localZ
+    end
+    chunk.referenceMinX, chunk.referenceMaxX = minX, maxX
+    chunk.referenceMinZ, chunk.referenceMaxZ = minZ, maxZ
+    chunk.minX, chunk.maxX = rebasedMinX, rebasedMaxX
+    chunk.minZ, chunk.maxZ = rebasedMinZ, rebasedMaxZ
+    return true
+  end
+  for _, key in ipairs(sourceKeys) do
+    local ok, rebaseError = rebaseBounds(sourceChunks[key])
+    if not ok then return nil, rebaseError end
+  end
+  if not assignedConnected(sourceChunks, mineKeys) then return nil, "assigned_chunks_disconnected" end
+
+  local seedKey = options.seedKey or (assignment and assignment.seedKey) or mineKeys[1]
+  if seedKey ~= nil then seedKey = tostring(seedKey) end
+  if not seedKey or not mineSet[seedKey] then return nil, "assigned_seed_not_mineable" end
+  local rootKey = options.rootKey or referenceRootKey or sourceKeys[1]
+  rootKey = rootKey and tostring(rootKey) or nil
+  local dockKey = options.dockKey or options.entranceKey or rootKey
+  dockKey = dockKey and tostring(dockKey) or nil
+  if workerCalibration then
+    local dockWorldX, dockWorldZ = localToWorld(workerCalibration, 0, 1)
+    local expectedDockKey = chunkKey("world", math.floor(dockWorldX / 16), math.floor(dockWorldZ / 16))
+    if not sourceChunks[expectedDockKey] then return nil, "worker_entrance_chunk_missing" end
+    if options.dockKey and tostring(options.dockKey) ~= expectedDockKey then return nil, "worker_dock_chunk_mismatch" end
+    dockKey = expectedDockKey
+    -- A group may share one controller dock while workers enter from
+    -- distinct bay chunks.  The worker-local entrance therefore need only be
+    -- present in the catalog and explicitly mineable/transit-allowed below;
+    -- it is not required to equal the reference worker's root chunk.
+  end
+  if not dockKey or not sourceChunks[dockKey] then return nil, "unknown_dock_chunk" end
+  if not mineSet[dockKey] and not transitSet[dockKey] then
+    return nil, "dock_requires_explicit_transit:" .. dockKey
+  end
+
+  local allSet, allKeys = {}, {}
+  for _, key in ipairs(mineKeys) do allSet[key] = true; allKeys[#allKeys + 1] = key end
+  for _, key in ipairs(transitKeys) do
+    if not allSet[key] then allSet[key] = true; allKeys[#allKeys + 1] = key end
+  end
+  table.sort(allKeys, function(left, right) return chunkComparator(sourceChunks[left], sourceChunks[right]) end)
+  local chunks = {}
+  for _, key in ipairs(allKeys) do
+    local source = sourceByKey[key] or sourceChunks[key]
+    local copy = cloneValue(source)
+    if type(copy) ~= "table" then return nil, "invalid_chunk_catalog" end
+    copy.key, copy.mode = key, "world"
+    copy.cx, copy.cz = sourceChunks[key].cx, sourceChunks[key].cz
+    copy.minX, copy.maxX = sourceChunks[key].minX, sourceChunks[key].maxX
+    copy.minZ, copy.maxZ = sourceChunks[key].minZ, sourceChunks[key].maxZ
+    copy.referenceMinX, copy.referenceMaxX = sourceChunks[key].referenceMinX, sourceChunks[key].referenceMaxX
+    copy.referenceMinZ, copy.referenceMaxZ = sourceChunks[key].referenceMinZ, sourceChunks[key].referenceMaxZ
+    copy.cells = sourceChunks[key].cells
+    copy.mine = mineSet[key] == true
+    copy.transit = transitSet[key] == true and not copy.mine
+    copy.parent, copy.anchor, copy.optimizedAnchor = nil, nil, nil
+    chunks[key] = copy
+  end
+  buildNeighborGraph(chunks, allKeys)
+
+  -- Every non-assigned edge on dock -> seed must be explicitly leased as
+  -- transit.  This also permits an entrance outside the worker's mine region
+  -- without silently granting access to arbitrary shared chunks.
+  local servicePath, serviceError = shortestPathInternal(chunks, dockKey, seedKey)
+  if not servicePath then return nil, serviceError or "service_route_disconnected" end
+  for _, key in ipairs(servicePath) do
+    if not mineSet[key] and not transitSet[key] then return nil, "service_route_requires_transit:" .. key end
+  end
+
+  -- Runtime movement still consumes `chunk.anchor`, including on older
+  -- workers that do not understand serviceRoute waypoints.  Populate every
+  -- mine/transit chunk with independent valid cells before constructing the
+  -- assigned DFS walk.
+  for _, key in ipairs(allKeys) do
+    local chunk = chunks[key]
+    local anchor = M.chunkAnchor(chunk) or { x = chunk.minX, z = chunk.minZ }
+    chunk.anchor = { x = anchor.x, z = anchor.z }
+  end
+  if chunks[seedKey] then
+    local entranceAnchor = contains(chunks[seedKey], 0, 1)
+      and { x = 0, z = 1 }
+      or M.chunkAnchor(chunks[seedKey], { x = 0, z = 1 })
+    if entranceAnchor then chunks[seedKey].anchor = { x = entranceAnchor.x, z = entranceAnchor.z } end
+  end
+  if chunks[dockKey] then
+    local dockAnchor = contains(chunks[dockKey], 0, 1)
+      and { x = 0, z = 1 }
+      or M.chunkAnchor(chunks[dockKey], { x = 0, z = 1 })
+    if dockAnchor then chunks[dockKey].anchor = { x = dockAnchor.x, z = dockAnchor.z } end
+  end
+  for index = 2, #servicePath do
+    local previousKey, currentKey = servicePath[index - 1], servicePath[index]
+    local boundary = M.chunkAnchor(chunks[currentKey], chunks[previousKey])
+    if boundary and currentKey ~= seedKey then chunks[currentKey].anchor = { x = boundary.x, z = boundary.z } end
+  end
+
+  local walk, visited = assignedWalk(chunks, mineKeys, seedKey, mineSet)
+  for _, key in ipairs(mineKeys) do
+    if not visited[key] then return nil, "assigned_chunks_disconnected" end
+  end
+  local mineCopies = {}
+  for _, key in ipairs(mineKeys) do mineCopies[key] = cloneValue(chunks[key]); mineCopies[key].neighbors = {} end
+  buildNeighborGraph(mineCopies, mineKeys)
+  local optimized, optimizedOrder = optimizedWalk(mineCopies, mineKeys, seedKey)
+  for _, key in ipairs(mineKeys) do
+    if mineCopies[key].optimizedAnchor then
+      chunks[key].optimizedAnchor = { x = mineCopies[key].optimizedAnchor.x, z = mineCopies[key].optimizedAnchor.z }
+    end
+  end
+  local routeCopy = {}
+  for index, key in ipairs(optimizedOrder) do routeCopy[index] = key end
+  local assignedColumns = 0
+  local assignedBounds
+  for _, key in ipairs(mineKeys) do assignedColumns = assignedColumns + chunks[key].cells end
+  for _, key in ipairs(mineKeys) do
+    local chunk = chunks[key]
+    assignedBounds = assignedBounds or { minX = chunk.minX, maxX = chunk.maxX, minZ = chunk.minZ, maxZ = chunk.maxZ }
+    assignedBounds.minX, assignedBounds.maxX = math.min(assignedBounds.minX, chunk.minX), math.max(assignedBounds.maxX, chunk.maxX)
+    assignedBounds.minZ, assignedBounds.maxZ = math.min(assignedBounds.minZ, chunk.minZ), math.max(assignedBounds.maxZ, chunk.maxZ)
+  end
+  local servicePlan = {
+    mode = "world", chunks = chunks, rootKey = dockKey,
+  }
+  local dockPose = { chunkKey = dockKey }
+  if chunks[dockKey] then
+    local dockAnchor = chunks[dockKey].anchor
+    if contains(chunks[dockKey], 0, 1) then
+      dockPose.x, dockPose.z = 0, 1
+    elseif dockAnchor then
+      dockPose.x, dockPose.z = dockAnchor.x, dockAnchor.z
+    end
+  end
+  local serviceRoute = M.shortestServiceRoute(servicePlan,
+    dockPose, { chunkKey = seedKey }, { y = options.y or options.bottomY or 0 })
+  if not serviceRoute then return nil, "service_route_disconnected" end
+  return {
+    mode = "world",
+    rootKey = seedKey,
+    dockKey = dockKey,
+    entranceKey = dockKey,
+    seedKey = seedKey,
+    chunks = chunks,
+    assignedKeys = cloneStringArray(mineKeys),
+    mineChunkKeys = cloneStringArray(mineKeys),
+    transitKeys = cloneStringArray(transitKeys),
+    serviceRoute = {
+      chunkKeys = cloneStringArray(serviceRoute.chunkKeys),
+      keys = cloneStringArray(serviceRoute.keys or serviceRoute.chunkKeys),
+      path = cloneStringArray(serviceRoute.path or serviceRoute.chunkKeys),
+      transitKeys = cloneStringArray(serviceRoute.transitKeys or serviceRoute.chunkKeys),
+      waypoints = cloneValue(serviceRoute.waypoints),
+      distance = serviceRoute.distance,
+      fallback = serviceRoute.fallback,
+    },
+    transitRouteKeys = cloneStringArray(servicePath),
+    walk = walk,
+    optimizedWalk = optimized,
+    optimizedRoute = optimizedOrder,
+    route = routeCopy,
+    columns = assignedColumns,
+    selectedChunks = #mineKeys,
+    catalogCount = #sourceKeys,
+    bounds = assignedBounds,
+    referenceCalibration = cloneValue(referenceCalibration),
+    workerCalibration = cloneValue(workerCalibration),
+    workerId = assignment and assignment.workerId or options.workerId,
+    groupJobId = assignment and assignment.groupJobId or options.groupJobId,
+    homeY = assignment and assignment.homeY or options.homeY,
+    bottomY = assignment and assignment.bottomY or options.bottomY,
+    depth = assignment and assignment.layers or options.layers,
+  }
+end
+
+M.assignedChunkPlan = M.buildAssignedChunkPlan
+M.buildWorkerChunkPlan = M.buildAssignedChunkPlan
+M.planAssignedChunks = M.buildAssignedChunkPlan
+M.planAssignment = M.buildAssignedChunkPlan
+M.buildAssignmentPlan = M.buildAssignedChunkPlan
+
+local function boundsFrom(value, length, options)
+  options = type(options) == "table" and options or {}
+  local minX, maxX, minZ, maxZ
+  if type(value) == "table" then
+    if value.minX ~= nil and value.maxX ~= nil and value.minZ ~= nil and value.maxZ ~= nil then
+      minX, maxX = integerValue(value.minX), integerValue(value.maxX)
+      minZ, maxZ = integerValue(value.minZ), integerValue(value.maxZ)
+    elseif value.width ~= nil and value.length ~= nil then

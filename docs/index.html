@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="CC Miner V4 の導入、GPS、ドック、操作、安全、検証をまとめた日本語マニュアル">
+  <title>CC Miner V4 マニュアル</title>
+  <link rel="stylesheet" href="assets/manual.css">
+</head>
+<body>
+<a class="skip-link" href="#main">本文へ移動</a>
+<header class="site-header"><div class="container header-inner">
+  <a class="brand" href="index.html">CC Miner V4 マニュアル</a>
+  <span class="header-note">CC: Restitched / CC:Tweaked 向け</span>
+  <details class="nav-toggle"><summary>目次</summary><nav class="site-nav" aria-label="ページ移動">
+    <a data-page href="index.html">入口</a><a data-page href="overview.html">概要</a><a data-page href="install.html">導入</a><a data-page href="build-gps.html">建築・GPS</a><a data-page href="worker-dock.html">ワーカー・ドック</a><a data-page href="controller.html">controller</a><a data-page href="operation.html">操作</a><a data-page href="groups.html">group / discard</a><a data-page href="performance.html">性能</a><a data-page href="safety.html">安全</a><a data-page href="troubleshooting.html">切分け</a><a data-page href="testing.html">検証</a><a data-page href="sources.html">参照</a>
+  </nav></details>
+</div></header>
+<div class="container layout">
+  <aside class="toc" aria-label="マニュアル目次"><h2>目次</h2><ul>
+    <li><a data-page href="index.html">入口</a></li><li><a data-page href="overview.html">概要・優先度</a></li><li><a data-page href="install.html">導入・更新</a></li><li><a data-page href="build-gps.html">建築と GPS</a></li><li><a data-page href="worker-dock.html">ワーカーとドック</a></li><li><a data-page href="controller.html">controller</a></li><li><a data-page href="operation.html">日常操作</a></li><li><a data-page href="groups.html">group / discard</a></li><li><a data-page href="performance.html">性能と見積</a></li><li><a data-page href="safety.html">安全設計</a></li><li><a data-page href="troubleshooting.html">トラブル切分け</a></li><li><a data-page href="testing.html">検証</a></li><li><a data-page href="sources.html">参照資料</a></li>
+  </ul></aside>
+  <main id="main" class="main">
+    <nav class="breadcrumbs" aria-label="パンくず"><a href="index.html">マニュアル</a> / 入口</nav>
+    <section class="hero">
+      <p class="tag p0">V4.0.0 / schema 4</p>
+      <h1>CC Miner を安全に始める</h1>
+      <p>CC Miner V4 は Advanced Mining Turtle と Advanced Computer で、チャンク単位の遠隔クアリーを復旧可能な状態機械として運転します。この入口から、初回設置、GPS 校正、ジョブ作成、停止・復旧までを順に確認できます。</p>
+      <div class="card-grid">
+        <div class="card"><h3>初めての方</h3><p><a href="install.html">導入・更新</a> → <a href="build-gps.html">建築と GPS</a> → <a href="operation.html">初回ジョブ</a>の順で進めます。</p></div>
+        <div class="card"><h3>今、停止した方</h3><p>タートルを動かさず、<a href="troubleshooting.html#recovery">復旧 wizard</a>と <code>waiting_*</code> の切分けを確認します。</p></div>
+        <div class="card"><h3>仕様を確認したい方</h3><p><a href="overview.html#priorities">P0 / P1 / P2</a>、<a href="groups.html">group / discard</a>、<a href="performance.html#bottom-y">絶対 BOTTOM Y</a>を参照します。</p></div>
+      </div>
+    </section>
+
+    <h2 id="quickstart">最短の初回手順</h2>
+    <ol class="steps">
+      <li><div><strong>役割を導入する。</strong> worker、controller、必要なら GPS host を同じネットワークキーで設定します。HTTP が使えない場合は offline bundle を使います。</div></li>
+      <li><div><strong>ドックを小さく作る。</strong> 後ろに搬出、上に燃料、seal=右、torch=左の専用チェストを置き、入口を空けます。</div></li>
+      <li><div><strong>GPS を使うなら CAL。</strong> 4 台以上のホストを異なる高さに置き、モデム座標を登録します。正面を 1 ブロック空け、GPS CAL の往復を完了します。</div></li>
+      <li><div><strong>小さい job を preview。</strong> 幅・長さ・深さ、SAFE/BALANCED/TURBO、chunk grid、液体・照明を入力し、preflight の fatal がゼロであることを確認します。</div></li>
+      <li><div><strong>運転中は境界で止める。</strong> PAUSE / STOP / RECALL を使い、手動でタートルを押したり回したりしません。完了後は report と補給結果を確認します。</div></li>
+    </ol>
+
+    <div class="callout warning"><strong>対象外の境界。</strong> CC Miner はチャンクロード状態を取得・表示・自動化しません。必要なロード範囲はサーバー／Modpack 管理者が用意します。管理者権限、認証基盤、強い暗号化も提供しません。</div>
+
+    <h2 id="commands">よく使うコマンド</h2>
+    <pre><code>ccm dashboard
+ccm discover
+ccm status
+ccm report
+ccm doctor
+ccm logs
+ccm start &lt;id&gt; &lt;width&gt; &lt;length&gt; &lt;depth&gt;
+ccm pause|resume|recall|service|abort|clear &lt;id&gt;
+ccm dock register &lt;id&gt; &lt;x&gt; &lt;y&gt; &lt;z&gt; [facing] [maxDepth]
+ccm bay register &lt;id&gt; &lt;x&gt; &lt;y&gt; &lt;z&gt; [facing] [maxDepth]
+ccm group register &lt;id&gt; &lt;workerIds comma&gt; [name dock bay mode partition workerBayMap workerDockMap]
+ccm group list|show|start|pause|resume|return|service|abort|clear|reassign &lt;id&gt;
+ccm gps &lt;id&gt;
+ccm calibrate &lt;id&gt;
+ccm rehome &lt;id&gt; RESET</code></pre>
+    <p class="small">CLI の <code>start</code> は簡易入口です。chunk grid、profile、queue、段階停止、history/report は dashboard から操作します。</p>
+
+    <h2 id="links">ページの使い分け</h2>
+    <div class="table-wrap"><table><thead><tr><th>目的</th><th>読むページ</th><th>要点</th></tr></thead><tbody>
+      <tr><td>構成を理解</td><td><a href="overview.html">概要・優先度</a></td><td>P0/P1/P2、状態機械、非対応範囲。</td></tr>
+      <tr><td>設置・GPS</td><td><a href="build-gps.html">建築と GPS</a> / <a href="worker-dock.html">ワーカーとドック</a></td><td>高さ、座標、モデム、起動、校正、失敗切分け。</td></tr>
+      <tr><td>UI・job</td><td><a href="controller.html">controller</a> / <a href="operation.html">日常操作</a></td><td>preflight、grid、queue、group、stop、report。</td></tr>
+      <tr><td>安全・復旧</td><td><a href="safety.html">安全設計</a> / <a href="troubleshooting.html">トラブル切分け</a></td><td>絶対 BOTTOM Y、液体、照明、low-space update、REHOME。</td></tr>
+      <tr><td>開発・受入</td><td><a href="performance.html">性能</a> / <a href="testing.html">検証</a> / <a href="sources.html">参照</a></td><td>速度の意味、静的検査、一次資料。</td></tr>
+    </tbody></table></div>
+    <nav class="pager" aria-label="ページ送り"><span></span><a href="overview.html">次へ：概要・優先度 →</a></nav>
+  </main>
+</div>
+<footer class="site-footer"><div class="container">CC Miner V4 マニュアル。本文は日本語。配布物と runtime の仕様はリポジトリの source を正とします。</div></footer>
+<script src="assets/manual.js" defer></script>
+</body></html>

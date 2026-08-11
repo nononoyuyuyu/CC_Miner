@@ -1,0 +1,190 @@
+  local minimum = field == "targetY" and -fieldLimits.targetY or 1
+  local maximum = fieldLimits[field] or 512
+  draft[field], draft.buffer = common.clamp(value + delta, minimum, maximum), nil
+  draft.buffer = tostring(draft[field])
+end
+
+local function writeHeader(title, target, background)
+  local width = target.getSize()
+  common.writeAt(1, 1, common.center(title, width), colors and colors.black or nil, background or (colors and colors.cyan or nil))
+end
+
+local function noticeLine(target, y)
+  local width, height = target.getSize()
+  y = y or height
+  if y < 1 then return end
+  local noticeColor = noticeIsError and (colors and colors.red or nil) or (colors and colors.lime or nil)
+  common.writeAt(1, y, common.fit(notice, width), noticeColor)
+end
+
+local function statusGlyph(state)
+  return ({ ok = "OK", warn = "!!", bad = "XX" })[state] or "??"
+end
+
+local function renderDashboard(target, key)
+  local width, height = target.getSize()
+  writeHeader("CC MINER V4 TOUCH CONTROL", target)
+  local ids = orderedIds()
+  local online = 0
+  for _, id in ipairs(ids) do if statusOf(workers[id]) ~= "offline" then online = online + 1 end end
+  common.writeAt(1, 2, common.fit(("Controller #%d | Workers %d/%d | Q%d H%d"):format(os.getComputerID(), online, #ids, #db.queue, #db.history), width), colors and colors.lightGray or nil)
+  local headerY = 4
+  common.writeAt(1, headerY, common.fit(width >= 48 and " ID    NAME           STATUS       PROGRESS       FUEL" or " ID NAME      STATUS   PROGRESS", width), colors and colors.yellow or nil)
+  local maxRows = math.max(1, height - 10)
+  if #ids == 0 then
+    common.writeAt(2, headerY + 2, common.fit("No workers. DISCOVER (D).", math.max(1, width - 2)), colors and colors.lightGray or nil)
+  else
+    local first = selected > maxRows and selected - maxRows + 1 or 1
+    for row = 1, maxRows do
+      local index = first + row - 1
+      local id = ids[index]
+      if not id then break end
+      local worker, data = workers[id], workers[id].data or {}
+      local status = statusOf(worker)
+      local line
+      if width >= 48 then
+        line = ("%s%-5s %-14s %-12s %-16s %-7s"):format(index == selected and ">" or " ", tostring(id), common.fit(workerLabel(worker, id), 14), common.fit(status, 12), common.fit(progressText(data), 16), tostring(data.fuel or "-"))
+      else
+        line = ("%s%-3s %-10s %-8s %s"):format(index == selected and ">" or " ", tostring(id), common.fit(workerLabel(worker, id), 10), common.fit(status, 8), progressText(data))
+      end
+      local y = headerY + row
+      common.writeAt(1, y, common.fit(line, width), index == selected and (colors and colors.black or nil) or common.statusColor(status), index == selected and (colors and colors.white or nil) or (colors and colors.black or nil))
+      addHitbox(key, 1, y, width, y, function() selected = index; invalidate() end)
+    end
+  end
+  local bottom = math.max(1, height - 4)
+  buttonRow(key, bottom, width, {
+    { "DISCOVER", dashboardAction("discover") }, { "NEW JOB", dashboardAction("new") },
+    { "PROGRESS", dashboardAction("progress") }, { "INFO", dashboardAction("info") },
+  })
+  buttonRow(key, bottom + 1, width, {
+    { "STOP", dashboardAction("stop") }, { "RECOVERY", dashboardAction("recovery") },
+    { "REPORT", dashboardAction("report") }, { "GPS", dashboardAction("gps") },
+  })
+  buttonRow(key, bottom + 2, width, {
+    { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
+    { "RECALL", dashboardAction("recall") }, { "SERVICE", dashboardAction("service") },
+  })
+  buttonRow(key, bottom + 3, width, {
+    { "ABORT", dashboardAction("abort") }, { "CLEAR", dashboardAction("clear") },
+    { "REHOME", dashboardAction("rehome") }, { "QUIT", dashboardAction("quit") },
+  })
+  -- Group controls are additive; the legacy single-worker rows above remain
+  -- unchanged so old monitors and keyboard shortcuts continue to work.
+  buttonRow(key, math.max(1, bottom - 1), width, {
+    { "GROUPS", dashboardAction("groups") }, { "G START", dashboardAction("group_start") },
+    { "G PAUSE", dashboardAction("group_pause") }, { "G RETURN", dashboardAction("group_return") },
+  })
+  local groupIds = orderedGroupIds()
+  if #groupIds > 0 then
+    local gy = math.max(2, bottom - 2)
+    local gid, g = selectedGroupRecord()
+    local gj = gid and activeGroupJob(gid) or nil
+    local aggregate = gj and (gj.aggregate or updateGroupAggregate(gj)) or nil
+    local line = ("Group %s %s %d workers %s%% minFuel=%s ACK=%s/%s"):format(tostring(gid), groupName(g, gid), #(groupWorkerIds(g)), tostring(aggregate and aggregate.percent or 0), tostring(aggregate and aggregate.minFuel or "-"), tostring(aggregate and aggregate.acks or 0), tostring(aggregate and aggregate.ackTotal or #groupWorkerIds(g)))
+    common.writeAt(1, gy, common.fit(line, width), colors and colors.cyan or nil)
+  end
+  noticeLine(target, height)
+end
+
+local function groupAction(groupCommandName)
+  return function()
+    local gid = selectedGroupRecord()
+    if not gid then setNotice("No group selected.", true); return end
+    if groupCommandName == "start" then
+      groupDraft = groupDraftDefaults(groupRecord(gid))
+      groupDraft.selectedField = "width"
+      groupDraft.buffer = tostring(groupDraft.width or 1)
+      groupDraft.preflight = nil
+      mode = "group_dimensions"
+    else
+      groupCommand(gid, groupCommandName)
+    end
+    invalidate()
+  end
+end
+
+local function groupAssignmentCount(result)
+  local count = 0
+  for _, assignment in pairs(result and result.assignments or {}) do if type(assignment) == "table" then count = count + 1 end end
+  return count
+end
+
+local function renderGroupDimensions(target, key)
+  local width, height = target.getSize()
+  local gid, group = selectedGroupRecord()
+  writeHeader("GROUP JOB / DIMENSIONS", target, colors and colors.cyan or nil)
+  if not gid or not group then
+    common.writeAt(1, 3, common.fit("No group selected.", width), colors and colors.yellow or nil)
+    buttonRow(key, math.max(1, height - 2), width, { { "BACK", function() mode = "groups" end } })
+    noticeLine(target, height)
+    return
+  end
+  groupDraft = groupDraft or groupDraftDefaults(group)
+  local ids = groupWorkerIds(group)
+  local worldMode = groupDraftWorldMode()
+  common.writeAt(1, 2, common.fit(("Group %s (%s) | workers=%d | %s | partition=%s"):format(groupName(group, gid), tostring(gid), #ids, worldMode and "WORLD" or "LOCAL", tostring(groupDraft.partition or group.partition or "stripe")), width), colors and colors.lightGray or nil)
+  common.writeAt(1, 3, common.fit(worldMode and "BOTTOM Y is absolute; each worker reports HOME Y/LAYERS." or "LOCAL uses DEPTH; multi-worker automatic splitting is disabled.", width), colors and colors.lightGray or nil)
+  local visibleFields = groupFieldOrder()
+  local fieldWidth = math.min(32, math.max(14, math.floor(width * 0.52)))
+  local rows = math.min(#visibleFields, math.max(1, math.floor((height - 13) / 2)))
+  for index = 1, rows do
+    local field = visibleFields[index]
+    local y = 4 + (index - 1) * 2
+    local active = groupDraft.selectedField == field
+    local shown = active and groupDraft.buffer or tostring(groupDraft[field] or 0)
+    common.writeAt(1, y, common.fit(fieldLabels[field], fieldWidth - 2), active and (colors and colors.black or nil) or (colors and colors.white or nil), active and (colors and colors.yellow or nil) or (colors and colors.black or nil))
+    drawButton(key, 1, y + 1, 3, "-", function() adjustGroupDraft(field, -1) end, true)
+    drawButton(key, 5, y + 1, math.max(5, fieldWidth - 11), shown, function() chooseGroupDraftField(field) end, true, active)
+    drawButton(key, fieldWidth - 5, y + 1, 3, "+", function() adjustGroupDraft(field, 1) end, true)
+  end
+  local keypadX = math.min(width - 12, fieldWidth + 2)
+  local keypadWidth = math.max(12, width - keypadX + 1)
+  local cellWidth = math.max(4, math.floor(keypadWidth / 3))
+  local labels = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "CLR", "0", "<" }
+  for index, label in ipairs(labels) do
+    local row = math.floor((index - 1) / 3)
+    local column = (index - 1) % 3
+    local x, y = keypadX + column * cellWidth, 4 + row * 2
+    if y <= height - 8 then
+      local action
+      if label == "CLR" then action = function() groupDraft.buffer = "0" end
+      elseif label == "<" then action = groupDraftBackspace
+      else local digit = label; action = function() groupDraftDigit(digit) end end
+      drawButton(key, x, y, math.max(3, cellWidth - 1), label, action, true)
+      addHitbox(key, x, y, x + math.max(2, cellWidth - 2), math.min(height - 8, y + 1), action)
+    end
+  end
+  local summaryY = math.max(8, height - 10)
+  local homeBits = {}
+  for _, id in ipairs(ids) do
+    local data = workerData(id) or {}
+    local homeY = data.homeY or data.gps and data.gps.calibration and data.gps.calibration.home and data.gps.calibration.home.y or "-"
+    homeBits[#homeBits + 1] = "#" .. tostring(id) .. " HOME=" .. tostring(homeY)
+  end
+  common.writeAt(1, summaryY, common.fit(table.concat(homeBits, " "), width), colors and colors.lightGray or nil)
+  local result = groupDraft.preflight
+  if result then
+    local assignmentText = (result.fatal and "PREFLIGHT BLOCKED" or "PREFLIGHT OK") .. " assignments=" .. tostring(groupAssignmentCount(result)) .. "/" .. tostring(#ids) .. " chunks=" .. tostring(result.selectedChunks or 0)
+    common.writeAt(1, summaryY + 1, common.fit(assignmentText, width), result.fatal and (colors and colors.red or nil) or (colors and colors.lime or nil))
+    local row = summaryY + 2
+    for _, id in ipairs(ids) do
+      if row >= height - 5 then break end
+      local assignment = result.assignments and (result.assignments[tostring(id)] or result.assignments[id]) or nil
+      local chunks = assignment and #(assignment.chunkKeys or {}) or 0
+      local homeY = assignment and assignment.homeY or (workerData(id) or {}).homeY or "-"
+      local layers = assignment and assignment.layers or (homeY ~= "-" and result.bottomY and tonumber(homeY) and math.floor(tonumber(homeY) - tonumber(result.bottomY) + 1) or "-")
+      common.writeAt(1, row, common.fit(("#%s chunks=%d HOME Y=%s LAYERS=%s"):format(tostring(id), chunks, tostring(homeY), tostring(layers)), width), colors and colors.white or nil)
+      row = row + 1
+    end
+  else
+    common.writeAt(1, summaryY + 1, common.fit("PRECHECK required before START.", width), colors and colors.yellow or nil)
+  end
+  buttonRow(key, math.max(1, height - 4), width, {
+    { "LIGHT " .. tostring(groupDraft.lighting and groupDraft.lighting.mode or "safe"), function() local modes = { "off", "safe", "custom" }; local now = groupDraft.lighting and groupDraft.lighting.mode or "safe"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; groupDraft.lighting.mode = modes[n % #modes + 1]; groupDraft.preflight = nil; invalidate() end },
+    { "WATER " .. tostring(groupDraft.waterMode or "seal"), function() local modes = { "ignore", "stop", "seal" }; local now = groupDraft.waterMode or "seal"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; groupDraft.waterMode = modes[n % #modes + 1]; groupDraft.preflight = nil; invalidate() end },
+    { "PROFILE " .. tostring(groupDraft.profile or "balanced"), function() local modes = { "safe", "balanced", "turbo" }; local now = groupDraft.profile or "balanced"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; groupDraft.profile = modes[n % #modes + 1]; groupDraft.preflight = nil; invalidate() end },
+    { "PART " .. tostring(groupDraft.partition or group.partition or "stripe"), function() groupDraft.partition = (tostring(groupDraft.partition or group.partition or "stripe") == "stripe") and "round_robin" or "stripe"; groupDraft.preflight = nil; invalidate() end },
+  })
+  local canStart = result and not result.fatal
+  buttonRow(key, math.max(1, height - 2), width, {

@@ -1,0 +1,383 @@
+      lastError = nil,
+      triggerEmptySlots = 3,
+      maxStacksPerPass = 8,
+    },
+    -- Route and wall-clock metrics are compact and safe to update on every
+    -- move.  The aliases below make reports from older/newer controllers
+    -- readable without requiring a state migration write before boot.
+    routeMetrics = {
+      moves = 0,
+      turns = 0,
+      distance = 0,
+      routeLength = 0,
+      detours = 0,
+      services = 0,
+      lastRoute = nil,
+    },
+    timeMetrics = {
+      startedAt = nil,
+      updatedAt = nil,
+      elapsedSeconds = 0,
+      activeSeconds = 0,
+      serviceSeconds = 0,
+      returnSeconds = 0,
+      lastMoveAt = nil,
+    },
+    metrics = {
+      route = {
+        moves = 0,
+        turns = 0,
+        distance = 0,
+        routeLength = 0,
+        detours = 0,
+        services = 0,
+      },
+      time = {
+        startedAt = nil,
+        updatedAt = nil,
+        elapsedSeconds = 0,
+        activeSeconds = 0,
+        serviceSeconds = 0,
+        returnSeconds = 0,
+      },
+    },
+    journal = {
+      enabled = true,
+      -- Compact runtime counters are retained alongside descriptive metadata.
+      seq = 0,
+      writes = 0,
+      checkpoints = 0,
+      sequence = 0,
+      entries = 0,
+      lastCheckpointAt = nil,
+      lastCheckpointMove = 0,
+      lastEntryAt = nil,
+      lastError = nil,
+      recovered = false,
+      -- Lightweight journal metadata is intentionally separate from the
+      -- descriptive append-only counters above.  It can be persisted at a
+      -- higher cadence without rewriting a full state report.
+      lightweight = {
+        enabled = true,
+        seq = 0,
+        writes = 0,
+        checkpoints = 0,
+        lastAt = nil,
+        lastError = nil,
+      },
+    },
+    lighting = {
+      mode = "safe",
+      interval = 10,
+      temporaryFloor = true,
+      placed = 0,
+      torchesPlaced = 0,
+      torchesRecovered = 0,
+      torchRefills = 0,
+      torchShortages = 0,
+      shortages = 0,
+      lastPlacedAt = nil,
+      lastError = nil,
+      lastAt = nil,
+      lastPose = nil,
+    },
+    water = {
+      mode = "seal",
+      detected = 0,
+      sealed = 0,
+      blocked = 0,
+      stopped = 0,
+      ignored = 0,
+      continuousSeals = 0,
+      lastAt = nil,
+      lastError = nil,
+      last = nil,
+      lastRun = 0,
+    },
+    recycle = {
+      enabled = true,
+      attempts = 0,
+      recycled = 0,
+      skipped = 0,
+      held = 0,
+      cap = 64,
+      overflow = 0,
+      compressed = 0,
+      byName = {},
+      lastAt = nil,
+      lastError = nil,
+    },
+    serviceStats = {
+      started = 0,
+      completed = 0,
+      interrupted = 0,
+      moves = 0,
+      adaptive = 0,
+    },
+    -- `report` is the current/last job report.  `jobReport` is kept as an
+    -- explicit alias for controllers written against the V4 draft API.
+    report = nil,
+    lastReport = nil,
+    jobReport = nil,
+    estimate = { estimated = 0, actual = 0, variance = 0 },
+    lastError = nil,
+    completionReason = nil,
+    pendingAction = nil,
+    updatedAt = M.nowSeconds(),
+    stats = {
+      moves = 0,
+      turns = 0,
+      blocksDug = 0,
+      lavaSealed = 0,
+      gpsFixes = 0,
+      gpsRecoveries = 0,
+      unloads = 0,
+      refuels = 0,
+      sealRefills = 0,
+      torchesPlaced = 0,
+      torchesRecovered = 0,
+      torchRefills = 0,
+      torchShortages = 0,
+      waterDetected = 0,
+      waterSealed = 0,
+      waterBlocked = 0,
+      waterStopped = 0,
+      waterIgnored = 0,
+      recycledBlocks = 0,
+      recycled = 0,
+      recycleRuns = 0,
+      sealOverflow = 0,
+      compressions = 0,
+      discardPasses = 0,
+      discardedBlocks = 0,
+      discardSkipped = 0,
+      discardUnknown = 0,
+      routeMoves = 0,
+      routeTurns = 0,
+      routeDistance = 0,
+      elapsedSeconds = 0,
+      services = 0,
+      serviceReturns = 0,
+      serviceMoves = 0,
+      journalRecoveries = 0,
+      journalWrites = 0,
+      powerRecoveries = 0,
+      jobsStarted = 0,
+      jobsAborted = 0,
+      jobsFailed = 0,
+      jobReports = 0,
+      jobsCompleted = 0,
+      startedAt = M.nowSeconds(),
+    },
+    recentCommands = {},
+  }
+  -- Keep report aliases independent: ComputerCraft's serializer rejects
+  -- shared table references on some builds.
+  state.discard = M.copy(state.discardStats)
+  state.metrics.route = M.copy(state.routeMetrics)
+  state.metrics.time = M.copy(state.timeMetrics)
+  return state
+end
+
+local function normalizeEnum(value, allowed, fallback)
+  value = string.lower(M.trim(value))
+  return allowed[value] and value or fallback
+end
+
+local function normalizeInteger(value, minimum, maximum, fallback)
+  value = tonumber(value)
+  if not value or value ~= math.floor(value) then return fallback end
+  if minimum and value < minimum then return fallback end
+  if maximum and value > maximum then return fallback end
+  return value
+end
+
+local function normalizeNumber(value, minimum, maximum, fallback)
+  value = tonumber(value)
+  if not value then return fallback end
+  if minimum and value < minimum then return fallback end
+  if maximum and value > maximum then return fallback end
+  return value
+end
+
+local function normalizeBoolean(value, fallback)
+  if type(value) == "boolean" then return value end
+  return fallback
+end
+
+local function normalizeString(value, fallback, minimum, maximum)
+  if type(value) ~= "string" then return fallback end
+  if minimum and #value < minimum then return fallback end
+  if maximum and #value > maximum then return fallback end
+  return value
+end
+
+local function normalizePeripheralName(value, fallback)
+  value = normalizeString(value, fallback, 0, 64)
+  if type(value) ~= "string" then return "" end
+  if value:find("[%c]") then return fallback or "" end
+  return value
+end
+
+local function normalizeSlotList(value, fallback)
+  if type(value) ~= "table" then return M.copy(fallback) end
+  local out, seen = {}, {}
+  for index = 1, #value do
+    local slot = normalizeInteger(value[index], 1, 16, nil)
+    if not slot or seen[slot] then return M.copy(fallback) end
+    seen[slot] = true
+    out[#out + 1] = slot
+  end
+  if #out == 0 and #fallback > 0 then return M.copy(fallback) end
+  return out
+end
+
+local function normalizeBlockMap(value, fallback)
+  if type(value) ~= "table" then return M.copy(fallback) end
+  local out = {}
+  for name, enabled in pairs(value) do
+    if type(name) ~= "string" or type(enabled) ~= "boolean" then return M.copy(fallback) end
+    out[name] = enabled
+  end
+  return out
+end
+
+-- Unlike a block map used for sealing/lighting, a discard allowlist is a
+-- positive safety boundary.  Invalid entries are ignored (and therefore
+-- retained) rather than being interpreted as permission to throw an item
+-- away.  Accepting a comma-separated legacy string keeps hand-edited V2
+-- configurations readable.
+local function normalizeAllowlist(value, fallback)
+  fallback = type(fallback) == "table" and fallback or {}
+  local out = {}
+  local function add(name)
+    if type(name) ~= "string" then return false end
+    local trimmed = M.trim(name)
+    if trimmed ~= name then return false end
+    name = trimmed
+    -- Only complete Minecraft item IDs are accepted.  Requiring a namespace
+    -- and path prevents wildcard/partial names from becoming discard grants.
+    if name == "" or #name > 128 or not name:match("^[a-z0-9_.%-]+:[a-z0-9_./%-]+$") then return false end
+    out[name] = true
+    return true
+  end
+  if type(value) == "string" then
+    if value == "" then return M.copy(fallback) end
+    if value:match("^[,;]") or value:match("[,;]$") or value:find("[,;][,;]") then
+      return M.copy(fallback)
+    end
+    local had = false
+    for item in value:gmatch("[^,;]+") do
+      had = true
+      if not add(item) then return M.copy(fallback) end
+    end
+    return had and out or M.copy(fallback)
+  end
+  if type(value) ~= "table" then return M.copy(fallback) end
+  local isArray = #value > 0
+  if isArray then
+    for index = 1, #value do
+      if not add(value[index]) then return M.copy(fallback) end
+    end
+    return out
+  end
+  for name, enabled in pairs(value) do
+    if type(name) ~= "string" or type(enabled) ~= "boolean" then return M.copy(fallback) end
+    if enabled and not add(name) then return M.copy(fallback) end
+  end
+  return out
+end
+
+local function normalizeDiscardMode(value, fallback)
+  local key = string.upper(M.trim(tostring(value or "")))
+  local aliases = {
+    KEEP_ALL = "KEEP_ALL", KEEPALL = "KEEP_ALL", KEEP = "KEEP_ALL",
+    DISCARD_EXCESS_STONE = "DISCARD_EXCESS_STONE",
+    DISCARD_EXCESS = "DISCARD_EXCESS_STONE", EXCESS_STONE = "DISCARD_EXCESS_STONE",
+    CUSTOM_ALLOWLIST = "CUSTOM_ALLOWLIST", CUSTOM = "CUSTOM_ALLOWLIST",
+    ALLOWLIST = "CUSTOM_ALLOWLIST",
+  }
+  return aliases[key] or fallback
+end
+
+local function normalizeCoordinate(value, fallback)
+  local number = tonumber(value)
+  if not number or number ~= math.floor(number) then return fallback end
+  if number < -30000000 or number > 30000000 then return fallback end
+  return number
+end
+
+local function normalizeHomeWorld(value, fallback)
+  fallback = type(fallback) == "table" and fallback or { x = nil, y = nil, z = nil }
+  if type(value) == "string" then
+    local world = normalizeString(value, fallback.world or fallback.dimension, 1, 64)
+    if world then return { x = fallback.x, y = fallback.y, z = fallback.z, world = world } end
+    return M.copy(fallback)
+  end
+  if type(value) ~= "table" then return M.copy(fallback) end
+  local out = {
+    x = normalizeCoordinate(value.x, fallback.x),
+    y = normalizeCoordinate(value.y, fallback.y),
+    z = normalizeCoordinate(value.z, fallback.z),
+  }
+  local hasCoordinate = value.x ~= nil or value.y ~= nil or value.z ~= nil
+  if hasCoordinate and (out.x == nil or out.y == nil or out.z == nil) then
+    return M.copy(fallback)
+  end
+  if value.dimension ~= nil then
+    out.dimension = normalizeString(value.dimension, fallback.dimension, 1, 64)
+  elseif fallback.dimension ~= nil then
+    out.dimension = fallback.dimension
+  end
+  if value.world ~= nil then
+    out.world = normalizeString(value.world, fallback.world, 1, 64)
+  elseif fallback.world ~= nil then
+    out.world = fallback.world
+  end
+  return out
+end
+
+local function normalizeFacing(value, fallback)
+  if type(value) == "string" then
+    local key = string.lower(M.trim(value))
+    local names = { south = 0, east = 1, north = 2, west = 3, front = 0, right = 1, back = 2, left = 3 }
+    if names[key] ~= nil then return names[key] end
+  end
+  local number = tonumber(value)
+  if number and number == math.floor(number) then return number % 4 end
+  return fallback
+end
+
+local function normalizeIdentifier(value, fallback, maximum)
+  if type(value) == "number" then value = tostring(value) end
+  value = normalizeString(value, fallback, 1, maximum or 64)
+  if type(value) ~= "string" or value:find("[%c%s]") then return fallback end
+  return value
+end
+
+local function firstNonNil(...)
+  for index = 1, select("#", ...) do
+    local value = select(index, ...)
+    if value ~= nil then return value end
+  end
+  return nil
+end
+
+local function normalizeTable(defaults, loaded)
+  if type(loaded) ~= "table" then return M.copy(defaults) end
+  return M.merge(defaults, loaded)
+end
+
+local function normalizeWorkerConfig(raw)
+  local defaults = M.defaultWorkerConfig()
+  local config = normalizeTable(defaults, raw)
+  config.role = "worker"
+  config.schema, config.version = M.SCHEMA, M.VERSION
+
+  -- The new schema is additive.  Read legacy flat names first, then let an
+  -- explicitly nested value win.  This keeps hand-edited V2/V4 files valid
+  -- while producing one canonical nested contract for new code.
+  local loaded = type(raw) == "table" and raw or {}
+  local loadedMaterials = type(loaded.materials) == "table" and loaded.materials or {}
+  local loadedDiscard = type(loaded.discard) == "table" and loaded.discard
+    or (type(loadedMaterials.discard) == "table" and loadedMaterials.discard or {})

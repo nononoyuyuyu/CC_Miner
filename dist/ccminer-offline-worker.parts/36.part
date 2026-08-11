@@ -1,0 +1,257 @@
+    local need = math.min(target - sealMaterialCount(), turtle.getItemSpace(slot))
+    if need <= 0 then need = 1 end
+    local sucked = runInventoryPhysicalAction("refill_seal_suck", {
+      slot = slot, count = need, direction = side,
+    }, function() return suckFunction(need) end)
+    if not sucked then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Lava-seal block inventory is empty."
+    end
+    if not isSealItemName(itemName(slot)) then
+      runInventoryPhysicalAction("refill_seal_reject", {
+        slot = slot, item = itemName(slot), direction = side,
+      }, dropFunction)
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Seal inventory contains an unsupported item. Use configured solid blocks only."
+    end
+    state.stats.sealRefills = (state.stats.sealRefills or 0) + 1
+  end
+  local restored, restoreError = restoreSideDirection(side, restoreDir)
+  turtle.select(originalSlot)
+  if not restored then return false, restoreError end
+  saveState()
+  return true
+end
+
+local function refillTorchAtHome()
+  local mode = effectiveLighting()
+  if mode == "off" then return true end
+  state.phase, state.status = "refilling_torch", "working"
+  saveState("refill_torch")
+  local materials = materialsConfig()
+  local lighting = config.lighting or {}
+  local target = tonumber(lighting.target or lighting.torchTarget or materials.torchTarget or config.torchTarget) or 32
+  target = math.max(1, math.floor(target))
+  if torchMaterialCount() >= target then return true end
+  local side = lighting.side or config.torchSide or "left"
+  local inspectFunction, suckFunction, dropFunction, restoreDir, sideError = sideFunctions(side)
+  if not inspectFunction then return false, sideError end
+  local checkSide = (side == "top" and "top") or (side == "bottom" and "bottom") or "front"
+  if not inventoryPresent(checkSide, inspectFunction) then
+    restoreSideDirection(side, restoreDir)
+    return false, "Torch inventory missing on configured side " .. side .. "."
+  end
+  local originalSlot = turtle.getSelectedSlot()
+  local attempts = 0
+  while torchMaterialCount() < target do
+    drainNetwork(3)
+    if movementInterrupted("service") then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "control_request"
+    end
+    attempts = attempts + 1
+    if attempts > 64 then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Torch loading safety limit reached."
+    end
+    local slot = nil
+    local preferred = preferredTorchSlots()
+    if type(preferred) == "table" then
+      for _, candidate in ipairs(preferred) do
+        local candidateSlot = tonumber(candidate)
+        if candidateSlot and not isReservedSlot(candidateSlot, "torch") and turtle.getItemCount(candidateSlot) == 0 then
+          slot = candidateSlot
+          break
+        end
+      end
+    end
+    if not slot then
+      for candidate = 1, 16 do
+        if not isReservedSlot(candidate, "torch") and turtle.getItemCount(candidate) == 0 then slot = candidate; break end
+      end
+    end
+    if not slot then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "No inventory space for torches."
+    end
+    turtle.select(slot)
+    local need = math.min(target - torchMaterialCount(), turtle.getItemSpace(slot))
+    if need <= 0 then need = 1 end
+    local sucked = runInventoryPhysicalAction("refill_torch_suck", {
+      slot = slot, count = need, direction = side,
+    }, function() return suckFunction(need) end)
+    if not sucked then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Torch inventory is empty."
+    end
+    if not isTorchItemName(itemName(slot)) then
+      runInventoryPhysicalAction("refill_torch_reject", {
+        slot = slot, item = itemName(slot), direction = side,
+      }, dropFunction)
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Torch inventory contains an unsupported item."
+    end
+    state.stats.torchRefills = (state.stats.torchRefills or 0) + 1
+  end
+  local restored, restoreError = restoreSideDirection(side, restoreDir)
+  turtle.select(originalSlot)
+  if not restored then return false, restoreError end
+  saveState("refill_torch_done")
+  return true
+end
+
+local function beginService(resumeAfter, finalStatus, reason, preserveCheckpoint)
+  if not state.service then
+    if not isHome() and not state.checkpoint then installCheckpointToken(checkpointToken()) end
+    state.serviceReturn = {}
+    state.service = {
+      resumeAfter = resumeAfter == true,
+      finalStatus = finalStatus or (resumeAfter and "working" or "paused"),
+      preserveCheckpoint = preserveCheckpoint == true,
+      reason = reason or "service",
+      startedAt = common.nowSeconds(),
+      returnDistance = 0,
+      returnStartedAt = nil,
+      returnEndedAt = nil,
+    }
+  else
+    if resumeAfter == false then state.service.resumeAfter = false end
+    if finalStatus then state.service.finalStatus = finalStatus end
+    if preserveCheckpoint ~= nil then state.service.preserveCheckpoint = preserveCheckpoint == true end
+    if reason then state.service.reason = reason end
+  end
+  if state.checkpoint and not state.resumeToken then state.resumeToken = common.copy(state.checkpoint) end
+  if state.job and state.job.groupJobId then
+    state.assignmentResumeToken = assignmentResumeSnapshot(state.resumeToken or state.checkpoint or checkpointToken())
+  end
+  if resumeAfter and not isHome() and not state.checkpoint then installCheckpointToken(checkpointToken()) end
+  state.returnReason = reason or state.returnReason
+  state.lastReturnReason = reason or state.lastReturnReason
+  state.status, state.phase, state.request = "working", "service_requested", nil
+  saveState()
+end
+
+local function finishService()
+  local service = state.service or {}
+  local finalStatus = service.finalStatus or (service.resumeAfter and "working" or "paused")
+  local preserveCheckpoint = service.preserveCheckpoint == true
+  state.lastReturnReason = service.reason or state.returnReason or state.lastReturnReason
+  state.service, state.request, state.lastError = nil, nil, nil
+  state.stagedStop = false
+  state.stats.services = (state.stats.services or 0) + 1
+  if finalStatus == "complete" then
+    state.stats.jobsCompleted = (state.stats.jobsCompleted or 0) + 1
+    state.checkpoint = nil
+    -- Completion is terminal: do not leave a stale work-point token that
+    -- could be overlaid by a later pending snapshot or mistaken for a
+    -- resumable assignment.
+    state.resumeToken = nil
+    state.assignmentResumeToken = nil
+    state.status, state.phase = "complete", "home"
+    state.estimate = state.estimate or {}
+    state.estimate.actual = state.job and state.job.cursor or 0
+    state.estimate.variance = (state.estimate.actual or 0) - (tonumber(state.estimate.estimated) or (state.estimate.actual or 0))
+    state.report = {
+      jobId = state.job and state.job.id or nil,
+      assignmentId = state.job and state.job.assignmentId or nil,
+      groupJobId = state.job and state.job.groupJobId or nil,
+      group = state.group and common.copy(state.group) or nil,
+      reason = state.completionReason,
+      returnReason = state.lastReturnReason or state.returnReason,
+      ["return"] = state.serviceReturn and common.copy(state.serviceReturn) or nil,
+      completedAt = common.nowSeconds(),
+      elapsed = state.job and math.max(0, common.nowSeconds() - (state.job.startedAt or common.nowSeconds())) or 0,
+      progress = state.job and { cursor = state.job.cursor or 0, total = state.job.total or 0 } or nil,
+      stats = common.copy(state.stats),
+      estimated = state.estimate and state.estimate.estimated or nil,
+      actual = state.job and state.job.cursor or nil,
+      materials = {
+        torchCount = torchMaterialCount(), sealCount = sealMaterialCount(),
+      },
+      discard = common.copy(state.discardStats or state.discard or {}),
+      throughput = throughputSnapshot(),
+      assignmentResumeToken = nil,
+    }
+    state.stats.jobReports = (state.stats.jobReports or 0) + 1
+    state.job.report = common.copy(state.report)
+    state.lastReport = common.copy(state.report)
+    state.jobReport = common.copy(state.report)
+  elseif finalStatus == "aborted" then
+    state.stats.jobsAborted = (state.stats.jobsAborted or 0) + 1
+    state.checkpoint = nil
+    state.status, state.phase = "aborted", "home"
+    state.estimate = state.estimate or {}
+    state.estimate.actual = state.job and state.job.cursor or 0
+    state.estimate.variance = (state.estimate.actual or 0) - (tonumber(state.estimate.estimated) or (state.estimate.actual or 0))
+    state.report = {
+      jobId = state.job and state.job.id or nil,
+      assignmentId = state.job and state.job.assignmentId or nil,
+      groupJobId = state.job and state.job.groupJobId or nil,
+      group = state.group and common.copy(state.group) or nil,
+      reason = state.completionReason or service.reason or "aborted",
+      returnReason = state.lastReturnReason or state.returnReason,
+      ["return"] = state.serviceReturn and common.copy(state.serviceReturn) or nil,
+      aborted = true,
+      completedAt = common.nowSeconds(),
+      elapsed = state.job and math.max(0, common.nowSeconds() - (state.job.startedAt or common.nowSeconds())) or 0,
+      progress = state.job and { cursor = state.job.cursor or 0, total = state.job.total or 0 } or nil,
+      stats = common.copy(state.stats),
+      estimated = state.estimate and state.estimate.estimated or nil,
+      actual = state.job and state.job.cursor or nil,
+      materials = { torchCount = torchMaterialCount(), sealCount = sealMaterialCount() },
+      discard = common.copy(state.discardStats or state.discard or {}),
+      throughput = throughputSnapshot(),
+      assignmentResumeToken = state.assignmentResumeToken and common.copy(state.assignmentResumeToken)
+        or assignmentResumeSnapshot(state.resumeToken or state.checkpoint),
+    }
+    state.stats.jobReports = (state.stats.jobReports or 0) + 1
+    if state.job then state.job.report = common.copy(state.report) end
+    state.lastReport = common.copy(state.report)
+    state.jobReport = common.copy(state.report)
+  elseif finalStatus == "paused" then
+    if not preserveCheckpoint then state.checkpoint = nil end
+    state.status, state.phase = "paused", "home_paused"
+  else
+    state.checkpoint = nil
+    state.status, state.phase = "working", "mining"
+  end
+  saveState("service_finished", true)
+  heartbeat(true)
+end
+
+local function continueService()
+  if not state.service then return true end
+  state.status = "working"
+  state.service.returnStartedAt = state.service.returnStartedAt or common.nowSeconds()
+  state.service.returnDistance = state.service.returnDistance or 0
+  state.serviceReturn = state.serviceReturn or {}
+  state.serviceReturn.startedAt = state.serviceReturn.startedAt or common.nowSeconds()
+  state.returnReason = state.service.reason or state.returnReason or "service"
+  if not isHome() then
+    state.phase = "returning"
+    local returnDistance = estimatedReturnDistance(state.pose)
+    if returnDistance then state.service.returnDistance = returnDistance end
+    saveState("service_return_start", true)
+    local preReturnGPS, preReturnError = verifyGPS(true)
+    if not preReturnGPS then markBlocked("GPS verification before return failed: " .. tostring(preReturnError)); return false end
+    local ok, err
+    if state.job and state.job.strategy == "chunk_plan" then
+      ok, err = navigateChunkPlanHome("service")
+    else
+      ok, err = navigateTo({ x = 0, y = 0, z = 0 }, "home", "service")
+    end
+    if not ok then
+      if err == "control_request" then return false end
+      markBlocked("Return to home failed: " .. tostring(err))
+      return false
+    end
+  end
+
+  local ok, err = turnTo(0)

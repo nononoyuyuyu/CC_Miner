@@ -1,0 +1,221 @@
+    if fuel and (aggregate.minFuel == nil or fuel < aggregate.minFuel) then aggregate.minFuel = fuel end
+    local progress = data and data.progress or {}
+    local cursor, total = tonumber(progress and progress.cursor or data and data.job and data.job.cursor), tonumber(progress and progress.total or data and data.job and data.job.total)
+    if cursor and total and total > 0 then weightedDone, weightedTotal = weightedDone + math.max(0, math.min(cursor, total)), weightedTotal + total end
+    local warning = data and (data.lastError or data.completionReason)
+    if warning and not seenWarning[tostring(warning)] then seenWarning[tostring(warning)] = true; aggregate.warnings[#aggregate.warnings + 1] = tostring(warning) end
+    local ack = groupJob.acks and groupJob.acks[tostring(id)]
+    if ack and ack.ok ~= nil then aggregate.acks = aggregate.acks + 1 end
+  end
+  aggregate.percent = weightedTotal > 0 and math.floor(weightedDone * 100 / weightedTotal + 0.5) or (#ids > 0 and math.floor(aggregate.complete * 100 / #ids + 0.5) or 0)
+  if aggregate.blocked > 0 then aggregate.warnings[#aggregate.warnings + 1] = "blocked=" .. tostring(aggregate.blocked) end
+  if aggregate.waiting > 0 then aggregate.warnings[#aggregate.warnings + 1] = "service=" .. tostring(aggregate.waiting) end
+  if aggregate.minFuel == nil then aggregate.warnings[#aggregate.warnings + 1] = "minFuel=unknown" end
+  for _, eventWarning in ipairs(groupJob.alerts or {}) do
+    local text = tostring(eventWarning)
+    if not seenWarning[text] then seenWarning[text] = true; aggregate.warnings[#aggregate.warnings + 1] = text end
+  end
+  groupJob.aggregate = persistentDraft(aggregate)
+  groupJob.minFuel = aggregate.minFuel
+  groupJob.warnings = common.copy(aggregate.warnings)
+  groupJob.updatedAt = common.nowSeconds()
+  return aggregate
+end
+
+local function findGroupJobForWorker(id, data)
+  local explicit = groupJobIdForWorker(id, data)
+  if explicit and db.groupJobs[explicit] then return db.groupJobs[explicit], explicit end
+  return nil, explicit
+end
+
+local function normalizeStatus(data)
+  data = data or {}
+  -- V2 workers expose cursor/total under job and have no progress/materials
+  -- objects.  Keep a normalized view without requiring a worker upgrade.
+  data.progress = type(data.progress) == "table" and data.progress or {}
+  if data.job then
+    if data.progress.cursor == nil then data.progress.cursor = data.job.cursor end
+    if data.progress.total == nil then data.progress.total = data.job.total end
+    if data.progress.percent == nil then data.progress.percent = data.job.percent end
+    if data.progress.layer == nil then data.progress.layer = data.job.currentLayer end
+  end
+  data.materials = type(data.materials) == "table" and data.materials or {}
+  if data.materials.fuel == nil then data.materials.fuel = data.fuel end
+  if data.materials.inventoryEmpty == nil then data.materials.inventoryEmpty = data.inventoryEmpty end
+  if data.materials.seal == nil and data.seal then data.materials.seal = data.seal.count end
+  data.capabilities = type(data.capabilities) == "table" and data.capabilities or {}
+  return data
+end
+
+local function activeJobId(data)
+  return data and data.job and tostring(data.job.id or "") or nil
+end
+
+local function addHistory(id, data, reason)
+  if not data then return end
+  local job = data.job or {}
+  local report = data.report or {}
+  db.history[#db.history + 1] = {
+    id = tostring(job.id or ("worker-" .. tostring(id) .. "-" .. common.nowMillis())),
+    jobId = job.id,
+    workerId = tonumber(id) or id,
+    worker = workerLabel(workers[id], id),
+    name = job.name,
+    status = data.status,
+    reason = reason or data.completionReason,
+    startedAt = job.startedAt,
+    finishedAt = common.nowSeconds(),
+    progress = common.copy(data.progress or job),
+    stats = common.copy(data.stats or {}),
+    report = common.copy(report),
+  }
+  local historyLimit = math.max(1, tonumber(config.historyLimit) or 50)
+  while #db.history > historyLimit do table.remove(db.history, 1) end
+  saveControllerDb()
+end
+
+local function releaseLeasesForWorker(id, jobId)
+  local kept = {}
+  local currentAtHome = workers[id] and workers[id].data and workers[id].data.atHome == true
+  for _, lease in ipairs(db.leases or {}) do
+    local sameWorker = tonumber(lease.workerId) == tonumber(id)
+    local sameJob = not jobId or tostring(lease.jobId) == tostring(jobId)
+    if not (sameWorker and sameJob and (not lease.groupJobId or currentAtHome)) then kept[#kept + 1] = lease end
+  end
+  db.leases = kept
+  local keptGroup = {}
+  for _, lease in ipairs(db.groupLeases or {}) do
+    local sameWorker = tonumber(lease.workerId) == tonumber(id)
+    local sameJob = not jobId or tostring(lease.jobId) == tostring(jobId) or tostring(lease.groupJobId) == tostring(jobId)
+    if not (sameWorker and sameJob and (not lease.groupJobId or currentAtHome)) then keptGroup[#keptGroup + 1] = lease end
+  end
+  db.groupLeases = keptGroup
+  db.activeLeases = common.copy(kept)
+  saveControllerDb()
+end
+
+local function acknowledgeQueuedStart(id, data)
+  local job = data and data.job
+  if not job then return end
+  for index, item in ipairs(db.queue or {}) do
+    local awaiting = item.awaiting
+    if awaiting and tonumber(awaiting.workerId) == tonumber(id) and tostring(awaiting.jobId) == tostring(job.id) then
+      table.remove(db.queue, index)
+      saveControllerDb()
+      setNotice("Queued job accepted by worker #" .. tostring(id) .. ".", false)
+      return
+    end
+  end
+end
+
+local function alert(kind, id, text)
+  -- Offline/unknown are intentionally not alerts.  Respect the optional
+  -- per-channel settings and allow the same condition after cooldown.
+  local settings = config.alerts or {}
+  if settings.enabled == false then return end
+  if kind == "complete" and settings.onComplete == false then return end
+  if kind == "material" and settings.onWaiting == false then return end
+  if kind == "blocked" and settings.onError == false then return end
+  local key = tostring(id) .. ":" .. tostring(kind)
+  local now = common.nowSeconds()
+  local previous = alertLedger[key]
+  local cooldown = math.max(0, tonumber(settings.cooldownSeconds) or 30)
+  if previous and now - (previous.at or 0) < cooldown then return end
+  alertLedger[key] = { at = now }
+  if settings.speaker ~= false then
+    local instrument = kind == "complete" and "pling" or kind == "material" and "bell" or "bass"
+    local pitch = kind == "complete" and 12 or kind == "material" and 6 or 4
+    for _, entry in ipairs(speakers) do
+      local speaker = entry.device
+      if speaker and speaker.playNote then pcall(speaker.playNote, instrument, 1, pitch)
+      elseif speaker and speaker.playSound then pcall(speaker.playSound, "minecraft:block.note_block." .. instrument, 1, 1) end
+    end
+  end
+  if settings.redstone ~= false then
+    local side = tostring(settings.redstoneSide or "back")
+    local timer = os.startTimer and os.startTimer(0.25)
+    if redstone and redstone.setOutput then
+      pcall(redstone.setOutput, side, true)
+      if timer then alertTimers[timer] = { global = true, side = side } end
+    else
+      local relays = {}
+      for _, entry in ipairs(redstoneDevices) do
+        local relay = entry.device
+        if relay and relay.setOutput then
+          pcall(relay.setOutput, side, true)
+          relays[#relays + 1] = relay
+        end
+      end
+      if timer and #relays > 0 then alertTimers[timer] = { relays = relays, side = side } end
+    end
+  end
+  if text and text ~= "" then setNotice(text, kind == "blocked") end
+end
+
+local function clearAlert(id, kind)
+  alertLedger[tostring(id) .. ":" .. tostring(kind)] = nil
+end
+
+local function handleMessage(sender, message)
+  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
+  if not valid then return false end
+  if message.kind == "status" then
+    local payload = normalizeStatus(message.payload)
+    local id = tonumber(payload.id)
+    if not id or id ~= tonumber(sender) then return false end
+    workers[id] = workers[id] or {}
+    local previous = workers[id].data
+    workers[id].data = payload
+    workers[id].lastSeen = common.nowSeconds()
+    workers[id].sender = sender
+    local groupJob = findGroupJobForWorker(id, payload)
+    if groupJob then
+      if groupJob.status == "starting" and payload.job and payload.job.assignmentId then acceptGroupStart(groupJob, id, payload.job.assignmentId) end
+      finalizePendingReassignment(groupJob, id, payload)
+      local assignment = groupJob.assignments and (groupJob.assignments[tostring(id)] or groupJob.assignments[id])
+      if assignment then
+        assignment.status = payload.status or payload.phase or assignment.status
+        if payload.status == "complete" or payload.status == "completed" or payload.status == "aborted" or payload.status == "idle" then
+          if groupJob.awaitingAck then groupJob.awaitingAck[tostring(id)] = nil end
+          if groupJob.pending then groupJob.pending[tostring(id)] = nil end
+        end
+        assignment.progress = common.copy(payload.progress or payload.job and payload.job.progress or {})
+        assignment.lastSeen = common.nowSeconds()
+        if payload.status == "complete" or payload.status == "completed" then assignment.finishedAt = common.nowSeconds() end
+        if payload.completionReason then assignment.returnReason = payload.completionReason end
+        if payload.report or payload.stats then assignment.report = common.copy(payload.report or payload.stats) end
+      end
+      updateGroupAggregate(groupJob)
+      if payload.completionReason then groupJob.returnReason = payload.completionReason end
+      if payload.report or payload.stats then
+        groupJob.metrics = groupJob.metrics or {}
+        local report = payload.report or payload.stats
+        for key, value in pairs(report or {}) do if type(value) ~= "table" then groupJob.metrics[key] = value end end
+        if report and (report.discard or report.discardStats) then groupJob.metrics.discard = common.copy(report.discard or report.discardStats) end
+        groupJob.report = common.copy(groupJob.metrics)
+      end
+      local allDone = true
+      for _, item in pairs(groupJob.assignments or {}) do if type(item) == "table" and item.status ~= "complete" and item.status ~= "completed" and item.status ~= "reassigned" then allDone = false; break end end
+      if allDone and groupJob.status == "working" then
+        groupJob.status, groupJob.finishedAt = "complete", common.nowSeconds()
+        releaseGroupLeases(groupJob)
+        if not groupJob.historyRecorded then
+          db.history[#db.history + 1] = { id = tostring(groupJob.groupJobId), kind = "group", groupJobId = groupJob.groupJobId, groupId = groupJob.groupId, workerId = nil, worker = groupName(groupRecord(groupJob.groupId), groupJob.groupId), name = groupJob.name, status = "complete", reason = groupJob.returnReason or "complete", startedAt = groupJob.startedAt, finishedAt = groupJob.finishedAt, metrics = common.copy(groupJob.metrics or groupJob.report or {}) }
+          groupJob.historyRecorded = true
+        end
+      end
+      maybeFinalizeGroup(groupJob)
+      saveControllerDb()
+    end
+    acknowledgeQueuedStart(id, payload)
+    local oldStatus = previous and tostring(previous.status or "") or ""
+    local newStatus = tostring(payload.status or "unknown")
+    if newStatus == "complete" and oldStatus ~= "complete" then
+      addHistory(id, payload, payload.completionReason or "complete")
+      releaseLeasesForWorker(id, activeJobId(previous))
+      alert("complete", id, "Worker #" .. tostring(id) .. " completed a job.")
+    elseif newStatus == "aborted" and oldStatus ~= "aborted" then
+      addHistory(id, payload, payload.completionReason or "aborted")
+      releaseLeasesForWorker(id, activeJobId(previous))
+    elseif newStatus == "blocked" and oldStatus ~= "blocked" then
+      alert("blocked", id, "Worker #" .. tostring(id) .. " is blocked.")

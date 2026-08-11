@@ -1,0 +1,265 @@
+    bottomY = integerValue(bottomY)
+    if not bottomY then return nil, "invalid_bottom_y" end
+  end
+  local homeYMap = options.workerHomeY or options.homeYs
+  if type(homeYMap) == "table" then
+    for _, worker in ipairs(workers) do
+      if worker.homeY == nil then
+        local candidate = homeYMap[worker.id] or homeYMap[worker.key]
+        if candidate ~= nil then
+          worker.homeY = integerValue(candidate)
+          if worker.homeY == nil then return nil, "invalid_home_y" end
+        end
+      end
+    end
+  end
+  local defaultLayers = options.layers
+  if defaultLayers ~= nil then
+    defaultLayers = integerValue(defaultLayers, 1, MAX_DIMENSION)
+    if not defaultLayers then return nil, "invalid_layers" end
+  end
+  local groupJobId = options.groupJobId or options.jobId or "group"
+  if (type(groupJobId) ~= "string" and type(groupJobId) ~= "number") or tostring(groupJobId) == "" then
+    return nil, "invalid_group_job_id"
+  end
+  local strategy = options.strategy
+  -- Older controller settings called graph growth "round_robin".  Keep that
+  -- spelling accepted while retaining connected ownership guarantees.
+  if strategy == "round_robin" then strategy = "graph" end
+  if strategy ~= nil and strategy ~= "stripe" and strategy ~= "graph" and strategy ~= "growth" then
+    return nil, "invalid_partition_strategy"
+  end
+  if options.stripeAxis ~= nil and options.stripeAxis ~= "x" and options.stripeAxis ~= "z" then
+    return nil, "invalid_stripe_axis"
+  end
+  local distanceWeight = options.distanceWeight
+  if distanceWeight == nil then distanceWeight = 0.25 end
+  distanceWeight = numberValue(distanceWeight)
+  if not distanceWeight or distanceWeight < 0 or distanceWeight > MAX_DIMENSION then return nil, "invalid_distance_weight" end
+
+  local owner, owned, loads, strategyUsed, seeds, stripeAxisUsed
+  if strategy ~= "graph" and strategy ~= "growth" and options.stripeFirst ~= false then
+    owner, owned, loads, strategyUsed, stripeAxisUsed = stripeOwner(chunks, keys, workers, options)
+  end
+  if strategy == "stripe" and not owner then return nil, owned or "stripe_partition_unavailable" end
+  if not owner then
+    owner, owned, loads, strategyUsed, seeds = graphOwner(chunks, keys, workers,
+      strategy == "growth" and "growth" or "graph", distanceWeight)
+  end
+  if not owner then return nil, owned or "partition_failed" end
+
+  -- Rectangular stripes are expected to be connected, but a hand-authored
+  -- catalog may have irregular bounding boxes.  Fail closed (or use graph
+  -- growth for the automatic strategy) instead of handing a worker a split
+  -- region.
+  local function ownedConnected(list)
+    if #list < 2 then return true end
+    local allowed, seen, queue = {}, {}, { list[1] }
+    for _, key in ipairs(list) do allowed[key] = true end
+    seen[list[1]] = true
+    local head = 1
+    while queue[head] do
+      local key = queue[head]; head = head + 1
+      for _, neighbor in ipairs(chunks[key].neighbors or {}) do
+        if allowed[neighbor] and not seen[neighbor] then seen[neighbor] = true; queue[#queue + 1] = neighbor end
+      end
+    end
+    for _, key in ipairs(list) do if not seen[key] then return false end end
+    return true
+  end
+  local allConnected = true
+  for index = 1, #workers do if not ownedConnected(owned[index]) then allConnected = false; break end end
+  if not allConnected then
+    if strategy == "stripe" then return nil, "partition_disconnected" end
+    owner, owned, loads, strategyUsed, seeds = graphOwner(chunks, keys, workers, "graph", distanceWeight)
+    stripeAxisUsed = nil
+    if not owner then return nil, owned or "partition_disconnected" end
+  end
+
+  -- Stripe assignment has no growth seeds, but each worker still needs a
+  -- deterministic checkpoint near its bay.  Prefer the bay's chunk when it is
+  -- inside the stripe; otherwise choose the closest owned chunk.
+  if strategyUsed == "stripe" then
+    seeds = {}
+    for index, worker in ipairs(workers) do
+      local candidate = workerBayChunk(worker, chunks, keys)
+      if not candidate or owner[candidate] ~= index then
+        local best, bestDistance
+        for _, key in ipairs(owned[index] or {}) do
+          local chunk = chunks[key]
+          local distance = worker.bay
+            and (math.abs(worker.bay.x - (chunk.cx * 16 + 8)) + math.abs(worker.bay.z - (chunk.cz * 16 + 8)))
+            or 0
+          if not best or distance < bestDistance or (distance == bestDistance and chunkComparator(chunk, chunks[best])) then
+            best, bestDistance = key, distance
+          end
+        end
+        candidate = best
+      end
+      seeds[index] = candidate
+    end
+  end
+
+  -- Prefer the canonical entrance chunk in the shared reference-local
+  -- catalog.  Falling back to lexicographic order is only for hand-authored
+  -- catalogs that do not expose the (0,1) entrance cell.
+  local rootKey = options.rootKey and tostring(options.rootKey) or nil
+  if not rootKey then
+    for _, key in ipairs(keys) do
+      if contains(chunks[key], 0, 1) then rootKey = key; break end
+    end
+  end
+  rootKey = rootKey or keys[1]
+  if not chunks[rootKey] then return nil, "unknown_root_chunk" end
+  local assignments, totalCost, assignedSet = {}, 0, {}
+  for index, worker in ipairs(workers) do
+    local chunkKeys = uniqueSortedKeys(owned[index], chunks)
+    if #chunkKeys == 0 then return nil, "empty_worker_assignment" end
+    local seedKey = worker.bayChunkKey
+      or (worker.seedKey and chunks[worker.seedKey] and worker.seedKey)
+      or (seeds and seeds[index]) or chunkKeys[1]
+    if not owner[seedKey] or owner[seedKey] ~= index then seedKey = chunkKeys[1] end
+    local transitSet, originKey = {}, workerBayChunk(worker, chunks, keys) or rootKey
+    if not chunks[originKey] then originKey = rootKey end
+    -- A bay-aligned stripe is itself connected and starts at the worker's own
+    -- bay seed, so it needs no transit lease at all.  For graph growth keep
+    -- the explicit shortest paths, but include only keys outside this
+    -- worker's mine assignment.
+    if not (strategyUsed == "stripe" and bayAware) then
+      local originTree = graphBreadthTree(chunks, originKey)
+      for _, targetKey in ipairs(chunkKeys) do
+        local path = pathFromBreadthTree(originTree, originKey, targetKey)
+        if path then
+          for _, transitKey in ipairs(path) do
+            if owner[transitKey] ~= index then transitSet[transitKey] = true end
+          end
+        end
+      end
+    end
+    for _, targetKey in ipairs(chunkKeys) do assignedSet[targetKey] = true end
+    local transitKeys = {}
+    for transitKey in pairs(transitSet) do transitKeys[#transitKeys + 1] = transitKey end
+    table.sort(transitKeys, function(a, b) return chunkComparator(chunks[a], chunks[b]) end)
+    local layers = defaultLayers
+    if layers == nil and worker.homeY ~= nil and bottomY ~= nil then layers = worker.homeY - bottomY + 1 end
+    if layers == nil then layers = 1 end
+    if layers < 1 or layers > MAX_DIMENSION then return nil, "invalid_worker_layers" end
+    local volume = loads[index] * layers
+    if volume > MAX_BLOCKS then return nil, "group_too_large" end
+    local distance = #transitKeys + math.max(0, #chunkKeys - 1)
+    if worker.bay then
+      local seedChunk = chunks[seedKey]
+      distance = distance + math.abs(worker.bay.x - (seedChunk.cx * 16 + 8))
+        + math.abs(worker.bay.z - (seedChunk.cz * 16 + 8))
+    end
+    local estimatedCost = volume + distance
+    -- Lease overlap checks operate on global chunk keys.  Do not prefix these
+    -- arrays with a worker name: that would make two assignments appear
+    -- disjoint to the controller.  The assignment-scoped identity lives in
+    -- leaseId separately, while each array gets its own copy for CC's
+    -- serializer.
+    local leaseKeys = cloneStringArray(chunkKeys)
+    local transitLeaseKeys = cloneStringArray(transitKeys)
+    local assignment = {
+      workerId = worker.id,
+      groupJobId = groupJobId,
+      leaseId = tostring(groupJobId) .. ":" .. tostring(worker.id),
+      chunkKeys = chunkKeys,
+      transitKeys = transitKeys,
+      transitLeaseKeys = transitLeaseKeys,
+      leaseKeys = leaseKeys,
+      seedKey = seedKey,
+      estimatedCost = estimatedCost,
+      estimatedVolume = volume,
+      volume = volume,
+      estimatedDistance = distance,
+      distance = distance,
+      distanceWeight = distanceWeight,
+      homeY = worker.homeY,
+      bottomY = bottomY,
+      layers = layers,
+      layersInfo = { homeY = worker.homeY, bottomY = bottomY, count = layers },
+      strategy = strategyUsed,
+      stripeAxis = stripeAxisUsed,
+    }
+    assignments[#assignments + 1] = assignment
+    totalCost = totalCost + estimatedCost
+  end
+
+  local unassigned = {}
+  for _, key in ipairs(keys) do if not assignedSet[key] then unassigned[#unassigned + 1] = key end end
+  local result = {
+    assignments = {},
+    unassigned = cloneStringArray(unassigned),
+    totalCost = totalCost,
+    groupJobId = groupJobId,
+    strategy = strategyUsed,
+    stripeAxis = stripeAxisUsed,
+    distanceWeight = distanceWeight,
+    bottomY = bottomY,
+    catalogCount = #keys,
+  }
+  for index, assignment in ipairs(assignments) do result.assignments[index] = groupAssignmentCopy(assignment) end
+  -- Mapping is useful to controller callers, but must be a deep independent
+  -- copy: CC's serializer treats even equal table references as recursive.
+  result.byWorker = {}
+  for _, assignment in ipairs(assignments) do result.byWorker[assignment.workerId] = groupAssignmentCopy(assignment) end
+  return result
+end
+
+M.groupPartition = M.partitionGroup
+M.splitGroupWorkers = M.partitionGroup
+M.assignGroupWorkers = M.partitionGroup
+M.partitionWorkersGroup = M.partitionGroup
+
+-- Build a worker-local plan from a shared world catalog.  The catalog may be
+-- an array/map, or an existing plan.  `assignedKeys` are the only mineable
+-- chunks; `transitKeys` are optional, explicit lease keys that may be crossed
+-- while travelling from a dock/entrance to the assigned seed.
+local function cloneValue(value, depth)
+  if type(value) ~= "table" then return value end
+  depth = (depth or 0) + 1
+  if depth > 16 then return nil end
+  local copy = {}
+  for key, item in pairs(value) do
+    local copiedKey = type(key) == "table" and nil or key
+    if copiedKey ~= nil then copy[copiedKey] = cloneValue(item, depth) end
+  end
+  return copy
+end
+
+local function assignedCatalogEntries(catalog)
+  if type(catalog) ~= "table" then return nil, nil, "invalid_chunk_catalog" end
+  local source = catalog
+  if type(catalog.catalog) == "table" then source = catalog.catalog end
+  if type(catalog.chunks) == "table" then source = catalog.chunks end
+  local entries, byKey = {}, {}
+  if #source > 0 then
+    for index = 1, #source do
+      local entry = source[index]
+      if type(entry) ~= "table" then return nil, nil, "invalid_chunk_catalog" end
+      local key = entry.key and tostring(entry.key) or nil
+      if not key or byKey[key] then return nil, nil, "duplicate_chunk_key" end
+      byKey[key] = entry; entries[#entries + 1] = entry
+    end
+  else
+    for key, entry in pairs(source) do
+      if type(entry) ~= "table" then return nil, nil, "invalid_chunk_catalog" end
+      local normalized = entry.key and tostring(entry.key) or tostring(key)
+      if normalized == "" or byKey[normalized] then return nil, nil, "duplicate_chunk_key" end
+      if entry.key == nil or tostring(entry.key) == "" then
+        -- Keep map-key catalogs immutable while giving catalogGraph the
+        -- explicit key required by its world-key validation.
+        local copy = {}
+        for field, value in pairs(entry) do copy[field] = value end
+        copy.key = normalized
+        entry = copy
+      end
+      byKey[normalized] = entry; entries[#entries + 1] = entry
+    end
+  end
+  return entries, byKey
+end
+
+local function assignedKeyList(value, field)
+  if type(value) == "table" and field and type(value[field]) == "table" then value = value[field] end

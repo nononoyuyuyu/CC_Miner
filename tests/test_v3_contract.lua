@@ -1,6 +1,6 @@
 -- Worker/controller are interactive CC:Tweaked programs, so their private
 -- locals cannot be exercised without booting a turtle/monitor/rednet stack.
--- Keep only small source-contract assertions for safety-critical branches.
+-- Keep only small V4 source-contract assertions for safety-critical branches.
 
 local root = arg[1]
 
@@ -21,6 +21,7 @@ end
 
 local worker = parts("src/ccminer/worker_parts", 5)
 local controller = parts("src/ccminer/controller_parts", 3)
+local quarry = read("src/ccminer/lib/quarry.lua")
 
 local function marker(text, expected, label)
   assert(text:find(expected, 1, true), "missing " .. label .. " source contract: " .. expected)
@@ -35,12 +36,21 @@ marker(worker, 'if profile == "turbo" then return math.min(12, math.max(requeste
 marker(controller, 'local function profileParameters(profile, lighting)', "controller profile parameters")
 marker(controller, 'if name ~= "safe" and name ~= "balanced" and name ~= "turbo" then return nil', "profile validation")
 
--- Multi-worker assignments are rejected at the worker boundary; controller
--- leases also reject overlaps before a command is sent.
-marker(worker, 'Multi-worker chunk partitioning is disabled in this release; dispatch independent jobs.', "worker assignment rejection")
-marker(worker, 'if assignmentTotal and assignmentTotal > 1 then', "assignment count guard")
-marker(worker, 'Multi-worker assignments are disabled in this release; dispatch independent jobs.', "assignment count rejection")
+-- V4 group assignments are explicit and fail closed: metadata without a
+-- non-empty authoritative assignment never falls back to a full footprint.
+marker(worker, "local assignmentChunks = payload.assignmentChunks", "group assignment extraction")
+marker(worker, 'local assignmentPlanRequested = type(assignmentChunks) == "table" and assignmentListCount(assignmentChunks) > 0', "group assignment count guard")
+marker(worker, 'if (job.groupJobId or job.assignmentId or assignment ~= nil) and not assignmentPlanRequested then', "group assignment refusal guard")
+marker(worker, "Group assignment keys are required; refusing full-footprint fallback.", "group assignment rejection")
 marker(controller, 'if conflict then return nil, "Active lease overlap with " .. tostring(conflict.jobId or conflict.assignmentId)', "controller overlap rejection")
+
+-- V4 discard, bounded routes, and unique world-group bays remain explicit
+-- source contracts even though the executable code is split into parts.
+marker(worker, "local function discardPolicy()", "discard policy")
+marker(worker, "local function navigateServiceRoute(plan, fromPose, toPose, context, mode)", "bounded service route")
+marker(worker, "No safe chunk service route.", "route refusal")
+marker(controller, "bay chunk unique:", "unique bay guard")
+marker(quarry, "duplicate_worker_bay_chunk:", "duplicate bay rejection")
 
 -- World depth is derived from calibrated home Y and targetY, while chunk-grid
 -- selection is whole-chunk only (partial masks are a fatal preflight item).
@@ -70,4 +80,4 @@ marker(worker, 'torch = slotSet(materials.torchSlots or config.torchSlots)', "re
 marker(worker, 'if role == "seal" then return sets.torch[number] or sets.fuel[number] end', "seal slot exclusion")
 marker(worker, 'if role == "torch" then return sets.seal[number] or sets.fuel[number] end', "torch slot exclusion")
 
-print("worker/controller V3 source contracts passed")
+print("worker/controller V4 source contracts passed")

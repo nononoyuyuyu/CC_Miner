@@ -1,0 +1,285 @@
+    if type(toSave.materials) == "table" and type(toSave.discard) == "table" then
+      toSave.materials.discard = M.copy(toSave.discard)
+    end
+  end
+  return M.saveTable(M.CONFIG_PATH, toSave)
+end
+
+return M
+]] },
+  { source = [[src/ccminer/lib/protocol.lua]], target = [[lib/protocol.lua]], digest = [[a54c89ea1bed23e86e77932bcddd36d256edb868346d137ecdabeedc0c033ae9]], content = [[-- CC Miner V4/V2-compatible rednet protocol helpers
+
+local common = dofile("/ccminer/lib/common.lua")
+local M = {}
+
+local function makeId(prefix)
+  local millis = common.nowMillis()
+  local randomPart = math.random(100000, 999999)
+  return ("%s-%d-%d-%d"):format(prefix or "msg", os.getComputerID(), millis, randomPart)
+end
+
+function M.message(kind, key, payload, target)
+  return {
+    magic = common.MAGIC,
+    schema = common.SCHEMA,
+    version = common.VERSION,
+    kind = kind,
+    key = key,
+    sender = os.getComputerID(),
+    target = target,
+    id = makeId(kind),
+    sentAt = common.nowSeconds(),
+    payload = payload or {},
+  }
+end
+
+function M.validate(message, expectedKey, expectedTarget, actualSender)
+  if type(message) ~= "table" then return false, "not_table" end
+  if message.magic ~= common.MAGIC then return false, "bad_magic" end
+  if tonumber(message.schema) ~= common.SCHEMA then return false, "bad_schema" end
+  if message.version ~= common.VERSION then return false, "bad_version" end
+  if type(message.kind) ~= "string" then return false, "bad_kind" end
+  if type(message.id) ~= "string" or message.id == "" then return false, "bad_id" end
+  if type(message.payload) ~= "table" then return false, "bad_payload" end
+  local claimedSender = tonumber(message.sender)
+  if not claimedSender then return false, "bad_sender" end
+  if actualSender and claimedSender ~= tonumber(actualSender) then return false, "sender_mismatch" end
+  if expectedKey and expectedKey ~= "" and message.key ~= expectedKey then return false, "bad_key" end
+  if expectedTarget and message.target and tonumber(message.target) ~= tonumber(expectedTarget) then
+    return false, "wrong_target"
+  end
+  return true
+end
+
+function M.open()
+  local opened = common.openWirelessModems()
+  return #opened > 0, opened
+end
+
+function M.send(target, message)
+  if not rednet then return false, "rednet_unavailable" end
+  local ok, result = pcall(rednet.send, tonumber(target), message, common.PROTOCOL)
+  if not ok then return false, tostring(result) end
+  return result == true, result == true and nil or "send_failed"
+end
+
+function M.broadcast(message)
+  if not rednet then return false, "rednet_unavailable" end
+  local ok, result = pcall(rednet.broadcast, message, common.PROTOCOL)
+  if not ok then return false, tostring(result) end
+  return result ~= false, result == false and "broadcast_failed" or nil
+end
+
+function M.receive(timeout)
+  if not rednet then return nil, nil, "rednet_unavailable" end
+  local ok, sender, message, protocolName = pcall(rednet.receive, common.PROTOCOL, timeout)
+  if not ok then return nil, nil, tostring(sender) end
+  if not sender then return nil, nil, nil end
+  return sender, message, protocolName
+end
+
+function M.reply(target, key, request, kind, payload)
+  local message = M.message(kind, key, payload, target)
+  if request and request.id then message.replyTo = request.id end
+  return M.send(target, message)
+end
+
+return M
+]] },
+  { source = [[src/ccminer/setup.lua]], target = [[setup.lua]], digest = [[312a981a6a81d28fccd9059e66465a9d1f266af1405f6bbc02b1d3c7f1747456]], content = [=[-- CC Miner V4 - interactive configuration
+
+local args = { ... }
+local common = dofile("/ccminer/lib/common.lua")
+local current = common.loadConfig()
+local requestedRole = string.lower(tostring(args[1] or (current and current.role) or ""))
+
+-- Setup is intentionally forgiving when it reads a hand-edited/old config:
+-- malformed values are replaced by a safe default before they are passed to
+-- the interactive validators.  This prevents an invalid stored default from
+-- trapping a user in a prompt loop while preserving every valid old value.
+local function validInteger(value, fallback, minimum, maximum)
+  local number = tonumber(value)
+  if not number or number ~= math.floor(number) then return fallback end
+  if minimum and number < minimum then return fallback end
+  if maximum and number > maximum then return fallback end
+  return number
+end
+
+local function validNumber(value, fallback, minimum, maximum)
+  local number = tonumber(value)
+  if not number then return fallback end
+  if minimum and number < minimum then return fallback end
+  if maximum and number > maximum then return fallback end
+  return number
+end
+
+local function ensureTable(config, key, defaults)
+  if type(config[key]) ~= "table" then config[key] = common.copy(defaults) end
+  config[key] = common.merge(defaults, config[key])
+  return config[key]
+end
+
+local function enumPrompt(label, defaultValue, values, fallback)
+  local normalized = string.lower(common.trim(tostring(defaultValue or "")))
+  if not values[normalized] then
+    fallback = string.lower(common.trim(tostring(fallback or "")))
+    if values[fallback] then
+      normalized = fallback
+    else
+      local options = {}
+      for value in pairs(values) do options[#options + 1] = value end
+      table.sort(options)
+      normalized = options[1]
+    end
+  end
+  return string.lower(common.prompt(label, normalized, function(value)
+    value = string.lower(common.trim(value))
+    if values[value] then return true end
+    local options = {}
+    for option in pairs(values) do options[#options + 1] = option end
+    table.sort(options)
+    return false, "Enter one of: " .. table.concat(options, "/") .. "."
+  end))
+end
+
+local function sidePrompt(label, defaultValue)
+  return enumPrompt(label, defaultValue or "back", {
+    front = true, back = true, left = true, right = true, top = true, bottom = true,
+  }, "back")
+end
+
+local function torchSidePrompt(defaultValue, sealSide)
+  local choices = { left = true, right = true }
+  local safeSide = sealSide == "left" and "right" or "left"
+  local side = enumPrompt("Torch chest side (left/right)", defaultValue or safeSide, choices, safeSide)
+  if sealSide and side == sealSide then
+    print("Warning: torch chest side must not match the seal-block chest side.")
+    local fallback = safeSide
+    repeat
+      side = enumPrompt("Re-select torch chest side", fallback, choices, fallback)
+      if side == sealSide then print("Warning: choose a side different from " .. sealSide .. ".") end
+    until side ~= sealSide
+  end
+  return side
+end
+
+local function peripheralNamePrompt(label, defaultValue)
+  local fallback = type(defaultValue) == "string" and defaultValue or ""
+  return common.prompt(label, fallback, function(value)
+    if #value > 64 or value:find("[%c]") then return false, "Use 0 to 64 printable characters." end
+    if #value == 0 then return false, "Enter a peripheral name." end
+    return true
+  end)
+end
+
+local function identifierPrompt(label, defaultValue, fallback)
+  local safeDefault = type(defaultValue) == "string" and defaultValue or fallback
+  return common.prompt(label, safeDefault, function(value)
+    if #value < 1 or #value > 64 or value:find("[%c%s]") then
+      return false, "Use 1 to 64 non-space characters."
+    end
+    return true
+  end)
+end
+
+local function discardModePrompt(defaultValue)
+  local value = string.upper(common.trim(tostring(defaultValue or "KEEP_ALL")))
+  local allowed = {
+    KEEP_ALL = true,
+    DISCARD_EXCESS_STONE = true,
+    CUSTOM_ALLOWLIST = true,
+  }
+  if not allowed[value] then value = "KEEP_ALL" end
+  value = common.prompt("Discard mode (KEEP_ALL/DISCARD_EXCESS_STONE/CUSTOM_ALLOWLIST)", value, function(text)
+    text = string.upper(common.trim(text))
+    if allowed[text] then return true end
+    return false, "Enter KEEP_ALL, DISCARD_EXCESS_STONE, or CUSTOM_ALLOWLIST."
+  end)
+  return string.upper(common.trim(value))
+end
+
+local function allowlistText(value)
+  local names = {}
+  if type(value) == "table" then
+    for name, enabled in pairs(value) do
+      if enabled == true then names[#names + 1] = tostring(name) end
+    end
+  end
+  table.sort(names)
+  return table.concat(names, ",")
+end
+
+local function allowlistPrompt(defaultValue)
+  local text = common.prompt("Discard allowlist (item IDs, comma-separated; blank=none)", allowlistText(defaultValue), function(value)
+    if #value > 2048 or value:find("[%c]") then return false, "Use comma-separated item IDs only." end
+    if value ~= "" and (value:match("^[,;]") or value:match("[,;]$") or value:find("[,;][,;]")) then
+      return false, "Do not leave empty entries in the allowlist."
+    end
+    for item in value:gmatch("[^,;]+") do
+      local trimmed = common.trim(item)
+      if trimmed ~= item then return false, "Do not include spaces around item IDs." end
+      item = trimmed
+      if item == "" or #item > 128 or not item:match("^[a-z0-9_.%-]+:[a-z0-9_./%-]+$") then
+        return false, "Use complete item IDs such as minecraft:stone (no wildcard or partial names)."
+      end
+    end
+    return true
+  end)
+  local out = {}
+  for item in text:gmatch("[^,;]+") do
+    item = common.trim(item)
+    if item ~= "" then out[item] = true end
+  end
+  return out
+end
+
+if requestedRole ~= "worker" and requestedRole ~= "controller" and requestedRole ~= "gps" then
+  common.clear(colors and colors.black or nil, colors and colors.white or nil)
+  print("CC MINER " .. tostring(common.VERSION) .. " SETUP")
+  print("")
+  print("1. Worker (mining turtle)")
+  print("2. Controller (computer + touch monitor)")
+  print("3. GPS host (computer + wireless modem)")
+  print("")
+  local choice = common.promptNumber("Role", turtle and 1 or 2, 1, 3)
+  requestedRole = choice == 1 and "worker" or choice == 2 and "controller" or "gps"
+end
+
+if requestedRole == "worker" and not turtle then error("Worker role can only be configured on a turtle.", 0) end
+if requestedRole == "gps" and turtle then print("Warning: use a stationary computer for a GPS host.") end
+
+common.clear(colors and colors.black or nil, colors and colors.white or nil)
+print("CC MINER " .. tostring(common.VERSION) .. " SETUP - " .. string.upper(requestedRole))
+print("")
+
+local config
+if requestedRole == "gps" then
+  config = common.merge(common.defaultGPSConfig(), current and current.role == "gps" and current or {})
+  config.role = "gps"
+  config.gpsName = common.prompt("GPS host name", config.gpsName or common.safeComputerLabel("GPS"), function(value)
+    return #value >= 1 and #value <= 20, "Use 1 to 20 characters."
+  end)
+  print("Enter the WORLD coordinates of the wireless modem block.")
+  print("GPS needs at least four hosts at different 3D positions.")
+  config.x = common.promptNumber("World X", config.x or 0, -30000000, 30000000)
+  config.y = common.promptNumber("World Y", config.y or 0, -2048, 2048)
+  config.z = common.promptNumber("World Z", config.z or 0, -30000000, 30000000)
+  if os.setComputerLabel then os.setComputerLabel(config.gpsName) end
+else
+  print("All workers and the controller must use the SAME network key.")
+  print("Use only ASCII letters, numbers, '-' and '_'.")
+  print("")
+  local previousKey = current and current.networkKey
+  if previousKey == "CHANGE_ME" then previousKey = nil end
+  local key = common.prompt("Network key", previousKey or common.randomToken(16), function(value)
+    if #value < 8 or #value > 40 then return false, "Use 8 to 40 characters." end
+    if value:find("[^%w_-]") then return false, "Use only letters, numbers, '-' and '_'." end
+    return true
+  end)
+
+  if requestedRole == "worker" then
+    config = common.merge(common.defaultWorkerConfig(), current and current.role == "worker" and current or {})
+    config.role, config.networkKey = "worker", key
+    local workerDefaults = common.defaultWorkerConfig()
+    local discard = ensureTable(config, "discard", workerDefaults.discard)
+    local performance = ensureTable(config, "performance", workerDefaults.performance)

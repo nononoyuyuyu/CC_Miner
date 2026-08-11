@@ -1,4 +1,4 @@
--- CC Miner V3 - interactive configuration
+-- CC Miner V4 - interactive configuration
 
 local args = { ... }
 local common = dofile("/ccminer/lib/common.lua")
@@ -84,6 +84,67 @@ local function peripheralNamePrompt(label, defaultValue)
   end)
 end
 
+local function identifierPrompt(label, defaultValue, fallback)
+  local safeDefault = type(defaultValue) == "string" and defaultValue or fallback
+  return common.prompt(label, safeDefault, function(value)
+    if #value < 1 or #value > 64 or value:find("[%c%s]") then
+      return false, "Use 1 to 64 non-space characters."
+    end
+    return true
+  end)
+end
+
+local function discardModePrompt(defaultValue)
+  local value = string.upper(common.trim(tostring(defaultValue or "KEEP_ALL")))
+  local allowed = {
+    KEEP_ALL = true,
+    DISCARD_EXCESS_STONE = true,
+    CUSTOM_ALLOWLIST = true,
+  }
+  if not allowed[value] then value = "KEEP_ALL" end
+  value = common.prompt("Discard mode (KEEP_ALL/DISCARD_EXCESS_STONE/CUSTOM_ALLOWLIST)", value, function(text)
+    text = string.upper(common.trim(text))
+    if allowed[text] then return true end
+    return false, "Enter KEEP_ALL, DISCARD_EXCESS_STONE, or CUSTOM_ALLOWLIST."
+  end)
+  return string.upper(common.trim(value))
+end
+
+local function allowlistText(value)
+  local names = {}
+  if type(value) == "table" then
+    for name, enabled in pairs(value) do
+      if enabled == true then names[#names + 1] = tostring(name) end
+    end
+  end
+  table.sort(names)
+  return table.concat(names, ",")
+end
+
+local function allowlistPrompt(defaultValue)
+  local text = common.prompt("Discard allowlist (item IDs, comma-separated; blank=none)", allowlistText(defaultValue), function(value)
+    if #value > 2048 or value:find("[%c]") then return false, "Use comma-separated item IDs only." end
+    if value ~= "" and (value:match("^[,;]") or value:match("[,;]$") or value:find("[,;][,;]")) then
+      return false, "Do not leave empty entries in the allowlist."
+    end
+    for item in value:gmatch("[^,;]+") do
+      local trimmed = common.trim(item)
+      if trimmed ~= item then return false, "Do not include spaces around item IDs." end
+      item = trimmed
+      if item == "" or #item > 128 or not item:match("^[a-z0-9_.%-]+:[a-z0-9_./%-]+$") then
+        return false, "Use complete item IDs such as minecraft:stone (no wildcard or partial names)."
+      end
+    end
+    return true
+  end)
+  local out = {}
+  for item in text:gmatch("[^,;]+") do
+    item = common.trim(item)
+    if item ~= "" then out[item] = true end
+  end
+  return out
+end
+
 if requestedRole ~= "worker" and requestedRole ~= "controller" and requestedRole ~= "gps" then
   common.clear(colors and colors.black or nil, colors and colors.white or nil)
   print("CC MINER " .. tostring(common.VERSION) .. " SETUP")
@@ -132,6 +193,10 @@ else
     config = common.merge(common.defaultWorkerConfig(), current and current.role == "worker" and current or {})
     config.role, config.networkKey = "worker", key
     local workerDefaults = common.defaultWorkerConfig()
+    local discard = ensureTable(config, "discard", workerDefaults.discard)
+    local performance = ensureTable(config, "performance", workerDefaults.performance)
+    local dock = ensureTable(config, "dock", workerDefaults.dock)
+    local group = ensureTable(config, "group", workerDefaults.group)
     local lighting = ensureTable(config, "lighting", workerDefaults.lighting)
     local materials = ensureTable(config, "materials", workerDefaults.materials)
     ensureTable(config, "service", workerDefaults.service)
@@ -154,6 +219,44 @@ else
     end)
     config.fuelTarget = common.promptNumber("Fuel target", validInteger(config.fuelTarget, 12000, 500, 100000), 500, 100000)
     config.reserveEmptySlots = common.promptNumber("Reserved empty slots", validInteger(config.reserveEmptySlots, 3, 1, 8), 1, 8)
+
+    -- Disposal is deliberately a short, explicit safety wizard.  KEEP_ALL is
+    -- the default; the stone mode keeps only its built-in stone candidates,
+    -- while CUSTOM_ALLOWLIST considers only complete IDs entered by the user.
+    discard.mode = discardModePrompt(discard.mode)
+    if discard.mode == "CUSTOM_ALLOWLIST" then
+      discard.allowlist = allowlistPrompt(discard.allowlist)
+    else
+      discard.allowlist = type(discard.allowlist) == "table" and discard.allowlist or {}
+    end
+    discard.retainSealTarget = validInteger(discard.retainSealTarget or config.retainSealTarget, 64, 1, 512)
+    discard.triggerEmptySlots = common.promptNumber(
+      "Discard when empty slots reach",
+      validInteger(discard.triggerEmptySlots, config.reserveEmptySlots or 3, 0, 16),
+      0,
+      16
+    )
+    print("設定方向に inventory が見つかった場合は、誤投入防止のため world 廃棄をスキップします。")
+    discard.direction = enumPrompt("現場廃棄方向 (front/back/left/right/top/bottom)", discard.direction or config.outputSide or "back", {
+      front = true, back = true, left = true, right = true, top = true, bottom = true,
+    }, "back")
+    discard.maxStacksPerPass = validInteger(discard.maxStacksPerPass, 8, 1, 64)
+    config.retainSealTarget = discard.retainSealTarget
+    materials.retainSealTarget = discard.retainSealTarget
+    materials.discard = common.copy(discard)
+
+    -- Dock/group identity is intentionally simple for first-time users.  GPS
+    -- calibration later fills homeWorld/facing; existing calibration is copied
+    -- here so a setup rerun cannot erase it.
+    dock.id = identifierPrompt("Dock ID", dock.id, "main")
+    dock.groupId = identifierPrompt("Worker group ID", dock.groupId, "default")
+    dock.bayId = identifierPrompt("Dock bay ID", dock.bayId, "main")
+    dock.requireSameFloor = common.promptYesNo("Require same-floor dock checks", dock.requireSameFloor ~= false)
+    dock.sameFloor, dock.verifySameFloor = dock.requireSameFloor, dock.requireSameFloor
+    group.id, group.groupId = dock.groupId, dock.groupId
+    if type(config.gps) == "table" and config.gps.calibration and config.gps.calibration.home then
+      dock.homeWorld = common.copy(config.gps.calibration.home)
+    end
     config.lavaMode = enumPrompt("Lava behavior (seal/stop)", config.lavaMode or "seal", {
       seal = true, stop = true,
     }, "seal")
@@ -184,10 +287,26 @@ else
     end
     materials.compactEveryMoves = validInteger(materials.compactEveryMoves, 32, 1, 100000)
     materials.retainSealTarget = validInteger(materials.retainSealTarget, 64, 1, 512)
+    materials.retainSealTarget = discard.retainSealTarget
+    config.retainSealTarget = discard.retainSealTarget
+    materials.discard = common.copy(discard)
     materials.recycleMinedBlocks = common.promptYesNo("Recycle mined blocks", materials.recycleMinedBlocks ~= false)
     journal.checkpointEvery = validInteger(journal.checkpointEvery, 32, 1, 100000)
     journal.maxEntries = validInteger(journal.maxEntries, 256, 1, 10000)
     journal.enabled = common.promptYesNo("Enable resumable journal", journal.enabled ~= false)
+    performance.gpsVerifyEveryMoves = validInteger(performance.gpsVerifyEveryMoves, 32, 32, 64)
+    performance.gpsVerifyMoves = performance.gpsVerifyEveryMoves
+    performance.gpsVerifyCadence = performance.gpsVerifyEveryMoves
+    performance.lightweightCheckpointEveryMoves = validInteger(
+      performance.lightweightCheckpointEveryMoves,
+      16,
+      1,
+      100000
+    )
+    performance.lightweightCheckpointCadence = performance.lightweightCheckpointEveryMoves
+    performance.journalEveryMoves = performance.lightweightCheckpointEveryMoves
+    performance.checkpointEveryMoves = validInteger(performance.checkpointEveryMoves, journal.checkpointEvery, 1, 100000)
+    performance.checkpointCadence = performance.checkpointEveryMoves
     config.gps = ensureTable(config, "gps", workerDefaults.gps)
     config.gps.enabled = common.promptYesNo("Use GPS when available", config.gps.enabled ~= false)
     if config.gps.enabled then
@@ -195,8 +314,10 @@ else
     else
       config.gps.required = false
     end
+    config.gps.verifyEveryMoves = performance.gpsVerifyEveryMoves
     if config.gps.calibration and common.promptYesNo("Clear stored GPS calibration for a relocated dock", false) then
       config.gps.calibration = nil
+      dock.homeWorld = { x = nil, y = nil, z = nil }
     end
     config.attackEntities = common.promptYesNo("Attack blocking entities", config.attackEntities == true)
     config.outputSide, config.fuelSide = "back", "top"
@@ -205,11 +326,31 @@ else
     config = common.merge(common.defaultControllerConfig(), current and current.role == "controller" and current or {})
     config.role, config.networkKey = "controller", key
     local controllerDefaults = common.defaultControllerConfig()
+    local group = ensureTable(config, "group", controllerDefaults.group)
+    local dock = ensureTable(config, "dock", controllerDefaults.dock)
     local alerts = ensureTable(config, "alerts", controllerDefaults.alerts)
     config.historyLimit = common.promptNumber("History entries to retain", validInteger(config.historyLimit, 50, 1, 1000), 1, 1000)
     config.queueEnabled = common.promptYesNo("Enable job queue", config.queueEnabled ~= false)
     config.overlapProtection = common.promptYesNo("Protect overlapping jobs", config.overlapProtection ~= false)
     config.adaptiveRefresh = common.promptYesNo("Enable adaptive refresh", config.adaptiveRefresh ~= false)
+    -- Keep group setup approachable: one worker-capacity value, one service
+    -- concurrency value, and an explicit GPS safety gate for partitioning.
+    group.maxWorkers = common.promptNumber("Maximum workers in a group", validInteger(group.maxWorkers, 16, 1, 256), 1, 256)
+    group.maxConcurrentService = common.promptNumber(
+      "Maximum concurrent service returns",
+      validInteger(group.maxConcurrentService, 1, 1, 64),
+      1,
+      64
+    )
+    group.partitionMode = enumPrompt("Partition mode (stripe/round_robin)", group.partitionMode or "stripe", {
+      stripe = true, round_robin = true,
+    }, "stripe")
+    group.requireGpsForPartition = common.promptYesNo(
+      "Require GPS for multi-worker partitioning",
+      group.requireGpsForPartition ~= false
+    )
+    dock.baySpacing = common.promptNumber("Dock bay spacing", validInteger(dock.baySpacing, 4, 1, 256), 1, 256)
+    dock.requireSameFloor = common.promptYesNo("Require same-floor dock checks", dock.requireSameFloor ~= false)
     local sorting = ensureTable(config, "sorting", controllerDefaults.sorting)
     sorting.enabled = common.promptYesNo("Enable automatic item sorting", sorting.enabled == true)
     if sorting.enabled then

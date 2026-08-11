@@ -1,0 +1,250 @@
+end
+
+local function handlePointer(key, x, y)
+  local boxes = hitboxes[key] or {}
+  for index = #boxes, 1, -1 do
+    local box = boxes[index]
+    if x >= box.x1 and x <= box.x2 and y >= box.y1 and y <= box.y2 then box.action(); invalidate(); return true end
+  end
+  return false
+end
+]] },
+  { source = [[src/ccminer/controller_parts/03.part]], target = [[controller_parts/03.part]], digest = [[fd6b5545e259227bc15c4e3b9786233142adb4aa429d8255aa489d2f7b6bca1d]], content = [[-- CC Miner V4 - keyboard/CLI compatibility and event loop.
+
+local function processChar(character)
+  character = string.lower(character or "")
+  if mode == "job_dimensions" then
+    if character:match("%d") or character == "-" then draftDigit(character) end
+    return
+  elseif mode == "group_dimensions" or mode == "group_job" then
+    if character:match("%d") or character == "-" then groupDraftDigit(character)
+    elseif character == "p" then
+      local gid = selectedGroupRecord()
+      if gid and groupDraft then commitGroupDraftField(); groupDraft.preflight = computeGroupPreflight(gid, groupDraft); invalidate() end
+    elseif character == "s" then
+      local gid = selectedGroupRecord()
+      if gid and groupDraft then commitGroupDraftField(); local result = groupDraft.preflight or computeGroupPreflight(gid, groupDraft); groupDraft.preflight = result; if result and not result.fatal then startGroup(gid, groupDraft) end; invalidate() end
+    elseif character == "b" or character == "q" then mode = "groups"; invalidate() end
+    return
+  elseif mode == "confirm" then
+    if character == "y" then
+      if confirmState and confirmState.twoStep and not confirmState.armed then
+        confirmState.armed = true; confirmState.message = "FINAL confirmation: press Y again to send REHOME RESET."; invalidate(); return
+      end
+      local id = selectedWorker()
+      if confirmState and id then
+        if confirmState.command == "stop" then stageStop(id, (confirmState.payload or {}).mode or "abort") else sendCommand(id, confirmState.command, confirmState.payload) end
+      end
+      confirmState, mode = nil, "dashboard"
+    elseif character == "n" then confirmState, mode = nil, "dashboard"; setNotice("Cancelled.", false) end
+    return
+  elseif mode == "job_grid" then
+    if character == "a" then allGrid(true) elseif character == "c" then allGrid(false) elseif character == "i" then invertGrid() elseif character == "r" then draft.rectMode = not draft.rectMode; draft.rectStart = nil; invalidate() end
+    return
+  elseif mode == "groups" then
+    local ids = orderedGroupIds()
+    if character == "s" then groupAction("start")()
+    elseif character == "p" then groupAction("pause")()
+    elseif character == "r" then groupAction("resume")()
+    elseif character == "h" then groupAction("return")()
+    elseif character == "v" then mode = "group_info"; invalidate()
+    end
+    return
+  elseif mode == "group_info" then
+    if character == "b" or character == "q" then mode = "groups"; invalidate() end
+    return
+  end
+  if mode ~= "dashboard" then return end
+  local id = selectedWorker()
+  if character == "d" then discover()
+  elseif character == "n" then dashboardAction("new")()
+  elseif character == "p" then sendCommand(id, "pause")
+  elseif character == "r" then sendCommand(id, "resume")
+  elseif character == "h" then sendCommand(id, "recall")
+  elseif character == "s" then dashboardAction("stop")()
+  elseif character == "x" then dashboardAction("abort")()
+  elseif character == "c" then dashboardAction("clear")()
+  elseif character == "i" then dashboardAction("info")()
+  elseif character == "g" then dashboardAction("progress")()
+  elseif character == "e" then dashboardAction("recovery")()
+  elseif character == "t" then dashboardAction("report")()
+  elseif character == "l" then dashboardAction("gps")()
+  elseif character == "v" then dashboardAction("groups")()
+  elseif character == "q" then running = false end
+end
+
+local function processKey(keyCode)
+  if keys and keyCode == keys.escape then
+    if mode == "dashboard" then
+      running = false
+    else
+      mode, draft, confirmState = "dashboard", nil, nil
+      invalidate()
+    end
+    return
+  end
+  if mode == "dashboard" then
+    local ids = orderedIds()
+    if keys and keyCode == keys.up then
+      selected = math.max(1, selected - 1)
+      invalidate()
+    elseif keys and keyCode == keys.down then
+      selected = math.min(math.max(1, #ids), selected + 1)
+      invalidate()
+    elseif keys and keyCode == keys.enter then
+      mode = "info"
+      invalidate()
+    end
+  elseif mode == "groups" then
+    local ids = orderedGroupIds()
+    if keys and keyCode == keys.up then selectedGroup = math.max(1, selectedGroup - 1); invalidate()
+    elseif keys and keyCode == keys.down then selectedGroup = math.min(math.max(1, #ids), selectedGroup + 1); invalidate()
+    elseif keys and keyCode == keys.enter then mode = "group_info"; invalidate()
+    elseif keys and keyCode == keys.backspace then mode = "dashboard"; invalidate() end
+  elseif mode == "group_info" then
+    if keys and (keyCode == keys.enter or keyCode == keys.backspace) then mode = "groups"; invalidate() end
+  elseif mode == "group_dimensions" or mode == "group_job" then
+    if keys and keyCode == keys.backspace then
+      groupDraftBackspace(); invalidate()
+    elseif keys and keyCode == keys.tab then
+      local position = 1
+      local fields = groupFieldOrder()
+      for index, field in ipairs(fields) do if field == (groupDraft and groupDraft.selectedField) then position = index end end
+      chooseGroupDraftField(fields[position % #fields + 1]); invalidate()
+    elseif keys and keyCode == keys.enter then
+      local gid = selectedGroupRecord()
+      if gid and groupDraft then commitGroupDraftField(); groupDraft.preflight = computeGroupPreflight(gid, groupDraft); invalidate() end
+    elseif keys and keyCode == keys.left then
+      adjustGroupDraft(groupDraft and groupDraft.selectedField or "width", -1); invalidate()
+    elseif keys and keyCode == keys.right then
+      adjustGroupDraft(groupDraft and groupDraft.selectedField or "width", 1); invalidate()
+    end
+  elseif mode == "job_dimensions" then
+    if keys and keyCode == keys.backspace then
+      draftBackspace()
+      invalidate()
+    elseif keys and keyCode == keys.tab then
+      local position = 1
+      local fields = currentFieldOrder()
+      for index, field in ipairs(fields) do
+        if field == draft.selectedField then position = index end
+      end
+      chooseDraftField(fields[position % #fields + 1])
+      invalidate()
+    elseif keys and keyCode == keys.enter then
+      commitDraftField()
+      mode = "job_grid"
+      invalidate()
+    elseif keys and keyCode == keys.left then
+      adjustDraft(draft.selectedField or "width", -1)
+      invalidate()
+    elseif keys and keyCode == keys.right then
+      adjustDraft(draft.selectedField or "width", 1)
+      invalidate()
+    end
+  elseif mode == "job_grid" or mode == "job_chunks" then
+    if keys and keyCode == keys.left then
+      draft.gridPageX = math.max(1, (draft.gridPageX or 1) - 1)
+      invalidate()
+    elseif keys and keyCode == keys.right then
+      draft.gridPageX = (draft.gridPageX or 1) + 1
+      invalidate()
+    elseif keys and keyCode == keys.up then
+      draft.gridPageZ = math.max(1, (draft.gridPageZ or 1) - 1)
+      invalidate()
+    elseif keys and keyCode == keys.down then
+      draft.gridPageZ = (draft.gridPageZ or 1) + 1
+      invalidate()
+    elseif keys and keyCode == keys.enter then
+      local result = computePreflight()
+      if result then mode = "preflight" end
+      invalidate()
+    end
+  elseif mode == "preflight" then
+    if keys and keyCode == keys.enter and draft and draft.preflight and not draft.preflight.fatal then
+      startDraft()
+    elseif keys and keyCode == keys.q then
+      queueDraft()
+    end
+  elseif mode == "progress" or mode == "recovery" or mode == "report" or mode == "info" or mode == "stop_menu" then
+    if keys and (keyCode == keys.enter or keyCode == keys.backspace) then
+      mode = "dashboard"
+      invalidate()
+    end
+  elseif mode == "confirm" and keys and keyCode == keys.y then
+    processChar("y")
+  end
+end
+
+local function pumpFor(seconds)
+  local deadline = common.nowSeconds() + (seconds or 1)
+  while common.nowSeconds() <= deadline do
+    local sender, message = protocol.receive(0.25)
+    if sender then handleMessage(sender, message) end
+    groupSchedulerTick()
+  end
+end
+
+local function makeCliDraft(id, width, length, depth)
+  local previous = db.lastDraft or {}
+  local calibration = draftCalibration(id)
+  local targetY = calibration and calibration.home and tonumber(calibration.home.y) and (tonumber(calibration.home.y) - depth + 1) or nil
+  return {
+    workerId = id, width = width, length = length, depth = depth,
+    targetY = targetY,
+    lighting = normalizedLighting(previous.lighting),
+    waterMode = normalizedWaterMode(previous.waterMode), profile = normalizedProfile(previous.profile),
+    selectedField = "width", buffer = tostring(width), excluded = {},
+    gridPageX = 1, gridPageZ = 1, rectMode = false, autoAssign = false,
+    name = "CLI Quarry",
+  }
+end
+
+local function printQueue()
+  if #db.queue == 0 then print("Queue empty."); return end
+  for index, item in ipairs(db.queue) do print(("%d: #%s %dx%dx%d profile=%s queued=%s"):format(index, tostring(item.workerId or "-"), tonumber(item.width) or 0, tonumber(item.length) or 0, tonumber(item.depth) or 0, tostring(item.profile or "balanced"), tostring(item.queuedAt or "-"))) end
+end
+
+local function printHistory()
+  if #db.history == 0 then print("No history."); return end
+  for index = #db.history, 1, -1 do
+    local item = db.history[index]
+    print(("%s %-8s worker=%s job=%s reason=%s"):format(tostring(item.finishedAt or "-"), tostring(item.status or "-"), tostring(item.workerId or "-"), tostring(item.jobId or item.id or "-"), tostring(item.reason or "-")))
+  end
+end
+
+local function splitCsv(value)
+  local out = {}
+  for item in tostring(value or ""):gmatch("[^,]+") do out[#out + 1] = tonumber(item) or common.trim(item) end
+  return out
+end
+
+local function splitMap(value)
+  local out = {}
+  for item in tostring(value or ""):gmatch("[^,]+") do
+    local key, mapped = item:match("^([^=]+)=(.+)$")
+    if key and mapped then out[common.trim(key)] = common.trim(mapped) end
+  end
+  return out
+end
+
+local function printGroups()
+  local ids = orderedGroupIds()
+  if #ids == 0 then print("No groups."); return end
+  for _, gid in ipairs(ids) do
+    local group = groupRecord(gid)
+    local job = activeGroupJob(gid)
+    local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, online = 0, total = #groupWorkerIds(group), minFuel = "-", warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
+    print(("%s name=%s workers=%d/%d status=%s progress=%s%% minFuel=%s ACK=%d/%d warn=%s"):format(tostring(gid), groupName(group, gid), aggregate.online or 0, aggregate.total or 0, tostring(job and job.status or "idle"), tostring(aggregate.percent or 0), tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0, table.concat(aggregate.warnings or {}, ";")))
+  end
+end
+
+local function commandGroupMode()
+  local sub = string.lower(args[2] or "list")
+  if sub == "list" or sub == "status" then printGroups(); return true end
+  if sub == "show" then
+    local gid = args[3]
+    local group = gid and groupRecord(gid)
+    if not group then print("Group not found.") else
+      local job = activeGroupJob(gid)
+      local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, minFuel = "-", warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }

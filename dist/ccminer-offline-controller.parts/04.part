@@ -1,0 +1,170 @@
+  local loadedPerformance = type(loaded.performance) == "table" and loaded.performance or {}
+  local loadedDock = type(loaded.dock) == "table" and loaded.dock or {}
+  local loadedJournal = type(loaded.journal) == "table" and loaded.journal or {}
+
+  config.networkKey = normalizeString(config.networkKey, defaults.networkKey, 8, 40)
+  config.workerName = normalizeString(config.workerName, defaults.workerName, 1, 20)
+  config.profile = normalizeEnum(config.profile, { safe = true, balanced = true, turbo = true }, defaults.profile)
+  config.waterMode = normalizeEnum(config.waterMode, { ignore = true, stop = true, seal = true }, defaults.waterMode)
+  config.maxContinuousSeal = normalizeInteger(config.maxContinuousSeal, 1, 4096, defaults.maxContinuousSeal)
+  config.reserveEmptySlots = normalizeInteger(config.reserveEmptySlots, 1, 8, defaults.reserveEmptySlots)
+  config.fuelBuffer = normalizeInteger(config.fuelBuffer, 0, 100000, defaults.fuelBuffer)
+  config.fuelTarget = normalizeInteger(config.fuelTarget, 500, 100000, defaults.fuelTarget)
+  config.moveRetries = normalizeInteger(config.moveRetries, 0, 100, defaults.moveRetries)
+  config.moveRetryDelay = normalizeNumber(config.moveRetryDelay, 0, 10, defaults.moveRetryDelay)
+  config.heartbeatSeconds = normalizeNumber(config.heartbeatSeconds, 0.1, 60, defaults.heartbeatSeconds)
+  config.maxWidth = normalizeInteger(config.maxWidth, 1, 4096, defaults.maxWidth)
+  config.maxLength = normalizeInteger(config.maxLength, 1, 4096, defaults.maxLength)
+  config.maxDepth = normalizeInteger(config.maxDepth, 1, 4096, defaults.maxDepth)
+  config.maxVolume = normalizeInteger(config.maxVolume, 1, 100000000, defaults.maxVolume)
+  config.lavaMode = normalizeEnum(config.lavaMode, { seal = true, stop = true }, defaults.lavaMode)
+  config.sealSide = normalizeEnum(config.sealSide, { right = true, left = true }, defaults.sealSide)
+  config.outputSide = normalizeEnum(config.outputSide,
+    { front = true, back = true, left = true, right = true, top = true, bottom = true }, defaults.outputSide)
+  config.fuelSide = normalizeEnum(config.fuelSide,
+    { front = true, back = true, left = true, right = true, top = true, bottom = true }, defaults.fuelSide)
+  config.torchSide = normalizeEnum(config.torchSide,
+    { left = true, right = true }, defaults.torchSide)
+  config.sealTarget = normalizeInteger(config.sealTarget, 16, 512, defaults.sealTarget)
+  config.sealReserve = normalizeInteger(config.sealReserve, 1, math.max(1, config.sealTarget - 1), defaults.sealReserve)
+  config.attackEntities = normalizeBoolean(config.attackEntities, defaults.attackEntities)
+
+  config.discard = normalizeTable(defaults.discard, config.discard)
+  local legacyRetainSeal = firstNonNil(loadedMaterials.retainSealTarget, loaded.retainSealTarget)
+  local requestedRetainSeal = loadedDiscard.retainSealTarget
+  if requestedRetainSeal == nil then requestedRetainSeal = legacyRetainSeal end
+  config.discard.mode = normalizeDiscardMode(
+    firstNonNil(loadedDiscard.mode, loadedDiscard.policy, loaded.discardPolicy, config.discard.mode),
+    defaults.discard.mode
+  )
+  local requestedAllowlist = loadedDiscard.allowlist
+  if requestedAllowlist == nil then
+    requestedAllowlist = loadedDiscard.allowList or loadedDiscard.allowedItems
+      or loaded.discardAllowlist or loaded.allowedDiscardItems
+  end
+  config.discard.allowlist = normalizeAllowlist(requestedAllowlist or config.discard.allowlist, defaults.discard.allowlist)
+  config.discard.stoneAllowlist = normalizeBlockMap(
+    loadedDiscard.stoneAllowlist or loaded.stoneAllowlist or config.discard.stoneAllowlist,
+    defaults.discard.stoneAllowlist
+  )
+  config.discard.retainSealTarget = normalizeInteger(requestedRetainSeal or config.discard.retainSealTarget,
+    1, 512, defaults.discard.retainSealTarget)
+  config.discard.triggerEmptySlots = normalizeInteger(
+    loadedDiscard.triggerEmptySlots or loadedDiscard.emptySlots or loaded.reserveEmptySlots
+      or config.discard.triggerEmptySlots,
+    0, 16, defaults.discard.triggerEmptySlots
+  )
+  config.discard.direction = normalizeEnum(
+    loadedDiscard.direction or config.discard.direction,
+    { front = true, back = true, left = true, right = true, top = true, bottom = true, up = true, down = true },
+    defaults.discard.direction
+  )
+  config.discard.maxStacksPerPass = normalizeInteger(
+    loadedDiscard.maxStacksPerPass or loadedDiscard.maxStacks or config.discard.maxStacksPerPass,
+    1, 64, defaults.discard.maxStacksPerPass
+  )
+  -- Keep the legacy material aliases synchronized.  The nested discard value
+  -- is canonical, but older workers still read materials.retainSealTarget.
+  config.materials = normalizeTable(defaults.materials, config.materials)
+  if loadedDiscard.retainSealTarget == nil and legacyRetainSeal ~= nil then
+    config.materials.retainSealTarget = config.discard.retainSealTarget
+  end
+  config.materials.retainSealTarget = config.discard.retainSealTarget
+  config.retainSealTarget = config.discard.retainSealTarget
+
+  config.lighting = normalizeTable(defaults.lighting, config.lighting)
+  config.lighting.mode = normalizeEnum(config.lighting.mode, { off = true, safe = true, custom = true }, defaults.lighting.mode)
+  config.lighting.interval = normalizeInteger(config.lighting.interval, 1, 4096, defaults.lighting.interval)
+  config.lighting.temporaryFloor = normalizeBoolean(config.lighting.temporaryFloor, defaults.lighting.temporaryFloor)
+  config.lighting.torchTarget = normalizeInteger(config.lighting.torchTarget, 1, 512, defaults.lighting.torchTarget)
+  config.lighting.torchReserve = normalizeInteger(config.lighting.torchReserve, 0, math.max(0, config.lighting.torchTarget - 1), defaults.lighting.torchReserve)
+  config.lighting.reserve = normalizeInteger(config.lighting.reserve, 0, 512, defaults.lighting.reserve)
+  config.lighting.preferredSlots = normalizeSlotList(config.lighting.preferredSlots, defaults.lighting.preferredSlots)
+  config.lighting.torchBlocks = normalizeBlockMap(config.lighting.torchBlocks, defaults.lighting.torchBlocks)
+  config.lighting.slot = normalizeInteger(config.lighting.slot, 1, 16, defaults.lighting.slot)
+  local loadedLighting = type(raw) == "table" and raw.lighting or nil
+  local requestedTorchSide = type(loadedLighting) == "table" and loadedLighting.side or nil
+  if requestedTorchSide == nil and type(raw) == "table" then requestedTorchSide = raw.torchSide end
+  config.lighting.side = normalizeEnum(requestedTorchSide or config.lighting.side,
+    { left = true, right = true }, defaults.lighting.side)
+  if config.lavaMode == "seal" and config.lighting.side == config.sealSide then
+    config.lighting.side = config.sealSide == "left" and "right" or "left"
+  end
+  -- V4 uses lighting.side; retain the flat alias for older draft configs.
+  config.torchSide = config.lighting.side
+
+  config.materials = normalizeTable(defaults.materials, config.materials)
+  for _, key in ipairs({ "sealSlots", "torchSlots", "fuelReserveSlots" }) do
+    config.materials[key] = normalizeSlotList(config.materials[key], defaults.materials[key])
+  end
+  config.materials.compactEveryMoves = normalizeInteger(config.materials.compactEveryMoves, 1, 100000, defaults.materials.compactEveryMoves)
+  config.materials.recycleMinedBlocks = normalizeBoolean(config.materials.recycleMinedBlocks, defaults.materials.recycleMinedBlocks)
+  config.materials.retainSealTarget = normalizeInteger(config.discard.retainSealTarget, 1, 512, defaults.materials.retainSealTarget)
+  config.discard.retainSealTarget = config.materials.retainSealTarget
+  config.retainSealTarget = config.discard.retainSealTarget
+  -- Keep legacy material compatibility as an independent copy.  Some
+  -- ComputerCraft serializers reject shared table references.
+  config.materials.discard = M.copy(config.discard)
+
+  config.performance = normalizeTable(defaults.performance, config.performance)
+  local requestedGpsVerify = loadedPerformance.gpsVerifyEveryMoves
+    or loadedPerformance.gpsVerifyMoves
+    or loadedPerformance.gpsVerifyCadence
+    or config.performance.gpsVerifyEveryMoves
+  config.performance.gpsVerifyEveryMoves = normalizeInteger(requestedGpsVerify, 32, 64,
+    defaults.performance.gpsVerifyEveryMoves)
+  config.performance.gpsVerifyMoves = config.performance.gpsVerifyEveryMoves
+  config.performance.gpsVerifyCadence = config.performance.gpsVerifyEveryMoves
+  local requestedLightweight = loadedPerformance.lightweightCheckpointEveryMoves
+    or loadedPerformance.lightweightCheckpointCadence
+    or loadedPerformance.journalEveryMoves
+    or loadedJournal.lightweightCheckpointEveryMoves
+    or loadedJournal.checkpointEvery
+    or config.performance.lightweightCheckpointEveryMoves
+  config.performance.lightweightCheckpointEveryMoves = normalizeInteger(requestedLightweight, 1, 100000,
+    defaults.performance.lightweightCheckpointEveryMoves)
+  config.performance.lightweightCheckpointCadence = config.performance.lightweightCheckpointEveryMoves
+  config.performance.journalEveryMoves = config.performance.lightweightCheckpointEveryMoves
+  local requestedCheckpoint = loadedPerformance.checkpointEveryMoves
+    or loadedPerformance.checkpointCadence
+    or config.performance.checkpointEveryMoves
+  config.performance.checkpointEveryMoves = normalizeInteger(requestedCheckpoint, 1, 100000,
+    defaults.performance.checkpointEveryMoves)
+  config.performance.checkpointCadence = config.performance.checkpointEveryMoves
+
+  -- Journal settings predate `performance`; preserve their values but expose
+  -- the lightweight cadence as the canonical checkpoint hint.
+  config.journal = normalizeTable(defaults.journal, config.journal)
+  config.journal.enabled = normalizeBoolean(config.journal.enabled, defaults.journal.enabled)
+  config.journal.checkpointEvery = normalizeInteger(config.journal.checkpointEvery, 1, 100000, defaults.journal.checkpointEvery)
+  config.journal.lightweightCheckpointEveryMoves = normalizeInteger(
+    config.journal.lightweightCheckpointEveryMoves,
+    1,
+    100000,
+    defaults.journal.lightweightCheckpointEveryMoves
+  )
+  config.journal.maxEntries = normalizeInteger(config.journal.maxEntries, 1, 10000, defaults.journal.maxEntries)
+  if type(config.journal.path) ~= "string" or M.trim(config.journal.path) == "" then config.journal.path = defaults.journal.path end
+  if type(config.journal.pendingPath) ~= "string" or M.trim(config.journal.pendingPath) == "" then config.journal.pendingPath = defaults.journal.pendingPath end
+  config.journal.lightweightCheckpointEveryMoves = config.performance.lightweightCheckpointEveryMoves
+
+  config.dock = normalizeTable(defaults.dock, config.dock)
+  local legacyAssignment = loaded.groupId or loaded.group or loaded.groupAssignment or loaded.assignment
+  if type(legacyAssignment) == "table" then
+    legacyAssignment = legacyAssignment.groupId or legacyAssignment.id or legacyAssignment.name
+  end
+  local legacyDockId = type(loaded.dock) == "string" and loaded.dock or nil
+  local dockId = loadedDock.id or loaded.dockId or loaded.homeDockId or legacyDockId or config.dock.id
+  local groupId = loadedDock.groupId or legacyAssignment or config.dock.groupId
+  local bayId = loadedDock.bayId or loaded.bayId or loaded.bay or config.dock.bayId
+  if type(dockId) == "table" then dockId = dockId.id or dockId.name end
+  if type(groupId) == "table" then groupId = groupId.id or groupId.name or groupId.groupId end
+  if type(bayId) == "table" then bayId = bayId.id or bayId.name or bayId.bayId end
+  config.dock.id = normalizeIdentifier(dockId, defaults.dock.id, 64)
+  config.dock.groupId = normalizeIdentifier(groupId, defaults.dock.groupId, 64)
+  config.dock.bayId = normalizeIdentifier(bayId, defaults.dock.bayId, 64)
+  local homeWorld = loadedDock.homeWorld or loadedDock.world or loadedDock.position or loadedDock.home
+    or loaded.homeWorld or loaded.gpsHome
+  if not homeWorld and type(config.gps) == "table" and type(config.gps.calibration) == "table" then
+    homeWorld = config.gps.calibration.home
+  end

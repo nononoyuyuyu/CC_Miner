@@ -1,0 +1,412 @@
+        wireless = ok and result == true
+      end
+      if wireless then
+        local ok = pcall(rednet.open, name)
+        if ok then opened[#opened + 1] = name end
+      end
+    end
+  end
+  return opened
+end
+
+function M.findPeripherals(peripheralType)
+  local found = {}
+  if not peripheral then return found end
+  for _, name in ipairs(peripheral.getNames()) do
+    local matches = peripheral.getType(name) == peripheralType
+    if not matches and peripheral.hasType then
+      local ok, result = pcall(peripheral.hasType, name, peripheralType)
+      matches = ok and result == true
+    end
+    if matches then found[#found + 1] = { name = name, device = peripheral.wrap(name) } end
+  end
+  table.sort(found, function(a, b) return a.name < b.name end)
+  return found
+end
+
+function M.findPeripheral(peripheralType, preferredName)
+  local all = M.findPeripherals(peripheralType)
+  if preferredName and preferredName ~= "" then
+    for _, entry in ipairs(all) do if entry.name == preferredName then return entry.device, entry.name end end
+  end
+  if all[1] then return all[1].device, all[1].name end
+  return nil, nil
+end
+
+function M.isInventorySide(side)
+  if not peripheral or not side then return false end
+  local wrapped = peripheral.wrap(side)
+  if not wrapped then return false end
+  return type(wrapped.list) == "function" or type(wrapped.size) == "function"
+end
+
+function M.withTerm(target, callback)
+  if not target or not term or not term.redirect then return callback() end
+  local old = term.redirect(target)
+  local ok, a, b, c = pcall(callback)
+  term.redirect(old)
+  if not ok then error(a, 0) end
+  return a, b, c
+end
+
+function M.setColors(background, foreground)
+  if term and term.isColor and term.isColor() then
+    if background and term.setBackgroundColor then term.setBackgroundColor(background) end
+    if foreground and term.setTextColor then term.setTextColor(foreground) end
+  end
+end
+
+function M.clear(background, foreground)
+  M.setColors(background, foreground)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+function M.writeAt(x, y, text, foreground, background)
+  if background and term.isColor and term.isColor() then term.setBackgroundColor(background) end
+  if foreground and term.isColor and term.isColor() then term.setTextColor(foreground) end
+  term.setCursorPos(math.max(1, x), math.max(1, y))
+  term.write(tostring(text or ""))
+end
+
+function M.statusColor(status)
+  if not colors then return nil end
+  local map = {
+    idle = colors.lightGray,
+    working = colors.lime,
+    calibrating = colors.lightBlue,
+    paused = colors.yellow,
+    waiting_fuel = colors.orange,
+    waiting_output = colors.orange,
+    waiting_seal = colors.orange,
+    dormant = colors.gray,
+    waiting_torch = colors.orange,
+    waiting_water = colors.blue,
+    recovering = colors.lightBlue,
+    blocked = colors.red,
+    complete = colors.cyan,
+    aborted = colors.red,
+    offline = colors.gray,
+    hosting = colors.lime,
+  }
+  return map[status] or colors.white
+end
+
+function M.defaultWorkerConfig()
+  return {
+    schema = M.SCHEMA,
+    version = M.VERSION,
+    role = "worker",
+    networkKey = "CHANGE_ME",
+    workerName = M.safeComputerLabel("Miner"),
+    controllerId = 0,
+    reserveEmptySlots = 3,
+    fuelBuffer = 256,
+    fuelTarget = 12000,
+    moveRetries = 20,
+    moveRetryDelay = 0.4,
+    heartbeatSeconds = 2,
+    attackEntities = false,
+    -- V4 operating profile.  These fields are additive so a V2 config can
+    -- still be loaded and merged with the defaults below.
+    profile = "balanced",
+    waterMode = "seal",
+    maxContinuousSeal = 32,
+    maxWidth = 128,
+    maxLength = 512,
+    maxDepth = 128,
+    maxVolume = 2000000,
+    outputSide = "back",
+    fuelSide = "top",
+    -- Material disposal is opt-in.  KEEP_ALL is intentionally the safe
+    -- default: an item which is not explicitly listed can never be discarded
+    -- by the worker runtime.
+    discard = {
+      mode = "KEEP_ALL",
+      allowlist = {},
+      stoneAllowlist = {
+        ["minecraft:stone"] = true,
+        ["minecraft:cobblestone"] = true,
+        ["minecraft:cobbled_deepslate"] = true,
+      },
+      retainSealTarget = 64,
+      triggerEmptySlots = 3,
+      direction = "back",
+      maxStacksPerPass = 8,
+    },
+    -- Legacy flat alias; normalizeWorkerConfig keeps it synchronized with
+    -- discard.retainSealTarget for V2 worker code.
+    retainSealTarget = 64,
+    -- Runtime pacing knobs are kept separate from job geometry.  GPS checks
+    -- are intentionally in the 32--64 move range to avoid turning every
+    -- block into a network round trip; the lightweight journal checkpoint is
+    -- cheaper and may run more frequently.
+    performance = {
+      gpsVerifyEveryMoves = 32,
+      gpsVerifyMoves = 32,
+      gpsVerifyCadence = 32,
+      lightweightCheckpointEveryMoves = 16,
+      lightweightCheckpointCadence = 16,
+      checkpointEveryMoves = 32,
+      checkpointCadence = 32,
+      journalEveryMoves = 16,
+    },
+    -- A dock is the stable identity used by workers and controller group
+    -- assignment.  homeWorld is populated after GPS calibration; nil values
+    -- mean that the user has not entered world coordinates yet.
+    dock = {
+      id = "main",
+      groupId = "default",
+      bayId = "main",
+      homeWorld = { x = nil, y = nil, z = nil },
+      facing = 0,
+      lane = 0,
+      requireSameFloor = true,
+      sameFloor = true,
+      verifySameFloor = true,
+    },
+    -- Optional worker-side assignment mirror.  The dock.groupId value is
+    -- authoritative; this table is retained for payloads written by older
+    -- controllers that used `group`/`assignment` roots.
+    group = {
+      id = "default",
+      groupId = "default",
+      assignmentId = nil,
+    },
+    -- Keep the torch chest separate from the output/seal chest by default.
+    torchSide = "left",
+    lavaMode = "seal",
+    sealSide = "right",
+    sealTarget = 64,
+    sealReserve = 8,
+    sealBlocks = {
+      ["minecraft:cobblestone"] = true,
+      ["minecraft:cobbled_deepslate"] = true,
+      ["minecraft:stone"] = true,
+      ["minecraft:netherrack"] = true,
+      ["minecraft:dirt"] = true,
+    },
+    lighting = {
+      mode = "safe",
+      interval = 10,
+      temporaryFloor = true,
+      torchTarget = 64,
+      torchReserve = 8,
+      preferredSlots = { 15, 16 },
+      torchBlocks = {
+        ["minecraft:torch"] = true,
+      },
+      reserve = 8,
+      -- Runtime compatibility knobs.  The V4 planner primarily uses the
+      -- fields above; these make an explicitly configured side/slot safe for
+      -- older worker code as well.
+      slot = 16,
+      side = "left",
+    },
+    materials = {
+      sealSlots = { 13, 14 },
+      torchSlots = { 15, 16 },
+      fuelReserveSlots = { 12 },
+      compactEveryMoves = 32,
+      recycleMinedBlocks = true,
+      retainSealTarget = 64,
+    },
+    service = {
+      adaptive = true,
+      finishCurrentChunk = true,
+      stations = {},
+    },
+    journal = {
+      enabled = true,
+      checkpointEvery = 32,
+      lightweightCheckpointEveryMoves = 16,
+      pendingPath = M.ROOT .. "/data/state.pending",
+      maxEntries = 256,
+      path = M.ROOT .. "/data/state.journal",
+    },
+    alerts = {
+      enabled = true,
+      speaker = false,
+      redstone = false,
+      redstoneSide = "back",
+      cooldownSeconds = 10,
+      onWaiting = true,
+      onComplete = true,
+      onError = true,
+    },
+    gps = {
+      enabled = true,
+      required = false,
+      timeout = 2,
+      verifyEveryMoves = 32,
+      autoResolvePending = true,
+      calibration = nil,
+    },
+    protectedBlocks = {
+      ["minecraft:bedrock"] = true,
+      ["minecraft:end_portal"] = true,
+      ["minecraft:end_portal_frame"] = true,
+      ["minecraft:nether_portal"] = true,
+      ["minecraft:reinforced_deepslate"] = true,
+      ["computercraft:turtle_normal"] = true,
+      ["computercraft:turtle_advanced"] = true,
+      ["computercraft:computer_normal"] = true,
+      ["computercraft:computer_advanced"] = true,
+    },
+  }
+end
+
+function M.defaultControllerConfig()
+  return {
+    schema = M.SCHEMA,
+    version = M.VERSION,
+    role = "controller",
+    networkKey = "CHANGE_ME",
+    controllerName = M.safeComputerLabel("Control"),
+    workerTimeoutSeconds = 10,
+    discoverySeconds = 5,
+    monitorTextScale = 0.5,
+    monitorName = "",
+    touchEnabled = true,
+    historyLimit = 50,
+    queueEnabled = true,
+    overlapProtection = true,
+    adaptiveRefresh = true,
+    -- Group settings are the controller's single source of truth for
+    -- assignment/partition/service limits.  Individual group records are
+    -- persisted in the controller database, not duplicated in config.
+    group = {
+      maxWorkers = 16,
+      maxConcurrentService = 1,
+      partitionMode = "stripe",
+      requireGpsForPartition = true,
+    },
+    -- Bay placement is intentionally kept with the dock contract so workers
+    -- can verify that a return is on the configured floor before servicing.
+    dock = {
+      baySpacing = 4,
+      requireSameFloor = true,
+    },
+    alerts = {
+      enabled = true,
+      speaker = true,
+      redstone = true,
+      redstoneSide = "back",
+      cooldownSeconds = 10,
+    },
+    presets = {
+      safe = {
+        profile = "safe",
+        waterMode = "stop",
+        maxContinuousSeal = 8,
+      },
+      balanced = {
+        profile = "balanced",
+        waterMode = "seal",
+        maxContinuousSeal = 32,
+      },
+      turbo = {
+        profile = "turbo",
+        waterMode = "seal",
+        maxContinuousSeal = 64,
+      },
+    },
+    sorting = {
+      enabled = false,
+      interval = 30,
+      source = "",
+      valuableTarget = "",
+      bulkTarget = "",
+      sealTarget = "",
+      valuableItems = {},
+      sealBlocks = {
+        ["minecraft:cobblestone"] = true,
+        ["minecraft:cobbled_deepslate"] = true,
+        ["minecraft:stone"] = true,
+        ["minecraft:netherrack"] = true,
+        ["minecraft:dirt"] = true,
+      },
+    },
+  }
+end
+
+function M.defaultGPSConfig()
+  return {
+    schema = M.SCHEMA,
+    version = M.VERSION,
+    role = "gps",
+    gpsName = M.safeComputerLabel("GPS"),
+    x = 0,
+    y = 0,
+    z = 0,
+  }
+end
+
+function M.defaultState()
+  local state = {
+    schema = M.SCHEMA,
+    version = M.VERSION,
+    status = "idle",
+    phase = "home",
+    pose = { x = 0, y = 0, z = 0, dir = 0 },
+    gps = {
+      available = false,
+      lastFix = nil,
+      lastFixAt = nil,
+      lastError = nil,
+      corrections = 0,
+    },
+    job = nil,
+    checkpoint = nil,
+    request = nil,
+    service = nil,
+    stagedStop = false,
+    -- Durable lifecycle markers.  A return can be requested for many reasons
+    -- (fuel, inventory, seal/torch stock, operator stop, ...); keeping the
+    -- reason and resume token in state makes a power-loss restart explicit.
+    returnReason = nil,
+    lastReturnReason = nil,
+    resumeToken = nil,
+    resume = {
+      token = nil,
+      issuedAt = nil,
+      consumedAt = nil,
+    },
+    -- Disposal is audited independently of the general recycle counters.
+    -- Items that are not selected by the active policy are counted as held or
+    -- skipped rather than silently dropped.
+    discardStats = {
+      enabled = false,
+      mode = "KEEP_ALL",
+      passes = 0,
+      attempts = 0,
+      stacks = 0,
+      discarded = 0,
+      items = 0,
+      skipped = 0,
+      held = 0,
+      unknown = 0,
+      overflow = 0,
+      byName = {},
+      lastAt = nil,
+      lastError = nil,
+      triggerEmptySlots = 3,
+      maxStacksPerPass = 8,
+    },
+    -- Short alias used by worker reports; both tables start with identical
+    -- counters and are normalized together when an older state is loaded by
+    -- the worker runtime.
+    discard = {
+      enabled = false,
+      mode = "KEEP_ALL",
+      passes = 0,
+      attempts = 0,
+      stacks = 0,
+      discarded = 0,
+      items = 0,
+      skipped = 0,
+      held = 0,
+      unknown = 0,
+      overflow = 0,
+      byName = {},
+      lastAt = nil,

@@ -1,0 +1,255 @@
+      local assignedKeys = plan.assignedKeys or plan.mineChunkKeys or assignmentChunks
+      local transitKeys = plan.transitKeys or plan.transitRouteKeys or job.assignmentTransitChunks or {}
+      job.assignmentChunks = common.copy(assignedKeys)
+      job.assignmentTransitChunks = common.copy(transitKeys)
+      job.assignmentSet, job.transitSet = {}, {}
+      for _, key in ipairs(assignedKeys or {}) do job.assignmentSet[tostring(key)] = true end
+      for _, key in ipairs(transitKeys or {}) do
+        key = tostring(key)
+        if not job.assignmentSet[key] then job.transitSet[key] = true end
+      end
+      selectedCells = tonumber(plan.columns) or 0
+      if selectedCells <= 0 then return nil, "Group assignment selects no mineable chunks." end
+    end
+    job.total = selectedCells * depth
+    job.route = {
+      layer = 0, walkIndex = 1, phase = "travel", localCursor = 0,
+      currentKey = plan.rootKey, breadcrumbs = {},
+    }
+  else
+    job.strategy = "serpentine"
+    job.total = fullVolume
+  end
+  if job.total <= 0 then return nil, "The exclusion mask leaves no blocks to mine." end
+  if payload.assignmentResumeToken ~= nil then
+    local resumeToken, resumeError = validateAssignmentResumeToken(payload.assignmentResumeToken, job)
+    if not resumeToken then return nil, resumeError end
+    job.assignmentResumeToken = resumeToken
+  end
+  return job
+end
+
+local function facingNumber(value)
+  if type(value) == "number" then return math.floor(value) % 4 end
+  local text = tostring(value or ""):lower()
+  local names = { south = 0, east = 1, north = 2, west = 3,
+    forward = 0, right = 1, back = 2, left = 3 }
+  return names[text]
+end
+
+local function verifyAssignmentDock(job)
+  if type(job) ~= "table" then return true end
+  if not job.groupJobId and not job.groupId and not job.assignmentId and not job.homeWorld then return true end
+  local dock = type(job.dock) == "table" and job.dock or {}
+  local expected = job.homeWorld or dock.homeWorld or dock.world
+  if type(expected) == "table" and tonumber(expected.x) == nil and tonumber(expected.y) == nil and tonumber(expected.z) == nil then expected = nil end
+  local facing = facingNumber(dock.facing or dock.direction or job.facing)
+  local bottomY = tonumber(job.bottomY or dock.bottomY)
+  local maxDepth = tonumber(job.maxDepth or dock.maxDepth)
+  if maxDepth and tonumber(job.depth) and tonumber(job.depth) > maxDepth then
+    return false, "Group assignment depth exceeds dock maxDepth."
+  end
+  if not expected and facing == nil and not bottomY then return true end
+  local calibration = gpsCalibration()
+  if not calibration then return false, "Group/world assignment requires GPS calibration." end
+  local fix, fixError = locateGPS()
+  if not fix then return false, "Group/world dock GPS verification failed: " .. tostring(fixError) end
+  if expected then
+    local x, y, z = tonumber(expected.x), tonumber(expected.y), tonumber(expected.z)
+    if not x or not y or not z then return false, "Group dock homeWorld is invalid." end
+    if fix.x ~= math.floor(x) or fix.y ~= math.floor(y) or fix.z ~= math.floor(z) then
+      return false, ("Group dock mismatch: expected %d,%d,%d, located %d,%d,%d."):format(
+        x, y, z, fix.x, fix.y, fix.z)
+    end
+  else
+    local home = calibration.home or {}
+    if home.x and home.y and home.z and (fix.x ~= home.x or fix.y ~= home.y or fix.z ~= home.z) then
+      return false, "GPS fix is not at the calibrated group dock."
+    end
+  end
+  if facing ~= nil and tonumber(state.pose.dir) ~= facing then
+    return false, ("Group dock facing mismatch: expected dir %d, current dir %d."):format(facing, state.pose.dir)
+  end
+  local homeY = tonumber(calibration.home and calibration.home.y)
+  if bottomY and homeY and tonumber(job.depth) then
+    local derivedBottom = homeY - tonumber(job.depth) + 1
+    if bottomY ~= derivedBottom then
+      return false, ("Group bottomY mismatch: expected %d from depth, received %d."):format(derivedBottom, bottomY)
+    end
+  end
+  return true
+end
+
+local function startJob(payload)
+  payload = payload or {}
+  local requestedId = payload.jobId and tostring(payload.jobId) or nil
+  if requestedId and state.job and tostring(state.job.id) == requestedId then
+    return true, "Job already accepted; existing state retained."
+  end
+  if state.job and state.status ~= "complete" and state.status ~= "aborted" then
+    return false, "An unfinished job already exists; resume, abort, or clear it first."
+  end
+  if state.pendingAction then return false, "Recovery is required after an interrupted physical action." end
+  if not isHome() then return false, "Worker is not at home. Recall or physically recover it first." end
+  if tonumber(state.pose and state.pose.dir) ~= 0 then
+    return false, "Worker must face the quarry at home before starting a job. Use REHOME after physical recovery."
+  end
+  if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+    return false, "Worker is busy."
+  end
+  local job, err = validateJob(payload)
+  if not job then return false, err end
+  local dockOK, dockError = verifyAssignmentDock(job)
+  if not dockOK then return false, dockError end
+  local assignmentResume = job.assignmentResumeToken and common.copy(job.assignmentResumeToken) or nil
+  state.job = job
+  state.group = {
+    groupJobId = job.groupJobId,
+    groupId = job.groupId,
+    assignmentId = job.assignmentId,
+    assignment = job.assignment and common.copy(job.assignment) or nil,
+    assignmentChunks = job.assignmentChunks and common.copy(job.assignmentChunks) or nil,
+    transitChunks = job.assignmentTransitChunks and common.copy(job.assignmentTransitChunks) or nil,
+    bay = job.bay,
+    bayId = job.bayId,
+    dock = job.dock and common.copy(job.dock) or nil,
+    lease = job.lease and common.copy(job.lease) or nil,
+    homeWorld = job.homeWorld and common.copy(job.homeWorld) or nil,
+    bottomY = job.bottomY,
+    maxDepth = job.maxDepth,
+  }
+  state.dock = job.dock and common.copy(job.dock) or state.dock
+  state.stats.jobsStarted = (state.stats.jobsStarted or 0) + 1
+  state.checkpoint = nil
+  state.resumeToken = nil
+  state.assignmentResumeToken = nil
+  if assignmentResume then
+    state.job.cursor = assignmentResume.cursor
+    state.job.route = state.job.route or {}
+    for _, key in ipairs({ "layer", "walkIndex", "localCursor", "phase", "currentKey" }) do
+      if assignmentResume[key] ~= nil then state.job.route[key] = assignmentResume[key] end
+    end
+    -- Keep the physical turtle at home while the service phase navigates to
+    -- the validated world checkpoint.  The token pose is a destination, not
+    -- an in-memory claim that the turtle already moved there.
+    state.resumeToken = common.copy(assignmentResume)
+    state.checkpoint = common.copy(assignmentResume)
+    state.assignmentResumeToken = common.copy(job.assignmentResumeToken)
+  end
+  state.service = {
+    resumeAfter = true,
+    finalStatus = "working",
+    preserveCheckpoint = false,
+    reason = assignmentResume and "assignment_resume" or "job_start",
+    startedAt = common.nowSeconds(),
+  }
+  state.request = nil
+  state.stagedStop = false
+  state.status = "working"
+  state.phase = "starting_service"
+  state.lastError = nil
+  state.completionReason = nil
+  state.report = nil
+  state.estimate = {
+    estimated = math.max(1, job.total or 1),
+    actual = 0,
+    variance = 0,
+    startedAt = common.nowSeconds(),
+  }
+  state.lighting.mode = (job.lighting and job.lighting.mode) or (config.lighting and config.lighting.mode) or "off"
+  state.lighting.interval = (job.lighting and job.lighting.interval) or (config.lighting and config.lighting.interval) or 32
+  state.water.mode = job.waterMode or config.waterMode or (config.water and config.water.mode) or "ignore"
+  state.pose = { x = 0, y = 0, z = 0, dir = state.pose.dir or 0 }
+  saveState()
+  common.log("INFO", ("Job started: %s %dx%dx%d strategy=%s exclusions=%d"):format(
+    job.id, job.width, job.length, job.depth, job.strategy, #job.excludedChunks
+  ))
+  return true, "Job accepted."
+end
+
+local function calibrateGPS()
+  if state.pendingAction then return false, "Resolve the pending physical action first." end
+  if not isHome() or state.pose.dir ~= 0 then return false, "Place the turtle at home facing the quarry before GPS calibration." end
+  if state.job then return false, "Clear the active job before GPS calibration." end
+  if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
+    return false, "Worker must be stopped before GPS calibration."
+  end
+  if fuelLevel() ~= "unlimited" and tonumber(fuelLevel() or 0) < 2 then return false, "At least 2 fuel is required." end
+]] },
+  { source = [[src/ccminer/worker_parts/02.part]], target = [[worker_parts/02.part]], digest = [[8be5b6fb095f4d4b8edc0f752b0a2b138e9ddf51fe16ccbb02899cdc66f47590]], content = [[  local blocked = turtle.inspect()
+  if blocked then return false, "The block directly in front of the dock must be empty for calibration." end
+
+  state.status, state.phase, state.lastError = "calibrating", "gps_calibration", nil
+  saveState()
+  local homeFix, homeError = locateGPS()
+  if not homeFix then
+    state.status, state.phase = "blocked", "gps_error"
+    state.lastError = homeError
+    saveState()
+    return false, homeError
+  end
+
+  local prepared, prepareError = beginPhysicalAction("gps_calibration", { home = homeFix })
+  if not prepared then return false, prepareError end
+  local moved, moveError = turtle.forward()
+  if not moved then
+    cancelPhysicalAction()
+    state.status, state.phase, state.lastError = "blocked", "gps_error", moveError or "Calibration move failed."
+    saveState()
+    return false, state.lastError
+  end
+  sleep(0.15)
+  local forwardFix, forwardError = locateGPS()
+  local returned, returnError = turtle.back()
+  if not returned then
+    state.status, state.phase = "blocked", "recovery_required"
+    state.lastError = "GPS calibration moved forward but could not return: " .. tostring(returnError)
+    saveState()
+    return false, state.lastError
+  end
+  if not forwardFix then
+    cancelPhysicalAction()
+    state.status, state.phase, state.lastError = "blocked", "gps_error", forwardError
+    saveState()
+    return false, forwardError
+  end
+
+  local calibration, calibrationError = geo.calibrationFromFixes(homeFix, forwardFix)
+  if not calibration then
+    cancelPhysicalAction()
+    state.status, state.phase, state.lastError = "blocked", "gps_error", calibrationError
+    saveState()
+    return false, calibrationError
+  end
+  config.gps = config.gps or {}
+  config.gps.enabled = true
+  config.gps.calibration = calibration
+  local saved, saveError = common.saveConfig(config)
+  if not saved then
+    cancelPhysicalAction()
+    state.status, state.phase = "blocked", "gps_error"
+    state.lastError = "Could not save GPS calibration: " .. tostring(saveError)
+    saveState()
+    return false, state.lastError
+  end
+  state.gps.available = true
+  state.gps.lastFix = homeFix
+  state.gps.lastFixAt = common.nowSeconds()
+  state.gps.lastError = nil
+  state.status, state.phase, state.lastError = "idle", "home", nil
+  commitPhysicalAction()
+  common.log("INFO", ("GPS calibrated at %d,%d,%d forward=%d,%d"):format(
+    homeFix.x, homeFix.y, homeFix.z, calibration.forward.x, calibration.forward.z
+  ))
+  return true, "GPS calibrated."
+end
+
+local function applyControlCommand(command, payload)
+  payload = payload or {}
+  if command == "pause_now" or command == "finish_row" or command == "finish_layer" or command == "return_home" then
+    payload.mode = command
+    command = "stop"
+  end
+  if state.pendingAction and command ~= "rehome" and command ~= "ping" and command ~= "status" and command ~= "gps_fix" then
+    return false, "Recovery required: return the turtle to its dock and use REHOME, or reboot with working GPS recovery."
+  end

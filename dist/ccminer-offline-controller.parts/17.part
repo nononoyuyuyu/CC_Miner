@@ -1,0 +1,252 @@
+  if type(workerIds) ~= "table" then return nil, "invalid_worker_ids" end
+  local workers, seen = {}, {}
+  for _, id in ipairs(workerIds) do
+    if #workers >= MAX_WORKERS then return nil, "too_many_workers" end
+    if id == nil or (type(id) ~= "string" and type(id) ~= "number") or tostring(id) == "" then
+      return nil, "invalid_worker_id"
+    end
+    local key = tostring(id)
+    if seen[key] then return nil, "duplicate_worker_id" end
+    seen[key] = true
+    workers[#workers + 1] = { id = id, key = key }
+  end
+  if #workers == 0 then return nil, "no_workers" end
+  table.sort(workers, function(a, b) return a.key < b.key end)
+  return workers
+end
+
+local function partitionChunks(catalog, workerIds)
+  if type(catalog) ~= "table" then return nil, "invalid_chunk_catalog" end
+  local workers, workerError = workerList(workerIds)
+  if not workers then return nil, workerError end
+  local chunks, keys = catalogGraph(catalog)
+  if not chunks then return nil, keys end
+  if #workers > #keys then return nil, "more_workers_than_chunks" end
+  if not graphConnected(chunks, keys) then return nil, "chunk_catalog_disconnected" end
+
+  local owner, loads, owned = {}, {}, {}
+  for index, worker in ipairs(workers) do loads[index], owned[index] = 0, {} end
+  local seeds = { keys[1] }
+  local seedSet = { [keys[1]] = true }
+  -- Farthest-point seeds spread workers over the world graph while keeping
+  -- every later region reachable through an adjacent frontier.
+  for index = 2, #workers do
+    local distances = {}
+    for _, seed in ipairs(seeds) do
+      local fromSeed = graphDistances(chunks, seed)
+      for key, distance in pairs(fromSeed) do
+        if distances[key] == nil or distance < distances[key] then distances[key] = distance end
+      end
+    end
+    local selected
+    for _, key in ipairs(keys) do
+      if not seedSet[key] and (not selected or distances[key] > distances[selected] or (distances[key] == distances[selected] and chunkComparator(chunks[key], chunks[selected]))) then
+        selected = key
+      end
+    end
+    if not selected then return nil, "worker_seed_failed" end
+    seeds[#seeds + 1] = selected
+    seedSet[selected] = true
+  end
+  for index, seed in ipairs(seeds) do
+    owner[seed] = index
+    owned[index][#owned[index] + 1] = seed
+    loads[index] = loads[index] + chunks[seed].cells
+  end
+
+  local assigned = #seeds
+  local target = 0
+  for _, key in ipairs(keys) do target = target + chunks[key].cells end
+  target = target / #workers
+  while assigned < #keys do
+    local bestKey, bestOwner, bestDeficit, bestProjected
+    for _, key in ipairs(keys) do
+      if not owner[key] then
+        local candidates, candidateSeen = {}, {}
+        for _, neighbor in ipairs(chunks[key].neighbors or {}) do
+          local index = owner[neighbor]
+          if index and not candidateSeen[index] then candidateSeen[index] = true; candidates[#candidates + 1] = index end
+        end
+        for _, index in ipairs(candidates) do
+          local deficit = target - loads[index]
+          local projected = math.abs((loads[index] + chunks[key].cells) - target)
+          if not bestKey or deficit > bestDeficit or (deficit == bestDeficit and projected < bestProjected) or (deficit == bestDeficit and projected == bestProjected and (chunkComparator(chunks[key], chunks[bestKey]) or (key == bestKey and index < bestOwner))) then
+            bestKey, bestOwner, bestDeficit, bestProjected = key, index, deficit, projected
+          end
+        end
+      end
+    end
+    if not bestKey then return nil, "chunk_catalog_disconnected" end
+    owner[bestKey] = bestOwner
+    owned[bestOwner][#owned[bestOwner] + 1] = bestKey
+    loads[bestOwner] = loads[bestOwner] + chunks[bestKey].cells
+    assigned = assigned + 1
+  end
+
+  local result = {}
+  for index, worker in ipairs(workers) do
+    table.sort(owned[index], function(left, right) return chunkComparator(chunks[left], chunks[right]) end)
+    result[worker.id] = { chunkKeys = owned[index], cells = loads[index] }
+  end
+  return result
+end
+
+M.partitionChunks = partitionChunks
+M.assignWorkers = partitionChunks
+M.splitWorkers = partitionChunks
+M.splitWorkerChunks = partitionChunks
+M.partitionWorkers = partitionChunks
+M.assignChunkWorkers = partitionChunks
+M.splitWorkerAssignments = partitionChunks
+
+-- -------------------------------------------------------------------------
+-- Group dispatch helpers
+-- -------------------------------------------------------------------------
+-- Group dispatch accepts either an already-built GPS catalog or a compact
+-- descriptor ({ width, length, worldSeed/calibration }).  Keeping catalog
+-- construction here lets a controller send only a worker bay and a GPS world
+-- seed while preserving the world-coordinate safety checks in buildCatalog.
+local function worldSeedCalibration(seed, options)
+  options = type(options) == "table" and options or {}
+  if type(seed) ~= "table" then return nil, "gps_not_calibrated" end
+  local nested = seed.home and seed or (seed.calibration and seed.calibration) or seed
+  if validCalibration(nested) then
+    return {
+      home = { x = nested.home.x, y = nested.home.y, z = nested.home.z },
+      forward = { x = nested.forward.x, z = nested.forward.z },
+    }
+  end
+  local point = seed.position or seed.world or seed.bay or seed.worldSeed or seed
+  local x, z = numberValue(point.x), numberValue(point.z)
+  if (not x or not z) and point.cx ~= nil and point.cz ~= nil then
+    local cx, cz = integerValue(point.cx), integerValue(point.cz)
+    if cx and cz then x, z = cx * 16 + 8, cz * 16 + 8 end
+  end
+  local y = numberValue(point.y)
+  if not x or not z then return nil, "gps_not_calibrated" end
+  y = y or numberValue(options.homeY) or 0
+  local forward = seed.forward or options.forward or { x = 0, z = 1 }
+  local fx, fz = numberValue(forward.x), numberValue(forward.z)
+  if not fx or not fz or math.abs(fx) + math.abs(fz) ~= 1 then return nil, "gps_not_calibrated" end
+  return { home = { x = x, y = y, z = z }, forward = { x = fx, z = fz } }
+end
+
+function M.buildWorldCatalog(width, length, worldSeed, options)
+  options = type(options) == "table" and options or {}
+  if type(width) == "table" then
+    local descriptor = width
+    if descriptor.width == nil and descriptor.length == nil and integerValue(length, 1, MAX_DIMENSION)
+        and integerValue(worldSeed, 1, MAX_DIMENSION) then
+      -- Flexible seed-first form: buildWorldCatalog(worldSeed, width, length).
+      local seed = descriptor
+      width, length, worldSeed = length, worldSeed, seed
+      descriptor = nil
+    end
+    if descriptor == nil then
+      local calibration = options.calibration or worldSeedCalibration(worldSeed, options)
+      if not calibration then return nil, "gps_not_calibrated" end
+      local catalog, catalogError = M.buildCatalog(width, length, "world", calibration)
+      if not catalog then return nil, catalogError end
+      catalog.referenceCalibration = {
+        home = { x = calibration.home.x, y = calibration.home.y, z = calibration.home.z },
+        forward = { x = calibration.forward.x, z = calibration.forward.z },
+      }
+      catalog.calibrationSeed = {
+        home = { x = calibration.home.x, y = calibration.home.y, z = calibration.home.z },
+        forward = { x = calibration.forward.x, z = calibration.forward.z },
+      }
+      local bounds
+      for _, chunk in ipairs(catalog) do
+        if contains(chunk, 0, 1) then catalog.rootKey = chunk.key; break end
+      end
+      for _, chunk in ipairs(catalog) do
+        bounds = bounds or { minX = chunk.minX, maxX = chunk.maxX, minZ = chunk.minZ, maxZ = chunk.maxZ }
+        bounds.minX, bounds.maxX = math.min(bounds.minX, chunk.minX), math.max(bounds.maxX, chunk.maxX)
+        bounds.minZ, bounds.maxZ = math.min(bounds.minZ, chunk.minZ), math.max(bounds.maxZ, chunk.maxZ)
+      end
+      catalog.bounds = bounds
+      return catalog
+    end
+    options = type(length) == "table" and length or options
+    width, length = descriptor.width, descriptor.length
+    worldSeed = descriptor.worldSeed or descriptor.seed or descriptor.calibration or options.worldSeed or worldSeed
+    if descriptor.options and type(descriptor.options) == "table" then
+      local merged = {}
+      for key, value in pairs(descriptor.options) do merged[key] = value end
+      for key, value in pairs(options) do merged[key] = value end
+      options = merged
+      if worldSeed == nil then worldSeed = options.worldSeed end
+    end
+  end
+  local calibration = options.calibration
+  if not calibration then calibration = worldSeedCalibration(worldSeed, options) end
+  if not calibration then return nil, "gps_not_calibrated" end
+  local catalog, catalogError = M.buildCatalog(width, length, "world", calibration)
+  if not catalog then return nil, catalogError end
+  -- Arrays may carry metadata fields in Lua.  Keep the reference GPS seed and
+  -- bounds available to assigned-plan builders without sharing calibration
+  -- tables with the caller or with persisted worker state.
+  catalog.referenceCalibration = {
+    home = { x = calibration.home.x, y = calibration.home.y, z = calibration.home.z },
+    forward = { x = calibration.forward.x, z = calibration.forward.z },
+  }
+  catalog.calibrationSeed = {
+    home = { x = calibration.home.x, y = calibration.home.y, z = calibration.home.z },
+    forward = { x = calibration.forward.x, z = calibration.forward.z },
+  }
+  local referenceRoot
+  for _, chunk in ipairs(catalog) do
+    if contains(chunk, 0, 1) then referenceRoot = chunk.key; break end
+  end
+  catalog.rootKey = referenceRoot
+  local bounds
+  for _, chunk in ipairs(catalog) do
+    bounds = bounds or { minX = chunk.minX, maxX = chunk.maxX, minZ = chunk.minZ, maxZ = chunk.maxZ }
+    bounds.minX, bounds.maxX = math.min(bounds.minX, chunk.minX), math.max(bounds.maxX, chunk.maxX)
+    bounds.minZ, bounds.maxZ = math.min(bounds.minZ, chunk.minZ), math.max(bounds.maxZ, chunk.maxZ)
+  end
+  catalog.bounds = bounds
+  return catalog
+end
+
+M.catalogFromWorldSeed = M.buildWorldCatalog
+M.worldCatalog = M.buildWorldCatalog
+M.buildGpsCatalog = M.buildWorldCatalog
+M.buildCatalogFromWorldSeed = M.buildWorldCatalog
+M.worldCatalogFromSeed = M.buildWorldCatalog
+
+local function groupCatalogInput(catalog, options)
+  options = type(options) == "table" and options or {}
+  if catalog == nil and options.width ~= nil and options.length ~= nil then
+    local generated, generatedError = M.buildWorldCatalog(options.width, options.length, options.worldSeed, options)
+    if not generated then return nil, nil, generatedError end
+    local chunks, keys = catalogGraph(generated)
+    if not chunks then return nil, nil, keys end
+    return chunks, keys
+  end
+  if type(catalog) ~= "table" then return nil, nil, "invalid_chunk_catalog" end
+  local descriptor = catalog
+  local hasChunks = type(descriptor.chunks) == "table" or #descriptor > 0
+  if not hasChunks and descriptor.width ~= nil and descriptor.length ~= nil then
+    local generated, generatedError = M.buildWorldCatalog(descriptor, options)
+    if not generated then return nil, nil, generatedError end
+    local chunks, keys = catalogGraph(generated)
+    if not chunks then return nil, nil, keys end
+    return chunks, keys
+  end
+  -- A caller may pass { worldSeed = ..., width = ..., length = ... } with no
+  -- explicit calibration.  Treat this as the same descriptor form above.
+  if not hasChunks and options.width ~= nil and options.length ~= nil then
+    local generated, generatedError = M.buildWorldCatalog(options.width, options.length,
+      descriptor.worldSeed or descriptor.seed or options.worldSeed, options)
+    if not generated then return nil, nil, generatedError end
+    local chunks, keys = catalogGraph(generated)
+    if not chunks then return nil, nil, keys end
+    return chunks, keys
+  end
+  local chunks, keys = catalogGraph(catalog)
+  if not chunks then return nil, nil, keys end
+  return chunks, keys
+end
+
+local function groupWorkerList(values)

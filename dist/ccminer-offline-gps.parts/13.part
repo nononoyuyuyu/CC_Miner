@@ -1,0 +1,262 @@
+        -- Registry validation and coordinate normalization stay in the
+        -- controller.  Preserve every argument so legacy and extended
+        -- register forms remain compatible.
+        forwardController()
+      end
+    elseif command == "stop" then
+      local mode = string.lower(tostring(args[3] or ""))
+      local stopModes = {
+        now = "pause_now", row = "finish_row", layer = "finish_layer", home = "return_home",
+        pause_now = "pause_now", finish_row = "finish_row", finish_layer = "finish_layer",
+        return_home = "return_home", abort = "abort",
+      }
+      local controllerMode = stopModes[mode]
+      local valid = controllerMode ~= nil
+      if not tonumber(args[2]) or not valid then
+        reportError("Usage: ccm stop <id> <now|row|layer|home|abort>")
+      else
+        local forwarded = {}
+        for index = 1, #args do forwarded[index] = args[index] end
+        forwarded[3] = controllerMode
+        forwardController(forwarded)
+      end
+    else
+      forwardController()
+    end
+  end
+elseif command == "status" then
+  local config, configError = common.loadConfig()
+  if not config then reportError(configError or "Not configured."); return end
+  print("CC Miner " .. tostring(common.VERSION or ""))
+  print("Role: " .. tostring(config.role))
+  print("Computer ID: " .. tostring(os.getComputerID()))
+  print("Label: " .. tostring(os.getComputerLabel and os.getComputerLabel() or "-"))
+  if type(config.networkKey) == "string" and config.networkKey ~= "" then print("Network key: configured (masked)") else print("Network key: not configured") end
+  printStatusFeature("Profile", config.profile)
+  printStatusFeature("Lighting", config.lighting, config.lightMode)
+  printStatusFeature("Water", config.water, config.waterMode)
+  printStatusFeature("Materials", config.materials)
+  printStatusFeature("Staged stop", config.stagedStop)
+  if config.role == "worker" then
+    local state, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
+    if stateError then reportError(stateError) end
+    print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
+    if state.pose then print(("Pose: x=%s y=%s z=%s dir=%s"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir)) end
+    print("GPS calibrated: " .. tostring(config.gps and config.gps.calibration ~= nil))
+    print("Lava mode: " .. tostring(config.lavaMode))
+    printStatusFeature("Lighting", state.lighting, config.lighting or config.lightMode)
+    printStatusFeature("Water", state.water, config.water or config.waterMode)
+    printStatusFeature("Profile", state.profile, config.profile)
+    printStatusFeature("Materials", state.materials, config.materials)
+    printStatusFeature("Staged stop", state.stagedStop, config.stagedStop)
+    if state.job then print(("Job: %s %s/%s [%s]"):format(tostring(state.job.name), tostring(state.job.cursor), tostring(state.job.total), tostring(state.job.strategy))) end
+    printOperationalFields(state, config)
+    if state.lastError then print("Error: " .. tostring(state.lastError)) end
+  elseif config.role == "gps" then
+    print(("Coordinates: %s, %s, %s"):format(config.x, config.y, config.z))
+  end
+elseif command == "logs" then
+  if not fs.exists(common.LOG_PATH) then print("No log file yet."); return end
+  local handle = fs.open(common.LOG_PATH, "r")
+  local lines = {}
+  while true do
+    local line = handle.readLine()
+    if not line then break end
+    lines[#lines + 1] = line
+    if #lines > 30 then table.remove(lines, 1) end
+  end
+  handle.close()
+  for _, line in ipairs(lines) do print(line) end
+elseif command == "update" then
+  if not http then reportError("HTTP API is disabled."); return end
+  shell.run("wget", "run", "https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua", "update")
+else
+  reportError("Unknown command: " .. command)
+  printHelp()
+end
+]] },
+  { source = [[src/ccminer/gps_host.lua]], target = [[gps_host.lua]], digest = [[326f3a7b66868af6f3d2825af6ad96483c0d062cf6ac442ba00db363b2e52939]], content = [[-- CC Miner V4 - managed GPS host launcher.
+
+local common = dofile("/ccminer/lib/common.lua")
+local config, err = common.loadConfig()
+if not config or config.role ~= "gps" then error(err or "GPS host is not configured. Run: ccm setup gps", 0) end
+
+if os.setComputerLabel then os.setComputerLabel(config.gpsName or common.safeComputerLabel("GPS")) end
+local opened = common.openWirelessModems()
+if #opened == 0 then error("No wireless modem found. Attach a wireless modem to this GPS host.", 0) end
+
+common.clear(colors and colors.black or nil, colors and colors.white or nil)
+print("CC Miner V4 GPS Host " .. common.VERSION)
+print("Name: " .. tostring(config.gpsName))
+print(("Coordinates: %d, %d, %d"):format(config.x, config.y, config.z))
+print("Modem: " .. table.concat(opened, ", "))
+print("")
+print("Hosting GPS. Keep this chunk loaded.")
+common.log("INFO", ("GPS host started at %d,%d,%d"):format(config.x, config.y, config.z))
+
+local ok = shell.run("gps", "host", tostring(config.x), tostring(config.y), tostring(config.z))
+if not ok then error("The built-in GPS host program exited unexpectedly.", 0) end
+]] },
+}
+local FILE_COUNT = 6
+local WORKER_PARTS = {}
+local CONTROLLER_PARTS = {}
+local ENTRYPOINT = [[gps_host.lua]]
+local UPDATE_SENTINEL = [[-- CC Miner V4 update-incomplete sentinel for gps
+error("CC Miner runtime update is incomplete. Re-transfer the offline bundle and run update-low-space.", 0)
+]]
+local LOW_SPACE_STEPS = {
+  { kind = "runtime", index = 1 },
+  { kind = "runtime", index = 2 },
+  { kind = "runtime", index = 3 },
+  { kind = "runtime", index = 4 },
+  { kind = "runtime", index = 5 },
+  { kind = "obsolete", target = [[lib/geo.lua]] },
+  { kind = "obsolete", target = [[lib/quarry.lua]] },
+  { kind = "obsolete", target = [[worker.lua]] },
+  { kind = "obsolete", target = [[worker_parts/01.part]] },
+  { kind = "obsolete", target = [[worker_parts/02.part]] },
+  { kind = "obsolete", target = [[worker_parts/03.part]] },
+  { kind = "obsolete", target = [[worker_parts/04.part]] },
+  { kind = "obsolete", target = [[worker_parts/05.part]] },
+  { kind = "obsolete", target = [[controller.lua]] },
+  { kind = "obsolete", target = [[controller_parts/01.part]] },
+  { kind = "obsolete", target = [[controller_parts/02.part]] },
+  { kind = "obsolete", target = [[controller_parts/03.part]] },
+}
+
+local function fail(message)
+  error(tostring(message), 0)
+end
+local function ensureDir(path)
+  if not path or path == "" or fs.exists(path) then return end
+  local parent = fs.getDir(path)
+  if parent and parent ~= "" and parent ~= path then ensureDir(parent) end
+  fs.makeDir(path)
+end
+local function readFile(path)
+  if not fs.exists(path) or fs.isDir(path) then return nil end
+  local handle = fs.open(path, "r")
+  if not handle then return nil end
+  local text = handle.readAll(); handle.close(); return text
+end
+local function writeFile(path, text)
+  ensureDir(fs.getDir(path))
+  local handle = fs.open(path, "w")
+  if not handle then return false, "Cannot write " .. path end
+  local ok, writeError = pcall(handle.write, text or "")
+  handle.close()
+  if not ok then return false, tostring(writeError) end
+  return true
+end
+local function digest(text)
+  if not textutils or type(textutils.sha256) ~= "function" then
+    return nil, "textutils.sha256 is required for strict offline bundle verification."
+  end
+  local ok, value = pcall(textutils.sha256, text or "")
+  if not ok or type(value) ~= "string" then return nil, tostring(value or "sha256 failed") end
+  return string.lower(value)
+end
+local function compileText(label, text)
+  local loader = loadstring or load
+  local compiled, compileError = loader(text, "@" .. label)
+  if not compiled then return false, tostring(compileError) end
+  return true
+end
+local function validateEmbedded()
+  if #files ~= FILE_COUNT then fail("Embedded runtime file count is invalid for role " .. ROLE) end
+  local seen = {}
+  local aggregate = {
+    "ccminer-offline-role", "\0", VERSION, "\0", tostring(SCHEMA), "\0", ROLE, "\0", tostring(#files), "\0",
+  }
+  for index, file in ipairs(files) do
+    if type(file.target) ~= "string" or type(file.content) ~= "string" or seen[file.target] then
+      fail("Embedded runtime order/target is invalid at index " .. tostring(index))
+    end
+    seen[file.target] = true
+    local actual, digestError = digest(file.content)
+    if not actual then fail(digestError) end
+    if actual ~= string.lower(file.digest or "") then
+      fail("Embedded runtime digest mismatch: " .. tostring(file.target))
+    end
+    aggregate[#aggregate + 1] = file.source; aggregate[#aggregate + 1] = "\0"
+    aggregate[#aggregate + 1] = file.target; aggregate[#aggregate + 1] = "\0"
+    aggregate[#aggregate + 1] = file.digest; aggregate[#aggregate + 1] = "\0"
+    aggregate[#aggregate + 1] = file.content; aggregate[#aggregate + 1] = "\0"
+  end
+  local aggregateDigest, aggregateError = digest(table.concat(aggregate))
+  if not aggregateDigest then fail(aggregateError) end
+  if aggregateDigest ~= string.lower(SOURCE_DIGEST) then
+    fail("Embedded role source digest mismatch for " .. ROLE)
+  end
+  return true
+end
+local function validateParts(label, targets)
+  if #targets == 0 then return true end
+  local source = {}
+  for index, target in ipairs(targets) do
+    local found
+    for _, file in ipairs(files) do if file.target == target then found = file.content; break end end
+    if not found then fail("Embedded runtime part is missing: " .. target) end
+    source[index] = found
+  end
+  local ok, compileError = compileText(label .. ".assembled.lua", table.concat(source))
+  if not ok then fail("Assembled source failed syntax validation: " .. label .. ": " .. compileError) end
+end
+local function validateAll()
+  validateEmbedded()
+  for _, file in ipairs(files) do
+    if not file.target:match("%.part$") then
+      local ok, compileError = compileText(file.target, file.content)
+      if not ok then fail("Embedded file failed syntax validation: " .. file.target .. ": " .. compileError) end
+    end
+  end
+  validateParts("worker", WORKER_PARTS)
+  validateParts("controller", CONTROLLER_PARTS)
+end
+-- Kept as a named boundary for source-contract checks and recovery logs.  The
+-- role bundle validates from memory, so no /ccminer.update staging tree is
+-- needed before a low-space commit.
+local function validateLowSpaceStage()
+  validateAll()
+end
+local function copyIfPresent(source, target)
+  local text = readFile(source)
+  if text then return writeFile(target, text) end
+  return true
+end
+local function moveChecked(source, target)
+  local ok, moveError = pcall(fs.move, source, target)
+  if not ok or not fs.exists(target) then
+    return false, tostring(moveError or ("Move destination is missing: " .. target))
+  end
+  return true
+end
+local function atomicWrite(path, text)
+  local temp, backup = path .. ".tmp", path .. ".bak"
+  ensureDir(fs.getDir(path))
+  if fs.exists(temp) then fs.delete(temp) end
+  local wrote, writeError = writeFile(temp, text)
+  if not wrote then return false, writeError end
+  local hadCurrent = fs.exists(path)
+  if hadCurrent then
+    if fs.exists(backup) then fs.delete(backup) end
+    local moved, moveError = moveChecked(path, backup)
+    if not moved then fs.delete(temp); return false, "Cannot rotate previous file: " .. moveError end
+  end
+  local moved, moveError = moveChecked(temp, path)
+  if not moved then
+    if fs.exists(path) then fs.delete(path) end
+    local restored = true
+    local restoreError
+    if hadCurrent and fs.exists(backup) then
+      restored, restoreError = moveChecked(backup, path)
+    elseif hadCurrent then
+      restored, restoreError = false, "backup is missing"
+    end
+    if fs.exists(temp) then fs.delete(temp) end
+    return false, "Atomic replace failed: " .. tostring(moveError) .. "; rollback: " .. tostring(restoreError or restored)
+  end
+  if fs.exists(backup) then fs.delete(backup) end
+  if fs.exists(temp) then fs.delete(temp) end
+  return true

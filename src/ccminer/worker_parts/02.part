@@ -136,7 +136,7 @@ local function applyControlCommand(command, payload)
         state.status, state.phase = "working", "mining"
       end
       state.request = nil
-      saveState()
+      saveState("resume", true)
       return true, "Resume accepted."
     elseif state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
       state.status = "working"
@@ -180,7 +180,8 @@ local function applyControlCommand(command, payload)
     if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
       return false, "Worker is busy."
     end
-    state.job, state.checkpoint, state.service, state.request = nil, nil, nil, nil
+    state.job, state.checkpoint, state.resumeToken, state.assignmentResumeToken, state.service, state.request = nil, nil, nil, nil, nil, nil
+    state.group, state.dock = nil, nil
     state.stagedStop = false
     state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
     saveState()
@@ -213,7 +214,8 @@ local function applyControlCommand(command, payload)
       end
     end
     state.pose = { x = 0, y = 0, z = 0, dir = 0 }
-    state.job, state.checkpoint, state.service, state.request, state.pendingAction = nil, nil, nil, nil, nil
+    state.job, state.checkpoint, state.resumeToken, state.assignmentResumeToken, state.service, state.request, state.pendingAction = nil, nil, nil, nil, nil, nil, nil
+    state.group, state.dock = nil, nil
     state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
     saveState()
     return true, "Local position reset to home."
@@ -377,6 +379,13 @@ end
 local function updatePoseAfterMove(direction)
   state.pose = geo.poseAfterMove(state.pose, direction)
   state.stats.moves = (state.stats.moves or 0) + 1
+  state.routeMetrics = state.routeMetrics or { moves = 0, turns = 0, distance = 0 }
+  state.routeMetrics.moves = (state.routeMetrics.moves or 0) + 1
+  state.routeMetrics.distance = (state.routeMetrics.distance or 0) + 1
+  state.stats.routeMoves = (state.stats.routeMoves or 0) + 1
+  state.stats.routeDistance = (state.stats.routeDistance or 0) + 1
+  state.timeMetrics = state.timeMetrics or {}
+  state.timeMetrics.lastMoveAt = common.nowSeconds()
 end
 
 local function sealFluid(action, direction, data, fluidKind)

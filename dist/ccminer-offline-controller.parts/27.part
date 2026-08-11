@@ -1,0 +1,212 @@
+    if chunk.key ~= rootKey and chunkExcluded[chunk.key] == true then
+      out[#out + 1] = { mode = chunkMode, cx = chunk.cx, cz = chunk.cz, key = chunk.key }
+    end
+  end
+  return out, #out
+end
+
+local function draftCells(catalog, rootKey)
+  local total, excluded = 0, 0
+  local chunkExcluded = draft and draft.excluded or {}
+  for _, chunk in ipairs(catalog or {}) do
+    total = total + 1
+    if chunk.key ~= rootKey and chunkExcluded[chunk.key] then excluded = excluded + 1 end
+  end
+  return total, excluded
+end
+
+local function estimateFuel(blocks, width, length, depth)
+  -- Conservative enough to gate an obviously empty turtle, but unknown fuel
+  -- remains yellow rather than fatal so old workers can still be used.
+  local travel = (width or 1) * (length or 1) + (depth or 1) * 2
+  return math.max(16, math.floor((blocks or 0) * 2 + travel * 3 + 32))
+end
+
+local function profileParameters(profile, lighting)
+  local name = tostring(profile or "balanced")
+  if name ~= "safe" and name ~= "balanced" and name ~= "turbo" then return nil, "Invalid profile: " .. name end
+  local light = type(lighting) == "table" and lighting or {}
+  local mode = tostring(light.mode or "safe")
+  local requested = math.max(1, math.floor(tonumber(light.interval) or 10))
+  local interval
+  if mode == "off" then interval = 0
+  elseif name == "safe" then interval = math.min(requested, 8)
+  elseif name == "turbo" then interval = 12
+  else interval = requested end
+  return {
+    profile = name,
+    lightingMode = mode,
+    requestedInterval = requested,
+    effectiveInterval = interval,
+    fuelMultiplier = name == "safe" and 1.5 or 1,
+  }
+end
+
+local function effectiveJobDepth(chunkMode, calibration)
+  if chunkMode == "world" then
+    if not (calibration and calibration.home and tonumber(calibration.home.y)) then return nil, "GPS calibration home Y is unavailable." end
+    local homeY = tonumber(calibration.home.y)
+    local targetY = tonumber(draft.targetY) or (homeY - (tonumber(draft.depth) or 1) + 1)
+    draft.targetY = targetY
+    local depth = math.floor(homeY - targetY + 1)
+    if depth < 1 then return nil, "targetY must be at or below the calibrated home Y." end
+    return depth, targetY
+  end
+  return math.max(1, math.floor(tonumber(draft.depth) or 1)), nil
+end
+
+local activeLeaseOverlap
+
+local function computePreflight()
+  if not draft then return nil, "No draft." end
+  local profileInfo, profileError = profileParameters(draft.profile, draft.lighting)
+  if not profileInfo then
+    draft.preflight = { fatal = true, checks = { { name = "profile", state = "bad", detail = profileError, fatal = true } }, profile = draft.profile }
+    return draft.preflight
+  end
+  local catalog, catalogError, chunkMode, calibration, rootKey = buildDraftCatalog()
+  if not catalog then return nil, catalogError end
+  local partialMask = normalizeChunkMask(catalog, rootKey)
+  local excludedChunks, excludedColumns = excludedChunksForDraft(catalog, chunkMode, rootKey)
+  local jobDepth, targetY = effectiveJobDepth(chunkMode, calibration)
+  if not jobDepth then
+    draft.preflight = { fatal = true, checks = { { name = "targetY", state = "bad", detail = targetY, fatal = true } } }
+    return draft.preflight
+  end
+  local plan, planError = quarry.buildChunkPlan({
+    width = draft.width, length = draft.length, depth = jobDepth,
+    chunkMode = chunkMode, excludedChunks = excludedChunks,
+  }, calibration)
+  local cells, cellExcluded = draftCells(catalog, rootKey)
+  local blocks = plan and (plan.columns * jobDepth) or ((cells - cellExcluded) * jobDepth)
+  local interval = math.max(1, profileInfo.effectiveInterval > 0 and profileInfo.effectiveInterval or 1)
+  local estimate, estimateError
+  if type(quarry.estimateJob) == "function" then
+    estimate, estimateError = quarry.estimateJob({
+      width = draft.width, length = draft.length, depth = jobDepth,
+      chunkMode = chunkMode, excludedChunks = excludedChunks,
+      lighting = common.copy(draft.lighting), waterMode = draft.waterMode,
+      targetY = targetY,
+    }, calibration, { torchInterval = interval })
+  end
+  if not estimate and estimateError then planError = estimateError end
+  local id, worker = draftWorker()
+  local data = worker and worker.data or {}
+  local checks = {}
+  local function check(name, state, detail, fatal)
+    checks[#checks + 1] = { name = name, state = state, detail = detail, fatal = fatal == true }
+  end
+  local baseFuelEstimate = estimate and (estimate.minimumFuel or estimate.minFuel) or estimateFuel(blocks, draft.width, draft.length, jobDepth)
+  local requiredFuel = math.ceil(baseFuelEstimate * profileInfo.fuelMultiplier)
+  local fuel = tonumber(data.fuel)
+  local fuelState = fuel and fuel >= requiredFuel and "ok" or "warn"
+  local fuelDetail = ("estimate need %d (base %d), worker %s"):format(requiredFuel, baseFuelEstimate, tostring(data.fuel or "unknown"))
+  check("cells", "ok", tostring(estimate and (estimate.surfaceCells or estimate.columns) or (cells - cellExcluded)), false)
+  check("chunks", "ok", tostring((plan and plan.catalogCount or #catalog) - #excludedChunks) .. "/" .. tostring(#catalog), false)
+  check("blocks", "ok", common.humanNumber(estimate and (estimate.blocks or estimate.totalBlocks) or blocks), false)
+  check("fuel", fuelState, fuelDetail, false)
+  local torchNeed = profileInfo.effectiveInterval == 0 and 0 or (estimate and (estimate.torches or estimate.estimatedTorches) or math.ceil((blocks or 0) / interval))
+  check("profile", "ok", profileInfo.profile .. " interval=" .. tostring(profileInfo.effectiveInterval), false)
+  if profileInfo.effectiveInterval == 0 then
+    check("torches", "ok", "0 (lighting off)", false)
+  else
+    check("torches", "warn", tostring(torchNeed) .. " estimated @" .. tostring(profileInfo.effectiveInterval), false)
+  end
+  check("exclusions", #excludedChunks > 0 and "warn" or "ok", tostring(#excludedChunks), false)
+  if plan then check("connectivity", "ok", "connected", false) else check("connectivity", "bad", tostring(planError), true) end
+  if partialMask then check("selection", "bad", "partial cell mask cannot be sent; select whole chunks", true) end
+  if chunkMode == "world" then
+    check("GPS", calibration and "ok" or "bad", calibration and "calibrated" or "calibration required", not calibration)
+  else
+    check("GPS", "ok", "local mode (world features unavailable)", false)
+  end
+  if id and worker and statusOf(worker) ~= "offline" then check("worker", "ok", workerLabel(worker, id), false)
+  else check("worker", "bad", "offline or not selected", true) end
+  if fuel and fuel >= requiredFuel then
+    check("worker fuel", "ok", ("available %s / need %d"):format(tostring(fuel), requiredFuel), false)
+  elseif fuel then
+    check("worker fuel", "warn", ("available %s / need %d (dock refill expected)"):format(tostring(fuel), requiredFuel), false)
+  else
+    check("worker fuel", "warn", ("unknown / need %d"):format(requiredFuel), false)
+  end
+  if data.inventoryEmpty ~= nil then
+    check("inventory", tonumber(data.inventoryEmpty) > 0 and "ok" or "warn", tostring(data.inventoryEmpty or 0) .. " empty", false)
+  else check("inventory", "warn", "unknown", false) end
+  local seal = tonumber(data.materials and (data.materials.sealCount or data.materials.seal) or data.seal and data.seal.count)
+  local torchStock = tonumber(data.lighting and data.lighting.torchCount or data.materials and data.materials.torchCount)
+  if draft.waterMode == "seal" and seal and seal <= 0 then check("seal material", "warn", "0 (dock refill expected)", false)
+  elseif draft.waterMode == "seal" then check("seal material", "warn", "seal stock unknown", false) end
+  if draft.lighting and draft.lighting.mode ~= "off" and torchStock and torchStock < torchNeed then check("torch material", "warn", tostring(torchStock) .. "/" .. tostring(torchNeed) .. " (dock refill expected)", false)
+  elseif draft.lighting and draft.lighting.mode ~= "off" then check("torch material", "warn", "torch stock unknown", false) end
+  local caps = data.capabilities or {}
+  if draft.waterMode ~= "ignore" then
+    if caps.waterHandling == false then check("water capability", "bad", "worker lacks waterHandling", true)
+    elseif caps.waterHandling == nil then check("water capability", "warn", "worker capability unknown", false)
+    else check("water capability", "ok", "ready", false) end
+  else check("water capability", "ok", "ignore", false) end
+  if draft.lighting and draft.lighting.mode ~= "off" then
+    if caps.lighting == false then check("lighting capability", "bad", "worker lacks lighting", true)
+    elseif caps.lighting == nil then check("lighting capability", "warn", "worker capability unknown", false)
+    else check("lighting capability", "ok", "ready", false) end
+  else check("lighting capability", "ok", "off", false) end
+  local selectedChunkKeys = {}
+  for _, chunk in ipairs(catalog) do
+    local excluded = false
+    for _, item in ipairs(excludedChunks) do if item.key == chunk.key then excluded = true; break end end
+    if not excluded then selectedChunkKeys[#selectedChunkKeys + 1] = chunk.key end
+  end
+  local leaseConflict = (not draft.queueing) and id and activeLeaseOverlap and activeLeaseOverlap(chunkMode, id, selectedChunkKeys)
+  if leaseConflict then check("lease", "bad", "overlaps active job " .. tostring(leaseConflict.jobId or "unknown"), true) end
+  local fatal = false
+  for _, item in ipairs(checks) do if item.fatal or item.state == "bad" and item.fatal then fatal = true end end
+  local result = {
+    checks = checks, fatal = fatal, catalog = catalog, plan = plan, planError = planError,
+    chunkMode = chunkMode, calibration = calibration, rootKey = rootKey,
+    excludedChunks = excludedChunks, cells = estimate and (estimate.surfaceCells or estimate.columns) or (cells - cellExcluded), blocks = estimate and (estimate.blocks or estimate.totalBlocks) or blocks,
+    chunks = plan and plan.catalogCount or #catalog, selectedChunks = (plan and plan.selectedChunks) or (#catalog - #excludedChunks), totalChunks = #catalog, exclusions = #excludedChunks,
+    torches = torchNeed, fuel = requiredFuel, baseFuel = baseFuelEstimate, estimate = estimate, jobDepth = jobDepth, targetY = targetY,
+    profile = profileInfo.profile, requestedInterval = profileInfo.requestedInterval, effectiveInterval = profileInfo.effectiveInterval,
+    fuelMultiplier = profileInfo.fuelMultiplier,
+  }
+  draft.preflight = result
+  return result
+end
+
+activeLeaseOverlap = function(mode, workerId, chunks)
+  for _, lease in ipairs(db.leases or {}) do
+    local leaseMode = lease.mode == "world" and "world" or "local"
+    if mode == "world" and leaseMode == "world" then
+      local set = {}
+      for _, key in ipairs(lease.chunks or {}) do set[tostring(key)] = true end
+      for _, key in ipairs(chunks or {}) do if set[tostring(key)] then return lease end end
+    elseif mode == "local" and leaseMode == "local" and tonumber(lease.workerId) == tonumber(workerId) then
+      return lease
+    end
+  end
+  return nil
+end
+
+local function reserveLease(jobId, workerId, mode, chunks, assignmentId)
+  local conflict = activeLeaseOverlap(mode, workerId, chunks)
+  if conflict then return nil, "Active lease overlap with " .. tostring(conflict.jobId or conflict.assignmentId) end
+  local lease = {
+    jobId = tostring(jobId), assignmentId = assignmentId, workerId = tonumber(workerId) or workerId,
+    mode = mode, chunks = common.copy(chunks or {}), createdAt = common.nowSeconds(),
+  }
+  db.leases[#db.leases + 1] = lease
+  db.activeLeases = common.copy(db.leases)
+  local ok, err = saveControllerDb()
+  if not ok then table.remove(db.leases); return nil, err or "Could not persist active lease" end
+  return lease
+end
+
+local function chunkKeySet(catalog)
+  local set = {}
+  for _, chunk in ipairs(catalog or {}) do set[chunk.key] = true end
+  return set
+end
+
+local function deterministicPartition(chunks, count)
+  local out = {}
+  count = math.max(1, tonumber(count) or 1)
+  for index = 1, count do out[index] = {} end

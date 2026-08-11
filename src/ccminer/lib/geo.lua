@@ -1,4 +1,4 @@
--- CC Miner V3 - GPS and coordinate transforms.
+-- CC Miner V4 - GPS and coordinate transforms.
 
 local M = {}
 

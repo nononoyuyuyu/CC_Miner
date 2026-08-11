@@ -1,0 +1,205 @@
+  else finding("PASS", "discard.allowlist", tostring(count) .. " explicit entries") end
+end
+
+local function runDoctor()
+  local counts = { PASS = 0, WARN = 0, FAIL = 0 }
+  local function finding(level, name, message)
+    level = string.upper(tostring(level))
+    if counts[level] == nil then level = "WARN" end
+    counts[level] = counts[level] + 1
+    print(("%s %-22s %s"):format(level, tostring(name), tostring(message or "")))
+  end
+
+  print("CC Miner doctor (read-only)")
+  local rawConfig, configError = readTableNoWrite(common.CONFIG_PATH)
+  local config = type(rawConfig) == "table" and rawConfig or {}
+  local role = tostring(config.role or "")
+  if not rawConfig then
+    finding("FAIL", "config.file", "configuration is " .. tostring(configError or "missing"))
+  else
+    finding("PASS", "config.file", "readable")
+  end
+  if type(config.schema) ~= "number" then
+    finding("FAIL", "config.schema", "schema is missing")
+  elseif tonumber(common.SCHEMA) and config.schema ~= common.SCHEMA then
+    finding("FAIL", "config.schema", ("expected %s, found %s"):format(tostring(common.SCHEMA), tostring(config.schema)))
+  else
+    finding("PASS", "config.schema", tostring(config.schema))
+  end
+  if role ~= "worker" and role ~= "controller" and role ~= "gps" then
+    finding("FAIL", "config.role", "unknown role: " .. (role == "" and "missing" or role))
+  else
+    finding("PASS", "config.role", role)
+  end
+  if config.version == nil then finding("WARN", "config.version", "missing") else finding("PASS", "config.version", tostring(config.version)) end
+
+  local networkKey = config.networkKey
+  if role ~= "gps" then
+    if type(networkKey) ~= "string" or networkKey == "" or networkKey == "CHANGE_ME" then
+      finding("FAIL", "config.networkKey", "missing or still CHANGE_ME")
+    else
+      finding("PASS", "config.networkKey", "configured (masked)")
+    end
+  end
+  if role == "worker" then
+    local numericChecks = {
+      { "config.maxWidth", config.maxWidth, 1 }, { "config.maxLength", config.maxLength, 1 },
+      { "config.maxDepth", config.maxDepth, 1 }, { "config.maxVolume", config.maxVolume, 1 },
+      { "config.reserveEmptySlots", config.reserveEmptySlots, 0 },
+    }
+    for _, check in ipairs(numericChecks) do
+      if tonumber(check[2]) and tonumber(check[2]) >= check[3] then finding("PASS", check[1], tostring(check[2]))
+      else finding("FAIL", check[1], "must be a number >= " .. tostring(check[3])) end
+    end
+    finding("PASS", "config.profile", tostring(config.profile or "balanced"))
+    finding("PASS", "config.water", valueString(config.water or config.waterMode or "seal"))
+    finding("PASS", "config.lighting", valueString(config.lighting or config.lightMode or "off"))
+    finding("PASS", "config.materials", valueString(config.materials or {}))
+  elseif role == "controller" then
+    local controllerNumbers = {
+      { "config.historyLimit", config.historyLimit, 1 },
+      { "config.workerTimeoutSeconds", config.workerTimeoutSeconds, 1 },
+      { "config.discoverySeconds", config.discoverySeconds, 1 },
+    }
+    for _, check in ipairs(controllerNumbers) do
+      if tonumber(check[2]) and tonumber(check[2]) >= check[3] then finding("PASS", check[1], tostring(check[2]))
+      else finding("FAIL", check[1], "must be a number >= " .. tostring(check[3])) end
+    end
+    finding("PASS", "config.queueEnabled", valueString(config.queueEnabled))
+    finding("PASS", "config.overlapProtection", valueString(config.overlapProtection))
+    finding("PASS", "config.adaptiveRefresh", valueString(config.adaptiveRefresh))
+    finding("PASS", "config.presets", valueString(config.presets or {}))
+  elseif role == "gps" then
+    finding("PASS", "config.coordinates", ("%s, %s, %s"):format(tostring(config.x), tostring(config.y), tostring(config.z)))
+  end
+
+  if role == "worker" then doctorDiscardAllowlist(config, finding) end
+
+  local labelApi = os and type(os.getComputerLabel) == "function"
+  local label = labelApi and os.getComputerLabel() or nil
+  if not labelApi then finding("WARN", "label.api", "getComputerLabel unavailable")
+  elseif label and label ~= "" then finding("PASS", "label", tostring(label))
+  else finding("WARN", "label", "computer label is not set") end
+
+  local modems = wirelessModems()
+  if #modems > 0 then finding("PASS", "modem", table.concat(modems, ", "))
+  elseif role == "worker" or role == "controller" or role == "gps" then finding("FAIL", "modem", "no wireless modem detected")
+  else finding("WARN", "modem", "role is not configured") end
+
+  local gpsApi = gps and type(gps.locate) == "function"
+  local gpsConfig = type(config.gps) == "table" and config.gps or {}
+  if role == "worker" and gpsConfig.enabled == false then finding("WARN", "gps.api", "disabled in config")
+  elseif gpsApi then finding("PASS", "gps.api", "gps.locate available")
+  elseif role == "worker" and gpsConfig.required == true then finding("FAIL", "gps.api", "required GPS API unavailable")
+  else finding("WARN", "gps.api", "gps.locate unavailable") end
+
+  if role == "worker" then
+    if not turtle then
+      finding("FAIL", "turtle", "worker role is running without a turtle API")
+    else
+      local sides = {
+        { "inventory.output", config.outputSide or "back", true },
+        { "inventory.fuel", config.fuelSide or "top", true },
+      }
+      if (config.lavaMode or "seal") == "seal" then sides[#sides + 1] = { "inventory.seal", config.sealSide or "right", true } end
+      local usedSides = {}
+      for _, item in ipairs(sides) do
+        local side = tostring(item[2])
+        if usedSides[side] then finding("WARN", item[1], "same side as another inventory: " .. side) end
+        usedSides[side] = true
+        if inventoryAvailable(side) then
+          local slots = inventorySlots(side)
+          finding("PASS", item[1], side .. (slots and (" (" .. slots .. " slots)") or ""))
+        else finding("FAIL", item[1], "inventory missing on " .. side) end
+      end
+      local fuel, fuelLimit = fuelStatus()
+      if fuel == nil then finding("FAIL", "fuel.api", "turtle fuel API unavailable")
+      elseif fuel == "unlimited" then finding("PASS", "fuel", "unlimited")
+      else
+        local target = tonumber(config.fuelTarget) or 0
+        local buffer = tonumber(config.fuelBuffer) or 0
+        if tonumber(fuel) and target > 0 and fuel < math.min(target, buffer > 0 and buffer or target) then
+          finding("WARN", "fuel", ("%s / %s (below configured reserve)"):format(tostring(fuel), tostring(fuelLimit or "-")))
+        else finding("PASS", "fuel", ("%s / %s"):format(tostring(fuel), tostring(fuelLimit or "-"))) end
+      end
+      local used, empty = countInventorySlots()
+      if used == nil then finding("FAIL", "inventory.slots", "turtle inventory API unavailable")
+      else
+        local reserve = tonumber(config.reserveEmptySlots) or 0
+        if empty < reserve then finding("WARN", "inventory.reserve", ("%d empty (target %d)"):format(empty, reserve))
+        else finding("PASS", "inventory.reserve", ("%d empty (target %d)"):format(empty, reserve)) end
+        local reserved = configuredReservedSlots(config)
+        if #reserved == 0 then finding("WARN", "inventory.reservedSlots", "no explicit material slots")
+        else
+          local present = {}
+          for _, slot in ipairs(reserved) do
+            local ok, count = pcall(turtle.getItemCount, slot)
+            present[#present + 1] = tostring(slot) .. "=" .. tostring(ok and count or 0)
+          end
+          finding("PASS", "inventory.reservedSlots", table.concat(present, ", "))
+        end
+      end
+    end
+  end
+
+  local rawState, stateError = readTableNoWrite(common.STATE_PATH)
+  if role == "worker" then
+    if not rawState then
+      finding(stateError == "missing" and "WARN" or "FAIL", "state.file", "state is " .. tostring(stateError or "missing"))
+    else
+      finding("PASS", "state.file", "readable")
+      local state = rawState
+      if tonumber(state.schema) ~= tonumber(common.SCHEMA) then finding("FAIL", "state.schema", "schema mismatch")
+      else finding("PASS", "state.schema", tostring(state.schema)) end
+      local statuses = { idle = true, working = true, paused = true, blocked = true, complete = true, aborted = true,
+        waiting_fuel = true, waiting_output = true, waiting_seal = true, waiting_torch = true, waiting_water = true,
+        recovering = true, dormant = true, calibrating = true }
+      if statuses[state.status] then finding("PASS", "state.status", tostring(state.status))
+      else finding("WARN", "state.status", "unknown status: " .. tostring(state.status)) end
+      if state.pendingAction ~= nil then
+        if type(state.pendingAction) ~= "table" or not state.pendingAction.kind then finding("FAIL", "state.pending", "malformed pendingAction")
+        elseif state.status ~= "blocked" and state.phase ~= "recovery_required" then finding("WARN", "state.pending", "pending action exists while state is not blocked")
+        else finding("PASS", "state.pending", tostring(state.pendingAction.kind)) end
+      else finding("PASS", "state.pending", "none") end
+      local active = state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output"
+        or state.status == "waiting_seal" or state.status == "waiting_torch"
+      if active and type(state.job) ~= "table" and type(state.service) ~= "table" then
+        finding("FAIL", "state.job", "active state has no job or service")
+      elseif type(state.job) == "table" then
+        local cursor, total = tonumber(state.job.cursor), tonumber(state.job.total)
+        if not cursor or not total or cursor < 0 or total <= 0 or cursor > total then
+          finding("FAIL", "state.job", "cursor/total is inconsistent")
+        else finding("PASS", "state.job", ("%d/%d"):format(cursor, total)) end
+      else finding("PASS", "state.job", "none") end
+      if state.request ~= nil and type(state.request) ~= "string" then finding("WARN", "state.request", "request is not a string") end
+      if state.stagedStop ~= nil and type(state.stagedStop) ~= "table" and type(state.stagedStop) ~= "boolean" then
+        finding("FAIL", "state.stagedStop", "malformed staged stop")
+      elseif type(state.stagedStop) == "table" then
+        finding("PASS", "state.stagedStop", valueString(state.stagedStop))
+      else
+        finding("PASS", "state.stagedStop", "none")
+      end
+
+      local calibration = tableValue(config, "gps", "calibration") or tableValue(state, "gps", "calibration")
+      local dockMetadata = state.dock or config.dock
+      local dock = dockMetadata
+      if type(dockMetadata) == "table" and not coordinateTable(dockMetadata) then
+        dock = dockMetadata.homeWorld or dockMetadata.world or dockMetadata.position or dockMetadata.home
+      end
+      if dock == nil and type(calibration) == "table" then dock = calibration.home end
+      if dock == nil and type(dockMetadata) == "table" then finding("PASS", "dock", "metadata=" .. valueString(dockMetadata))
+      elseif dock == nil then finding("PASS", "dock", "not configured/calibrated")
+      elseif coordinateTable(dock) then finding("PASS", "dock", coordinateText(dock))
+      elseif type(dockMetadata) == "table" then finding("PASS", "dock", "metadata=" .. valueString(dockMetadata))
+      else finding("FAIL", "dock", "dock coordinates are malformed") end
+
+      local bay = state.bay or config.bay
+      if bay == nil then finding("PASS", "bay", "not configured")
+      elseif type(bay) ~= "table" then finding("FAIL", "bay", "bay metadata is malformed")
+      elseif bay.capacity ~= nil and (not tonumber(bay.capacity) or tonumber(bay.capacity) < 1) then
+        finding("FAIL", "bay", "capacity must be a positive number")
+      else finding("PASS", "bay", valueString(bay)) end
+
+      local group = state.group or config.group
+      if group == nil and state.groupId == nil and config.groupId == nil then
+        finding("PASS", "group", "not assigned")

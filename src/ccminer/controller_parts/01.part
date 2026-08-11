@@ -1,4 +1,4 @@
--- CC Miner V3 - controller state, persistence and job orchestration.
+-- CC Miner V4 - controller state, persistence and job orchestration.
 -- The controller is deliberately tolerant of V2 worker payloads.  New
 -- fields are additive and every command has a legacy equivalent where one
 -- exists.
@@ -29,7 +29,15 @@ local function dbDefaults()
     queue = {},
     history = {},
     leases = {},
-    activeLeases = {}, -- independent compatibility snapshot for V3 draft tools.
+    activeLeases = {}, -- independent compatibility snapshot for V4 draft tools.
+    -- Group state is deliberately additive.  The legacy queue/history/preset
+    -- keys above remain authoritative for single-worker operation.
+    groups = {},
+    docks = {},
+    bays = {},
+    groupJobs = {},
+    groupLeases = {},
+    groupScheduler = { replenishConcurrency = 1, staggerSeconds = 0 },
     lastPreset = nil,
     lastDraft = nil,
     updatedAt = common.nowSeconds(),
@@ -55,10 +63,21 @@ local function persistentDraft(source)
   return value
 end
 
+-- Group records intentionally retain preflight/report fields.  Clone every
+-- field independently (rather than copying one shared root) to keep the
+-- ComputerCraft serializer free of table aliases while preserving the
+-- durable group-job audit trail.
+local function persistentGroupValue(source)
+  local value = {}
+  if type(source) ~= "table" then return value end
+  for key, item in pairs(source) do value[common.copy(key)] = common.copy(item) end
+  return value
+end
+
 local function loadControllerDb()
   local loaded, err = common.loadTable(DB_PATH, dbDefaults())
   db = common.merge(dbDefaults(), loaded or {})
-  -- `leases` is authoritative for V3.  Fall back to the old draft alias only
+  -- `leases` is authoritative for V4.  Fall back to the old draft alias only
   -- when a legacy file has no leases table at all.
   if type(loaded) == "table" and type(loaded.leases) ~= "table" and type(loaded.activeLeases) == "table" then
     db.leases = common.copy(loaded.activeLeases)
@@ -66,6 +85,17 @@ local function loadControllerDb()
   db.leases = type(db.leases) == "table" and db.leases or {}
   db.activeLeases = common.copy(db.leases)
   db.presets, db.queue, db.history = db.presets or {}, db.queue or {}, db.history or {}
+  db.groups = type(db.groups) == "table" and db.groups or {}
+  db.docks = type(db.docks) == "table" and db.docks or {}
+  db.bays = type(db.bays) == "table" and db.bays or {}
+  db.groupJobs = type(db.groupJobs) == "table" and db.groupJobs or {}
+  db.groupLeases = type(db.groupLeases) == "table" and db.groupLeases or {}
+  if #db.groupLeases == 0 then
+    for _, lease in ipairs(db.leases) do if type(lease) == "table" and lease.groupJobId then db.groupLeases[#db.groupLeases + 1] = common.copy(lease) end end
+  end
+  db.groupScheduler = type(db.groupScheduler) == "table" and db.groupScheduler or { replenishConcurrency = 1, staggerSeconds = 0 }
+  db.groupScheduler.replenishConcurrency = math.max(1, math.floor(tonumber(db.groupScheduler.replenishConcurrency) or 1))
+  db.groupScheduler.staggerSeconds = math.max(0, tonumber(db.groupScheduler.staggerSeconds) or 0)
   dbError = err
 end
 
@@ -74,7 +104,25 @@ local function saveControllerDb()
   -- Keep the compatibility field, but never point it at `leases`: CC's
   -- serializer rejects repeated table references.
   db.activeLeases = common.copy(db.leases or {})
-  local ok, err = common.saveTable(DB_PATH, db)
+  -- Group tables may have been assembled from live worker payloads.  Copy
+  -- each top-level value independently so `groups`/`groupJobs`/leases never
+  -- share a table reference in the serialized database.
+  local persistedGroups, persistedDocks, persistedBays, persistedJobs, persistedGroupLeases = {}, {}, {}, {}, {}
+  for key, value in pairs(db.groups or {}) do persistedGroups[key] = persistentGroupValue(value) end
+  for key, value in pairs(db.docks or {}) do persistedDocks[key] = persistentGroupValue(value) end
+  for key, value in pairs(db.bays or {}) do persistedBays[key] = persistentGroupValue(value) end
+  for key, value in pairs(db.groupJobs or {}) do persistedJobs[key] = persistentGroupValue(value) end
+  for key, value in pairs(db.groupLeases or {}) do persistedGroupLeases[key] = persistentGroupValue(value) end
+  -- Do not replace the live tables with sanitized copies: callers may hold a
+  -- reference to a group job while saving an ACK or scheduler transition.
+  -- Build a detached root exclusively for serialization instead.
+  local persistedDb = {}
+  for key, value in pairs(db) do persistedDb[key] = common.copy(value) end
+  persistedDb.groups, persistedDb.docks, persistedDb.bays = persistedGroups, persistedDocks, persistedBays
+  persistedDb.groupJobs, persistedDb.groupLeases = persistedJobs, persistedGroupLeases
+  persistedDb.groupScheduler = persistentDraft(db.groupScheduler or {})
+  persistedDb.activeLeases = common.copy(db.leases or {})
+  local ok, err = common.saveTable(DB_PATH, persistedDb)
   if not ok then dbError = err end
   return ok, err
 end
@@ -83,6 +131,16 @@ loadControllerDb()
 
 local workers = {}
 local selected = 1
+local selectedGroup = 1
+local groupMode = false
+local groupDraft = nil
+local groupCommandAcks = {}
+local groupSchedulerLast = 0
+local normalizedProfile, normalizedWaterMode, normalizedLighting
+local releaseGroupLeases
+local finalizePendingReassignment
+local acceptGroupStart, rejectGroupStart
+local sortedJobAssignments, groupSafeStop
 local notice = dbError and ("Controller DB recovered: " .. tostring(dbError)) or "Controller ready. Touch DISCOVER or press D."
 local noticeIsError = false
 local lastDiscovery = 0
@@ -148,6 +206,415 @@ local function workerData(id)
   return worker and worker.data or nil
 end
 
+-- Group registry ---------------------------------------------------------
+-- Groups are controller-owned durable records.  Keeping worker IDs in the
+-- record (rather than storing live worker tables) makes the database safe to
+-- serialize and lets discovery update status without mutating group config.
+local function orderedGroupIds()
+  local ids = {}
+  for id, group in pairs(db.groups or {}) do
+    if type(group) == "table" then ids[#ids + 1] = tostring(group.id or id) end
+  end
+  table.sort(ids)
+  if #ids == 0 then selectedGroup = 1 else selectedGroup = common.clamp(selectedGroup, 1, #ids) end
+  return ids
+end
+
+local function groupRecord(groupId)
+  if groupId == nil then return nil end
+  local key = tostring(groupId)
+  local direct = db.groups and (db.groups[groupId] or db.groups[key])
+  if type(direct) == "table" then return direct end
+  for id, group in pairs(db.groups or {}) do
+    if type(group) == "table" and tostring(group.id or id) == key then return group end
+  end
+  return nil
+end
+
+local function groupWorkerIds(group)
+  local out, seen = {}, {}
+  if type(group) ~= "table" then return out end
+  local source = type(group.workerIds) == "table" and group.workerIds or group.workers
+  if type(source) ~= "table" then return out end
+  for _, value in ipairs(source) do
+    local id = tonumber(value) or value
+    local key = tostring(id)
+    if key ~= "" and not seen[key] then seen[key] = true; out[#out + 1] = id end
+  end
+  if #out == 0 then
+    for key, value in pairs(source) do
+      local id = tonumber(value) or tonumber(key) or value
+      local text = tostring(id)
+      if text ~= "" and not seen[text] then seen[text] = true; out[#out + 1] = id end
+    end
+  end
+  table.sort(out, function(a, b) return tostring(a) < tostring(b) end)
+  return out
+end
+
+local function groupName(group, groupId)
+  return type(group) == "table" and tostring(group.name or group.id or groupId) or ("Group-" .. tostring(groupId or "?"))
+end
+
+local function groupWorkerResourceId(group, id, kind)
+  local source = kind == "bay" and (group and (group.workerBays or group.bays)) or (group and (group.workerDocks or group.docks))
+  local value = type(source) == "table" and (source[tostring(id)] or source[id]) or nil
+  if type(value) == "table" then value = value.id or value.bayId or value.dockId end
+  if value == nil then value = kind == "bay" and group and group.bayId or group and group.dockId end
+  if value == nil then
+    local data = workerData(id) or {}
+    value = kind == "bay" and (data.bayId or data.bay) or (data.dockId or data.dock)
+    if type(value) == "table" then value = value.id or value.bayId or value.dockId end
+  end
+  return value and tostring(value) or nil
+end
+
+local function groupWorkerResource(group, id, kind)
+  local resourceId = groupWorkerResourceId(group, id, kind)
+  if not resourceId then return nil, nil end
+  local registry = kind == "bay" and db.bays or db.docks
+  local value = registry and (registry[resourceId] or registry[tonumber(resourceId)]) or nil
+  return resourceId, type(value) == "table" and value or nil
+end
+
+local function normalizeFacingValue(value)
+  if value == nil or value == "" then return nil end
+  if type(value) == "number" then
+    local n = math.floor(value)
+    if n >= 0 and n <= 3 and n == value then return n end
+    return nil
+  end
+  local text = tostring(value):lower():gsub("[%s%-]", "_")
+  local names = { south = 0, front = 0, east = 1, right = 1, north = 2, back = 2, west = 3, left = 3 }
+  if names[text] ~= nil then return names[text] end
+  local n = tonumber(text)
+  if n and math.floor(n) == n and n >= 0 and n <= 3 then return n end
+  return nil
+end
+
+local function normalizeRegisteredResource(value)
+  if type(value) ~= "table" then return nil, "resource_value_required" end
+  local world = value.world or value.position
+  if type(world) ~= "table" then return nil, "world_coordinates_required" end
+  local x, y, z = tonumber(world.x), tonumber(world.y), tonumber(world.z)
+  if not x or not y or not z or x ~= math.floor(x) or y ~= math.floor(y) or z ~= math.floor(z) then
+    return nil, "world_coordinates_must_be_integers"
+  end
+  local normalized = common.copy(value)
+  normalized.world = { x = x, y = y, z = z }
+  normalized.position = nil
+  local facing = normalizeFacingValue(value.facing or value.direction)
+  if (value.facing ~= nil or value.direction ~= nil) and facing == nil then return nil, "invalid_facing" end
+  normalized.facing, normalized.direction = facing, nil
+  if value.maxDepth ~= nil then
+    local maxDepth = tonumber(value.maxDepth)
+    if not maxDepth or maxDepth < 1 or maxDepth ~= math.floor(maxDepth) then return nil, "maxDepth_must_be_positive_integer" end
+    normalized.maxDepth = maxDepth
+  end
+  return normalized
+end
+
+local function registerDock(dockId, value)
+  dockId = common.trim(dockId or "")
+  if dockId == "" then return false, "dock_id_required" end
+  local normalized, err = normalizeRegisteredResource(value)
+  if not normalized then return false, err end
+  value = normalized
+  value.id, value.updatedAt = dockId, common.nowSeconds()
+  db.docks[dockId] = persistentGroupValue(value)
+  saveControllerDb()
+  return true
+end
+
+local function registerBay(bayId, value)
+  bayId = common.trim(bayId or "")
+  if bayId == "" then return false, "bay_id_required" end
+  local normalized, err = normalizeRegisteredResource(value)
+  if not normalized then return false, err end
+  value = normalized
+  value.id, value.updatedAt = bayId, common.nowSeconds()
+  db.bays[bayId] = persistentGroupValue(value)
+  saveControllerDb()
+  return true
+end
+
+local function registerGroup(groupId, workerIds, options)
+  groupId = common.trim(groupId or "")
+  if groupId == "" then return false, "group_id_required" end
+  options = type(options) == "table" and options or {}
+  local ids, seen = {}, {}
+  for _, value in ipairs(workerIds or {}) do
+    local id = tonumber(value) or value
+    if tostring(id) ~= "" and not seen[tostring(id)] then seen[tostring(id)] = true; ids[#ids + 1] = id end
+  end
+  if #ids == 0 then return false, "group_workers_required" end
+  local maxWorkers = tonumber(config.group and config.group.maxWorkers)
+  if maxWorkers and #ids > maxWorkers then return false, "group_max_workers_exceeded:" .. tostring(maxWorkers) end
+  table.sort(ids, function(a, b) return tostring(a) < tostring(b) end)
+  local previous = groupRecord(groupId) or {}
+  local mode = tostring(options.mode or previous.mode or "world"):lower()
+  if mode ~= "world" and mode ~= "local" then return false, "group_mode_unsupported:" .. mode end
+  local partition = tostring(options.partition or previous.partition or (config.group and config.group.partitionMode) or "stripe"):lower()
+  if partition ~= "stripe" and partition ~= "round_robin" then return false, "partition_mode_unsupported:" .. partition end
+  local allowedWorkers = {}
+  for _, id in ipairs(ids) do allowedWorkers[tostring(id)] = true end
+  local function validateResourceMap(source, name)
+    if source == nil then return true end
+    if type(source) ~= "table" then return false, name .. "_map_invalid" end
+    for key, raw in pairs(source) do
+      local id = tostring(key)
+      if not allowedWorkers[id] then return false, name .. "_worker_unknown:" .. id end
+      local value = raw
+      if type(value) == "table" then value = value.id or value.bayId or value.dockId end
+      if value == nil or common.trim(value) == "" then return false, name .. "_value_empty:" .. id end
+    end
+    return true
+  end
+  local mapOK, mapError = validateResourceMap(options.workerBays or previous.workerBays, "worker_bay")
+  if not mapOK then return false, mapError end
+  mapOK, mapError = validateResourceMap(options.workerDocks or previous.workerDocks, "worker_dock")
+  if not mapOK then return false, mapError end
+  local group = {
+    id = groupId,
+    name = tostring(options.name or previous.name or groupId),
+    workerIds = common.copy(ids),
+    dockId = options.dockId or previous.dockId,
+    bayId = options.bayId or previous.bayId,
+    -- Per-worker overrides are maps keyed by worker ID.  A shared dock/bay
+    -- remains a convenient default for legacy group registrations.
+    workerBays = common.copy(options.workerBays or previous.workerBays or {}),
+    workerDocks = common.copy(options.workerDocks or previous.workerDocks or {}),
+    mode = mode,
+    partition = partition,
+    staggerSeconds = math.max(0, tonumber(options.staggerSeconds or previous.staggerSeconds) or tonumber(db.groupScheduler.staggerSeconds) or 0),
+    replenishConcurrency = math.max(1, math.floor(tonumber(options.replenishConcurrency or previous.replenishConcurrency) or tonumber(db.groupScheduler.replenishConcurrency) or 1)),
+    updatedAt = common.nowSeconds(),
+  }
+  db.groups[groupId] = persistentGroupValue(group)
+  saveControllerDb()
+  return true, db.groups[groupId]
+end
+
+local function selectedGroupRecord()
+  local ids = orderedGroupIds()
+  local id = ids[selectedGroup]
+  return id, id and groupRecord(id) or nil
+end
+
+local function activeGroupJob(groupId)
+  local latest
+  for id, job in pairs(db.groupJobs or {}) do
+    if type(job) == "table" and tostring(job.groupId or id) == tostring(groupId) then
+      if not latest or tonumber(job.updatedAt or job.startedAt or 0) > tonumber(latest.updatedAt or latest.startedAt or 0) then latest = job end
+    end
+  end
+  return latest
+end
+
+local function groupWorkersTerminalAtHome(groupJob, requireAll)
+  if type(groupJob) ~= "table" then return true end
+  local group = groupRecord(groupJob.groupId)
+  local partialStart = groupJob.status == "PARTIAL_START" and requireAll ~= true
+  for _, id in ipairs(groupWorkerIds(group)) do
+    local key = tostring(id)
+    -- A PARTIAL_START must wait only for workers that actually accepted the
+    -- assignment.  Unstarted/offline targets have no physical lease or
+    -- return route and must not hold finalization forever.
+    if not (partialStart and not (groupJob.started and groupJob.started[key])) then
+      local worker = workers[id]
+      local data = worker and worker.data or {}
+      if statusOf(worker) == "offline" then return false end
+      if groupJob.awaitingAck and groupJob.awaitingAck[key] then return false end
+      local status = tostring(data.status or data.phase or "unknown")
+      if status ~= "complete" and status ~= "completed" and status ~= "aborted" and status ~= "idle" then return false end
+      if data.atHome ~= true then return false end
+    end
+  end
+  return true
+end
+
+local function maybeFinalizeGroup(groupJob)
+  if type(groupJob) ~= "table" then return false end
+  if (groupJob.status == "aborting" or groupJob.status == "clear_requested" or groupJob.status == "PARTIAL_START") and groupWorkersTerminalAtHome(groupJob) then
+    local clear = groupJob.status == "clear_requested"
+    groupJob.status = clear and "cleared" or "aborted"
+    groupJob.finishedAt = common.nowSeconds()
+    releaseGroupLeases(groupJob)
+    if not groupJob.historyRecorded then
+      db.history[#db.history + 1] = { id = tostring(groupJob.groupJobId), kind = "group", groupJobId = groupJob.groupJobId, groupId = groupJob.groupId, worker = groupName(groupRecord(groupJob.groupId), groupJob.groupId), name = groupJob.name, status = groupJob.status, reason = groupJob.returnReason or groupJob.status, startedAt = groupJob.startedAt, finishedAt = groupJob.finishedAt, metrics = common.copy(groupJob.metrics or groupJob.report or {}) }
+      groupJob.historyRecorded = true
+    end
+    return true
+  end
+  return false
+end
+
+finalizePendingReassignment = function(groupJob, workerId, data)
+  local pending = groupJob and groupJob.pendingReassignment
+  if type(pending) ~= "table" or tonumber(pending.targetWorkerId) ~= tonumber(workerId) then return false end
+  local job = data and data.job or {}
+  -- A status response can arrive late (or be the target's pre-dispatch idle
+  -- snapshot).  Never treat that as acceptance of a pending reassignment:
+  -- the echoed assignment and parent group identity are mandatory, and the
+  -- worker must report an actually accepted/running job state.
+  local assignmentId = data and (data.assignmentId or job.assignmentId) or nil
+  if assignmentId == nil or tostring(assignmentId) ~= tostring(pending.assignmentId) then return false end
+  local reportedGroupJobId = data and (data.groupJobId or (data.group and data.group.groupJobId)) or nil
+  reportedGroupJobId = reportedGroupJobId or (job and (job.groupJobId or job.parentGroupJobId))
+  if reportedGroupJobId == nil or tostring(reportedGroupJobId) ~= tostring(groupJob.groupJobId) then return false end
+  local status = tostring((data and (data.status or data.phase)) or ""):lower()
+  local acceptedStates = {
+    accepted = true, starting = true, working = true, mining = true, transit = true,
+    servicing = true, service = true, service_requested = true, waiting_fuel = true,
+    waiting_output = true, waiting_seal = true, waiting_torch = true, waiting_water = true,
+  }
+  if not acceptedStates[status] then return false end
+  local source = groupJob.assignments and (groupJob.assignments[tostring(pending.sourceWorkerId)] or groupJob.assignments[pending.sourceWorkerId])
+  if not source then return false end
+  local targetKey = tostring(pending.targetWorkerId)
+  local target = groupJob.assignments[targetKey] or {
+    workerId = pending.targetWorkerId, groupJobId = groupJob.groupJobId, parentJobId = groupJob.groupJobId,
+    jobId = groupJob.groupJobId .. "/reassign-" .. targetKey, assignmentId = pending.assignmentId, chunkKeys = {}, transitKeys = {},
+  }
+  target.chunkKeys = common.copy(pending.chunkKeys or {})
+  target.transitKeys = common.copy(pending.transitKeys or {})
+  target.assignmentResumeToken = pending.assignmentResumeToken and common.copy(pending.assignmentResumeToken) or nil
+  target.status, target.reassignedFrom, target.reassignedAt = "reassigned", pending.sourceWorkerId, common.nowSeconds()
+  target.bay, target.bayId, target.dock, target.dockId = pending.bay, pending.bayId, common.copy(pending.dock or {}), pending.dockId
+  target.homeWorld, target.maxDepth, target.facing = common.copy(pending.homeWorld), pending.maxDepth, pending.facing
+  groupJob.assignments[targetKey] = target
+  source.chunkKeys, source.status = {}, "reassigned"
+  groupJob.pendingReassignment = nil
+  groupJob.alerts = groupJob.alerts or {}
+  groupJob.alerts[#groupJob.alerts + 1] = "REASSIGNED:#" .. tostring(pending.sourceWorkerId) .. "->#" .. targetKey
+  for _, collection in ipairs({ db.leases or {}, db.groupLeases or {} }) do
+    for _, lease in ipairs(collection) do
+      if tostring(lease.groupJobId or "") == tostring(groupJob.groupJobId) and tostring(lease.assignmentId or "") == tostring(source.assignmentId) then
+        lease.workerId = pending.targetWorkerId
+        lease.assignmentId = pending.assignmentId
+        lease.jobId = target.jobId
+        lease.chunks = common.copy(lease.kind == "transit" and pending.transitKeys or pending.chunkKeys or {})
+      end
+    end
+  end
+  updateGroupAggregate(groupJob)
+  saveControllerDb()
+  return true
+end
+
+acceptGroupStart = function(groupJob, workerId, assignmentId)
+  if type(groupJob) ~= "table" then return false end
+  local key = tostring(workerId)
+  local assignment = groupJob.assignments and (groupJob.assignments[key] or groupJob.assignments[workerId])
+  if not assignment then return false end
+  if assignmentId and tostring(assignment.assignmentId or "") ~= tostring(assignmentId) then return false end
+  assignment.status, assignment.acceptedAt = "started", common.nowSeconds()
+  groupJob.started = groupJob.started or {}; groupJob.started[key] = true
+  groupJob.awaitingAck = groupJob.awaitingAck or {}; groupJob.awaitingAck[key] = nil
+  groupJob.pending = groupJob.pending or {}; groupJob.pending[key] = nil
+  groupJob.acks = groupJob.acks or {}; groupJob.acks[key] = { ok = true, command = "START", at = common.nowSeconds() }
+  local remaining = false
+  for _, candidate in ipairs(sortedJobAssignments(groupJob)) do
+    local candidateKey = tostring(candidate.workerId)
+    if not groupJob.started[candidateKey] and not groupJob.failed[candidateKey] then remaining = true; break end
+  end
+  if not remaining and not groupJob.pendingReassignment then groupJob.status = "working"; groupJob.startedAt = groupJob.startedAt or common.nowSeconds() end
+  groupJob.updatedAt = common.nowSeconds()
+  updateGroupAggregate(groupJob)
+  saveControllerDb()
+  return true
+end
+
+rejectGroupStart = function(groupJob, workerId, reason)
+  if type(groupJob) ~= "table" then return false end
+  local key = tostring(workerId)
+  local assignment = groupJob.assignments and (groupJob.assignments[key] or groupJob.assignments[workerId])
+  if assignment then assignment.status, assignment.error = "failed", reason or "start_rejected" end
+  groupJob.failed = groupJob.failed or {}; groupJob.failed[key] = true
+  groupJob.awaitingAck = groupJob.awaitingAck or {}; groupJob.awaitingAck[key] = nil
+  groupJob.pending = groupJob.pending or {}; groupJob.pending[key] = nil
+  groupJob.status = "PARTIAL_START"
+  for startedKey in pairs(groupJob.started or {}) do groupSafeStop(groupJob, startedKey, "start_rejected") end
+  releaseGroupLeases(groupJob, true)
+  groupJob.alerts = groupJob.alerts or {}
+  groupJob.alerts[#groupJob.alerts + 1] = "PARTIAL_START"
+  groupJob.alerts[#groupJob.alerts + 1] = "worker #" .. key .. ": " .. tostring(reason or "start rejected")
+  updateGroupAggregate(groupJob)
+  saveControllerDb()
+  return false
+end
+
+local function groupJobIdForWorker(id, data)
+  local job = data and data.job or {}
+  local candidate = data and (data.groupJobId or data.group and data.group.groupJobId) or nil
+  candidate = candidate or job.groupJobId or job.parentGroupJobId or job.groupId
+  if candidate then return tostring(candidate) end
+  for key, groupJob in pairs(db.groupJobs or {}) do
+    if type(groupJob) == "table" then
+      for _, assignment in pairs(groupJob.assignments or {}) do
+        if type(assignment) == "table" and tonumber(assignment.workerId) == tonumber(id) and (not job.id or tostring(assignment.jobId or "") == tostring(job.id or "") or tostring(assignment.assignmentId or "") == tostring(job.assignmentId or "")) then
+          return tostring(groupJob.groupJobId or groupJob.id or key)
+        end
+      end
+    end
+  end
+  return nil
+end
+
+local function groupStatusLabel(status)
+  status = tostring(status or "unknown")
+  if status == "completed" then return "complete" end
+  if status == "waiting" or status == "service_requested" then return "service" end
+  return status
+end
+
+local function updateGroupAggregate(groupJob)
+  if type(groupJob) ~= "table" then return nil end
+  local group = groupRecord(groupJob.groupId)
+  local ids = groupWorkerIds(group)
+  local aggregate = { total = #ids, online = 0, active = 0, complete = 0, blocked = 0, waiting = 0, percent = 0, minFuel = nil, warnings = {}, acks = 0, ackTotal = #ids }
+  local weightedDone, weightedTotal = 0, 0
+  local seenWarning = {}
+  for _, id in ipairs(ids) do
+    local worker = workers[id]
+    local data = worker and worker.data or nil
+    local status = statusOf(worker)
+    if status ~= "offline" then aggregate.online = aggregate.online + 1 else aggregate.warnings[#aggregate.warnings + 1] = "offline:#" .. tostring(id) end
+    if status == "complete" or status == "completed" then aggregate.complete = aggregate.complete + 1 end
+    if status == "blocked" then aggregate.blocked = aggregate.blocked + 1 end
+    if status == "waiting_fuel" or status == "waiting_output" or status == "waiting_seal" or status == "waiting_torch" or status == "waiting_water" or status == "service" then aggregate.waiting = aggregate.waiting + 1 end
+    if status == "working" or status == "mining" or status == "starting" then aggregate.active = aggregate.active + 1 end
+    local fuel = data and tonumber(data.fuel or data.materials and data.materials.fuel)
+    if fuel and (aggregate.minFuel == nil or fuel < aggregate.minFuel) then aggregate.minFuel = fuel end
+    local progress = data and data.progress or {}
+    local cursor, total = tonumber(progress and progress.cursor or data and data.job and data.job.cursor), tonumber(progress and progress.total or data and data.job and data.job.total)
+    if cursor and total and total > 0 then weightedDone, weightedTotal = weightedDone + math.max(0, math.min(cursor, total)), weightedTotal + total end
+    local warning = data and (data.lastError or data.completionReason)
+    if warning and not seenWarning[tostring(warning)] then seenWarning[tostring(warning)] = true; aggregate.warnings[#aggregate.warnings + 1] = tostring(warning) end
+    local ack = groupJob.acks and groupJob.acks[tostring(id)]
+    if ack and ack.ok ~= nil then aggregate.acks = aggregate.acks + 1 end
+  end
+  aggregate.percent = weightedTotal > 0 and math.floor(weightedDone * 100 / weightedTotal + 0.5) or (#ids > 0 and math.floor(aggregate.complete * 100 / #ids + 0.5) or 0)
+  if aggregate.blocked > 0 then aggregate.warnings[#aggregate.warnings + 1] = "blocked=" .. tostring(aggregate.blocked) end
+  if aggregate.waiting > 0 then aggregate.warnings[#aggregate.warnings + 1] = "service=" .. tostring(aggregate.waiting) end
+  if aggregate.minFuel == nil then aggregate.warnings[#aggregate.warnings + 1] = "minFuel=unknown" end
+  for _, eventWarning in ipairs(groupJob.alerts or {}) do
+    local text = tostring(eventWarning)
+    if not seenWarning[text] then seenWarning[text] = true; aggregate.warnings[#aggregate.warnings + 1] = text end
+  end
+  groupJob.aggregate = persistentDraft(aggregate)
+  groupJob.minFuel = aggregate.minFuel
+  groupJob.warnings = common.copy(aggregate.warnings)
+  groupJob.updatedAt = common.nowSeconds()
+  return aggregate
+end
+
+local function findGroupJobForWorker(id, data)
+  local explicit = groupJobIdForWorker(id, data)
+  if explicit and db.groupJobs[explicit] then return db.groupJobs[explicit], explicit end
+  return nil, explicit
+end
+
 local function normalizeStatus(data)
   data = data or {}
   -- V2 workers expose cursor/total under job and have no progress/materials
@@ -196,12 +663,20 @@ end
 
 local function releaseLeasesForWorker(id, jobId)
   local kept = {}
+  local currentAtHome = workers[id] and workers[id].data and workers[id].data.atHome == true
   for _, lease in ipairs(db.leases or {}) do
     local sameWorker = tonumber(lease.workerId) == tonumber(id)
     local sameJob = not jobId or tostring(lease.jobId) == tostring(jobId)
-    if not (sameWorker and sameJob) then kept[#kept + 1] = lease end
+    if not (sameWorker and sameJob and (not lease.groupJobId or currentAtHome)) then kept[#kept + 1] = lease end
   end
   db.leases = kept
+  local keptGroup = {}
+  for _, lease in ipairs(db.groupLeases or {}) do
+    local sameWorker = tonumber(lease.workerId) == tonumber(id)
+    local sameJob = not jobId or tostring(lease.jobId) == tostring(jobId) or tostring(lease.groupJobId) == tostring(jobId)
+    if not (sameWorker and sameJob and (not lease.groupJobId or currentAtHome)) then keptGroup[#keptGroup + 1] = lease end
+  end
+  db.groupLeases = keptGroup
   db.activeLeases = common.copy(kept)
   saveControllerDb()
 end
@@ -280,6 +755,45 @@ local function handleMessage(sender, message)
     workers[id].data = payload
     workers[id].lastSeen = common.nowSeconds()
     workers[id].sender = sender
+    local groupJob = findGroupJobForWorker(id, payload)
+    if groupJob then
+      if groupJob.status == "starting" and payload.job and payload.job.assignmentId then acceptGroupStart(groupJob, id, payload.job.assignmentId) end
+      finalizePendingReassignment(groupJob, id, payload)
+      local assignment = groupJob.assignments and (groupJob.assignments[tostring(id)] or groupJob.assignments[id])
+      if assignment then
+        assignment.status = payload.status or payload.phase or assignment.status
+        if payload.status == "complete" or payload.status == "completed" or payload.status == "aborted" or payload.status == "idle" then
+          if groupJob.awaitingAck then groupJob.awaitingAck[tostring(id)] = nil end
+          if groupJob.pending then groupJob.pending[tostring(id)] = nil end
+        end
+        assignment.progress = common.copy(payload.progress or payload.job and payload.job.progress or {})
+        assignment.lastSeen = common.nowSeconds()
+        if payload.status == "complete" or payload.status == "completed" then assignment.finishedAt = common.nowSeconds() end
+        if payload.completionReason then assignment.returnReason = payload.completionReason end
+        if payload.report or payload.stats then assignment.report = common.copy(payload.report or payload.stats) end
+      end
+      updateGroupAggregate(groupJob)
+      if payload.completionReason then groupJob.returnReason = payload.completionReason end
+      if payload.report or payload.stats then
+        groupJob.metrics = groupJob.metrics or {}
+        local report = payload.report or payload.stats
+        for key, value in pairs(report or {}) do if type(value) ~= "table" then groupJob.metrics[key] = value end end
+        if report and (report.discard or report.discardStats) then groupJob.metrics.discard = common.copy(report.discard or report.discardStats) end
+        groupJob.report = common.copy(groupJob.metrics)
+      end
+      local allDone = true
+      for _, item in pairs(groupJob.assignments or {}) do if type(item) == "table" and item.status ~= "complete" and item.status ~= "completed" and item.status ~= "reassigned" then allDone = false; break end end
+      if allDone and groupJob.status == "working" then
+        groupJob.status, groupJob.finishedAt = "complete", common.nowSeconds()
+        releaseGroupLeases(groupJob)
+        if not groupJob.historyRecorded then
+          db.history[#db.history + 1] = { id = tostring(groupJob.groupJobId), kind = "group", groupJobId = groupJob.groupJobId, groupId = groupJob.groupId, workerId = nil, worker = groupName(groupRecord(groupJob.groupId), groupJob.groupId), name = groupJob.name, status = "complete", reason = groupJob.returnReason or "complete", startedAt = groupJob.startedAt, finishedAt = groupJob.finishedAt, metrics = common.copy(groupJob.metrics or groupJob.report or {}) }
+          groupJob.historyRecorded = true
+        end
+      end
+      maybeFinalizeGroup(groupJob)
+      saveControllerDb()
+    end
     acknowledgeQueuedStart(id, payload)
     local oldStatus = previous and tostring(previous.status or "") or ""
     local newStatus = tostring(payload.status or "unknown")
@@ -302,6 +816,14 @@ local function handleMessage(sender, message)
   elseif message.kind == "ack" then
     local payload = message.payload or {}
     setNotice((payload.ok and "OK: " or "ERROR: ") .. tostring(payload.message or ""), not payload.ok)
+    local ackGroupJobId = payload.groupJobId or payload.parentGroupJobId or payload.group and payload.group.groupJobId
+    if ackGroupJobId and db.groupJobs[tostring(ackGroupJobId)] then
+      local ackJob = db.groupJobs[tostring(ackGroupJobId)]
+      ackJob.acks = ackJob.acks or {}
+      ackJob.acks[tostring(sender)] = { ok = payload.ok == true, message = payload.message, command = payload.command, at = common.nowSeconds() }
+      updateGroupAggregate(ackJob)
+      saveControllerDb()
+    end
     if type(payload.status) == "table" and payload.status.id then
       local id = tonumber(payload.status.id)
       if not id or id ~= tonumber(sender) then return false end
@@ -310,6 +832,30 @@ local function handleMessage(sender, message)
       workers[id].data = normalizeStatus(payload.status)
       workers[id].lastSeen = common.nowSeconds()
       workers[id].sender = sender
+      local groupJob = findGroupJobForWorker(id, workers[id].data)
+      if groupJob then
+        local statusJob = workers[id].data.job or {}
+        if payload.ok and statusJob.assignmentId and groupJob.status == "starting" then acceptGroupStart(groupJob, id, statusJob.assignmentId)
+        elseif payload.ok == false and groupJob.status == "starting" then rejectGroupStart(groupJob, id, payload.message or "start rejected")
+        elseif payload.ok == false and (groupJob.status == "aborting" or groupJob.status == "clear_requested") then
+          if groupJob.awaitingAck then groupJob.awaitingAck[tostring(id)] = nil end
+          if groupJob.pending then groupJob.pending[tostring(id)] = nil end
+        end
+        local pending = groupJob.pendingReassignment
+        local ackMatchesReassignment = not pending
+          or (payload.assignmentId ~= nil and tostring(payload.assignmentId) == tostring(pending.assignmentId))
+        if pending and payload.ok == false and (payload.assignmentId == nil or tostring(payload.assignmentId) == tostring(pending.assignmentId)) then
+          groupJob.pendingReassignment = nil
+          groupJob.alerts = groupJob.alerts or {}
+          groupJob.alerts[#groupJob.alerts + 1] = "REASSIGN_REJECTED:#" .. tostring(id) .. ":" .. tostring(payload.message or "worker rejected")
+        elseif ackMatchesReassignment then
+          finalizePendingReassignment(groupJob, id, workers[id].data)
+        end
+        groupJob.acks = groupJob.acks or {}
+        groupJob.acks[tostring(id)] = { ok = payload.ok == true, message = payload.message, at = common.nowSeconds() }
+        updateGroupAggregate(groupJob)
+        saveControllerDb()
+      end
       acknowledgeQueuedStart(id, workers[id].data)
       local st = workers[id].data.status
       if (st == "complete" or st == "aborted") and previous and previous.status ~= st then
@@ -336,6 +882,76 @@ local function sendCommand(id, command, payload)
   if ok then setNotice(("Command '%s' sent to #%s."):format(command, tostring(id)), false)
   else setNotice("Send failed: " .. tostring(err), true) end
   return ok
+end
+
+local GROUP_WIRE_COMMAND = { start = "start", pause = "pause", resume = "resume", return_home = "recall", recall = "recall", service = "service", abort = "abort", clear = "clear" }
+
+local function groupCommand(groupId, command, payload)
+  local group = groupRecord(groupId)
+  if not group then setNotice("Group not found: " .. tostring(groupId), true); return false, 0 end
+  command = tostring(command or ""):lower()
+  local requestedCommand = command
+  if command == "return" then command = "return_home" end
+  if command == "start" and not (payload and payload.groupJobId) then
+    local current = activeGroupJob(groupId)
+    if current then payload = common.copy(payload or {}); payload.groupJobId = current.groupJobId or current.id end
+  end
+  payload = type(payload) == "table" and common.copy(payload) or {}
+  payload.group = true
+  payload.scope = "group"
+  payload.groupId = tostring(groupId)
+  payload.requestedCommand = requestedCommand
+  payload.groupCommand = string.upper(command == "return_home" and "RETURN" or command)
+  local groupJob = payload.groupJobId and db.groupJobs[tostring(payload.groupJobId)] or activeGroupJob(groupId)
+  if command == "clear" and groupJob and not groupWorkersTerminalAtHome(groupJob, true) then
+    setNotice("Group CLEAR blocked until every worker is terminal and home.", true)
+    return false, 0
+  end
+  if groupJob then
+    payload.groupJobId = tostring(groupJob.groupJobId or groupJob.id)
+    groupJob.acks = groupJob.acks or {}
+    groupJob.lastCommand = payload.groupCommand
+    groupJob.commandSentAt = common.nowSeconds()
+  end
+  local sent, attempted = 0, 0
+  for _, id in ipairs(groupWorkerIds(group)) do
+    attempted = attempted + 1
+    local individual = common.copy(payload)
+    individual.targetWorkerId = tonumber(id) or id
+    individual.workerId = tonumber(id) or id
+    individual.command = GROUP_WIRE_COMMAND[command] or command
+    local assignment = groupJob and groupJob.assignments and (groupJob.assignments[tostring(id)] or groupJob.assignments[id])
+    if assignment and command == "start" then
+      individual.assignmentId = assignment.assignmentId
+      individual.assignment = common.copy(assignment)
+      individual.assignmentChunks = common.copy(assignment.chunkKeys or assignment.chunks or {})
+    end
+    if sendCommand(id, individual.command, individual) then
+      sent = sent + 1
+      if groupJob then groupJob.acks[tostring(id)] = { ok = nil, command = individual.groupCommand, sentAt = common.nowSeconds() } end
+    end
+  end
+  if groupJob then updateGroupAggregate(groupJob); saveControllerDb() end
+  if groupJob and (command == "clear" or command == "abort") then
+    groupJob.status = command == "clear" and "clear_requested" or "aborting"
+    if command == "abort" then
+      -- Assignments that were never sent cannot later race an ABORT.  Keep
+      -- awaiting ACK entries until their worker confirms/returns, since the
+      -- START packet may already be in flight.
+      groupJob.pending = {}
+    end
+    groupJob.returnReason = groupJob.returnReason or (command == "abort" and "group_abort" or "group_clear")
+    maybeFinalizeGroup(groupJob)
+    saveControllerDb()
+  end
+  if sent < attempted then setNotice(("Group %s: %d/%d commands sent."):format(payload.groupCommand, sent, attempted), true) else setNotice(("Group %s sent to %d workers."):format(payload.groupCommand, sent), false) end
+  return sent == attempted and attempted > 0, sent
+end
+
+local function groupCommandBySelected(command)
+  local id = selectedGroupRecord()
+  if not id then setNotice("No group selected.", true); return false end
+  return groupCommand(id, command)
 end
 
 local function progressText(data)
@@ -401,7 +1017,7 @@ local function parseCellKey(key)
   return tonumber(x), tonumber(z)
 end
 
--- V3 selection is chunk-granular.  A short-lived V2 draft could contain the
+-- V4 selection is chunk-granular.  A short-lived V2 draft could contain the
 -- old cellExcluded map; migrate complete chunks, but keep a fatal marker for a
 -- partial chunk instead of silently dropping the user's selection.
 local function normalizeChunkMask(catalog, rootKey)
@@ -609,7 +1225,7 @@ local function computePreflight()
     chunkMode = chunkMode, calibration = calibration, rootKey = rootKey,
     excludedChunks = excludedChunks, cells = estimate and (estimate.surfaceCells or estimate.columns) or (cells - cellExcluded), blocks = estimate and (estimate.blocks or estimate.totalBlocks) or blocks,
     chunks = plan and plan.catalogCount or #catalog, selectedChunks = (plan and plan.selectedChunks) or (#catalog - #excludedChunks), totalChunks = #catalog, exclusions = #excludedChunks,
-    torches = torchNeed, fuel = requiredFuel, baseFuel = baseFuel, estimate = estimate, jobDepth = jobDepth, targetY = targetY,
+    torches = torchNeed, fuel = requiredFuel, baseFuel = baseFuelEstimate, estimate = estimate, jobDepth = jobDepth, targetY = targetY,
     profile = profileInfo.profile, requestedInterval = profileInfo.requestedInterval, effectiveInterval = profileInfo.effectiveInterval,
     fuelMultiplier = profileInfo.fuelMultiplier,
   }
@@ -657,6 +1273,734 @@ local function deterministicPartition(chunks, count)
   for index = 1, count do out[index] = {} end
   for index, chunk in ipairs(chunks or {}) do out[((index - 1) % count) + 1][#out[((index - 1) % count) + 1] + 1] = chunk end
   return out
+end
+
+-- Group planning ---------------------------------------------------------
+-- The quarry module may expose the richer partitionGroup API in newer
+-- runtimes.  Controllers assembled with an older quarry.lua still work for
+-- world plans through partitionChunks; local plans intentionally never get an
+-- automatic split because their coordinates are dock-relative.
+local function groupWorkerSpecs(group)
+  local specs = {}
+  for _, id in ipairs(groupWorkerIds(group)) do
+    local data = workerData(id) or {}
+    local calibration = data.gps and data.gps.calibration or data.calibration
+    local home = calibration and calibration.home or data.home
+    local world = data.world or data.position
+    local bayId, bay = groupWorkerResource(group, id, "bay")
+    local dockId, dock = groupWorkerResource(group, id, "dock")
+    local bayPoint = bay and (bay.world or bay.position or bay) or nil
+    local bayChunkKey = bayPoint and tonumber(bayPoint.x) and tonumber(bayPoint.z)
+      and quarry.chunkKey("world", math.floor(tonumber(bayPoint.x) / 16), math.floor(tonumber(bayPoint.z) / 16)) or nil
+    specs[#specs + 1] = {
+      workerId = tonumber(id) or id,
+      id = tonumber(id) or id,
+      version = data.version or data.workerVersion,
+      home = common.copy(home),
+      calibration = common.copy(calibration),
+      world = common.copy(world),
+      facing = data.facing or data.pose and data.pose.dir,
+      homeY = tonumber(home and home.y or data.homeY),
+      maxDepth = tonumber(data.maxDepth or data.capabilities and data.capabilities.maxDepth),
+      capability = common.copy(data.capabilities or {}),
+      bayId = bayId, bay = common.copy(bayPoint), bayChunkKey = bayChunkKey, bayMeta = common.copy(bay), dockId = dockId, dock = common.copy(dock),
+    }
+  end
+  return specs
+end
+
+local function normalizeGroupAssignments(raw, workerSpecs)
+  local source = type(raw) == "table" and (raw.byWorker or raw.assignments or raw) or nil
+  if type(source) ~= "table" then return nil, "invalid_group_assignments" end
+  local out, count = {}, 0
+  for index, spec in ipairs(workerSpecs or {}) do
+    local id, key = spec.workerId, tostring(spec.workerId)
+    -- Never pair assignments by array index: quarry is allowed to sort worker
+    -- IDs.  Match the explicit workerId (or byWorker map key) only.
+    local value = source[key] or source[id]
+    if type(value) ~= "table" then
+      for candidateKey, candidate in pairs(source) do
+        if type(candidate) == "table" and tostring(candidate.workerId or candidate.id) == key then value = candidate; break end
+        if tostring(candidateKey) == key and type(candidate) == "table" then value = candidate; break end
+      end
+    end
+    if type(value) ~= "table" then return nil, "group_assignment_missing_worker_" .. key end
+    local chunks = value.chunkKeys or value.chunks or value.assignmentChunks or {}
+    if type(chunks) ~= "table" then return nil, "group_assignment_invalid_chunks_" .. key end
+    local assignment = {
+      workerId = tonumber(value.workerId or id) or value.workerId or id,
+      chunkKeys = common.copy(chunks),
+      transitKeys = common.copy(value.transitKeys or value.transit or {}),
+      seedKey = value.seedKey,
+      estimatedCost = tonumber(value.estimatedCost or value.cost or value.cells) or 0,
+      homeY = tonumber(value.homeY or spec.homeY),
+      bottomY = tonumber(value.bottomY),
+      layers = tonumber(value.layers),
+    }
+    if #assignment.chunkKeys == 0 then return nil, "group_assignment_empty_" .. key end
+    out[key] = assignment
+    count = count + 1
+  end
+  return out, count
+end
+
+local function partitionGroupCatalog(catalog, group, options, workerSpecs)
+  local specs = workerSpecs or groupWorkerSpecs(group)
+  if #specs == 0 then return nil, "group_workers_required" end
+  options = type(options) == "table" and options or {}
+  options.strategy = options.strategy or (group and group.partition) or "stripe"
+  options.stripeFirst = options.stripeFirst ~= false
+  options.connected = true
+  options.balanced = true
+  options.requireConnected = true
+  if type(quarry.partitionGroup) == "function" then
+    local ok, raw, err = pcall(quarry.partitionGroup, catalog, specs, options)
+    if ok and raw then
+      local normalized, count = normalizeGroupAssignments(raw, specs)
+      local unassigned = raw and raw.unassigned
+      local hasUnassigned = type(unassigned) == "table" and ((#unassigned > 0) or next(unassigned) ~= nil)
+      if normalized and count == #specs and not hasUnassigned then return normalized, nil, raw end
+      if not err then err = count end
+    end
+  end
+  local mode = options.chunkMode == "world" and "world" or "local"
+  if mode ~= "world" and #specs > 1 then return nil, "local_group_partition_disabled" end
+  if #specs > 1 then return nil, "partitionGroup_required_for_multi_worker" end
+  if type(quarry.partitionChunks) ~= "function" then return nil, "group_partition_api_unavailable" end
+  local ids = {}
+  for _, spec in ipairs(specs) do ids[#ids + 1] = spec.workerId end
+  local ok, legacy = pcall(quarry.partitionChunks, catalog, ids)
+  if not ok or not legacy then return nil, tostring(legacy or "group_partition_api_unavailable") end
+  local normalized = {}
+  for _, spec in ipairs(specs) do
+    local value = legacy[spec.workerId] or legacy[tostring(spec.workerId)]
+    if type(value) ~= "table" then return nil, "legacy_partition_missing_worker_" .. tostring(spec.workerId) end
+    normalized[tostring(spec.workerId)] = {
+      workerId = spec.workerId,
+      chunkKeys = common.copy(value.chunkKeys or value.chunks or {}),
+      transitKeys = common.copy(value.transitKeys or {}),
+      seedKey = value.seedKey,
+      estimatedCost = tonumber(value.estimatedCost or value.cost or value.cells) or 0,
+      homeY = spec.homeY,
+    }
+  end
+  return normalized, nil, legacy
+end
+
+local function groupDraftDefaults(group)
+  local previous = db.lastDraft or {}
+  local workerIds = groupWorkerIds(group)
+  local firstData = workerIds[1] and workerData(workerIds[1]) or nil
+  local calibration = firstData and firstData.gps and firstData.gps.calibration
+  local homeY = calibration and calibration.home and tonumber(calibration.home.y) or tonumber(firstData and firstData.homeY)
+  local depth = tonumber(previous.depth) or 16
+  local bottomY = tonumber(previous.bottomY or previous.targetY)
+  if not bottomY and homeY then bottomY = homeY - depth + 1 end
+  return {
+    groupId = group and group.id,
+    width = tonumber(previous.width) or 8,
+    length = tonumber(previous.length) or 32,
+    depth = depth,
+    bottomY = bottomY,
+    targetY = bottomY,
+    mode = group and group.mode or "world",
+    partition = group and group.partition or (config.group and config.group.partitionMode) or "stripe",
+    lighting = normalizedLighting and normalizedLighting(previous.lighting) or common.copy(previous.lighting or { mode = "safe", interval = 10 }),
+    waterMode = normalizedWaterMode and normalizedWaterMode(previous.waterMode) or tostring(previous.waterMode or "seal"),
+    profile = normalizedProfile and normalizedProfile(previous.profile) or tostring(previous.profile or "balanced"),
+    name = previous.name or (group and group.name and ("Group " .. tostring(group.name)) or "Group Quarry"),
+  }
+end
+
+local function groupCatalogAndShape(group, value)
+  local mode = value.mode == "world" and "world" or "local"
+  local specs = groupWorkerSpecs(group)
+  local calibration
+  for _, spec in ipairs(specs) do
+    if spec.calibration then calibration = spec.calibration; break end
+  end
+  local catalog, err
+  if type(value.catalog) == "table" and #value.catalog > 0 then
+    catalog = common.copy(value.catalog)
+  else
+    catalog, err = quarry.buildCatalog(value.width, value.length, mode, calibration)
+  end
+  if not catalog then return nil, err end
+  local rootKey
+  for _, chunk in ipairs(catalog) do
+    if 0 >= chunk.minX and 0 <= chunk.maxX and 1 >= chunk.minZ and 1 <= chunk.maxZ then rootKey = chunk.key; break end
+  end
+  return catalog, nil, mode, rootKey, specs
+end
+
+local function groupCatalogDescriptor(catalog, mode, rootKey, specs)
+  local reference
+  for _, spec in ipairs(specs or {}) do if spec.calibration then reference = spec.calibration; break end end
+  local descriptor = { mode = mode, rootKey = rootKey, chunks = {}, origin = reference and common.copy(reference.home) or nil, calibrationSeed = reference and { home = common.copy(reference.home), forward = common.copy(reference.forward) } or nil }
+  for _, chunk in ipairs(catalog or {}) do
+    descriptor.chunks[#descriptor.chunks + 1] = {
+      key = tostring(chunk.key), mode = mode, cx = tonumber(chunk.cx), cz = tonumber(chunk.cz), cells = tonumber(chunk.cells),
+      minX = tonumber(chunk.minX), maxX = tonumber(chunk.maxX), minZ = tonumber(chunk.minZ), maxZ = tonumber(chunk.maxZ),
+    }
+  end
+  return descriptor
+end
+
+local function groupLeaseConflict(mode, workerId, keys, kind, groupJobId)
+  local function overlaps(lease)
+    if tostring(lease.groupJobId or "") == tostring(groupJobId or "") then return false end
+    local leaseMode = lease.mode == "world" and "world" or "local"
+    if leaseMode ~= mode then return false end
+    if mode == "local" and tonumber(lease.workerId) ~= tonumber(workerId) then return false end
+    local set = {}; for _, key in ipairs(lease.chunks or lease.keys or {}) do set[tostring(key)] = true end
+    for _, key in ipairs(keys or {}) do if set[tostring(key)] then return true end end
+    return false
+  end
+  for _, lease in ipairs(db.groupLeases or {}) do if overlaps(lease) then return lease end end
+  for _, lease in ipairs(db.leases or {}) do if overlaps(lease) then return lease end end
+  return nil
+end
+
+local function computeGroupPreflight(groupId, value)
+  local group = groupRecord(groupId)
+  if not group then return nil, "group_not_found" end
+  value = type(value) == "table" and value or groupDraftDefaults(group)
+  local catalog, catalogError, chunkMode, rootKey, specs = groupCatalogAndShape(group, value)
+  if not catalog then return nil, catalogError end
+  local checks, fatal = {}, false
+  local function check(name, state, detail, hard)
+    checks[#checks + 1] = { name = name, state = state, detail = detail, fatal = hard == true }
+    if hard and state == "bad" then fatal = true end
+  end
+  local ids = groupWorkerIds(group)
+  if #ids == 0 then check("workers", "bad", "group has no workers", true) end
+  local maxWorkers = tonumber(config.group and config.group.maxWorkers)
+  if maxWorkers and #ids > maxWorkers then check("worker limit", "bad", tostring(#ids) .. " > " .. tostring(maxWorkers), true) end
+  local defaultBayId = group.bayId and tostring(group.bayId) or nil
+  local defaultDockId = group.dockId and tostring(group.dockId) or nil
+  local bay = defaultBayId and db.bays[defaultBayId] or nil
+  local dock = defaultDockId and db.docks[defaultDockId] or nil
+  local worldMode = chunkMode == "world"
+  local partitionStrategy = tostring(value.partition or group.partition or (config.group and config.group.partitionMode) or "stripe"):lower()
+  if partitionStrategy ~= "stripe" and partitionStrategy ~= "round_robin" then
+    check("partition mode", "bad", partitionStrategy .. " is unsupported", true)
+    partitionStrategy = "stripe"
+  end
+  if worldMode and not rootKey then check("root chunk", "bad", "common catalog has no root chunk", true) end
+  if worldMode and #ids > 1 and type(quarry.partitionGroup) ~= "function" and type(quarry.partitionChunks) ~= "function" then
+    check("partition API", "bad", "quarry.partitionGroup unavailable", true)
+  end
+  if #ids > 1 and type(quarry.shortestServiceRoute) ~= "function" then
+    check("service route API", "bad", "quarry.shortestServiceRoute unavailable", true)
+  else
+    check("service route API", "ok", "worker route planner ready", false)
+  end
+  if worldMode and not bay and type(group.workerBays) ~= "table" then check("bay", "bad", "world group requires a registered bay", true) elseif bay then check("bay", "ok", tostring(group.bayId), false) end
+  if dock then check("dock", "ok", tostring(group.dockId), false) elseif worldMode and type(group.workerDocks) ~= "table" then check("dock", "warn", "dock metadata unavailable", false) end
+  local commonBottom = tonumber(value.bottomY or value.targetY)
+  local minDepth, minFuel, maxRequiredFuel = nil, nil, 0
+  local referenceCalibration
+  local referenceHomeY, referenceForward
+  local catalogWorldSet = {}
+  for _, chunk in ipairs(catalog or {}) do catalogWorldSet[tostring(chunk.key)] = true end
+  if worldMode and type(quarry.inverseWorldToLocal) ~= "function" then
+    check("world inverse API", "bad", "quarry.inverseWorldToLocal unavailable", true)
+  end
+  local homeChunkOwners = {}
+  for index, spec in ipairs(specs) do
+    local id, data = spec.workerId, workerData(spec.workerId) or {}
+    local bayId, workerBay = groupWorkerResource(group, id, "bay")
+    local dockId, workerDock = groupWorkerResource(group, id, "dock")
+    local status = statusOf(workers[id])
+    if status == "offline" then check("online:#" .. tostring(id), "bad", "offline", true) else check("online:#" .. tostring(id), "ok", status, false) end
+    local version = tostring(data.version or data.workerVersion or data.protocolVersion or "")
+    if version == "" then check("version:#" .. tostring(id), "bad", "worker version unknown", true) elseif version ~= common.VERSION then check("version:#" .. tostring(id), "bad", version .. " != " .. common.VERSION, true) else check("version:#" .. tostring(id), "ok", version, false) end
+    if data.atHome == true then check("home:#" .. tostring(id), "ok", "at home", false) else check("home:#" .. tostring(id), "bad", "worker is not at home", true) end
+    local caps = data.capabilities or {}
+    local groupCap = caps.groupControl or caps.groupJobs or caps.group or caps.groupAssignment or data.groupSupported
+    if groupCap == false then check("capability:#" .. tostring(id), "bad", "group control unsupported", true)
+    elseif groupCap == nil and worldMode then check("capability:#" .. tostring(id), "bad", "world group capability must be explicitly supported", true)
+    elseif groupCap == nil then check("capability:#" .. tostring(id), "warn", "group capability unknown", false)
+    else check("capability:#" .. tostring(id), "ok", "group ready", false) end
+    if worldMode then
+      local gps = data.gps and data.gps.calibration
+      if not gps or not gps.home or not tonumber(gps.home.x) or not tonumber(gps.home.y) or not tonumber(gps.home.z)
+        or not gps.forward or not tonumber(gps.forward.x) or not tonumber(gps.forward.z) then
+        check("GPS:#" .. tostring(id), "bad", "calibration with home/forward coordinates required", true)
+      else check("GPS:#" .. tostring(id), "ok", "calibrated", false) end
+      if gps and gps.home and tonumber(gps.home.x) and tonumber(gps.home.y) and tonumber(gps.home.z)
+        and gps.forward and tonumber(gps.forward.x) and tonumber(gps.forward.z) then
+        referenceHomeY = referenceHomeY or tonumber(gps.home.y)
+        referenceForward = referenceForward or { x = tonumber(gps.forward.x), z = tonumber(gps.forward.z) }
+        if referenceCalibration then
+          local same = tonumber(referenceCalibration.forward.x) == tonumber(gps.forward.x) and tonumber(referenceCalibration.forward.z) == tonumber(gps.forward.z)
+          if not same then check("GPS orientation:#" .. tostring(id), "bad", "world calibration differs from group reference", true) end
+        else referenceCalibration = gps end
+        if referenceHomeY and tonumber(gps.home.y) ~= referenceHomeY then check("GPS floor:#" .. tostring(id), "bad", "worker HOME Y differs from group floor", true) end
+        local homeCx, homeCz = math.floor(tonumber(gps.home.x) / 16), math.floor(tonumber(gps.home.z) / 16)
+        local homeKey = quarry.chunkKey("world", homeCx, homeCz)
+        spec.bayChunkKey = tostring(homeKey)
+        if not catalogWorldSet[tostring(homeKey)] then check("bay footprint:#" .. tostring(id), "bad", "worker bay entrance is outside common world footprint", true) end
+        local forwardX, forwardZ = tonumber(gps.home.x) + tonumber(gps.forward.x), tonumber(gps.home.z) + tonumber(gps.forward.z)
+        local forwardKey = quarry.chunkKey("world", math.floor(forwardX / 16), math.floor(forwardZ / 16))
+        if not catalogWorldSet[tostring(forwardKey)] then check("forward footprint:#" .. tostring(id), "bad", "worker bay forward entrance is outside common footprint", true) end
+        if tostring(homeKey) ~= tostring(forwardKey) then check("bay chunk:#" .. tostring(id), "bad", "worker home and forward entrance must share one bay chunk", true) end
+        if homeChunkOwners[tostring(homeKey)] then
+          check("bay chunk unique:#" .. tostring(id), "bad", "bay chunk already owned by worker #" .. tostring(homeChunkOwners[tostring(homeKey)]), true)
+        else
+          homeChunkOwners[tostring(homeKey)] = id
+        end
+        if type(quarry.inverseWorldToLocal) == "function" and referenceCalibration then
+          local okInverse, localForward = pcall(quarry.inverseWorldToLocal, referenceCalibration, forwardX, forwardZ)
+          if not okInverse or type(localForward) ~= "table" then
+            check("bay cell:#" .. tostring(id), "bad", "cannot rebase worker forward entrance to common catalog", true)
+          else
+            local forwardCell = false
+            for _, chunk in ipairs(catalog or {}) do
+              if tonumber(localForward.x) >= tonumber(chunk.minX) and tonumber(localForward.x) <= tonumber(chunk.maxX)
+                and tonumber(localForward.z) >= tonumber(chunk.minZ) and tonumber(localForward.z) <= tonumber(chunk.maxZ) then
+                forwardCell = tostring(chunk.key) == tostring(homeKey) or forwardCell
+              end
+            end
+            if not forwardCell then check("bay cell:#" .. tostring(id), "bad", "worker forward entrance is outside its bay chunk cells", true)
+            else check("bay cell:#" .. tostring(id), "ok", "forward entrance is inside its bay chunk", false) end
+          end
+        end
+      end
+      if not workerBay then
+        check("bay:#" .. tostring(id), "bad", "registered bay metadata unavailable", true)
+      elseif not workerBay.world then
+        check("bay pose:#" .. tostring(id), "bad", "bay world pose unavailable", true)
+      elseif workerBay.world then
+        local pos = data.world or data.position
+        local match = pos and tonumber(pos.x) == tonumber(workerBay.world.x) and tonumber(pos.y) == tonumber(workerBay.world.y) and tonumber(pos.z) == tonumber(workerBay.world.z)
+        if match then check("bay pose:#" .. tostring(id), "ok", "world pose verified", false) else check("bay pose:#" .. tostring(id), "bad", "worker is not at bay world pose", true) end
+        local facing = data.facing or data.pose and data.pose.dir
+        if facing == nil then check("bay facing:#" .. tostring(id), "bad", "worker facing unavailable", true)
+        elseif workerBay.facing ~= nil and tostring(facing) ~= tostring(workerBay.facing) then check("bay facing:#" .. tostring(id), "bad", "facing mismatch", true)
+        else check("bay facing:#" .. tostring(id), "ok", tostring(facing), false) end
+      end
+    end
+    if worldMode and not workerDock then check("dock:#" .. tostring(id), "bad", "registered dock metadata unavailable", true) end
+    if workerDock and workerDock.maxDepth and tonumber(spec.maxDepth) and tonumber(workerDock.maxDepth) < tonumber(spec.maxDepth) then spec.maxDepth = tonumber(workerDock.maxDepth) end
+    local homeY = tonumber(spec.homeY)
+    local bottom = commonBottom
+    if worldMode and (not homeY or not bottom) then check("Y:#" .. tostring(id), "bad", "HOME Y/BOTTOM Y unavailable", true) end
+    if worldMode and homeY and bottom then
+      local layers = math.floor(homeY - bottom + 1)
+      local maxDepth = tonumber(spec.maxDepth or config.maxDepth)
+      if layers < 1 then check("maxDepth:#" .. tostring(id), "bad", "BOTTOM Y is above HOME Y", true) elseif layers > maxDepth then check("maxDepth:#" .. tostring(id), "bad", tostring(layers) .. " > " .. tostring(maxDepth), true) else check("maxDepth:#" .. tostring(id), "ok", tostring(layers), false) end
+      minDepth = minDepth and math.min(minDepth, layers) or layers
+    end
+    local availableFuel = tonumber(data.fuel or data.materials and data.materials.fuel)
+    if availableFuel and (minFuel == nil or availableFuel < minFuel) then minFuel = availableFuel end
+    local workerDepth = (worldMode and homeY and commonBottom and math.max(1, math.floor(homeY - commonBottom + 1))) or tonumber(value.depth) or 1
+    maxRequiredFuel = math.max(maxRequiredFuel, estimateFuel(#catalog * workerDepth, value.width, value.length, workerDepth))
+    if chunkMode == "local" and #ids > 1 then check("local group partition", "bad", "local jobs cannot be auto-split", true) end
+  end
+  -- Bay metadata is controller-owned and may differ from GPS calibration
+  -- coordinates.  Validate all registered positions as a set before asking
+  -- quarry to partition; otherwise two workers can share one entrance or be
+  -- placed on different floors/orientations while each individual check
+  -- still appears valid.
+  if worldMode and #specs > 1 then
+    local bayPoints = {}
+    for _, spec in ipairs(specs) do
+      local bayId, workerBay = groupWorkerResource(group, spec.workerId, "bay")
+      local point = workerBay and (workerBay.world or workerBay.position or workerBay)
+      if point and tonumber(point.x) and tonumber(point.y) and tonumber(point.z) then
+        bayPoints[#bayPoints + 1] = {
+          workerId = spec.workerId, bayId = bayId, x = tonumber(point.x), y = tonumber(point.y), z = tonumber(point.z),
+          facing = workerBay.facing or workerBay.direction or spec.facing,
+        }
+      end
+    end
+    local requireSameFloor = not (config.dock and config.dock.requireSameFloor == false)
+    local spacing = math.max(0, tonumber(config.dock and config.dock.baySpacing) or 0)
+    for i = 1, #bayPoints do
+      for j = i + 1, #bayPoints do
+        local a, b = bayPoints[i], bayPoints[j]
+        if requireSameFloor and a.y ~= b.y then check("bay floor:#" .. tostring(a.workerId) .. "/#" .. tostring(b.workerId), "bad", "registered bay HOME Y differs", true) end
+        if a.facing ~= nil and b.facing ~= nil and tostring(a.facing) ~= tostring(b.facing) then
+          check("bay facing:#" .. tostring(a.workerId) .. "/#" .. tostring(b.workerId), "bad", "registered bay orientation differs", true)
+        end
+        local dx, dz = a.x - b.x, a.z - b.z
+        local distance = math.sqrt(dx * dx + dz * dz)
+        if distance <= 0 or (spacing > 0 and distance < spacing) then
+          check("bay spacing:#" .. tostring(a.workerId) .. "/#" .. tostring(b.workerId), "bad", "registered bay positions overlap or are closer than " .. tostring(spacing), true)
+        end
+      end
+    end
+  end
+  local partition, partitionError = partitionGroupCatalog(catalog, group, { chunkMode = chunkMode, strategy = partitionStrategy, bottomY = commonBottom, layers = chunkMode == "local" and tonumber(value.depth) or nil }, specs)
+  if not partition then check("connected partition", "bad", tostring(partitionError), true) else check("connected partition", "ok", value.partition or group.partition or "stripe", false) end
+  local assignments = partition
+  local selectedKeys = {}
+  if assignments then
+    for _, spec in ipairs(specs) do
+      local assignment = assignments[tostring(spec.workerId)] or assignments[spec.workerId]
+      local ownsBay = false
+      local mineSet = {}
+      if not assignment then check("assignment:#" .. tostring(spec.workerId), "bad", "partition missing worker assignment", true) end
+      for _, key in ipairs(assignment and assignment.chunkKeys or {}) do mineSet[tostring(key)] = true; selectedKeys[#selectedKeys + 1] = key end
+      if worldMode and spec.bayChunkKey and mineSet[tostring(spec.bayChunkKey)] then ownsBay = true end
+      if worldMode and not ownsBay then check("assignment bay chunk:#" .. tostring(spec.workerId), "bad", "assignment does not own worker bay chunk", true) end
+      for _, key in ipairs(assignment and assignment.transitKeys or {}) do
+        if not mineSet[tostring(key)] then check("transit ownership:#" .. tostring(spec.workerId), "bad", "transit chunk leaves worker assignment", true) end
+      end
+      if worldMode and spec.bayChunkKey and assignment and tostring(assignment.seedKey or "") ~= tostring(spec.bayChunkKey) then
+        check("assignment bay seed:#" .. tostring(spec.workerId), "bad", "assignment seed is not worker bay chunk", true)
+      end
+    end
+  end
+  local mineConflict = groupLeaseConflict(chunkMode, nil, selectedKeys, "mine", groupId)
+  if mineConflict then check("mine lease", "bad", "overlaps " .. tostring(mineConflict.groupJobId or mineConflict.jobId or "active"), true) else check("mine lease", "ok", "available", false) end
+  local transitKeys = {}
+  if assignments then for _, assignment in pairs(assignments) do for _, key in ipairs(assignment.transitKeys or {}) do transitKeys[#transitKeys + 1] = key end end end
+  local transitConflict = groupLeaseConflict(chunkMode, nil, transitKeys, "transit", groupId)
+  if transitConflict then check("transit lease", "bad", "overlaps " .. tostring(transitConflict.groupJobId or transitConflict.jobId or "active"), true) else check("transit lease", "ok", "available", false) end
+  if not minFuel then check("minimum fuel", "warn", "unknown / estimate " .. tostring(maxRequiredFuel) .. " (refill scheduler)", false) elseif minFuel < maxRequiredFuel then check("minimum fuel", "warn", tostring(minFuel) .. " < estimate " .. tostring(maxRequiredFuel) .. " (refill scheduler)", false) else check("minimum fuel", "ok", tostring(minFuel) .. " / estimate " .. tostring(maxRequiredFuel), false) end
+  local result = {
+    groupId = tostring(groupId), group = common.copy(group), value = common.copy(value), checks = checks, fatal = fatal,
+    catalog = catalog, catalogDescriptor = groupCatalogDescriptor(catalog, chunkMode, rootKey, specs), chunkMode = chunkMode, rootKey = rootKey, assignments = assignments,
+    workers = specs, bottomY = commonBottom, minLayers = minDepth, minFuel = minFuel, requiredFuel = maxRequiredFuel, partition = partitionStrategy,
+    totalChunks = #catalog, selectedChunks = #selectedKeys, warnings = {}, minimumFuel = minFuel, requiredFuel = maxRequiredFuel, computedAt = common.nowSeconds(),
+  }
+  for _, item in ipairs(checks) do if item.state == "warn" then result.warnings[#result.warnings + 1] = item.name .. ": " .. tostring(item.detail) end end
+  return result
+end
+
+local function groupLeaseEntries(job, assignment)
+  local entries = {}
+  for _, kind in ipairs({ "transit", "mine" }) do
+    local keys = kind == "transit" and (assignment.transitKeys or {}) or (assignment.chunkKeys or {})
+    entries[#entries + 1] = {
+      jobId = tostring(assignment.jobId), groupJobId = tostring(job.groupJobId), assignmentId = tostring(assignment.assignmentId), workerId = assignment.workerId,
+      kind = kind, mode = job.chunkMode, chunks = common.copy(keys), createdAt = common.nowSeconds(),
+    }
+  end
+  return entries
+end
+
+releaseGroupLeases = function(job, onlyPending)
+  if type(job) ~= "table" then return end
+  local removed = {}
+  local function keep(lease)
+    if tostring(lease.groupJobId or "") ~= tostring(job.groupJobId or "") then return true end
+    if onlyPending and job.started and job.started[tostring(lease.workerId)] then return true end
+    removed[#removed + 1] = lease
+    return false
+  end
+  local kept, keptGroup = {}, {}
+  for _, lease in ipairs(db.leases or {}) do if keep(lease) then kept[#kept + 1] = lease end end
+  for _, lease in ipairs(db.groupLeases or {}) do
+    if tostring(lease.groupJobId or "") ~= tostring(job.groupJobId or "") or (onlyPending and job.started and job.started[tostring(lease.workerId)]) then keptGroup[#keptGroup + 1] = lease end
+  end
+  db.leases, db.groupLeases = kept, keptGroup
+  db.activeLeases = common.copy(kept)
+  saveControllerDb()
+  return #removed
+end
+
+groupSafeStop = function(job, workerId, reason)
+  local payload = { scope = "group", group = true, groupId = job.groupId, groupJobId = job.groupJobId, groupCommand = "RETURN", mode = "return_home", safeStop = true, reason = reason or "partial_start" }
+  payload.targetWorkerId, payload.workerId = tonumber(workerId) or workerId, tonumber(workerId) or workerId
+  sendCommand(workerId, "stop", payload)
+end
+
+sortedJobAssignments = function(job)
+  local out = {}
+  for key, value in pairs(job and job.assignments or {}) do if type(value) == "table" then out[#out + 1] = value end end
+  table.sort(out, function(a, b) return tostring(a.workerId) < tostring(b.workerId) end)
+  return out
+end
+
+local function dispatchGroupJob(job, force)
+  if type(job) ~= "table" or (job.status ~= "starting" and job.status ~= "queued") then return false end
+  job.pending = job.pending or {}
+  job.started = job.started or {}
+  job.failed = job.failed or {}
+  job.awaitingAck = job.awaitingAck or {}
+  job.acks = job.acks or {}
+  for _ in pairs(job.awaitingAck) do return true end
+  local now = common.nowSeconds()
+  local stagger = math.max(0, tonumber(job.staggerSeconds) or 0)
+  for _, assignment in ipairs(sortedJobAssignments(job)) do
+    local key = tostring(assignment.workerId)
+    if not job.started[key] and not job.failed[key] and (force or not job.pending[key] or now >= (job.nextDispatchAt or 0)) then
+      local payload = {
+        scope = "group", group = true, groupId = tostring(job.groupId), groupJobId = tostring(job.groupJobId), parentGroupJobId = tostring(job.groupJobId), groupCommand = "START", requestedCommand = "start", assignmentCatalog = common.copy(job.catalog),
+        assignmentId = assignment.assignmentId, assignmentTotal = #sortedJobAssignments(job), assignmentChunks = common.copy(assignment.chunkKeys or {}), chunkKeys = common.copy(assignment.chunkKeys or {}), transitKeys = common.copy(assignment.transitKeys or {}), seedKey = assignment.seedKey, bayChunkKey = assignment.bayChunkKey,
+        homeY = assignment.homeY, bottomY = assignment.bottomY, targetY = assignment.bottomY, layers = assignment.layers, width = job.width, length = job.length, depth = assignment.layers or job.depth,
+        chunkMode = job.chunkMode, name = job.name, profile = job.profile, waterMode = job.waterMode, lighting = common.copy(job.lighting or {}), workerId = assignment.workerId, targetWorkerId = assignment.workerId,
+        bay = assignment.bay, bayId = assignment.bayId, dock = common.copy(assignment.dock or {}), dockId = assignment.dockId, homeWorld = common.copy(assignment.homeWorld), maxDepth = assignment.maxDepth, facing = assignment.facing,
+        lease = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) },
+        leases = { transit = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "transit", chunks = common.copy(assignment.transitKeys or {}) }, mine = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) } },
+      }
+      payload.command = "start"
+      payload.assignment = common.copy(assignment)
+      local ok = sendCommand(assignment.workerId, "start", payload)
+      job.pending[key] = nil
+      if ok then
+        job.awaitingAck[key] = { sentAt = now, attempts = tonumber(job.attempts and job.attempts[key] or 0) + 1, assignmentId = assignment.assignmentId }
+        job.attempts = job.attempts or {}; job.attempts[key] = job.awaitingAck[key].attempts
+        job.acks[key] = { ok = nil, command = "START", sentAt = now }
+        assignment.status = "sent"
+        assignment.sentAt = now
+        job.nextDispatchAt = now + stagger
+      else
+        job.failed[key] = true
+        assignment.status = "failed"
+        assignment.error = "start_send_failed"
+        job.status = "PARTIAL_START"
+        for startedKey in pairs(job.started) do groupSafeStop(job, startedKey, "partial_start") end
+        releaseGroupLeases(job, true)
+        job.alerts = job.alerts or {}
+        job.alerts[#job.alerts + 1] = "PARTIAL_START"
+        job.alerts[#job.alerts + 1] = "worker #" .. key .. " start failed"
+        updateGroupAggregate(job)
+        saveControllerDb()
+        return false
+      end
+      -- Wait for an explicit worker ACK/status before sending the next
+      -- assignment, even when staggerSeconds is zero.  This bounds bay
+      -- occupancy and makes a rejected start a deterministic PARTIAL_START.
+      break
+    end
+  end
+  updateGroupAggregate(job)
+  saveControllerDb()
+  return true
+end
+
+local function startGroup(groupId, value)
+  local group = groupRecord(groupId)
+  if not group then setNotice("Group not found: " .. tostring(groupId), true); return false end
+  value = type(value) == "table" and value or groupDraftDefaults(group)
+  local result, err = computeGroupPreflight(groupId, value)
+  if not result then setNotice("Group preflight unavailable: " .. tostring(err), true); return false end
+  if result.fatal then setNotice("Group start blocked by fatal preflight item.", true); return false end
+  local groupJobId = "g-" .. tostring(os.getComputerID()) .. "-" .. tostring(common.nowMillis())
+  local job = {
+    id = groupJobId, groupJobId = groupJobId, groupId = tostring(groupId), parentJobId = groupJobId, status = "starting", chunkMode = result.chunkMode,
+    width = tonumber(value.width), length = tonumber(value.length), depth = tonumber(value.depth), bottomY = result.bottomY, name = value.name,
+    profile = value.profile, waterMode = value.waterMode, lighting = common.copy(value.lighting or {}), partition = result.partition, staggerSeconds = tonumber(group.staggerSeconds) or tonumber(db.groupScheduler.staggerSeconds) or 0,
+    catalog = common.copy(result.catalogDescriptor), assignments = {}, started = {}, pending = {}, failed = {}, acks = {}, alerts = common.copy(result.warnings or {}), warnings = common.copy(result.warnings or {}), createdAt = common.nowSeconds(), updatedAt = common.nowSeconds(), preflight = { checks = common.copy(result.checks), bottomY = result.bottomY, partition = result.partition },
+  }
+  for _, spec in ipairs(result.workers or {}) do
+    local key = tostring(spec.workerId)
+    local raw = result.assignments and (result.assignments[key] or result.assignments[spec.workerId])
+    if not raw then setNotice("Group assignment missing worker #" .. key, true); return false end
+    local bayId, workerBay = groupWorkerResource(group, spec.workerId, "bay")
+    local dockId, workerDock = groupWorkerResource(group, spec.workerId, "dock")
+    local homeY = tonumber(raw.homeY or spec.homeY)
+    local bottomY = tonumber(raw.bottomY or result.bottomY)
+    local layers = tonumber(raw.layers) or (homeY and bottomY and math.floor(homeY - bottomY + 1) or value.depth)
+    local assignmentId = groupJobId .. ":" .. key
+    local assignment = {
+      workerId = spec.workerId, groupJobId = groupJobId, parentJobId = groupJobId, jobId = groupJobId .. "/" .. key, assignmentId = assignmentId,
+      chunkKeys = common.copy(raw.chunkKeys or {}), transitKeys = common.copy(raw.transitKeys or {}), seedKey = raw.seedKey, bayChunkKey = spec.bayChunkKey, estimatedCost = raw.estimatedCost, homeY = homeY, bottomY = bottomY, layers = layers, status = "queued",
+      bayId = bayId, bay = bayId, dockId = dockId,
+      dock = common.copy(workerDock or {}),
+      homeWorld = workerDock and common.copy(workerDock.homeWorld or workerDock.world) or (spec.home and common.copy(spec.home) or nil),
+      maxDepth = tonumber(workerDock and workerDock.maxDepth or spec.maxDepth or config.maxDepth),
+      facing = spec.facing,
+      lease = { groupJobId = groupJobId, assignmentId = assignmentId, workerId = spec.workerId, mode = result.chunkMode, kind = "mine", chunks = common.copy(raw.chunkKeys or {}) },
+      transitLease = { groupJobId = groupJobId, assignmentId = assignmentId, workerId = spec.workerId, mode = result.chunkMode, kind = "transit", chunks = common.copy(raw.transitKeys or {}) },
+    }
+    job.assignments[key], job.pending[key] = assignment, true
+  end
+  local leaseList = {}
+  for _, assignment in ipairs(sortedJobAssignments(job)) do
+    local entries = groupLeaseEntries(job, assignment)
+    for _, lease in ipairs(entries) do
+      local conflict = groupLeaseConflict(job.chunkMode, assignment.workerId, lease.chunks, lease.kind, groupJobId)
+      if conflict then setNotice("Group lease overlap: " .. tostring(conflict.groupJobId or conflict.jobId), true); return false end
+      leaseList[#leaseList + 1] = lease
+    end
+  end
+  for _, lease in ipairs(leaseList) do db.leases[#db.leases + 1] = common.copy(lease); db.groupLeases[#db.groupLeases + 1] = common.copy(lease) end
+  db.groupJobs[groupJobId] = job
+  db.activeLeases = common.copy(db.leases)
+  saveControllerDb()
+  local ok = dispatchGroupJob(job, true)
+  if ok and job.status == "working" then setNotice("Group START sent to all assignments.", false) elseif job.status == "PARTIAL_START" then setNotice("PARTIAL_START: started workers were safely stopped.", true) else setNotice("Group START queued by stagger scheduler.", false) end
+  return ok
+end
+
+local function assignmentResumeTokenFromStatus(data)
+  if type(data) ~= "table" then return nil end
+  local job, report = data.job or {}, data.report or data.lastReport or {}
+  return data.assignmentResumeToken or data.resumeToken
+    or job.assignmentResumeToken or job.resumeToken
+    or report.assignmentResumeToken or report.resumeToken
+end
+
+local function validateSourceResumeToken(job, source, sourceData, stoppedWorkerId)
+  sourceData = sourceData or {}
+  local status = tostring(sourceData.status or sourceData.phase or ""):lower()
+  local terminal = { idle = true, complete = true, completed = true, aborted = true, paused = true }
+  if not terminal[status] or sourceData.atHome ~= true then return nil, "source_assignment_not_terminal_at_home" end
+  local sourceGroupJobId = sourceData.groupJobId or sourceData.group and sourceData.group.groupJobId or sourceData.job and sourceData.job.groupJobId
+  if sourceGroupJobId == nil or tostring(sourceGroupJobId) ~= tostring(job.groupJobId) then return nil, "source_group_job_mismatch" end
+  local progress = sourceData.progress or {}
+  local cursor = tonumber(progress.cursor or sourceData.job and sourceData.job.cursor or 0) or 0
+  local token = assignmentResumeTokenFromStatus(sourceData)
+  if token == nil then
+    if cursor > 0 then return nil, "assignment_resume_token_required" end
+    return nil, nil
+  end
+  if type(token) ~= "table" then return nil, "assignment_resume_token_invalid" end
+  if token.groupJobId == nil or tostring(token.groupJobId) ~= tostring(job.groupJobId) then return nil, "assignment_resume_token_group_mismatch" end
+  if token.assignmentId == nil or tostring(token.assignmentId) ~= tostring(source.assignmentId) then return nil, "assignment_resume_token_assignment_mismatch" end
+  local tokenSource = token.sourceWorkerId or token.workerId
+  if tokenSource == nil or tonumber(tokenSource) ~= tonumber(stoppedWorkerId) then return nil, "assignment_resume_token_source_mismatch" end
+  local worldPose = token.worldPose
+  if type(worldPose) ~= "table" or tonumber(worldPose.x) == nil or tonumber(worldPose.y) == nil or tonumber(worldPose.z) == nil then return nil, "assignment_resume_token_world_pose_required" end
+  return common.copy(token), nil
+end
+
+local function reassignGroupAssignment(groupJobId, stoppedWorkerId, targetWorkerId)
+  local job = db.groupJobs and db.groupJobs[tostring(groupJobId)]
+  if not job then setNotice("Group job not found.", true); return false end
+  local source = job.assignments and (job.assignments[tostring(stoppedWorkerId)] or job.assignments[stoppedWorkerId])
+  if not source then setNotice("Stopped worker assignment not found.", true); return false end
+  if type(source.chunkKeys) ~= "table" or #source.chunkKeys == 0 then setNotice("No residual chunks to reassign.", true); return false end
+  local sourceData = workerData(stoppedWorkerId) or {}
+  local sourceToken, sourceTokenError = validateSourceResumeToken(job, source, sourceData, stoppedWorkerId)
+  if sourceTokenError then setNotice("Reassign source rejected: " .. tostring(sourceTokenError), true); return false end
+  if job.pendingReassignment then setNotice("A reassignment is already awaiting ACK.", true); return false end
+  targetWorkerId = targetWorkerId or nil
+  if not targetWorkerId then
+    for _, candidate in ipairs(groupWorkerIds(groupRecord(job.groupId))) do
+      local candidateData = workerData(candidate) or {}
+      local candidateStatus = statusOf(workers[candidate])
+      if tonumber(candidate) ~= tonumber(stoppedWorkerId) and (candidateStatus == "idle" or candidateStatus == "complete" or candidateStatus == "aborted") and candidateData.atHome == true then targetWorkerId = candidate; break end
+    end
+  end
+  if not targetWorkerId then setNotice("No online target for residual range.", true); return false end
+  local targetData, targetStatus = workerData(targetWorkerId) or {}, statusOf(workers[targetWorkerId])
+  if not ((targetStatus == "idle" or targetStatus == "complete" or targetStatus == "aborted") and targetData.atHome == true) then setNotice("Reassign target must be idle/terminal and at home.", true); return false end
+  if job.chunkMode == "world" and not (targetData.gps and targetData.gps.calibration) then setNotice("Reassign target requires GPS calibration.", true); return false end
+  local group = groupRecord(job.groupId)
+  local bayId, bay = groupWorkerResource(group, targetWorkerId, "bay")
+  local dockId, dock = groupWorkerResource(group, targetWorkerId, "dock")
+  if job.chunkMode == "world" and (not bay or not dock) then setNotice("Reassign target bay/dock metadata unavailable.", true); return false end
+  if bay and bay.world then
+    local pos = targetData.world or targetData.position
+    if not pos or tonumber(pos.x) ~= tonumber(bay.world.x) or tonumber(pos.y) ~= tonumber(bay.world.y) or tonumber(pos.z) ~= tonumber(bay.world.z) then setNotice("Reassign target is not at its bay pose.", true); return false end
+  end
+  local targetKey = tostring(targetWorkerId)
+  local existingTarget = job.assignments[targetKey]
+  local target = existingTarget and common.copy(existingTarget) or { workerId = tonumber(targetWorkerId) or targetWorkerId, groupJobId = job.groupJobId, parentJobId = job.groupJobId, jobId = job.groupJobId .. "/reassign-" .. targetKey, assignmentId = job.groupJobId .. ":reassign:" .. targetKey, chunkKeys = {}, transitKeys = {}, status = "pending_reassign" }
+  target.chunkKeys = common.copy(source.chunkKeys)
+  target.transitKeys = common.copy(source.transitKeys or {})
+  target.bay, target.bayId, target.dock, target.dockId = bayId, bayId, common.copy(dock or {}), dockId
+  target.homeWorld = dock and common.copy(dock.homeWorld or dock.world) or common.copy(target.homeWorld or targetData.world)
+  target.maxDepth = tonumber(dock and dock.maxDepth or target.maxDepth or config.maxDepth)
+  target.facing = targetData.facing or target.facing
+  if job.chunkMode == "world" and targetData.gps and targetData.gps.calibration and targetData.gps.calibration.home then
+    local targetHome = targetData.gps.calibration.home
+    if tonumber(targetHome.x) and tonumber(targetHome.z) then
+      target.bayChunkKey = quarry.chunkKey("world", math.floor(tonumber(targetHome.x) / 16), math.floor(tonumber(targetHome.z) / 16))
+    end
+  end
+  target.homeY = target.homeY or source.homeY
+  target.bottomY = target.bottomY or source.bottomY
+  target.layers = target.layers or source.layers
+  local outboundToken = sourceToken and common.copy(sourceToken) or nil
+  if outboundToken then
+    outboundToken.sourceAssignmentId = source.assignmentId
+    outboundToken.reassignedFromAssignmentId = source.assignmentId
+    outboundToken.assignmentId = target.assignmentId
+    outboundToken.groupJobId = job.groupJobId
+    outboundToken.jobId = target.jobId
+    outboundToken.sourceWorkerId = tonumber(stoppedWorkerId) or stoppedWorkerId
+    outboundToken.workerId = target.workerId
+    target.assignmentResumeToken = common.copy(outboundToken)
+  else
+    target.assignmentResumeToken = nil
+  end
+  local pending = {
+    sourceWorkerId = tonumber(stoppedWorkerId) or stoppedWorkerId, targetWorkerId = tonumber(targetWorkerId) or targetWorkerId, assignmentId = target.assignmentId, sourceAssignmentId = source.assignmentId,
+    jobId = target.jobId, chunkKeys = common.copy(source.chunkKeys), transitKeys = common.copy(source.transitKeys or {}), bay = bayId, bayId = bayId, dock = common.copy(dock or {}), dockId = dockId,
+    homeWorld = common.copy(target.homeWorld), maxDepth = target.maxDepth, facing = target.facing, homeY = target.homeY, bottomY = target.bottomY, layers = target.layers, assignmentResumeToken = common.copy(outboundToken), sentAt = common.nowSeconds(), status = "awaiting_ack",
+  }
+  local payload = {
+    scope = "group", group = true, groupId = job.groupId, groupJobId = job.groupJobId, parentGroupJobId = job.groupJobId, groupCommand = "START", requestedCommand = "start", command = "start", assignmentCatalog = common.copy(job.catalog),
+    assignmentId = target.assignmentId, sourceAssignmentId = source.assignmentId, reassignedFromAssignmentId = source.assignmentId, assignmentResumeToken = common.copy(outboundToken), assignmentChunks = common.copy(pending.chunkKeys), chunkKeys = common.copy(pending.chunkKeys), transitKeys = common.copy(pending.transitKeys), seedKey = target.seedKey,
+    homeY = target.homeY, bottomY = target.bottomY, targetY = target.bottomY, layers = target.layers, width = job.width, length = job.length, depth = target.layers or job.depth, chunkMode = job.chunkMode,
+    name = job.name, profile = job.profile, waterMode = job.waterMode, lighting = common.copy(job.lighting or {}), workerId = target.workerId, targetWorkerId = target.workerId,
+    bay = target.bay, bayId = target.bayId, dock = common.copy(target.dock or {}), dockId = target.dockId, homeWorld = common.copy(target.homeWorld), maxDepth = target.maxDepth, facing = target.facing,
+    lease = { groupJobId = job.groupJobId, assignmentId = target.assignmentId, workerId = target.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(pending.chunkKeys) }, assignment = common.copy(target),
+    leases = { transit = { groupJobId = job.groupJobId, assignmentId = target.assignmentId, workerId = target.workerId, mode = job.chunkMode, kind = "transit", chunks = common.copy(pending.transitKeys) }, mine = { groupJobId = job.groupJobId, assignmentId = target.assignmentId, workerId = target.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(pending.chunkKeys) } },
+  }
+  job.pendingReassignment = pending
+  saveControllerDb()
+  local ok = sendCommand(target.workerId, "start", payload)
+  if ok then
+    pending.sentAt = common.nowSeconds()
+    pending.status = "awaiting_ack"
+    saveControllerDb()
+    setNotice("Residual reassignment sent; awaiting worker ACK.", false)
+  else
+    job.pendingReassignment = nil
+    saveControllerDb()
+    setNotice("Residual reassignment send failed; original lease retained.", true)
+  end
+  return ok
+end
+
+local function groupSchedulerTick()
+  local now = common.nowSeconds()
+  if now == groupSchedulerLast then return end
+  groupSchedulerLast = now
+  -- Emergency fuel/service requests take precedence over ordinary staggered
+  -- starts.  The cap is persisted per group so restarts cannot overfill a bay.
+  for _, job in pairs(db.groupJobs or {}) do
+    if type(job) == "table" and (job.status == "starting" or job.status == "queued" or job.status == "working" or job.status == "PARTIAL_START") then
+      local group = groupRecord(job.groupId)
+      job.awaitingAck = job.awaitingAck or {}
+      job.pending = job.pending or {}
+      job.attempts = job.attempts or {}
+      if job.pendingReassignment and now - tonumber(job.pendingReassignment.sentAt or now) >= 10 then
+        local pending = job.pendingReassignment
+        job.pendingReassignment = nil
+        job.alerts = job.alerts or {}
+        job.alerts[#job.alerts + 1] = "REASSIGN_TIMEOUT:#" .. tostring(pending.targetWorkerId)
+        updateGroupAggregate(job)
+        saveControllerDb()
+      end
+      for waitingKey, waiting in pairs(job.awaitingAck) do
+        if now - tonumber(waiting.sentAt or now) >= 10 then
+          local attempts = tonumber(job.attempts[waitingKey] or waiting.attempts or 1)
+          job.awaitingAck[waitingKey] = nil
+          if attempts >= 2 then
+            rejectGroupStart(job, waitingKey, "start ACK timeout")
+          else
+            job.pending[waitingKey] = true
+            local assignment = job.assignments and (job.assignments[waitingKey] or job.assignments[tonumber(waitingKey)])
+            if assignment then assignment.status = "queued" end
+            job.nextDispatchAt = now
+          end
+        end
+      end
+      local limit = math.max(1, tonumber(group and group.replenishConcurrency or db.groupScheduler.replenishConcurrency) or 1)
+      local activeService = 0
+      job.serviceSentAt = job.serviceSentAt or {}
+      for _, id in ipairs(groupWorkerIds(group)) do
+        local data = workerData(id) or {}
+        if data.status == "waiting_fuel" or tonumber(data.fuel) and tonumber(data.fuel) <= tonumber(data.fuelLowWatermark or 0) then
+          activeService = activeService + 1
+          if activeService <= limit and now - tonumber(job.serviceSentAt[tostring(id)] or 0) >= 5 then
+            sendCommand(id, "service", { scope = "group", group = true, groupCommand = "SERVICE", groupId = job.groupId, groupJobId = job.groupJobId, priority = "EMERGENCY_FUEL", targetWorkerId = id, workerId = id })
+            job.serviceSentAt[tostring(id)] = now
+          end
+        end
+      end
+      if job.status == "starting" and now >= tonumber(job.nextDispatchAt or 0) then dispatchGroupJob(job, false) end
+    end
+  end
 end
 
 local function buildAssignments(result)
@@ -728,8 +2072,6 @@ local function startDraft()
   setNotice(("Job sent to %d worker%s."):format(#assignments, #assignments == 1 and "" or "s"), false)
   return true
 end
-
-local normalizedProfile, normalizedWaterMode, normalizedLighting
 
 local function queueDraft()
   if not draft then return false end
@@ -851,7 +2193,7 @@ local function stageStop(id, stopMode)
   local caps = worker and worker.data and worker.data.capabilities or {}
   local sent = sendCommand(id, "stop", { mode = stopMode, staged = true })
   -- V2 workers do not know `stop`; provide the old command after the explicit
-  -- V3 request, but only when capability is absent/false.
+  -- V4 request, but only when capability is absent/false.
   if not caps.stagedStop then
     local legacy = ({ pause_now = "pause", finish_row = "pause", finish_layer = "pause", return_home = "recall", abort = "abort" })[stopMode]
     if legacy then sent = sendCommand(id, legacy, { stopMode = stopMode }) or sent end
@@ -898,6 +2240,17 @@ local function dashboardAction(name)
   return function()
     local id = selectedWorker()
     if name == "discover" then discover()
+    elseif name == "groups" then mode = "groups"
+    elseif name == "group_start" or name == "group_pause" or name == "group_resume" or name == "group_return" then
+      local groupCommandName = ({ group_start = "start", group_pause = "pause", group_resume = "resume", group_return = "return" })[name]
+      local groupId = selectedGroupRecord()
+      if groupId then
+        if groupCommandName == "start" then
+          groupDraft = groupDraftDefaults(groupRecord(groupId))
+          local result = computeGroupPreflight(groupId, groupDraft)
+          if result and not result.fatal then startGroup(groupId, groupDraft) else setNotice("Group preflight blocked START.", true) end
+        else groupCommand(groupId, groupCommandName) end
+      else setNotice("No group selected.", true) end
     elseif name == "new" then
       local workerId, worker = selectedWorker()
       if not workerId or not worker then setNotice("Select a worker first.", true); return end

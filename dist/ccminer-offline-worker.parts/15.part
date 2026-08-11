@@ -1,0 +1,306 @@
+      if not seen[neighbor] then
+        seen[neighbor] = true
+        previous[neighbor] = key
+        if neighbor == toKey then
+          local path, current = { toKey }, toKey
+          while current ~= fromKey do
+            current = previous[current]
+            path[#path + 1] = current
+          end
+          local reversed = {}
+          for index = #path, 1, -1 do reversed[#reversed + 1] = path[index] end
+          return reversed
+        end
+        tail = tail + 1; queue[tail] = neighbor
+      end
+    end
+  end
+  return nil, "chunks_disconnected"
+end
+
+function M.shortestChunkPath(plan, fromKey, toKey)
+  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
+  local function normalizeKey(value)
+    if type(value) == "table" then
+      if value.key ~= nil then return tostring(value.key) end
+      local cx, cz = integerValue(value.cx), integerValue(value.cz)
+      if cx and cz then return chunkKey(plan.mode, cx, cz) end
+      return nil
+    end
+    return value == nil and nil or tostring(value)
+  end
+  fromKey, toKey = normalizeKey(fromKey), normalizeKey(toKey)
+  if fromKey == nil or toKey == nil then return nil, "invalid_chunk" end
+  return shortestPathInternal(plan.chunks, tostring(fromKey), tostring(toKey))
+end
+
+M.shortestPath = M.shortestChunkPath
+
+local function nearestUnvisitedPath(chunks, startKey, visited)
+  local queue, head, tail = { startKey }, 1, 1
+  local previous, seen = {}, { [startKey] = true }
+  while head <= tail do
+    local key = queue[head]; head = head + 1
+    for _, neighbor in ipairs(chunks[key].neighbors or {}) do
+      if not seen[neighbor] then
+        seen[neighbor] = true
+        previous[neighbor] = key
+        if not visited[neighbor] then
+          local path, current = { neighbor }, neighbor
+          while current ~= startKey do
+            current = previous[current]
+            path[#path + 1] = current
+          end
+          local reversed = {}
+          for index = #path, 1, -1 do reversed[#reversed + 1] = path[index] end
+          return reversed
+        end
+        tail = tail + 1; queue[tail] = neighbor
+      end
+    end
+  end
+  return nil
+end
+
+local function optimizedWalk(chunks, keys, rootKey)
+  local walk, order, visited = {}, {}, { [rootKey] = true }
+  local current = rootKey
+  -- Every plan is persisted in worker state.  CC:Tweaked's serializer rejects
+  -- shared table references, so keep compatibility fields as independent
+  -- point values instead of aliasing the chunk's anchor table.
+  local rootAnchor = chunks[rootKey].anchor
+    and { x = chunks[rootKey].anchor.x, z = chunks[rootKey].anchor.z }
+    or (contains(chunks[rootKey], 0, 1) and { x = 0, z = 1 } or { x = chunks[rootKey].minX, z = chunks[rootKey].minZ })
+  chunks[rootKey].optimizedAnchor = { x = rootAnchor.x, z = rootAnchor.z }
+  walk[1] = { key = rootKey, first = true, anchor = { x = rootAnchor.x, z = rootAnchor.z } }
+  order[1] = rootKey
+  while #order < #keys do
+    local nextKey
+    for _, neighbor in ipairs(chunks[current].neighbors or {}) do
+      if not visited[neighbor] then nextKey = neighbor; break end
+    end
+    local path
+    if nextKey then
+      path = { nextKey }
+    else
+      path = nearestUnvisitedPath(chunks, current, visited)
+      if not path then break end
+    end
+    local previous = current
+    for _, key in ipairs(path) do
+      local first = not visited[key]
+      if first then
+        visited[key] = true
+        order[#order + 1] = key
+      end
+      local anchor = M.chunkAnchor(chunks[key], chunks[previous]) or chunks[key].anchor
+      if first then chunks[key].optimizedAnchor = { x = anchor.x, z = anchor.z } end
+      walk[#walk + 1] = {
+        key = key,
+        first = first,
+        anchor = { x = anchor.x, z = anchor.z },
+      }
+      previous, current = key, key
+    end
+  end
+  return walk, order, visited
+end
+
+function M.buildChunkPlan(job, calibration)
+  job = type(job) == "table" and job or {}
+  local mode = job.chunkMode == "world" and "world" or "local"
+  local validWidth, validLength, validDepth = dimensions(job.width, job.length, job.depth)
+  if not validWidth then return nil, validLength end
+  local catalog, catalogError = M.buildCatalog(validWidth, validLength, mode, calibration)
+  if not catalog then return nil, catalogError end
+  local excluded, exclusionError = exclusionSet(job.excludedChunks, mode)
+  if not excluded then return nil, exclusionError end
+  local chunks, rootKey, columns = {}, nil, 0
+  local excludedCount = 0
+
+  for _, source in ipairs(catalog) do
+    if contains(source, 0, 1) then rootKey = source.key end
+    if excluded[source.key] then
+      excludedCount = excludedCount + 1
+    else
+      local copy = copyChunk(source)
+      chunks[copy.key] = copy
+      columns = columns + copy.cells
+    end
+  end
+
+  if not rootKey then return nil, "entrance_chunk_missing" end
+  if excluded[rootKey] then return nil, "The quarry entrance chunk cannot be excluded." end
+  if not chunks[rootKey] then return nil, "No mineable chunks remain." end
+
+  local keys = {}
+  for key in pairs(chunks) do keys[#keys + 1] = key end
+  table.sort(keys, function(left, right) return chunkComparator(chunks[left], chunks[right]) end)
+  buildNeighborGraph(chunks, keys)
+
+  -- Keep the original DFS parent tree and walk for recovery/checkpoint
+  -- compatibility.  The explicit stack avoids recursive overflow on large jobs.
+  local visited, walk = {}, {}
+  visited[rootKey] = true
+  chunks[rootKey].parent = nil
+  walk[1] = { key = rootKey, first = true }
+  local stack = { { key = rootKey, next = 1 } }
+  while #stack > 0 do
+    local frame = stack[#stack]
+    local chunk = chunks[frame.key]
+    local neighbor
+    while frame.next <= #chunk.neighbors do
+      local candidate = chunk.neighbors[frame.next]
+      frame.next = frame.next + 1
+      if not visited[candidate] then neighbor = candidate; break end
+    end
+    if neighbor then
+      visited[neighbor] = true
+      chunks[neighbor].parent = frame.key
+      walk[#walk + 1] = { key = neighbor, first = true }
+      stack[#stack + 1] = { key = neighbor, next = 1 }
+    else
+      stack[#stack] = nil
+      if #stack > 0 then walk[#walk + 1] = { key = stack[#stack].key, first = false } end
+    end
+  end
+
+  local visitedCount = 0
+  for _ in pairs(visited) do visitedCount = visitedCount + 1 end
+  if visitedCount ~= #keys then
+    local unreachable = {}
+    for _, key in ipairs(keys) do if not visited[key] then unreachable[#unreachable + 1] = key end end
+    return nil, "Excluded chunks split the quarry into disconnected regions: " .. table.concat(unreachable, ", ")
+  end
+
+  if contains(chunks[rootKey], 0, 1) then chunks[rootKey].anchor = { x = 0, z = 1 } end
+  local optimized, optimizedOrder = optimizedWalk(chunks, keys, rootKey)
+  return {
+    mode = mode,
+    width = validWidth,
+    length = validLength,
+    depth = validDepth,
+    rootKey = rootKey,
+    chunks = chunks,
+    walk = walk,
+    -- optimizedWalk is deliberately separate: worker recovery still uses the
+    -- DFS parent/walk representation above.
+    optimizedWalk = optimized,
+    optimizedRoute = optimizedOrder,
+    -- `route` is a legacy alias.  It must be a separate array because the
+    -- runtime state is saved with textutils.serialize, which rejects shared
+    -- table references even when the values are otherwise valid.
+    route = (function()
+      local copy = {}
+      for index, key in ipairs(optimizedOrder) do copy[index] = key end
+      return copy
+    end)(),
+    columns = columns,
+    selectedChunks = #keys,
+    excludedCount = excludedCount,
+    catalogCount = #catalog,
+  }
+end
+
+function M.chunkCellCount(chunk)
+  if type(chunk) ~= "table" then return nil, "invalid_chunk" end
+  local minX, maxX = integerValue(chunk.minX), integerValue(chunk.maxX)
+  local minZ, maxZ = integerValue(chunk.minZ), integerValue(chunk.maxZ)
+  if not minX or not maxX or not minZ or not maxZ or maxX < minX or maxZ < minZ then return nil, "invalid_chunk" end
+  local count = (maxX - minX + 1) * (maxZ - minZ + 1)
+  if count > MAX_COLUMNS then return nil, "chunk_too_large" end
+  return count
+end
+
+function M.chunkCell(chunk, index, y)
+  local count, countError = M.chunkCellCount(chunk)
+  if not count then return nil, countError end
+  index = integerValue(index, 0)
+  if not index or index >= count then return nil, "index_out_of_range" end
+  local width = chunk.maxX - chunk.minX + 1
+  local length = chunk.maxZ - chunk.minZ + 1
+  local row = math.floor(index / length)
+  local column = index % length
+  local z = row % 2 == 0 and (chunk.minZ + column) or (chunk.maxZ - column)
+  return { x = chunk.minX + row, y = numberValue(y) or 0, z = z }
+end
+
+function M.findChunk(plan, x, z)
+  if not plan or type(plan.chunks) ~= "table" then return nil end
+  x, z = numberValue(x), numberValue(z)
+  if not x or not z then return nil end
+  for key, chunk in pairs(plan.chunks) do
+    if contains(chunk, x, z) then return key, chunk end
+  end
+  return nil
+end
+
+function M.pathToRoot(plan, key)
+  local path, seen = {}, {}
+  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
+  if type(key) == "table" then key = key.key end
+  key = key and tostring(key) or nil
+  while key do
+    if seen[key] then return nil, "parent_cycle" end
+    seen[key] = true
+    path[#path + 1] = key
+    local chunk = plan.chunks[key]
+    if not chunk then return nil, "unknown_chunk:" .. tostring(key) end
+    key = chunk.parent
+  end
+  if path[#path] ~= plan.rootKey then return nil, "root_not_reached" end
+  return path
+end
+
+function M.pathFromRoot(plan, key)
+  local path, err = M.pathToRoot(plan, key)
+  if not path then return nil, err end
+  local reversed = {}
+  for index = #path, 1, -1 do reversed[#reversed + 1] = path[index] end
+  return reversed
+end
+
+-- Return a point on each side of one adjacent chunk edge.  The old recovery
+-- walk intentionally starts at a chunk's minimum corner; service traffic must
+-- not do that because it can add a full-corner detour on every transition.
+-- Selecting the midpoint of the shared edge is deterministic and minimises the
+-- worst-case distance for either side.  `edgeTransition` is kept independent
+-- from a plan's mutable anchor/parent fields so it remains safe after a state
+-- file is resumed on another worker.
+local function edgeTransitionPoints(left, right, y)
+  local pointY = numberValue(y) or 0
+  if left.maxX + 1 == right.minX then
+    local low, high = math.max(left.minZ, right.minZ), math.min(left.maxZ, right.maxZ)
+    if low <= high then
+      local z = math.floor((low + high) / 2)
+      return { x = left.maxX, y = pointY, z = z }, { x = right.minX, y = pointY, z = z }
+    end
+  elseif right.maxX + 1 == left.minX then
+    local low, high = math.max(left.minZ, right.minZ), math.min(left.maxZ, right.maxZ)
+    if low <= high then
+      local z = math.floor((low + high) / 2)
+      return { x = left.minX, y = pointY, z = z }, { x = right.maxX, y = pointY, z = z }
+    end
+  elseif left.maxZ + 1 == right.minZ then
+    local low, high = math.max(left.minX, right.minX), math.min(left.maxX, right.maxX)
+    if low <= high then
+      local x = math.floor((low + high) / 2)
+      return { x = x, y = pointY, z = left.maxZ }, { x = x, y = pointY, z = right.minZ }
+    end
+  elseif right.maxZ + 1 == left.minZ then
+    local low, high = math.max(left.minX, right.minX), math.min(left.maxX, right.maxX)
+    if low <= high then
+      local x = math.floor((low + high) / 2)
+      return { x = x, y = pointY, z = left.minZ }, { x = x, y = pointY, z = right.maxZ }
+    end
+  end
+  return nil, nil
+end
+
+local function normalizePlanKey(plan, value)
+  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
+  local key
+  if type(value) == "table" then
+    key = value.chunkKey or value.chunk or value.key
+    if key == nil and value.cx ~= nil and value.cz ~= nil then
+      local cx, cz = integerValue(value.cx), integerValue(value.cz)

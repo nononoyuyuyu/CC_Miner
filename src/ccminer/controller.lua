@@ -1,4 +1,4 @@
--- CC Miner V3 - generated controller source loader.
+-- CC Miner V4 - generated controller source loader.
 local parts = {
   "/ccminer/controller_parts/01.part",
   "/ccminer/controller_parts/02.part",

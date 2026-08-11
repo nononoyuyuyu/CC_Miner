@@ -1,0 +1,221 @@
+    if depth ~= nil and (depth ~= math.floor(depth) or depth ~= derivedDepth) then
+      return nil, "depth must equal the depth derived from targetY."
+    end
+    depth = derivedDepth
+  end
+  if not width or width ~= math.floor(width) then return nil, "Width must be a whole number." end
+  if not length or length ~= math.floor(length) then return nil, "Length must be a whole number." end
+  if not depth or depth ~= math.floor(depth) then return nil, "Depth must be a whole number." end
+  if width < 1 or width > config.maxWidth then return nil, "Width out of range (1-" .. config.maxWidth .. ")." end
+  if length < 1 or length > config.maxLength then return nil, "Length out of range (1-" .. config.maxLength .. ")." end
+  if depth < 1 or depth > config.maxDepth then return nil, "Depth out of range (1-" .. config.maxDepth .. ")." end
+  local fullVolume = width * length * depth
+  if fullVolume > config.maxVolume then return nil, "Volume exceeds limit " .. tostring(config.maxVolume) .. "." end
+
+  local exclusions = {}
+  for _, exclusion in ipairs(payload.excludedChunks or {}) do
+    if type(exclusion) == "table" and tonumber(exclusion.cx) and tonumber(exclusion.cz) then
+      exclusions[#exclusions + 1] = {
+        mode = exclusion.mode == "world" and "world" or "local",
+        cx = math.floor(exclusion.cx),
+        cz = math.floor(exclusion.cz),
+      }
+    end
+  end
+  if #exclusions > 512 then return nil, "Too many excluded chunks." end
+
+  local chunkMode = requestedChunkMode
+  if chunkMode == "world" and not gpsCalibration() then
+    return nil, "World-aligned chunk exclusion requires GPS calibration."
+  end
+
+  local assignment = type(payload.assignment) == "table" and payload.assignment or nil
+  local assignmentChunks = payload.assignmentChunks
+    or (assignment and (assignment.chunkKeys or assignment.chunks or assignment.assignmentChunks))
+  local function assignmentListCount(value)
+    if type(value) ~= "table" then return tonumber(value) or 0 end
+    if #value > 0 then return #value end
+    local count = 0
+    for _, enabled in pairs(value) do if enabled then count = count + 1 end end
+    return count
+  end
+  if assignmentChunks ~= nil and requestedChunkMode ~= "world" then
+    local count = assignmentListCount(assignmentChunks)
+    if count > 1 then
+      return nil, "Local automatic assignment/splitting is disabled; use explicit world chunk assignments."
+    end
+  end
+  local assignmentTotal = tonumber(payload.assignmentTotal or payload.assignmentCount)
+  if assignmentTotal and assignmentTotal > 1 and requestedChunkMode ~= "world" then
+    return nil, "Multi-worker assignments are disabled in this release; dispatch independent jobs."
+  end
+  if assignment and tonumber(assignment.total or assignment.count) and tonumber(assignment.total or assignment.count) > 1
+    and requestedChunkMode ~= "world" then
+    return nil, "Local automatic assignment/splitting is disabled; use explicit world chunk assignments."
+  end
+
+  local profile = payload.profile
+  if profile ~= nil then
+    profile = tostring(profile)
+    if profile ~= "safe" and profile ~= "balanced" and profile ~= "turbo" then
+      return nil, "profile must be safe, balanced, or turbo."
+    end
+  end
+
+  local groupJobId = payload.groupJobId or payload.groupId or (assignment and (assignment.groupJobId or assignment.groupId))
+  local bay = payload.bay or payload.bayId or (assignment and (assignment.bay or assignment.bayId))
+  local dock = payload.dock or (assignment and assignment.dock) or config.dock
+  local lease = payload.lease or (assignment and assignment.lease)
+  local assignmentId = payload.assignmentId or (assignment and assignment.assignmentId)
+  local assignmentName = assignment and assignment.name or nil
+  local assignmentWorker = assignment and (assignment.workerId or assignment.worker) or nil
+  local assignmentWorld = payload.homeWorld
+    or (assignment and (assignment.world or assignment.homeWorld))
+    or nil
+  local job = {
+    kind = "quarry",
+    id = tostring(payload.jobId or ("job-" .. common.nowMillis())),
+    name = tostring(payload.name or "Quarry"),
+    width = width,
+    length = length,
+    depth = depth,
+    cursor = 0,
+    startedAt = common.nowSeconds(),
+    excludedChunks = exclusions,
+    chunkMode = chunkMode,
+    assignmentId = assignmentId and tostring(assignmentId) or nil,
+    groupJobId = groupJobId and tostring(groupJobId) or nil,
+    groupId = payload.groupId and tostring(payload.groupId) or (assignment and assignment.groupId and tostring(assignment.groupId) or nil),
+    assignment = assignment and common.copy(assignment) or nil,
+    assignmentName = assignmentName and tostring(assignmentName) or nil,
+    assignmentWorker = assignmentWorker and tostring(assignmentWorker) or nil,
+    bay = bay and tostring(bay) or nil,
+    bayId = payload.bayId and tostring(payload.bayId) or (assignment and assignment.bayId and tostring(assignment.bayId) or nil),
+    dock = dock and common.copy(dock) or nil,
+    lease = lease and common.copy(lease) or nil,
+    homeWorld = assignmentWorld and common.copy(assignmentWorld) or (dock and dock.homeWorld and common.copy(dock.homeWorld) or nil),
+    bottomY = tonumber(payload.bottomY or (assignment and assignment.bottomY) or (dock and dock.bottomY)),
+    maxDepth = tonumber(payload.maxDepth or (assignment and assignment.maxDepth) or (dock and dock.maxDepth)),
+    facing = payload.facing or (assignment and assignment.facing) or (dock and (dock.facing or dock.direction)),
+    profile = profile,
+    targetY = targetY,
+    lighting = type(payload.lighting) == "table" and common.copy(payload.lighting) or nil,
+    waterMode = payload.waterMode and tostring(payload.waterMode) or nil,
+    assignmentChunks = assignmentChunks and common.copy(assignmentChunks) or nil,
+    assignmentTransitChunks = common.copy(payload.transitKeys
+      or payload.assignmentTransitChunks
+      or (assignment and (assignment.transitKeys or assignment.transitChunks or assignment.transit))
+      or {}),
+    seedKey = payload.seedKey or (assignment and assignment.seedKey) or nil,
+    dockKey = payload.dockKey or (assignment and assignment.dockKey) or nil,
+    assignmentProvided = assignment ~= nil or assignmentChunks ~= nil,
+  }
+  if job.maxDepth and depth > job.maxDepth then return nil, "Assignment depth exceeds maxDepth." end
+  if job.bottomY and targetY and targetY ~= job.bottomY then return nil, "Assignment bottomY does not match targetY." end
+  if job.bottomY == nil and targetY ~= nil then job.bottomY = targetY end
+  if requestedChunkMode == "local" and job.groupJobId and assignmentChunks and assignmentListCount(assignmentChunks) > 1 then
+    return nil, "Local group assignments cannot be automatically split."
+  end
+
+  local assignmentCatalog = payload.assignmentCatalog or payload.catalog or payload.groupCatalog
+  if assignment and type(assignment.catalog) == "table" then assignmentCatalog = assignment.catalog end
+  if assignment and type(assignment.worldCatalog) == "table" then assignmentCatalog = assignment.worldCatalog end
+  local assignmentPlanRequested = type(assignmentChunks) == "table" and assignmentListCount(assignmentChunks) > 0
+  -- Never turn an explicit assignment into a full-footprint plan.  A world
+  -- assignment is valid only with the controller's authoritative catalog;
+  -- absence of the planner is also a safe refusal, not a legacy fallback.
+  if assignmentPlanRequested and requestedChunkMode ~= "world" then
+    return nil, "Explicit group assignments require chunkMode=world."
+  end
+  if assignmentPlanRequested and type(assignmentCatalog) ~= "table" then
+    return nil, "Group assignment requires the authoritative chunk catalog."
+  end
+  if assignmentPlanRequested and type(quarry.buildAssignedChunkPlan) ~= "function" then
+    return nil, "Assigned chunk planning API unavailable; refusing unsafe group job."
+  end
+  if (job.groupJobId or job.assignmentId or assignment ~= nil) and not assignmentPlanRequested then
+    return nil, "Group assignment keys are required; refusing full-footprint fallback."
+  end
+  if assignmentPlanRequested then
+    local assignedSet, transitSet = {}, {}
+    local function collectAssignmentKeys(value, target)
+      if type(value) ~= "table" then return end
+      if #value > 0 then
+        for _, item in ipairs(value) do
+          local key = assignmentChunkKey(item, requestedChunkMode) or tostring(item)
+          target[key] = true
+        end
+      else
+        for item, enabled in pairs(value) do
+          if enabled then
+            local key = assignmentChunkKey(item, requestedChunkMode) or tostring(item)
+            target[key] = true
+          end
+        end
+      end
+    end
+    collectAssignmentKeys(assignmentChunks, assignedSet)
+    collectAssignmentKeys(job.assignmentTransitChunks, transitSet)
+    job.assignmentSet, job.transitSet = assignedSet, transitSet
+    -- The authoritative assigned planner receives the full catalog and
+    -- emits only mine/transit chunks.  Do not manufacture a giant exclusion
+    -- complement here: it is redundant, can exceed legacy exclusion limits,
+    -- and risks using the worker's local calibration as a world partition.
+    job.assignmentCatalog = assignmentCatalog and common.copy(assignmentCatalog) or nil
+  end
+
+  if job.waterMode ~= nil and job.waterMode ~= "ignore" and job.waterMode ~= "stop" and job.waterMode ~= "seal" then
+    return nil, "waterMode must be ignore, stop, or seal."
+  end
+  if job.lighting and job.lighting.mode ~= nil then
+    local mode = tostring(job.lighting.mode)
+    if mode ~= "off" and mode ~= "safe" and mode ~= "custom" then
+      return nil, "lighting.mode must be off, safe, or custom."
+    end
+    job.lighting.mode = mode
+    if job.lighting.interval ~= nil then
+      local interval = tonumber(job.lighting.interval)
+      if not interval or interval < 1 then return nil, "lighting.interval must be positive." end
+      job.lighting.interval = math.floor(interval)
+    end
+  end
+
+  if #exclusions > 0 or assignmentPlanRequested then
+    local planCalibration = (assignmentCatalog and assignmentCatalog.calibrationSeed) or gpsCalibration()
+    local plan, planError
+    if assignmentPlanRequested then
+      -- The assigned planner owns world-catalog validation, connectivity,
+      -- transit leases, and the dock-to-seed service route.  Keep this call
+      -- to its single canonical signature; broad compatibility attempts can
+      -- silently reinterpret the catalog as a job and mine the full region.
+      local assignment = job.assignment or {}
+      local assignmentOptions = {
+        transitKeys = job.assignmentTransitChunks or {},
+        seedKey = payload.seedKey or assignment.seedKey or job.seedKey,
+        rootKey = assignmentCatalog.rootKey,
+        dockKey = payload.dockKey or assignment.dockKey or assignmentCatalog.dockKey,
+        workerId = payload.workerId or assignment.workerId,
+        groupJobId = job.groupJobId,
+        bottomY = job.bottomY or targetY,
+        y = job.bottomY or targetY or 0,
+        referenceCalibration = assignmentCatalog.calibrationSeed,
+        workerCalibration = gpsCalibration(),
+        dockPose = { x = 0, y = 0, z = 1 },
+      }
+      local ok, assignedPlan = pcall(quarry.buildAssignedChunkPlan,
+        assignmentCatalog, assignmentChunks, assignmentOptions)
+      if not ok or type(assignedPlan) ~= "table" or type(assignedPlan.chunks) ~= "table" then
+        return nil, tostring(ok and assignedPlan or assignedPlan or "assigned plan failed")
+      end
+      plan = assignedPlan
+      planError = nil
+    else
+      plan, planError = quarry.buildChunkPlan(job, planCalibration)
+    end
+    if not plan then return nil, planError end
+    job.strategy = "chunk_plan"
+    job.chunkPlan = plan
+    local selectedCells = plan.columns or 0
+    if assignmentPlanRequested then
+      -- The planner returns independent arrays (serializer-safe); normalize
+      -- them into lookup sets used by the runtime's transit-only guard.

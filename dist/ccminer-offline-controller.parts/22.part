@@ -1,0 +1,272 @@
+      local width, validLength = integerValue(value.width, 1, MAX_DIMENSION), integerValue(value.length, 1, MAX_DIMENSION)
+      if not width or not validLength or width * validLength > MAX_COLUMNS then return nil, "invalid_bounds" end
+      local originX = integerValue(value.originX ~= nil and value.originX or options.originX or 0)
+      local originZ = integerValue(value.originZ ~= nil and value.originZ or options.originZ or 1)
+      if not originX or not originZ then return nil, "invalid_bounds" end
+      minX, maxX = originX, originX + width - 1
+      minZ, maxZ = originZ, originZ + validLength - 1
+    elseif value.plan then
+      return boundsFrom(value.plan, nil, options)
+    elseif value.chunks then
+      for _, chunk in pairs(value.chunks) do
+        if not minX or chunk.minX < minX then minX = chunk.minX end
+        if not maxX or chunk.maxX > maxX then maxX = chunk.maxX end
+        if not minZ or chunk.minZ < minZ then minZ = chunk.minZ end
+        if not maxZ or chunk.maxZ > maxZ then maxZ = chunk.maxZ end
+      end
+    end
+  else
+    local width = integerValue(value, 1, MAX_DIMENSION)
+    local validLength = integerValue(length, 1, MAX_DIMENSION)
+    if width and validLength and width * validLength <= MAX_COLUMNS then
+      local originX = integerValue(options.originX ~= nil and options.originX or 0)
+      local originZ = integerValue(options.originZ ~= nil and options.originZ or 1)
+      if originX and originZ then
+        minX, maxX = originX, originX + width - 1
+        minZ, maxZ = originZ, originZ + validLength - 1
+      end
+    end
+  end
+  if not minX or not maxX or not minZ or not maxZ or maxX < minX or maxZ < minZ then return nil, "invalid_bounds" end
+  if (maxX - minX + 1) * (maxZ - minZ + 1) > MAX_COLUMNS then return nil, "bounds_too_large" end
+  return {
+    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
+    width = maxX - minX + 1, length = maxZ - minZ + 1,
+    cells = (maxX - minX + 1) * (maxZ - minZ + 1),
+  }
+end
+
+function M.gridBounds(value, length, options)
+  return boundsFrom(value, length, options)
+end
+
+M.getGridBounds = M.gridBounds
+M.bounds = M.gridBounds
+
+function M.gridPage(bounds, page, pageWidth, pageHeight)
+  local normalized, boundsError = boundsFrom(bounds)
+  if not normalized then return nil, boundsError end
+  if type(pageWidth) == "table" then pageHeight, pageWidth = pageWidth.pageHeight, pageWidth.pageWidth end
+  pageWidth = integerValue(pageWidth, 1, MAX_DIMENSION) or 16
+  pageHeight = integerValue(pageHeight, 1, MAX_DIMENSION) or pageWidth
+  local pagesX = math.ceil(normalized.width / pageWidth)
+  local pagesZ = math.ceil(normalized.length / pageHeight)
+  local pageCount = pagesX * pagesZ
+  page = integerValue(page, 1, pageCount) or 1
+  local pageIndex = page - 1
+  local pageX, pageZ = pageIndex % pagesX, math.floor(pageIndex / pagesX)
+  local minX = normalized.minX + pageX * pageWidth
+  local minZ = normalized.minZ + pageZ * pageHeight
+  local maxX = math.min(normalized.maxX, minX + pageWidth - 1)
+  local maxZ = math.min(normalized.maxZ, minZ + pageHeight - 1)
+  return {
+    page = page, pageIndex = pageIndex, pageCount = pageCount,
+    pagesX = pagesX, pagesZ = pagesZ, pageX = pageX, pageZ = pageZ,
+    pageWidth = pageWidth, pageHeight = pageHeight,
+    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
+    width = maxX - minX + 1, length = maxZ - minZ + 1,
+    cells = (maxX - minX + 1) * (maxZ - minZ + 1),
+  }
+end
+
+M.getGridPage = M.gridPage
+M.page = M.gridPage
+M.gridPageInfo = M.gridPage
+M.pageInfo = M.gridPage
+
+function M.gridCell(bounds, index)
+  local normalized, boundsError = boundsFrom(bounds)
+  if not normalized then return nil, boundsError end
+  index = integerValue(index, 0)
+  if not index or index >= normalized.cells then return nil, "index_out_of_range" end
+  local row = math.floor(index / normalized.length)
+  local column = index % normalized.length
+  local z = row % 2 == 0 and (normalized.minZ + column) or (normalized.maxZ - column)
+  return { x = normalized.minX + row, z = z, index = index, row = row, column = column }
+end
+
+M.getGridCell = M.gridCell
+
+function M.gridCellInfo(bounds, x, z)
+  local normalized, boundsError = boundsFrom(bounds)
+  if not normalized then return nil, boundsError end
+  x, z = integerValue(x), integerValue(z)
+  if not x or not z then return nil, "invalid_position" end
+  local inside = contains(normalized, x, z)
+  local info = { x = x, z = z, inside = inside }
+  if inside then
+    local row, column = x - normalized.minX, z - normalized.minZ
+    info.row, info.column = row, column
+    info.index = row * normalized.length + (row % 2 == 0 and column or normalized.length - 1 - column)
+  end
+  return info
+end
+
+M.getCellInfo = M.gridCellInfo
+M.cellInfo = M.gridCellInfo
+
+function M.selectRectangle(bounds, x1, z1, x2, z2, options)
+  local normalized, boundsError = boundsFrom(bounds)
+  if not normalized then return nil, boundsError end
+  if type(x1) == "table" then
+    options = z1
+    local selection = x1
+    x1, z1, x2, z2 = selection.x1 or selection.minX, selection.z1 or selection.minZ, selection.x2 or selection.maxX, selection.z2 or selection.maxZ
+  end
+  x1, z1, x2, z2 = integerValue(x1), integerValue(z1), integerValue(x2), integerValue(z2)
+  if not x1 or not z1 or not x2 or not z2 then return nil, "invalid_rectangle" end
+  if x1 > x2 then x1, x2 = x2, x1 end
+  if z1 > z2 then z1, z2 = z2, z1 end
+  local minX, maxX = math.max(x1, normalized.minX), math.min(x2, normalized.maxX)
+  local minZ, maxZ = math.max(z1, normalized.minZ), math.min(z2, normalized.maxZ)
+  if minX > maxX or minZ > maxZ then return nil, "rectangle_out_of_bounds" end
+  local count = (maxX - minX + 1) * (maxZ - minZ + 1)
+  local result = {
+    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
+    width = maxX - minX + 1, length = maxZ - minZ + 1,
+    count = count, cellsCount = count,
+    clipped = minX ~= x1 or maxX ~= x2 or minZ ~= z1 or maxZ ~= z2,
+  }
+  local includeCells = true
+  if type(options) == "table" and options.includeCells == false then includeCells = false end
+  if type(options) == "boolean" then includeCells = options end
+  if includeCells and count <= MAX_SELECTION_CELLS then
+    result.cells = {}
+    for x = minX, maxX do
+      for z = minZ, maxZ do result.cells[#result.cells + 1] = { x = x, z = z } end
+    end
+    result.selectedCells = result.cells
+  elseif includeCells then
+    result.cellsTruncated = true
+  end
+  return result
+end
+
+M.rectangleSelection = M.selectRectangle
+M.selectRect = M.selectRectangle
+M.rectangle = M.selectRectangle
+M.selectRectangleCells = M.selectRectangle
+
+return M
+]=] },
+  { source = [[src/ccminer/controller.lua]], target = [[controller.lua]], digest = [[3781ea475623981ed6154c4c63d1aa29dbd50bb16815e98f7ac2b21cc05f74f2]], content = [[-- CC Miner V4 - generated controller source loader.
+local parts = {
+  "/ccminer/controller_parts/01.part",
+  "/ccminer/controller_parts/02.part",
+  "/ccminer/controller_parts/03.part",
+}
+local source = {}
+for index, path in ipairs(parts) do
+  local handle = fs.open(path, "r")
+  if not handle then error("Missing runtime part: " .. path, 0) end
+  source[index] = handle.readAll()
+  handle.close()
+end
+local loader = loadstring or load
+local program, compileError = loader(table.concat(source), "@/ccminer/controller.assembled.lua")
+if not program then error("Cannot assemble controller: " .. tostring(compileError), 0) end
+return program(...)
+]] },
+  { source = [[src/ccminer/controller_parts/01.part]], target = [[controller_parts/01.part]], digest = [[02f1f6044fc308b45d66026423d449fda34a79b7a2627b32b5f82b37a40c6437]], content = [[-- CC Miner V4 - controller state, persistence and job orchestration.
+-- The controller is deliberately tolerant of V2 worker payloads.  New
+-- fields are additive and every command has a legacy equivalent where one
+-- exists.
+
+local args = { ... }
+local common = dofile("/ccminer/lib/common.lua")
+local protocol = dofile("/ccminer/lib/protocol.lua")
+local quarry = dofile("/ccminer/lib/quarry.lua")
+
+local config, configError = common.loadConfig()
+if not config or config.role ~= "controller" then
+  error(configError or "Controller configuration not found. Run: ccm setup controller", 0)
+end
+
+if not os.getComputerLabel or not os.getComputerLabel() then
+  if os.setComputerLabel then os.setComputerLabel(config.controllerName) end
+end
+
+local networkReady, modemNames = protocol.open()
+if not networkReady then error("No wireless modem found next to the controller.", 0) end
+
+local DB_PATH = "/ccminer/data/controller.db"
+local function dbDefaults()
+  return {
+    schema = common.SCHEMA,
+    version = common.VERSION,
+    presets = {},
+    queue = {},
+    history = {},
+    leases = {},
+    activeLeases = {}, -- independent compatibility snapshot for V4 draft tools.
+    -- Group state is deliberately additive.  The legacy queue/history/preset
+    -- keys above remain authoritative for single-worker operation.
+    groups = {},
+    docks = {},
+    bays = {},
+    groupJobs = {},
+    groupLeases = {},
+    groupScheduler = { replenishConcurrency = 1, staggerSeconds = 0 },
+    lastPreset = nil,
+    lastDraft = nil,
+    updatedAt = common.nowSeconds(),
+  }
+end
+
+local db = dbDefaults()
+local dbError = nil
+
+-- Drafts carry UI-only preflight data.  That data includes chunk plans with
+-- compatibility aliases (for example `route`/`optimizedRoute`) which
+-- textutils.serialize cannot encode.  Keep only the durable form when a
+-- draft is copied into the controller database; copy each field separately
+-- so an accidental shared reference between fields cannot leak into storage.
+local function persistentDraft(source)
+  local value = {}
+  if type(source) ~= "table" then return value end
+  for key, item in pairs(source) do
+    if key ~= "preflight" and key ~= "queueIndex" and key ~= "awaiting" then
+      value[key] = common.copy(item)
+    end
+  end
+  return value
+end
+
+-- Group records intentionally retain preflight/report fields.  Clone every
+-- field independently (rather than copying one shared root) to keep the
+-- ComputerCraft serializer free of table aliases while preserving the
+-- durable group-job audit trail.
+local function persistentGroupValue(source)
+  local value = {}
+  if type(source) ~= "table" then return value end
+  for key, item in pairs(source) do value[common.copy(key)] = common.copy(item) end
+  return value
+end
+
+local function loadControllerDb()
+  local loaded, err = common.loadTable(DB_PATH, dbDefaults())
+  db = common.merge(dbDefaults(), loaded or {})
+  -- `leases` is authoritative for V4.  Fall back to the old draft alias only
+  -- when a legacy file has no leases table at all.
+  if type(loaded) == "table" and type(loaded.leases) ~= "table" and type(loaded.activeLeases) == "table" then
+    db.leases = common.copy(loaded.activeLeases)
+  end
+  db.leases = type(db.leases) == "table" and db.leases or {}
+  db.activeLeases = common.copy(db.leases)
+  db.presets, db.queue, db.history = db.presets or {}, db.queue or {}, db.history or {}
+  db.groups = type(db.groups) == "table" and db.groups or {}
+  db.docks = type(db.docks) == "table" and db.docks or {}
+  db.bays = type(db.bays) == "table" and db.bays or {}
+  db.groupJobs = type(db.groupJobs) == "table" and db.groupJobs or {}
+  db.groupLeases = type(db.groupLeases) == "table" and db.groupLeases or {}
+  if #db.groupLeases == 0 then
+    for _, lease in ipairs(db.leases) do if type(lease) == "table" and lease.groupJobId then db.groupLeases[#db.groupLeases + 1] = common.copy(lease) end end
+  end
+  db.groupScheduler = type(db.groupScheduler) == "table" and db.groupScheduler or { replenishConcurrency = 1, staggerSeconds = 0 }
+  db.groupScheduler.replenishConcurrency = math.max(1, math.floor(tonumber(db.groupScheduler.replenishConcurrency) or 1))
+  db.groupScheduler.staggerSeconds = math.max(0, tonumber(db.groupScheduler.staggerSeconds) or 0)
+  dbError = err
+end
+
+local function saveControllerDb()
+  db.schema, db.version, db.updatedAt = common.SCHEMA, common.VERSION, common.nowSeconds()

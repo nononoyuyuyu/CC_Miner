@@ -1,0 +1,230 @@
+  "/ccminer/worker_parts/02.part",
+  "/ccminer/worker_parts/03.part",
+  "/ccminer/worker_parts/04.part",
+  "/ccminer/worker_parts/05.part",
+}
+local source = {}
+for index, path in ipairs(parts) do
+  local handle = fs.open(path, "r")
+  if not handle then error("Missing runtime part: " .. path, 0) end
+  source[index] = handle.readAll()
+  handle.close()
+end
+local loader = loadstring or load
+local program, compileError = loader(table.concat(source), "@/ccminer/worker.assembled.lua")
+if not program then error("Cannot assemble worker: " .. tostring(compileError), 0) end
+return program(...)
+]] },
+  { source = [[src/ccminer/worker_parts/01.part]], target = [[worker_parts/01.part]], digest = [[41ff7fe4346dea1c891c8b0c4b3209f26d286c85ca56442d1e577580883f9d6d]], content = [[-- CC Miner V4 - autonomous quarry worker
+-- Home=(0,0,0), forward=+Z, right=+X, down=-Y.
+
+local common = dofile("/ccminer/lib/common.lua")
+local protocol = dofile("/ccminer/lib/protocol.lua")
+local quarry = dofile("/ccminer/lib/quarry.lua")
+local geo = dofile("/ccminer/lib/geo.lua")
+
+if not turtle then error("worker.lua must run on a turtle", 0) end
+
+local config, configError = common.loadConfig()
+if not config or config.role ~= "worker" then
+  error(configError or "Worker configuration not found. Run: ccm setup worker", 0)
+end
+
+-- Forward declaration: statusPayload is defined before the assignment resume
+-- helpers below, but Lua lexical scope otherwise resolves that call globally.
+local assignmentResumeSnapshot
+
+-- Accept both the V4 nested defaults and older flat V2 settings.  This is
+-- intentionally in-memory so an old config remains readable by V2 tooling.
+config.materials = config.materials or {}
+config.lighting = config.lighting or {}
+config.water = config.water or {}
+config.journal = config.journal or {}
+config.performance = config.performance or {}
+config.gps = config.gps or {}
+config.discard = config.discard or config.materials.discard or {}
+config.dock = config.dock or {}
+config.group = config.group or {}
+if config.lighting.mode == nil then config.lighting.mode = config.lightMode or "off" end
+if config.lighting.interval == nil then config.lighting.interval = config.torchInterval or 32 end
+if config.lighting.preferredSlots == nil then config.lighting.preferredSlots = config.torchSlots end
+if config.lighting.torchBlocks == nil then config.lighting.torchBlocks = config.torchBlocks end
+if type(config.lighting.torchBlocks) == "table" and #config.lighting.torchBlocks > 0 then
+  local allowed = {}
+  for _, name in ipairs(config.lighting.torchBlocks) do allowed[tostring(name)] = true end
+  config.lighting.torchBlocks = allowed
+end
+if config.materials.sealSlots == nil then config.materials.sealSlots = config.sealSlots end
+if config.materials.torchSlots == nil then config.materials.torchSlots = config.torchSlots end
+if config.materials.recycleMinedBlocks == nil then config.materials.recycleMinedBlocks = true end
+if config.materials.retainSealTarget == nil then config.materials.retainSealTarget = config.retainSealTarget or config.sealTarget end
+if tonumber(config.sealTarget) == nil or tonumber(config.sealTarget) < 1 then config.sealTarget = 64 end
+config.sealTarget = math.max(1, math.floor(tonumber(config.sealTarget) or 64))
+-- Disposal is deliberately opt-in.  Legacy V2 configurations used a
+-- recycle flag but had no authority to throw arbitrary items away; map those
+-- settings to the safe KEEP_ALL policy until an explicit mode is present.
+local discardMode = config.discard.mode or config.discard.policy or config.discardPolicy
+discardMode = tostring(discardMode or "KEEP_ALL"):upper()
+if discardMode ~= "KEEP_ALL" and discardMode ~= "DISCARD_EXCESS_STONE" and discardMode ~= "CUSTOM_ALLOWLIST" then
+  discardMode = "KEEP_ALL"
+end
+config.discard.mode = discardMode
+local configuredSealTarget = tonumber(
+  config.discard.retainSealTarget or config.materials.retainSealTarget or config.sealTarget
+)
+if not configuredSealTarget or configuredSealTarget < 1 then configuredSealTarget = 64 end
+config.discard.retainSealTarget = math.floor(configuredSealTarget)
+config.discard.triggerEmptySlots = math.max(0, math.floor(tonumber(
+  config.discard.triggerEmptySlots or config.reserveEmptySlots
+) or 3))
+config.discard.maxStacksPerPass = math.max(1, math.floor(tonumber(config.discard.maxStacksPerPass) or 8))
+if type(config.discard.allowlist) ~= "table" then config.discard.allowlist = {} end
+if type(config.discard.stoneAllowlist) ~= "table" then
+  config.discard.stoneAllowlist = {
+    ["minecraft:stone"] = true,
+    ["minecraft:cobblestone"] = true,
+    ["minecraft:cobbled_deepslate"] = true,
+  }
+end
+-- Keep a canonical alias for callers that still read materials.discard, but
+-- never share the table itself: CC's serializer rejects recursive aliases.
+config.materials.discard = common.copy(config.discard)
+config.materials.retainSealTarget = config.discard.retainSealTarget
+config.gps.verifyEveryMoves = math.max(1, math.floor(tonumber(
+  config.performance.gpsVerifyEveryMoves or config.gps.verifyEveryMoves
+) or 32))
+config.performance.gpsVerifyEveryMoves = config.gps.verifyEveryMoves
+config.performance.lightweightCheckpointEveryMoves = math.max(1, math.floor(tonumber(
+  config.performance.lightweightCheckpointEveryMoves or config.journal.checkpointEvery
+) or 16))
+config.performance.checkpointEveryMoves = math.max(1, math.floor(tonumber(
+  config.performance.checkpointEveryMoves or config.journal.checkpointEvery
+) or 32))
+-- Seal stock is a hard safety invariant.  An absent/invalid legacy target is
+-- migrated to 64 rather than allowing a zero-target refill to run dry.
+if tonumber(config.discard.retainSealTarget) < 1 then config.discard.retainSealTarget = 64 end
+if config.water.mode == nil then config.water.mode = config.waterMode or "ignore" end
+if config.journal.enabled == nil then config.journal.enabled = true end
+
+local rawState, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
+local state = common.merge(common.defaultState(), rawState)
+-- The atomic state file is authoritative.  A malformed state must never be
+-- treated as an empty job (which could cause an unsafe duplicate dig).
+if stateError then
+  state.status = "blocked"
+  state.phase = "state_corrupt"
+  state.lastError = tostring(stateError)
+  common.log("ERROR", stateError)
+end
+
+local function ensureV3State()
+  state.stats = state.stats or {}
+  local counters = {
+    torchesPlaced = 0, torchRefills = 0, torchShortages = 0,
+    waterDetected = 0, waterSealed = 0, waterBlocked = 0,
+    recycled = 0, sealOverflow = 0, compressions = 0,
+    serviceReturns = 0, journalWrites = 0,
+    discardPasses = 0, discardedBlocks = 0, discardSkipped = 0,
+    discardUnknown = 0, routeMoves = 0, routeDistance = 0,
+  }
+  for key, value in pairs(counters) do
+    if state.stats[key] == nil then state.stats[key] = value end
+  end
+  state.lighting = state.lighting or {
+    mode = "off", interval = 32, lastAt = nil, lastPose = nil,
+    placed = 0, shortages = 0,
+  }
+  state.water = state.water or {
+    mode = "ignore", detected = 0, sealed = 0, blocked = 0,
+    last = nil,
+  }
+  state.recycle = state.recycle or {
+    enabled = true, held = 0, cap = 64, overflow = 0,
+    compressed = 0, byName = {},
+  }
+  -- State migrations intentionally copy, rather than alias, legacy tables.
+  -- CC's serializer rejects recursive aliases and a power-loss recovery must
+  -- be able to distinguish discardStats from its report shorthand.
+  local discardDefaults = {
+    enabled = config.discard.mode ~= "KEEP_ALL", mode = config.discard.mode,
+    passes = 0, attempts = 0, stacks = 0, discarded = 0, items = 0,
+    skipped = 0, held = 0, unknown = 0, overflow = 0, byName = {},
+    lastAt = nil, lastError = nil, triggerEmptySlots = config.discard.triggerEmptySlots,
+  }
+  local legacyDiscard = state.discardStats or state.discard
+  state.discardStats = common.merge(discardDefaults, legacyDiscard)
+  state.discard = common.merge(discardDefaults, state.discardStats)
+  state.discard.mode = config.discard.mode
+  state.discard.triggerEmptySlots = config.discard.triggerEmptySlots
+  state.discard.maxStacksPerPass = config.discard.maxStacksPerPass
+  state.routeMetrics = state.routeMetrics or { moves = 0, turns = 0, distance = 0, routeLength = 0, detours = 0, services = 0 }
+  state.timeMetrics = state.timeMetrics or { startedAt = nil, updatedAt = nil, elapsedSeconds = 0, activeSeconds = 0, serviceSeconds = 0, returnSeconds = 0 }
+  state.metrics = state.metrics or { route = common.copy(state.routeMetrics), time = common.copy(state.timeMetrics) }
+  state.returnReason = state.returnReason or nil
+  state.lastReturnReason = state.lastReturnReason or nil
+  state.resumeToken = state.resumeToken or nil
+  state.assignmentResumeToken = state.assignmentResumeToken or nil
+  state.group = state.group or nil
+  state.dock = state.dock or nil
+  state.fluidSealRun = tonumber(state.fluidSealRun) or 0
+  state.fluidSealMarker = state.fluidSealMarker or nil
+  if state.stagedStop == nil then state.stagedStop = false end
+  state.report = state.report or nil
+  state.estimate = state.estimate or { estimated = 0, actual = 0, variance = 0 }
+  state.journal = state.journal or { seq = 0, writes = 0, checkpoints = 0 }
+  state.journal.lightweight = state.journal.lightweight or {
+    enabled = true, seq = 0, writes = 0, checkpoints = 0, lastAt = nil, lastError = nil,
+  }
+end
+ensureV3State()
+
+local function recoverPendingSnapshot()
+  local journalConfig = config.journal or {}
+  if journalConfig.enabled == false or not common.loadTable then return end
+  local path = journalConfig.pendingPath or "/ccminer/data/state.pending"
+  local pending, pendingError = common.loadTable(path, nil)
+  if pendingError or type(pending) ~= "table" then return end
+  local pendingJobId = pending.jobId
+  local currentJobId = state.job and state.job.id or nil
+  if pendingJobId and currentJobId and tostring(pendingJobId) == tostring(currentJobId) then
+    if pending.pose then state.pose = common.copy(pending.pose) end
+    for _, key in ipairs({ "status", "phase", "request", "service", "checkpoint", "resumeToken", "assignmentResumeToken", "stagedStop", "pendingAction" }) do
+      if pending[key] ~= nil then state[key] = common.copy(pending[key]) end
+    end
+    if state.job then
+      if pending.cursor ~= nil then state.job.cursor = tonumber(pending.cursor) or state.job.cursor end
+      if pending.route then state.job.route = common.merge(state.job.route or {}, pending.route) end
+    end
+    state.journal = state.journal or {}
+    state.journal.lightweight = state.journal.lightweight or {}
+    state.journal.lightweight.recovered = true
+    state.journal.recovered = true
+  elseif pending.pendingAction and not currentJobId then
+    -- A pending physical action without a matching full job is ambiguous;
+    -- retain it and force the normal recovery wizard at preflight.
+    state.pendingAction = common.copy(pending.pendingAction)
+    state.status, state.phase = "blocked", "recovery_required"
+    state.lastError = "Pending physical action has no matching full checkpoint."
+  end
+end
+
+recoverPendingSnapshot()
+
+local lastHeartbeat = 0
+local networkReady = false
+local pollNetwork
+
+local function appendJournal(event)
+  -- Journal is deliberately auxiliary: the atomic state remains the source
+  -- of truth.  If a filesystem implementation cannot append, continue with
+  -- the state save and expose the warning through the normal log.
+  local journalConfig = config.journal or {}
+  if journalConfig.enabled == false then return true end
+  local path = journalConfig.path or "/ccminer/data/state.journal"
+  local maxEntries = math.max(1, tonumber(journalConfig.maxEntries) or 256)
+  if not fs or not fs.open then return false end
+  if common.ensureDir then common.ensureDir(fs.getDir(path)) end
+  state.journal = state.journal or {}
+  local entries = tonumber(state.journal.entries) or 0
+  if entries >= maxEntries and fs.exists(path) then
+    local old = path .. ".1"

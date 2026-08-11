@@ -1,0 +1,253 @@
+    elseif newStatus == "waiting_fuel" or newStatus == "waiting_output" or newStatus == "waiting_seal" or newStatus == "waiting_torch" or newStatus == "waiting_water" then
+      alert("material", id, "Worker #" .. tostring(id) .. " needs materials.")
+    else
+      clearAlert(id, "blocked"); clearAlert(id, "material")
+    end
+    invalidate()
+    return true
+  elseif message.kind == "ack" then
+    local payload = message.payload or {}
+    setNotice((payload.ok and "OK: " or "ERROR: ") .. tostring(payload.message or ""), not payload.ok)
+    local ackGroupJobId = payload.groupJobId or payload.parentGroupJobId or payload.group and payload.group.groupJobId
+    if ackGroupJobId and db.groupJobs[tostring(ackGroupJobId)] then
+      local ackJob = db.groupJobs[tostring(ackGroupJobId)]
+      ackJob.acks = ackJob.acks or {}
+      ackJob.acks[tostring(sender)] = { ok = payload.ok == true, message = payload.message, command = payload.command, at = common.nowSeconds() }
+      updateGroupAggregate(ackJob)
+      saveControllerDb()
+    end
+    if type(payload.status) == "table" and payload.status.id then
+      local id = tonumber(payload.status.id)
+      if not id or id ~= tonumber(sender) then return false end
+      local previous = workers[id] and workers[id].data
+      workers[id] = workers[id] or {}
+      workers[id].data = normalizeStatus(payload.status)
+      workers[id].lastSeen = common.nowSeconds()
+      workers[id].sender = sender
+      local groupJob = findGroupJobForWorker(id, workers[id].data)
+      if groupJob then
+        local statusJob = workers[id].data.job or {}
+        if payload.ok and statusJob.assignmentId and groupJob.status == "starting" then acceptGroupStart(groupJob, id, statusJob.assignmentId)
+        elseif payload.ok == false and groupJob.status == "starting" then rejectGroupStart(groupJob, id, payload.message or "start rejected")
+        elseif payload.ok == false and (groupJob.status == "aborting" or groupJob.status == "clear_requested") then
+          if groupJob.awaitingAck then groupJob.awaitingAck[tostring(id)] = nil end
+          if groupJob.pending then groupJob.pending[tostring(id)] = nil end
+        end
+        local pending = groupJob.pendingReassignment
+        local ackMatchesReassignment = not pending
+          or (payload.assignmentId ~= nil and tostring(payload.assignmentId) == tostring(pending.assignmentId))
+        if pending and payload.ok == false and (payload.assignmentId == nil or tostring(payload.assignmentId) == tostring(pending.assignmentId)) then
+          groupJob.pendingReassignment = nil
+          groupJob.alerts = groupJob.alerts or {}
+          groupJob.alerts[#groupJob.alerts + 1] = "REASSIGN_REJECTED:#" .. tostring(id) .. ":" .. tostring(payload.message or "worker rejected")
+        elseif ackMatchesReassignment then
+          finalizePendingReassignment(groupJob, id, workers[id].data)
+        end
+        groupJob.acks = groupJob.acks or {}
+        groupJob.acks[tostring(id)] = { ok = payload.ok == true, message = payload.message, at = common.nowSeconds() }
+        updateGroupAggregate(groupJob)
+        saveControllerDb()
+      end
+      acknowledgeQueuedStart(id, workers[id].data)
+      local st = workers[id].data.status
+      if (st == "complete" or st == "aborted") and previous and previous.status ~= st then
+        addHistory(id, workers[id].data, workers[id].data.completionReason or st)
+        releaseLeasesForWorker(id, activeJobId(previous))
+      end
+    end
+    return true
+  end
+  return false
+end
+
+local function discover()
+  protocol.broadcast(protocol.message("discover", config.networkKey, { controllerName = config.controllerName, v3 = true }))
+  lastDiscovery = common.nowSeconds()
+  setNotice("Discovery broadcast sent.", false)
+end
+
+local function sendCommand(id, command, payload)
+  if not id then setNotice("No worker selected.", true); return false end
+  payload = payload or {}
+  payload.command = command
+  local ok, err = protocol.send(id, protocol.message("command", config.networkKey, payload, id))
+  if ok then setNotice(("Command '%s' sent to #%s."):format(command, tostring(id)), false)
+  else setNotice("Send failed: " .. tostring(err), true) end
+  return ok
+end
+
+local GROUP_WIRE_COMMAND = { start = "start", pause = "pause", resume = "resume", return_home = "recall", recall = "recall", service = "service", abort = "abort", clear = "clear" }
+
+local function groupCommand(groupId, command, payload)
+  local group = groupRecord(groupId)
+  if not group then setNotice("Group not found: " .. tostring(groupId), true); return false, 0 end
+  command = tostring(command or ""):lower()
+  local requestedCommand = command
+  if command == "return" then command = "return_home" end
+  if command == "start" and not (payload and payload.groupJobId) then
+    local current = activeGroupJob(groupId)
+    if current then payload = common.copy(payload or {}); payload.groupJobId = current.groupJobId or current.id end
+  end
+  payload = type(payload) == "table" and common.copy(payload) or {}
+  payload.group = true
+  payload.scope = "group"
+  payload.groupId = tostring(groupId)
+  payload.requestedCommand = requestedCommand
+  payload.groupCommand = string.upper(command == "return_home" and "RETURN" or command)
+  local groupJob = payload.groupJobId and db.groupJobs[tostring(payload.groupJobId)] or activeGroupJob(groupId)
+  if command == "clear" and groupJob and not groupWorkersTerminalAtHome(groupJob, true) then
+    setNotice("Group CLEAR blocked until every worker is terminal and home.", true)
+    return false, 0
+  end
+  if groupJob then
+    payload.groupJobId = tostring(groupJob.groupJobId or groupJob.id)
+    groupJob.acks = groupJob.acks or {}
+    groupJob.lastCommand = payload.groupCommand
+    groupJob.commandSentAt = common.nowSeconds()
+  end
+  local sent, attempted = 0, 0
+  for _, id in ipairs(groupWorkerIds(group)) do
+    attempted = attempted + 1
+    local individual = common.copy(payload)
+    individual.targetWorkerId = tonumber(id) or id
+    individual.workerId = tonumber(id) or id
+    individual.command = GROUP_WIRE_COMMAND[command] or command
+    local assignment = groupJob and groupJob.assignments and (groupJob.assignments[tostring(id)] or groupJob.assignments[id])
+    if assignment and command == "start" then
+      individual.assignmentId = assignment.assignmentId
+      individual.assignment = common.copy(assignment)
+      individual.assignmentChunks = common.copy(assignment.chunkKeys or assignment.chunks or {})
+    end
+    if sendCommand(id, individual.command, individual) then
+      sent = sent + 1
+      if groupJob then groupJob.acks[tostring(id)] = { ok = nil, command = individual.groupCommand, sentAt = common.nowSeconds() } end
+    end
+  end
+  if groupJob then updateGroupAggregate(groupJob); saveControllerDb() end
+  if groupJob and (command == "clear" or command == "abort") then
+    groupJob.status = command == "clear" and "clear_requested" or "aborting"
+    if command == "abort" then
+      -- Assignments that were never sent cannot later race an ABORT.  Keep
+      -- awaiting ACK entries until their worker confirms/returns, since the
+      -- START packet may already be in flight.
+      groupJob.pending = {}
+    end
+    groupJob.returnReason = groupJob.returnReason or (command == "abort" and "group_abort" or "group_clear")
+    maybeFinalizeGroup(groupJob)
+    saveControllerDb()
+  end
+  if sent < attempted then setNotice(("Group %s: %d/%d commands sent."):format(payload.groupCommand, sent, attempted), true) else setNotice(("Group %s sent to %d workers."):format(payload.groupCommand, sent), false) end
+  return sent == attempted and attempted > 0, sent
+end
+
+local function groupCommandBySelected(command)
+  local id = selectedGroupRecord()
+  if not id then setNotice("No group selected.", true); return false end
+  return groupCommand(id, command)
+end
+
+local function progressText(data)
+  if not data or not data.job then return "-" end
+  local p = data.progress or {}
+  return ("%3d%% %s/%s"):format(
+    tonumber(p.percent or data.job.percent) or 0,
+    common.humanNumber(p.cursor or data.job.cursor or 0),
+    common.humanNumber(p.total or data.job.total or 0)
+  )
+end
+
+local function resetHitboxes(key)
+  hitboxes[key] = {}
+end
+
+local function addHitbox(key, x1, y1, x2, y2, action)
+  hitboxes[key] = hitboxes[key] or {}
+  hitboxes[key][#hitboxes[key] + 1] = {
+    x1 = math.floor(x1), y1 = math.floor(y1), x2 = math.floor(x2), y2 = math.floor(y2), action = action,
+  }
+end
+
+local function drawButton(key, x, y, width, label, action, enabled, selectedButton)
+  width = math.max(3, math.floor(width))
+  local background = colors and (selectedButton and colors.lightBlue or enabled == false and colors.gray or colors.blue) or nil
+  local foreground = colors and (enabled == false and colors.lightGray or colors.white) or nil
+  common.writeAt(x, y, common.center(label, width), foreground, background)
+  if enabled ~= false and action then addHitbox(key, x, y, x + width - 1, y, action) end
+end
+
+local function buttonRow(key, y, width, definitions)
+  if width < 1 or y < 1 then return end
+  local count = math.max(1, #definitions)
+  local base = math.max(1, math.floor(width / count))
+  local x = 1
+  for index, definition in ipairs(definitions) do
+    local buttonWidth = index == count and (width - x + 1) or base
+    drawButton(key, x, y, buttonWidth, definition[1], definition[2], definition[3] ~= false, definition[4])
+    x = x + buttonWidth
+  end
+end
+
+local function draftWorker()
+  if not draft then return nil, nil end
+  return draft.workerId, workers[draft.workerId]
+end
+
+local function draftCalibration(workerId)
+  local worker
+  if workerId then worker = workers[workerId] else local _, selectedWorkerValue = draftWorker(); worker = selectedWorkerValue end
+  local gpsData = worker and worker.data and worker.data.gps
+  if gpsData and gpsData.calibrated and type(gpsData.calibration) == "table" then return gpsData.calibration end
+  return nil
+end
+
+local function cellKey(x, z)
+  return tostring(math.floor(x)) .. ":" .. tostring(math.floor(z))
+end
+
+local function parseCellKey(key)
+  local x, z = tostring(key):match("^(-?%d+):(-?%d+)$")
+  return tonumber(x), tonumber(z)
+end
+
+-- V4 selection is chunk-granular.  A short-lived V2 draft could contain the
+-- old cellExcluded map; migrate complete chunks, but keep a fatal marker for a
+-- partial chunk instead of silently dropping the user's selection.
+local function normalizeChunkMask(catalog, rootKey)
+  if not draft then return false end
+  draft.excluded = draft.excluded or {}
+  local legacy = draft.cellExcluded
+  if type(legacy) ~= "table" then return draft.partialMask == true end
+  local partial = draft.partialMask == true
+  for _, chunk in ipairs(catalog or {}) do
+    local total, selectedCells = 0, 0
+    for x = chunk.minX, chunk.maxX do
+      for z = chunk.minZ, chunk.maxZ do
+        total = total + 1
+        if legacy[cellKey(x, z)] then selectedCells = selectedCells + 1 end
+      end
+    end
+    if selectedCells > 0 and selectedCells < total then partial = true end
+    if selectedCells == total and chunk.key ~= rootKey then draft.excluded[chunk.key] = true end
+  end
+  draft.cellExcluded = nil
+  draft.partialMask = partial
+  return partial
+end
+
+local function buildDraftCatalog()
+  if not draft then return nil, "No draft." end
+  local calibration = draftCalibration()
+  local chunkMode = calibration and "world" or "local"
+  local catalog, err = quarry.buildCatalog(draft.width, draft.length, chunkMode, calibration)
+  if not catalog then return nil, err end
+  local rootKey
+  for _, chunk in ipairs(catalog) do
+    if 0 >= chunk.minX and 0 <= chunk.maxX and 1 >= chunk.minZ and 1 <= chunk.maxZ then rootKey = chunk.key end
+  end
+  return catalog, nil, chunkMode, calibration, rootKey
+end
+
+local function excludedChunksForDraft(catalog, chunkMode, rootKey)
+  local out = {}
+  local chunkExcluded = draft and draft.excluded or {}
+  for _, chunk in ipairs(catalog or {}) do

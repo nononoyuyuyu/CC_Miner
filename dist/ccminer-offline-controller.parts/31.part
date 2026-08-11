@@ -1,0 +1,153 @@
+      homeWorld = workerDock and common.copy(workerDock.homeWorld or workerDock.world) or (spec.home and common.copy(spec.home) or nil),
+      maxDepth = tonumber(workerDock and workerDock.maxDepth or spec.maxDepth or config.maxDepth),
+      facing = spec.facing,
+      lease = { groupJobId = groupJobId, assignmentId = assignmentId, workerId = spec.workerId, mode = result.chunkMode, kind = "mine", chunks = common.copy(raw.chunkKeys or {}) },
+      transitLease = { groupJobId = groupJobId, assignmentId = assignmentId, workerId = spec.workerId, mode = result.chunkMode, kind = "transit", chunks = common.copy(raw.transitKeys or {}) },
+    }
+    job.assignments[key], job.pending[key] = assignment, true
+  end
+  local leaseList = {}
+  for _, assignment in ipairs(sortedJobAssignments(job)) do
+    local entries = groupLeaseEntries(job, assignment)
+    for _, lease in ipairs(entries) do
+      local conflict = groupLeaseConflict(job.chunkMode, assignment.workerId, lease.chunks, lease.kind, groupJobId)
+      if conflict then setNotice("Group lease overlap: " .. tostring(conflict.groupJobId or conflict.jobId), true); return false end
+      leaseList[#leaseList + 1] = lease
+    end
+  end
+  for _, lease in ipairs(leaseList) do db.leases[#db.leases + 1] = common.copy(lease); db.groupLeases[#db.groupLeases + 1] = common.copy(lease) end
+  db.groupJobs[groupJobId] = job
+  db.activeLeases = common.copy(db.leases)
+  saveControllerDb()
+  local ok = dispatchGroupJob(job, true)
+  if ok and job.status == "working" then setNotice("Group START sent to all assignments.", false) elseif job.status == "PARTIAL_START" then setNotice("PARTIAL_START: started workers were safely stopped.", true) else setNotice("Group START queued by stagger scheduler.", false) end
+  return ok
+end
+
+local function assignmentResumeTokenFromStatus(data)
+  if type(data) ~= "table" then return nil end
+  local job, report = data.job or {}, data.report or data.lastReport or {}
+  return data.assignmentResumeToken or data.resumeToken
+    or job.assignmentResumeToken or job.resumeToken
+    or report.assignmentResumeToken or report.resumeToken
+end
+
+local function validateSourceResumeToken(job, source, sourceData, stoppedWorkerId)
+  sourceData = sourceData or {}
+  local status = tostring(sourceData.status or sourceData.phase or ""):lower()
+  local terminal = { idle = true, complete = true, completed = true, aborted = true, paused = true }
+  if not terminal[status] or sourceData.atHome ~= true then return nil, "source_assignment_not_terminal_at_home" end
+  local sourceGroupJobId = sourceData.groupJobId or sourceData.group and sourceData.group.groupJobId or sourceData.job and sourceData.job.groupJobId
+  if sourceGroupJobId == nil or tostring(sourceGroupJobId) ~= tostring(job.groupJobId) then return nil, "source_group_job_mismatch" end
+  local progress = sourceData.progress or {}
+  local cursor = tonumber(progress.cursor or sourceData.job and sourceData.job.cursor or 0) or 0
+  local token = assignmentResumeTokenFromStatus(sourceData)
+  if token == nil then
+    if cursor > 0 then return nil, "assignment_resume_token_required" end
+    return nil, nil
+  end
+  if type(token) ~= "table" then return nil, "assignment_resume_token_invalid" end
+  if token.groupJobId == nil or tostring(token.groupJobId) ~= tostring(job.groupJobId) then return nil, "assignment_resume_token_group_mismatch" end
+  if token.assignmentId == nil or tostring(token.assignmentId) ~= tostring(source.assignmentId) then return nil, "assignment_resume_token_assignment_mismatch" end
+  local tokenSource = token.sourceWorkerId or token.workerId
+  if tokenSource == nil or tonumber(tokenSource) ~= tonumber(stoppedWorkerId) then return nil, "assignment_resume_token_source_mismatch" end
+  local worldPose = token.worldPose
+  if type(worldPose) ~= "table" or tonumber(worldPose.x) == nil or tonumber(worldPose.y) == nil or tonumber(worldPose.z) == nil then return nil, "assignment_resume_token_world_pose_required" end
+  return common.copy(token), nil
+end
+
+local function reassignGroupAssignment(groupJobId, stoppedWorkerId, targetWorkerId)
+  local job = db.groupJobs and db.groupJobs[tostring(groupJobId)]
+  if not job then setNotice("Group job not found.", true); return false end
+  local source = job.assignments and (job.assignments[tostring(stoppedWorkerId)] or job.assignments[stoppedWorkerId])
+  if not source then setNotice("Stopped worker assignment not found.", true); return false end
+  if type(source.chunkKeys) ~= "table" or #source.chunkKeys == 0 then setNotice("No residual chunks to reassign.", true); return false end
+  local sourceData = workerData(stoppedWorkerId) or {}
+  local sourceToken, sourceTokenError = validateSourceResumeToken(job, source, sourceData, stoppedWorkerId)
+  if sourceTokenError then setNotice("Reassign source rejected: " .. tostring(sourceTokenError), true); return false end
+  if job.pendingReassignment then setNotice("A reassignment is already awaiting ACK.", true); return false end
+  targetWorkerId = targetWorkerId or nil
+  if not targetWorkerId then
+    for _, candidate in ipairs(groupWorkerIds(groupRecord(job.groupId))) do
+      local candidateData = workerData(candidate) or {}
+      local candidateStatus = statusOf(workers[candidate])
+      if tonumber(candidate) ~= tonumber(stoppedWorkerId) and (candidateStatus == "idle" or candidateStatus == "complete" or candidateStatus == "aborted") and candidateData.atHome == true then targetWorkerId = candidate; break end
+    end
+  end
+  if not targetWorkerId then setNotice("No online target for residual range.", true); return false end
+  local targetData, targetStatus = workerData(targetWorkerId) or {}, statusOf(workers[targetWorkerId])
+  if not ((targetStatus == "idle" or targetStatus == "complete" or targetStatus == "aborted") and targetData.atHome == true) then setNotice("Reassign target must be idle/terminal and at home.", true); return false end
+  if job.chunkMode == "world" and not (targetData.gps and targetData.gps.calibration) then setNotice("Reassign target requires GPS calibration.", true); return false end
+  local group = groupRecord(job.groupId)
+  local bayId, bay = groupWorkerResource(group, targetWorkerId, "bay")
+  local dockId, dock = groupWorkerResource(group, targetWorkerId, "dock")
+  if job.chunkMode == "world" and (not bay or not dock) then setNotice("Reassign target bay/dock metadata unavailable.", true); return false end
+  if bay and bay.world then
+    local pos = targetData.world or targetData.position
+    if not pos or tonumber(pos.x) ~= tonumber(bay.world.x) or tonumber(pos.y) ~= tonumber(bay.world.y) or tonumber(pos.z) ~= tonumber(bay.world.z) then setNotice("Reassign target is not at its bay pose.", true); return false end
+  end
+  local targetKey = tostring(targetWorkerId)
+  local existingTarget = job.assignments[targetKey]
+  local target = existingTarget and common.copy(existingTarget) or { workerId = tonumber(targetWorkerId) or targetWorkerId, groupJobId = job.groupJobId, parentJobId = job.groupJobId, jobId = job.groupJobId .. "/reassign-" .. targetKey, assignmentId = job.groupJobId .. ":reassign:" .. targetKey, chunkKeys = {}, transitKeys = {}, status = "pending_reassign" }
+  target.chunkKeys = common.copy(source.chunkKeys)
+  target.transitKeys = common.copy(source.transitKeys or {})
+  target.bay, target.bayId, target.dock, target.dockId = bayId, bayId, common.copy(dock or {}), dockId
+  target.homeWorld = dock and common.copy(dock.homeWorld or dock.world) or common.copy(target.homeWorld or targetData.world)
+  target.maxDepth = tonumber(dock and dock.maxDepth or target.maxDepth or config.maxDepth)
+  target.facing = targetData.facing or target.facing
+  if job.chunkMode == "world" and targetData.gps and targetData.gps.calibration and targetData.gps.calibration.home then
+    local targetHome = targetData.gps.calibration.home
+    if tonumber(targetHome.x) and tonumber(targetHome.z) then
+      target.bayChunkKey = quarry.chunkKey("world", math.floor(tonumber(targetHome.x) / 16), math.floor(tonumber(targetHome.z) / 16))
+    end
+  end
+  target.homeY = target.homeY or source.homeY
+  target.bottomY = target.bottomY or source.bottomY
+  target.layers = target.layers or source.layers
+  local outboundToken = sourceToken and common.copy(sourceToken) or nil
+  if outboundToken then
+    outboundToken.sourceAssignmentId = source.assignmentId
+    outboundToken.reassignedFromAssignmentId = source.assignmentId
+    outboundToken.assignmentId = target.assignmentId
+    outboundToken.groupJobId = job.groupJobId
+    outboundToken.jobId = target.jobId
+    outboundToken.sourceWorkerId = tonumber(stoppedWorkerId) or stoppedWorkerId
+    outboundToken.workerId = target.workerId
+    target.assignmentResumeToken = common.copy(outboundToken)
+  else
+    target.assignmentResumeToken = nil
+  end
+  local pending = {
+    sourceWorkerId = tonumber(stoppedWorkerId) or stoppedWorkerId, targetWorkerId = tonumber(targetWorkerId) or targetWorkerId, assignmentId = target.assignmentId, sourceAssignmentId = source.assignmentId,
+    jobId = target.jobId, chunkKeys = common.copy(source.chunkKeys), transitKeys = common.copy(source.transitKeys or {}), bay = bayId, bayId = bayId, dock = common.copy(dock or {}), dockId = dockId,
+    homeWorld = common.copy(target.homeWorld), maxDepth = target.maxDepth, facing = target.facing, homeY = target.homeY, bottomY = target.bottomY, layers = target.layers, assignmentResumeToken = common.copy(outboundToken), sentAt = common.nowSeconds(), status = "awaiting_ack",
+  }
+  local payload = {
+    scope = "group", group = true, groupId = job.groupId, groupJobId = job.groupJobId, parentGroupJobId = job.groupJobId, groupCommand = "START", requestedCommand = "start", command = "start", assignmentCatalog = common.copy(job.catalog),
+    assignmentId = target.assignmentId, sourceAssignmentId = source.assignmentId, reassignedFromAssignmentId = source.assignmentId, assignmentResumeToken = common.copy(outboundToken), assignmentChunks = common.copy(pending.chunkKeys), chunkKeys = common.copy(pending.chunkKeys), transitKeys = common.copy(pending.transitKeys), seedKey = target.seedKey,
+    homeY = target.homeY, bottomY = target.bottomY, targetY = target.bottomY, layers = target.layers, width = job.width, length = job.length, depth = target.layers or job.depth, chunkMode = job.chunkMode,
+    name = job.name, profile = job.profile, waterMode = job.waterMode, lighting = common.copy(job.lighting or {}), workerId = target.workerId, targetWorkerId = target.workerId,
+    bay = target.bay, bayId = target.bayId, dock = common.copy(target.dock or {}), dockId = target.dockId, homeWorld = common.copy(target.homeWorld), maxDepth = target.maxDepth, facing = target.facing,
+    lease = { groupJobId = job.groupJobId, assignmentId = target.assignmentId, workerId = target.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(pending.chunkKeys) }, assignment = common.copy(target),
+    leases = { transit = { groupJobId = job.groupJobId, assignmentId = target.assignmentId, workerId = target.workerId, mode = job.chunkMode, kind = "transit", chunks = common.copy(pending.transitKeys) }, mine = { groupJobId = job.groupJobId, assignmentId = target.assignmentId, workerId = target.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(pending.chunkKeys) } },
+  }
+  job.pendingReassignment = pending
+  saveControllerDb()
+  local ok = sendCommand(target.workerId, "start", payload)
+  if ok then
+    pending.sentAt = common.nowSeconds()
+    pending.status = "awaiting_ack"
+    saveControllerDb()
+    setNotice("Residual reassignment sent; awaiting worker ACK.", false)
+  else
+    job.pendingReassignment = nil
+    saveControllerDb()
+    setNotice("Residual reassignment send failed; original lease retained.", true)
+  end
+  return ok
+end
+
+local function groupSchedulerTick()
+  local now = common.nowSeconds()
+  if now == groupSchedulerLast then return end
+  groupSchedulerLast = now

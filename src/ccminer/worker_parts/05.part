@@ -13,6 +13,21 @@
   print(("Water: %s, detected=%d sealed=%d"):format(
     waterMode(), state.stats.waterDetected or 0, state.stats.waterSealed or 0
   ))
+  local throughput = throughputSnapshot()
+  local returnInfo = returnSnapshot()
+  print(("Throughput: %.2f/s  Return: %s d=%d t=%ds"):format(
+    throughput.perSecond or 0, tostring(returnInfo.reason or "-"),
+    tonumber(returnInfo.distance) or 0, tonumber(returnInfo.seconds) or 0
+  ))
+  local discard = state.discardStats or state.discard or {}
+  print(("Discard: %s stacks=%d items=%d"):format(
+    tostring((config.discard and config.discard.mode) or discard.mode or "KEEP_ALL"),
+    tonumber(discard.stacks) or 0, tonumber(discard.items or discard.discarded) or 0
+  ))
+  if state.group and (state.group.groupJobId or state.group.assignmentId or state.group.bay) then
+    print(("Group: %s bay=%s"):format(
+      tostring(state.group.groupJobId or state.group.groupId or "-"), tostring(state.group.bay or state.group.bayId or "-")))
+  end
   if state.job then
     print(("Job: %s %dx%dx%d [%s]"):format(
       tostring(state.job.name), state.job.width, state.job.length, state.job.depth, state.job.strategy or "serpentine"
@@ -40,6 +55,14 @@ end
 
 local function resolveNonMovementPending(pending)
   local kind = tostring(pending.kind or "")
+  if common.startsWith(kind, "discard_") or common.startsWith(kind, "refill_")
+    or common.startsWith(kind, "refuel_") or kind == "unload_home" then
+    -- A drop/suck transfer can change inventory while the pose stays fixed;
+    -- GPS cannot distinguish "before" from "after".  Stop for explicit
+    -- inventory/world revalidation instead of silently retrying or counting
+    -- a stack twice after power loss.
+    return false, "Pending inventory transfer requires manual revalidation before continuing."
+  end
   if common.startsWith(kind, "dig_") then
     local present, data = inspectPendingSide(kind)
     if present then

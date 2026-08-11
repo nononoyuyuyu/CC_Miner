@@ -1,0 +1,224 @@
+  for index, chunk in ipairs(chunks or {}) do out[((index - 1) % count) + 1][#out[((index - 1) % count) + 1] + 1] = chunk end
+  return out
+end
+
+-- Group planning ---------------------------------------------------------
+-- The quarry module may expose the richer partitionGroup API in newer
+-- runtimes.  Controllers assembled with an older quarry.lua still work for
+-- world plans through partitionChunks; local plans intentionally never get an
+-- automatic split because their coordinates are dock-relative.
+local function groupWorkerSpecs(group)
+  local specs = {}
+  for _, id in ipairs(groupWorkerIds(group)) do
+    local data = workerData(id) or {}
+    local calibration = data.gps and data.gps.calibration or data.calibration
+    local home = calibration and calibration.home or data.home
+    local world = data.world or data.position
+    local bayId, bay = groupWorkerResource(group, id, "bay")
+    local dockId, dock = groupWorkerResource(group, id, "dock")
+    local bayPoint = bay and (bay.world or bay.position or bay) or nil
+    local bayChunkKey = bayPoint and tonumber(bayPoint.x) and tonumber(bayPoint.z)
+      and quarry.chunkKey("world", math.floor(tonumber(bayPoint.x) / 16), math.floor(tonumber(bayPoint.z) / 16)) or nil
+    specs[#specs + 1] = {
+      workerId = tonumber(id) or id,
+      id = tonumber(id) or id,
+      version = data.version or data.workerVersion,
+      home = common.copy(home),
+      calibration = common.copy(calibration),
+      world = common.copy(world),
+      facing = data.facing or data.pose and data.pose.dir,
+      homeY = tonumber(home and home.y or data.homeY),
+      maxDepth = tonumber(data.maxDepth or data.capabilities and data.capabilities.maxDepth),
+      capability = common.copy(data.capabilities or {}),
+      bayId = bayId, bay = common.copy(bayPoint), bayChunkKey = bayChunkKey, bayMeta = common.copy(bay), dockId = dockId, dock = common.copy(dock),
+    }
+  end
+  return specs
+end
+
+local function normalizeGroupAssignments(raw, workerSpecs)
+  local source = type(raw) == "table" and (raw.byWorker or raw.assignments or raw) or nil
+  if type(source) ~= "table" then return nil, "invalid_group_assignments" end
+  local out, count = {}, 0
+  for index, spec in ipairs(workerSpecs or {}) do
+    local id, key = spec.workerId, tostring(spec.workerId)
+    -- Never pair assignments by array index: quarry is allowed to sort worker
+    -- IDs.  Match the explicit workerId (or byWorker map key) only.
+    local value = source[key] or source[id]
+    if type(value) ~= "table" then
+      for candidateKey, candidate in pairs(source) do
+        if type(candidate) == "table" and tostring(candidate.workerId or candidate.id) == key then value = candidate; break end
+        if tostring(candidateKey) == key and type(candidate) == "table" then value = candidate; break end
+      end
+    end
+    if type(value) ~= "table" then return nil, "group_assignment_missing_worker_" .. key end
+    local chunks = value.chunkKeys or value.chunks or value.assignmentChunks or {}
+    if type(chunks) ~= "table" then return nil, "group_assignment_invalid_chunks_" .. key end
+    local assignment = {
+      workerId = tonumber(value.workerId or id) or value.workerId or id,
+      chunkKeys = common.copy(chunks),
+      transitKeys = common.copy(value.transitKeys or value.transit or {}),
+      seedKey = value.seedKey,
+      estimatedCost = tonumber(value.estimatedCost or value.cost or value.cells) or 0,
+      homeY = tonumber(value.homeY or spec.homeY),
+      bottomY = tonumber(value.bottomY),
+      layers = tonumber(value.layers),
+    }
+    if #assignment.chunkKeys == 0 then return nil, "group_assignment_empty_" .. key end
+    out[key] = assignment
+    count = count + 1
+  end
+  return out, count
+end
+
+local function partitionGroupCatalog(catalog, group, options, workerSpecs)
+  local specs = workerSpecs or groupWorkerSpecs(group)
+  if #specs == 0 then return nil, "group_workers_required" end
+  options = type(options) == "table" and options or {}
+  options.strategy = options.strategy or (group and group.partition) or "stripe"
+  options.stripeFirst = options.stripeFirst ~= false
+  options.connected = true
+  options.balanced = true
+  options.requireConnected = true
+  if type(quarry.partitionGroup) == "function" then
+    local ok, raw, err = pcall(quarry.partitionGroup, catalog, specs, options)
+    if ok and raw then
+      local normalized, count = normalizeGroupAssignments(raw, specs)
+      local unassigned = raw and raw.unassigned
+      local hasUnassigned = type(unassigned) == "table" and ((#unassigned > 0) or next(unassigned) ~= nil)
+      if normalized and count == #specs and not hasUnassigned then return normalized, nil, raw end
+      if not err then err = count end
+    end
+  end
+  local mode = options.chunkMode == "world" and "world" or "local"
+  if mode ~= "world" and #specs > 1 then return nil, "local_group_partition_disabled" end
+  if #specs > 1 then return nil, "partitionGroup_required_for_multi_worker" end
+  if type(quarry.partitionChunks) ~= "function" then return nil, "group_partition_api_unavailable" end
+  local ids = {}
+  for _, spec in ipairs(specs) do ids[#ids + 1] = spec.workerId end
+  local ok, legacy = pcall(quarry.partitionChunks, catalog, ids)
+  if not ok or not legacy then return nil, tostring(legacy or "group_partition_api_unavailable") end
+  local normalized = {}
+  for _, spec in ipairs(specs) do
+    local value = legacy[spec.workerId] or legacy[tostring(spec.workerId)]
+    if type(value) ~= "table" then return nil, "legacy_partition_missing_worker_" .. tostring(spec.workerId) end
+    normalized[tostring(spec.workerId)] = {
+      workerId = spec.workerId,
+      chunkKeys = common.copy(value.chunkKeys or value.chunks or {}),
+      transitKeys = common.copy(value.transitKeys or {}),
+      seedKey = value.seedKey,
+      estimatedCost = tonumber(value.estimatedCost or value.cost or value.cells) or 0,
+      homeY = spec.homeY,
+    }
+  end
+  return normalized, nil, legacy
+end
+
+local function groupDraftDefaults(group)
+  local previous = db.lastDraft or {}
+  local workerIds = groupWorkerIds(group)
+  local firstData = workerIds[1] and workerData(workerIds[1]) or nil
+  local calibration = firstData and firstData.gps and firstData.gps.calibration
+  local homeY = calibration and calibration.home and tonumber(calibration.home.y) or tonumber(firstData and firstData.homeY)
+  local depth = tonumber(previous.depth) or 16
+  local bottomY = tonumber(previous.bottomY or previous.targetY)
+  if not bottomY and homeY then bottomY = homeY - depth + 1 end
+  return {
+    groupId = group and group.id,
+    width = tonumber(previous.width) or 8,
+    length = tonumber(previous.length) or 32,
+    depth = depth,
+    bottomY = bottomY,
+    targetY = bottomY,
+    mode = group and group.mode or "world",
+    partition = group and group.partition or (config.group and config.group.partitionMode) or "stripe",
+    lighting = normalizedLighting and normalizedLighting(previous.lighting) or common.copy(previous.lighting or { mode = "safe", interval = 10 }),
+    waterMode = normalizedWaterMode and normalizedWaterMode(previous.waterMode) or tostring(previous.waterMode or "seal"),
+    profile = normalizedProfile and normalizedProfile(previous.profile) or tostring(previous.profile or "balanced"),
+    name = previous.name or (group and group.name and ("Group " .. tostring(group.name)) or "Group Quarry"),
+  }
+end
+
+local function groupCatalogAndShape(group, value)
+  local mode = value.mode == "world" and "world" or "local"
+  local specs = groupWorkerSpecs(group)
+  local calibration
+  for _, spec in ipairs(specs) do
+    if spec.calibration then calibration = spec.calibration; break end
+  end
+  local catalog, err
+  if type(value.catalog) == "table" and #value.catalog > 0 then
+    catalog = common.copy(value.catalog)
+  else
+    catalog, err = quarry.buildCatalog(value.width, value.length, mode, calibration)
+  end
+  if not catalog then return nil, err end
+  local rootKey
+  for _, chunk in ipairs(catalog) do
+    if 0 >= chunk.minX and 0 <= chunk.maxX and 1 >= chunk.minZ and 1 <= chunk.maxZ then rootKey = chunk.key; break end
+  end
+  return catalog, nil, mode, rootKey, specs
+end
+
+local function groupCatalogDescriptor(catalog, mode, rootKey, specs)
+  local reference
+  for _, spec in ipairs(specs or {}) do if spec.calibration then reference = spec.calibration; break end end
+  local descriptor = { mode = mode, rootKey = rootKey, chunks = {}, origin = reference and common.copy(reference.home) or nil, calibrationSeed = reference and { home = common.copy(reference.home), forward = common.copy(reference.forward) } or nil }
+  for _, chunk in ipairs(catalog or {}) do
+    descriptor.chunks[#descriptor.chunks + 1] = {
+      key = tostring(chunk.key), mode = mode, cx = tonumber(chunk.cx), cz = tonumber(chunk.cz), cells = tonumber(chunk.cells),
+      minX = tonumber(chunk.minX), maxX = tonumber(chunk.maxX), minZ = tonumber(chunk.minZ), maxZ = tonumber(chunk.maxZ),
+    }
+  end
+  return descriptor
+end
+
+local function groupLeaseConflict(mode, workerId, keys, kind, groupJobId)
+  local function overlaps(lease)
+    if tostring(lease.groupJobId or "") == tostring(groupJobId or "") then return false end
+    local leaseMode = lease.mode == "world" and "world" or "local"
+    if leaseMode ~= mode then return false end
+    if mode == "local" and tonumber(lease.workerId) ~= tonumber(workerId) then return false end
+    local set = {}; for _, key in ipairs(lease.chunks or lease.keys or {}) do set[tostring(key)] = true end
+    for _, key in ipairs(keys or {}) do if set[tostring(key)] then return true end end
+    return false
+  end
+  for _, lease in ipairs(db.groupLeases or {}) do if overlaps(lease) then return lease end end
+  for _, lease in ipairs(db.leases or {}) do if overlaps(lease) then return lease end end
+  return nil
+end
+
+local function computeGroupPreflight(groupId, value)
+  local group = groupRecord(groupId)
+  if not group then return nil, "group_not_found" end
+  value = type(value) == "table" and value or groupDraftDefaults(group)
+  local catalog, catalogError, chunkMode, rootKey, specs = groupCatalogAndShape(group, value)
+  if not catalog then return nil, catalogError end
+  local checks, fatal = {}, false
+  local function check(name, state, detail, hard)
+    checks[#checks + 1] = { name = name, state = state, detail = detail, fatal = hard == true }
+    if hard and state == "bad" then fatal = true end
+  end
+  local ids = groupWorkerIds(group)
+  if #ids == 0 then check("workers", "bad", "group has no workers", true) end
+  local maxWorkers = tonumber(config.group and config.group.maxWorkers)
+  if maxWorkers and #ids > maxWorkers then check("worker limit", "bad", tostring(#ids) .. " > " .. tostring(maxWorkers), true) end
+  local defaultBayId = group.bayId and tostring(group.bayId) or nil
+  local defaultDockId = group.dockId and tostring(group.dockId) or nil
+  local bay = defaultBayId and db.bays[defaultBayId] or nil
+  local dock = defaultDockId and db.docks[defaultDockId] or nil
+  local worldMode = chunkMode == "world"
+  local partitionStrategy = tostring(value.partition or group.partition or (config.group and config.group.partitionMode) or "stripe"):lower()
+  if partitionStrategy ~= "stripe" and partitionStrategy ~= "round_robin" then
+    check("partition mode", "bad", partitionStrategy .. " is unsupported", true)
+    partitionStrategy = "stripe"
+  end
+  if worldMode and not rootKey then check("root chunk", "bad", "common catalog has no root chunk", true) end
+  if worldMode and #ids > 1 and type(quarry.partitionGroup) ~= "function" and type(quarry.partitionChunks) ~= "function" then
+    check("partition API", "bad", "quarry.partitionGroup unavailable", true)
+  end
+  if #ids > 1 and type(quarry.shortestServiceRoute) ~= "function" then
+    check("service route API", "bad", "quarry.shortestServiceRoute unavailable", true)
+  else
+    check("service route API", "ok", "worker route planner ready", false)
+  end

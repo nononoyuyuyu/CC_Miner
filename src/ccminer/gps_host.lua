@@ -1,4 +1,4 @@
--- CC Miner V3 - managed GPS host launcher.
+-- CC Miner V4 - managed GPS host launcher.
 
 local common = dofile("/ccminer/lib/common.lua")
 local config, err = common.loadConfig()
@@ -9,7 +9,7 @@ local opened = common.openWirelessModems()
 if #opened == 0 then error("No wireless modem found. Attach a wireless modem to this GPS host.", 0) end
 
 common.clear(colors and colors.black or nil, colors and colors.white or nil)
-print("CC Miner V3 GPS Host " .. common.VERSION)
+print("CC Miner V4 GPS Host " .. common.VERSION)
 print("Name: " .. tostring(config.gpsName))
 print(("Coordinates: %d, %d, %d"):format(config.x, config.y, config.z))
 print("Modem: " .. table.concat(opened, ", "))

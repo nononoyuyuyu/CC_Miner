@@ -1,0 +1,274 @@
+  if not ok then markBlocked("Cannot face quarry at home: " .. tostring(err)); return false end
+  if movementInterrupted("service") then return false end
+  local dockGPS, dockGPSError = verifyGPS(true)
+  if not dockGPS then markBlocked("GPS verification at dock failed: " .. tostring(dockGPSError)); return false end
+
+  ok, err = unloadAtHome()
+  if not ok then
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_output", "waiting_output", err
+    saveState(); heartbeat(true); return false
+  end
+  if movementInterrupted("service") then return false end
+
+  ok, err = refuelAtHome()
+  if not ok then
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_fuel", "waiting_fuel", err
+    saveState(); heartbeat(true); return false
+  end
+  if movementInterrupted("service") then return false end
+
+  ok, err = refillSealAtHome()
+  if not ok then
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_seal", "waiting_seal", err
+    saveState(); heartbeat(true); return false
+  end
+  if movementInterrupted("service") then return false end
+
+  ok, err = refillTorchAtHome()
+  if not ok then
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_torch", "waiting_torch", err
+    saveState("waiting_torch"); heartbeat(true); return false
+  end
+  if movementInterrupted("service") then return false end
+
+  if state.service.resumeAfter and (state.resumeToken or state.checkpoint) then
+    local token = state.resumeToken or state.checkpoint
+    local checkpoint = poseCopy(token)
+    checkpoint.dir = tonumber(token.dir) or checkpoint.dir
+    state.phase, state.status, state.lastError = "going_back", "working", nil
+    saveState("service_resume_start", true)
+    local preResumeGPS, preResumeError = verifyGPS(true)
+    if not preResumeGPS then markBlocked("GPS verification before resume failed: " .. tostring(preResumeError)); return false end
+    if state.job and state.job.strategy == "chunk_plan" then
+      ok, err = navigateChunkPlanWork(checkpoint, "service")
+    else
+      ok, err = navigateTo(checkpoint, "work", "service")
+    end
+    if not ok then
+      if err == "control_request" then return false end
+      markBlocked("Return to work point failed: " .. tostring(err))
+      return false
+    end
+    ok, err = turnTo(checkpoint.dir)
+    if not ok then markBlocked("Cannot restore work direction: " .. tostring(err)); return false end
+    if movementInterrupted("service") then return false end
+    local arrivedGPS, arrivedGPSError = verifyGPS(true)
+    if not arrivedGPS then markBlocked("GPS verification after resume failed: " .. tostring(arrivedGPSError)); return false end
+    if state.job and state.job.route then
+      for _, key in ipairs({ "layer", "walkIndex", "localCursor", "phase", "currentKey" }) do
+        if token[key] ~= nil then state.job.route[key] = token[key] end
+      end
+    end
+    state.checkpoint = nil
+    state.resumeToken = nil
+  end
+  state.service.returnEndedAt = common.nowSeconds()
+  state.service.returnSeconds = math.max(0, state.service.returnEndedAt - (state.service.returnStartedAt or state.service.returnEndedAt))
+  state.serviceReturn.endedAt = state.service.returnEndedAt
+  state.serviceReturn.seconds = state.service.returnSeconds
+  state.serviceReturn.distance = state.service.returnDistance or 0
+  state.timeMetrics = state.timeMetrics or {}
+  state.timeMetrics.returnSeconds = (state.timeMetrics.returnSeconds or 0) + state.service.returnSeconds
+  finishService()
+  return true
+end
+
+local function requiredDirectionTo(target)
+  local dx, dy, dz = target.x - state.pose.x, target.y - state.pose.y, target.z - state.pose.z
+  local manhattan = math.abs(dx) + math.abs(dy) + math.abs(dz)
+  if manhattan ~= 1 then return nil, "path_desync:" .. tostring(manhattan) end
+  if dy == 1 then return "up", nil, dy end
+  if dy == -1 then return "down", nil, dy end
+  if dx == 1 then return "forward", 1, 0 end
+  if dx == -1 then return "forward", 3, 0 end
+  if dz == 1 then return "forward", 0, 0 end
+  if dz == -1 then return "forward", 2, 0 end
+  return nil, "invalid_delta"
+end
+
+local function shouldService()
+  local _, empty = inventoryStats()
+  local materials, recycle = materialsConfig()
+  local reserveEmpty = profileReserveEmptySlots()
+  if empty <= reserveEmpty then return true, "inventory" end
+  local level = fuelLevel()
+  if level ~= "unlimited" then
+    local returnDistance, returnError = estimatedReturnDistance(state.pose)
+    if not returnDistance then
+      return true, "fuel_route:" .. tostring(returnError)
+    end
+    local nextCost = math.max(1, tonumber(config.nextSectionCost or config.serviceNextSectionCost) or 16)
+    if state.job then
+      local remaining = math.max(0, (state.job.total or 0) - (state.job.cursor or 0))
+      nextCost = math.min(nextCost + math.floor(remaining > 0 and math.sqrt(remaining) or 0), math.max(nextCost, remaining))
+    end
+    local needed = returnDistance + nextCost + profileFuelBuffer()
+    if tonumber(level or 0) <= needed then return true, "fuel" end
+  end
+  if (config.lavaMode or "seal") == "seal" and sealMaterialCount() <= (tonumber(config.sealReserve) or 8) then
+    return true, "seal"
+  end
+  local lightingMode = effectiveLighting()
+  if lightingMode ~= "off" and torchMaterialCount() <= (tonumber((config.lighting or {}).reserve) or tonumber((config.lighting or {}).torchReserve) or tonumber(config.torchReserve) or 4) then
+    return true, "torch"
+  end
+  local _, lightInterval = effectiveLighting()
+  if lightingMode ~= "off" and lightInterval > 0 then
+    local moves = tonumber(state.stats.moves) or 0
+    if moves > 0 and moves % lightInterval == 0 and torchMaterialCount() <= 0 then return true, "torch" end
+  end
+  -- compactEvery is intentionally handled by compressInventoryAtField()
+  -- from runMiningStep.  Returning home solely to merge stacks wastes fuel
+  -- and violates the local-compression contract.
+  return false
+end
+
+local function handlePendingRequest()
+  if state.request == "recall" or state.request == "return_home" then beginService(false, "paused", "recall", true); return true end
+  if state.request == "service" then beginService(false, "paused", "manual_service", true); return true end
+  if state.request == "abort" then beginService(false, "aborted", "abort", false); return true end
+  if state.request == "pause_now" then
+    state.request = nil
+    if state.stagedStop and type(state.stagedStop) == "table" then
+      state.stagedStop.reachedAt = common.nowSeconds()
+      state.stagedStop.boundary = "physical_safe"
+    end
+    state.status, state.phase = "paused", "paused"
+    saveState("pause_now_reached")
+    return true
+  end
+  return false
+end
+
+local function beginAutomaticService(reason)
+  beginService(true, "working", "automatic_" .. tostring(reason), false)
+  continueService()
+end
+
+local function handleMoveFailure(prefix, err, allowBedrock)
+  if err == "control_request" then return true end
+  if err == "seal_material" then beginAutomaticService("seal"); return true end
+  if err == "torch_material" then beginAutomaticService("torch"); return true end
+  if err == "torch_surface_unavailable" then
+    markBlocked(prefix .. ": no safe torch wall/floor surface was available.")
+    return true
+  end
+  if err == "inventory_full" then beginAutomaticService("inventory"); return true end
+  if err == "water_seal_limit" then
+    state.status, state.phase, state.lastError = "blocked", "water_seal_limit", prefix .. ": continuous water sealing limit reached."
+    state.stats.waterBlocked = (state.stats.waterBlocked or 0) + 1
+    saveState("water_seal_limit")
+    return true
+  end
+  if err == "lava_seal_limit" then
+    markBlocked(prefix .. ": continuous lava sealing limit reached.")
+    return true
+  end
+  if common.startsWith(err or "", "water:") then
+    state.status, state.phase, state.lastError = "blocked", "water_detected", prefix .. ": water detected (mode=" .. waterMode() .. ")."
+    saveState("water_stop")
+    return true
+  end
+  if err == "out_of_fuel" then
+    markBlocked(prefix .. ": fuel was exhausted before the safety return threshold.")
+    return true
+  end
+  if allowBedrock and common.startsWith(err or "", "protected:minecraft:bedrock") then
+    state.completionReason = "bedrock_reached"
+    beginService(false, "complete", "bedrock", false)
+    continueService()
+    return true
+  end
+  return false
+end
+
+local function completeJob(reason)
+  state.completionReason = reason or "completed"
+  beginService(false, "complete", "job_complete", false)
+  continueService()
+end
+
+local function stagedStopAtBoundary(job, boundary)
+  local staged = state.stagedStop
+  if not staged then return false end
+  local mode = tostring(staged.mode or "")
+  local safe = false
+  if mode == "pause_now" or mode == "return_home" or mode == "abort" then
+    safe = true
+  elseif mode == "finish_row" then
+    safe = boundary == "row"
+  elseif mode == "finish_layer" then
+    safe = boundary == "layer"
+  end
+  if not safe then return false end
+  state.stagedStop.reachedAt = common.nowSeconds()
+  state.stagedStop.boundary = boundary
+  local finalStatus = mode == "abort" and "aborted" or "paused"
+  beginService(false, finalStatus, "staged_" .. mode, true)
+  return true
+end
+
+local function rowBoundary(job)
+  if not job then return false end
+  local width = math.max(1, tonumber(job.length) or 1)
+  local cursor = tonumber(job.cursor) or 0
+  return cursor > 0 and cursor % width == 0
+end
+
+local function layerBoundary(job)
+  if not job then return false end
+  local rowVolume = math.max(1, (tonumber(job.width) or 1) * (tonumber(job.length) or 1))
+  local cursor = tonumber(job.cursor) or 0
+  return cursor > 0 and cursor % rowVolume == 0
+end
+
+local function runSerpentineStep(job)
+  job.cursor = tonumber(job.cursor) or 0
+  job.total = tonumber(job.total) or (job.width * job.length * job.depth)
+  if job.cursor >= job.total then completeJob(state.completionReason or "completed"); return end
+
+  local target = quarry.cellForJob(job, job.cursor)
+  if samePosePosition(state.pose, target) then
+    -- GPS recovery may prove that an interrupted move completed before the
+    -- cursor update was persisted. Treat the occupied cell as completed.
+    job.cursor = job.cursor + 1
+    if layerBoundary(job) then
+      local layerGPS, layerGPSError = verifyGPS(true)
+      if not layerGPS then markBlocked("GPS verification at recovered layer boundary failed: " .. tostring(layerGPSError)); return end
+    end
+    saveState()
+    if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or (rowBoundary(job) and "row" or nil)) then return end
+    return
+  end
+
+  local direction, targetDir, verticalDelta = requiredDirectionTo(target)
+  if not direction then
+    markBlocked("Quarry path/state mismatch at cell " .. tostring(job.cursor) .. ": " .. tostring(targetDir))
+    return
+  end
+  if targetDir ~= nil then
+    local ok, err = turnTo(targetDir)
+    if not ok then markBlocked("Turn failed: " .. tostring(err)); return end
+  end
+  local ok, err = moveOne(direction, "mining")
+  if not ok then
+    if handleMoveFailure("Mining stopped at cell " .. tostring(job.cursor), err, verticalDelta == -1) then return end
+    markBlocked("Mining stopped at cell " .. tostring(job.cursor) .. ": " .. tostring(err))
+    return
+  end
+  job.cursor = job.cursor + 1
+  if layerBoundary(job) then
+    local layerGPS, layerGPSError = verifyGPS(true)
+    if not layerGPS then markBlocked("GPS verification at layer boundary failed: " .. tostring(layerGPSError)); return end
+  end
+  saveState()
+  if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or (rowBoundary(job) and "row" or nil)) then return end
+  heartbeat(false)
+end
+
+local function runChunkPlanStep(job)
+  local plan, route = job.chunkPlan, job.route

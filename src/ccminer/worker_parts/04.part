@@ -9,14 +9,18 @@
     turtle.select(slot)
     local need = math.min(target - sealMaterialCount(), turtle.getItemSpace(slot))
     if need <= 0 then need = 1 end
-    local sucked = suckFunction(need)
+    local sucked = runInventoryPhysicalAction("refill_seal_suck", {
+      slot = slot, count = need, direction = side,
+    }, function() return suckFunction(need) end)
     if not sucked then
       restoreSideDirection(side, restoreDir)
       turtle.select(originalSlot)
       return false, "Lava-seal block inventory is empty."
     end
     if not isSealItemName(itemName(slot)) then
-      dropFunction()
+      runInventoryPhysicalAction("refill_seal_reject", {
+        slot = slot, item = itemName(slot), direction = side,
+      }, dropFunction)
       restoreSideDirection(side, restoreDir)
       turtle.select(originalSlot)
       return false, "Seal inventory contains an unsupported item. Use configured solid blocks only."
@@ -87,14 +91,18 @@ local function refillTorchAtHome()
     turtle.select(slot)
     local need = math.min(target - torchMaterialCount(), turtle.getItemSpace(slot))
     if need <= 0 then need = 1 end
-    local sucked = suckFunction(need)
+    local sucked = runInventoryPhysicalAction("refill_torch_suck", {
+      slot = slot, count = need, direction = side,
+    }, function() return suckFunction(need) end)
     if not sucked then
       restoreSideDirection(side, restoreDir)
       turtle.select(originalSlot)
       return false, "Torch inventory is empty."
     end
     if not isTorchItemName(itemName(slot)) then
-      dropFunction()
+      runInventoryPhysicalAction("refill_torch_reject", {
+        slot = slot, item = itemName(slot), direction = side,
+      }, dropFunction)
       restoreSideDirection(side, restoreDir)
       turtle.select(originalSlot)
       return false, "Torch inventory contains an unsupported item."
@@ -110,13 +118,17 @@ end
 
 local function beginService(resumeAfter, finalStatus, reason, preserveCheckpoint)
   if not state.service then
-    if not isHome() and not state.checkpoint then state.checkpoint = poseCopy() end
+    if not isHome() and not state.checkpoint then installCheckpointToken(checkpointToken()) end
+    state.serviceReturn = {}
     state.service = {
       resumeAfter = resumeAfter == true,
       finalStatus = finalStatus or (resumeAfter and "working" or "paused"),
       preserveCheckpoint = preserveCheckpoint == true,
       reason = reason or "service",
       startedAt = common.nowSeconds(),
+      returnDistance = 0,
+      returnStartedAt = nil,
+      returnEndedAt = nil,
     }
   else
     if resumeAfter == false then state.service.resumeAfter = false end
@@ -124,6 +136,13 @@ local function beginService(resumeAfter, finalStatus, reason, preserveCheckpoint
     if preserveCheckpoint ~= nil then state.service.preserveCheckpoint = preserveCheckpoint == true end
     if reason then state.service.reason = reason end
   end
+  if state.checkpoint and not state.resumeToken then state.resumeToken = common.copy(state.checkpoint) end
+  if state.job and state.job.groupJobId then
+    state.assignmentResumeToken = assignmentResumeSnapshot(state.resumeToken or state.checkpoint or checkpointToken())
+  end
+  if resumeAfter and not isHome() and not state.checkpoint then installCheckpointToken(checkpointToken()) end
+  state.returnReason = reason or state.returnReason
+  state.lastReturnReason = reason or state.lastReturnReason
   state.status, state.phase, state.request = "working", "service_requested", nil
   saveState()
 end
@@ -132,12 +151,18 @@ local function finishService()
   local service = state.service or {}
   local finalStatus = service.finalStatus or (service.resumeAfter and "working" or "paused")
   local preserveCheckpoint = service.preserveCheckpoint == true
+  state.lastReturnReason = service.reason or state.returnReason or state.lastReturnReason
   state.service, state.request, state.lastError = nil, nil, nil
   state.stagedStop = false
   state.stats.services = (state.stats.services or 0) + 1
   if finalStatus == "complete" then
     state.stats.jobsCompleted = (state.stats.jobsCompleted or 0) + 1
     state.checkpoint = nil
+    -- Completion is terminal: do not leave a stale work-point token that
+    -- could be overlaid by a later pending snapshot or mistaken for a
+    -- resumable assignment.
+    state.resumeToken = nil
+    state.assignmentResumeToken = nil
     state.status, state.phase = "complete", "home"
     state.estimate = state.estimate or {}
     state.estimate.actual = state.job and state.job.cursor or 0
@@ -145,7 +170,11 @@ local function finishService()
     state.report = {
       jobId = state.job and state.job.id or nil,
       assignmentId = state.job and state.job.assignmentId or nil,
+      groupJobId = state.job and state.job.groupJobId or nil,
+      group = state.group and common.copy(state.group) or nil,
       reason = state.completionReason,
+      returnReason = state.lastReturnReason or state.returnReason,
+      ["return"] = state.serviceReturn and common.copy(state.serviceReturn) or nil,
       completedAt = common.nowSeconds(),
       elapsed = state.job and math.max(0, common.nowSeconds() - (state.job.startedAt or common.nowSeconds())) or 0,
       progress = state.job and { cursor = state.job.cursor or 0, total = state.job.total or 0 } or nil,
@@ -155,6 +184,9 @@ local function finishService()
       materials = {
         torchCount = torchMaterialCount(), sealCount = sealMaterialCount(),
       },
+      discard = common.copy(state.discardStats or state.discard or {}),
+      throughput = throughputSnapshot(),
+      assignmentResumeToken = nil,
     }
     state.stats.jobReports = (state.stats.jobReports or 0) + 1
     state.job.report = common.copy(state.report)
@@ -170,7 +202,11 @@ local function finishService()
     state.report = {
       jobId = state.job and state.job.id or nil,
       assignmentId = state.job and state.job.assignmentId or nil,
+      groupJobId = state.job and state.job.groupJobId or nil,
+      group = state.group and common.copy(state.group) or nil,
       reason = state.completionReason or service.reason or "aborted",
+      returnReason = state.lastReturnReason or state.returnReason,
+      ["return"] = state.serviceReturn and common.copy(state.serviceReturn) or nil,
       aborted = true,
       completedAt = common.nowSeconds(),
       elapsed = state.job and math.max(0, common.nowSeconds() - (state.job.startedAt or common.nowSeconds())) or 0,
@@ -179,6 +215,10 @@ local function finishService()
       estimated = state.estimate and state.estimate.estimated or nil,
       actual = state.job and state.job.cursor or nil,
       materials = { torchCount = torchMaterialCount(), sealCount = sealMaterialCount() },
+      discard = common.copy(state.discardStats or state.discard or {}),
+      throughput = throughputSnapshot(),
+      assignmentResumeToken = state.assignmentResumeToken and common.copy(state.assignmentResumeToken)
+        or assignmentResumeSnapshot(state.resumeToken or state.checkpoint),
     }
     state.stats.jobReports = (state.stats.jobReports or 0) + 1
     if state.job then state.job.report = common.copy(state.report) end
@@ -191,16 +231,25 @@ local function finishService()
     state.checkpoint = nil
     state.status, state.phase = "working", "mining"
   end
-  saveState()
+  saveState("service_finished", true)
   heartbeat(true)
 end
 
 local function continueService()
   if not state.service then return true end
   state.status = "working"
+  state.service.returnStartedAt = state.service.returnStartedAt or common.nowSeconds()
+  state.service.returnDistance = state.service.returnDistance or 0
+  state.serviceReturn = state.serviceReturn or {}
+  state.serviceReturn.startedAt = state.serviceReturn.startedAt or common.nowSeconds()
+  state.returnReason = state.service.reason or state.returnReason or "service"
   if not isHome() then
     state.phase = "returning"
-    saveState()
+    local returnDistance = estimatedReturnDistance(state.pose)
+    if returnDistance then state.service.returnDistance = returnDistance end
+    saveState("service_return_start", true)
+    local preReturnGPS, preReturnError = verifyGPS(true)
+    if not preReturnGPS then markBlocked("GPS verification before return failed: " .. tostring(preReturnError)); return false end
     local ok, err
     if state.job and state.job.strategy == "chunk_plan" then
       ok, err = navigateChunkPlanHome("service")
@@ -217,6 +266,8 @@ local function continueService()
   local ok, err = turnTo(0)
   if not ok then markBlocked("Cannot face quarry at home: " .. tostring(err)); return false end
   if movementInterrupted("service") then return false end
+  local dockGPS, dockGPSError = verifyGPS(true)
+  if not dockGPS then markBlocked("GPS verification at dock failed: " .. tostring(dockGPSError)); return false end
 
   ok, err = unloadAtHome()
   if not ok then
@@ -250,10 +301,14 @@ local function continueService()
   end
   if movementInterrupted("service") then return false end
 
-  if state.service.resumeAfter and state.checkpoint then
-    local checkpoint = poseCopy(state.checkpoint)
+  if state.service.resumeAfter and (state.resumeToken or state.checkpoint) then
+    local token = state.resumeToken or state.checkpoint
+    local checkpoint = poseCopy(token)
+    checkpoint.dir = tonumber(token.dir) or checkpoint.dir
     state.phase, state.status, state.lastError = "going_back", "working", nil
-    saveState()
+    saveState("service_resume_start", true)
+    local preResumeGPS, preResumeError = verifyGPS(true)
+    if not preResumeGPS then markBlocked("GPS verification before resume failed: " .. tostring(preResumeError)); return false end
     if state.job and state.job.strategy == "chunk_plan" then
       ok, err = navigateChunkPlanWork(checkpoint, "service")
     else
@@ -267,8 +322,23 @@ local function continueService()
     ok, err = turnTo(checkpoint.dir)
     if not ok then markBlocked("Cannot restore work direction: " .. tostring(err)); return false end
     if movementInterrupted("service") then return false end
+    local arrivedGPS, arrivedGPSError = verifyGPS(true)
+    if not arrivedGPS then markBlocked("GPS verification after resume failed: " .. tostring(arrivedGPSError)); return false end
+    if state.job and state.job.route then
+      for _, key in ipairs({ "layer", "walkIndex", "localCursor", "phase", "currentKey" }) do
+        if token[key] ~= nil then state.job.route[key] = token[key] end
+      end
+    end
     state.checkpoint = nil
+    state.resumeToken = nil
   end
+  state.service.returnEndedAt = common.nowSeconds()
+  state.service.returnSeconds = math.max(0, state.service.returnEndedAt - (state.service.returnStartedAt or state.service.returnEndedAt))
+  state.serviceReturn.endedAt = state.service.returnEndedAt
+  state.serviceReturn.seconds = state.service.returnSeconds
+  state.serviceReturn.distance = state.service.returnDistance or 0
+  state.timeMetrics = state.timeMetrics or {}
+  state.timeMetrics.returnSeconds = (state.timeMetrics.returnSeconds or 0) + state.service.returnSeconds
   finishService()
   return true
 end
@@ -317,11 +387,9 @@ local function shouldService()
     local moves = tonumber(state.stats.moves) or 0
     if moves > 0 and moves % lightInterval == 0 and torchMaterialCount() <= 0 then return true, "torch" end
   end
-  local compactEvery = profileCompactEvery()
-  if compactEvery and compactEvery > 0 and (tonumber(state.stats.moves) or 0) > 0
-    and (tonumber(state.stats.moves) or 0) % math.floor(compactEvery) == 0 then
-    return true, "compress"
-  end
+  -- compactEvery is intentionally handled by compressInventoryAtField()
+  -- from runMiningStep.  Returning home solely to merge stacks wastes fuel
+  -- and violates the local-compression contract.
   return false
 end
 
@@ -434,6 +502,10 @@ local function runSerpentineStep(job)
     -- GPS recovery may prove that an interrupted move completed before the
     -- cursor update was persisted. Treat the occupied cell as completed.
     job.cursor = job.cursor + 1
+    if layerBoundary(job) then
+      local layerGPS, layerGPSError = verifyGPS(true)
+      if not layerGPS then markBlocked("GPS verification at recovered layer boundary failed: " .. tostring(layerGPSError)); return end
+    end
     saveState()
     if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or (rowBoundary(job) and "row" or nil)) then return end
     return
@@ -455,6 +527,10 @@ local function runSerpentineStep(job)
     return
   end
   job.cursor = job.cursor + 1
+  if layerBoundary(job) then
+    local layerGPS, layerGPSError = verifyGPS(true)
+    if not layerGPS then markBlocked("GPS verification at layer boundary failed: " .. tostring(layerGPSError)); return end
+  end
   saveState()
   if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or (rowBoundary(job) and "row" or nil)) then return end
   heartbeat(false)
@@ -467,6 +543,11 @@ local function runChunkPlanStep(job)
   route.walkIndex = tonumber(route.walkIndex) or 1
   route.localCursor = tonumber(route.localCursor) or 0
   route.phase = route.phase or "travel"
+  route.breadcrumbs = route.breadcrumbs or {}
+  if route.currentKey and route.breadcrumbs[#route.breadcrumbs] ~= route.currentKey then
+    route.breadcrumbs[#route.breadcrumbs + 1] = route.currentKey
+    while #route.breadcrumbs > 128 do table.remove(route.breadcrumbs, 1) end
+  end
 
   if route.walkIndex > #plan.walk then
     if route.layer + 1 >= job.depth then completeJob("completed"); return end
@@ -479,6 +560,8 @@ local function runChunkPlanStep(job)
     route.layer = route.layer + 1
     route.walkIndex, route.localCursor, route.phase = 1, 0, "travel"
     route.currentKey = plan.rootKey
+    local layerGPS, layerGPSError = verifyGPS(true)
+    if not layerGPS then markBlocked("GPS verification after layer change failed: " .. tostring(layerGPSError)); return end
     saveState()
     return
   end
@@ -491,7 +574,12 @@ local function runChunkPlanStep(job)
 
   if route.phase == "travel" then
     local ok, err
-    if samePosePosition(state.pose, anchor) then
+    if not quarry.findChunk(plan, state.pose.x, state.pose.z) then
+      -- The physical dock (0,0) is outside the quarry footprint.  The first
+      -- trip must bridge home -> dock and then follow the assigned
+      -- dock/transit BFS route, never a direct home -> seed shortcut.
+      ok, err = navigateChunkPlanWork(anchor, "mining")
+    elseif samePosePosition(state.pose, anchor) then
       ok = true
     elseif route.currentKey and route.currentKey ~= walkStep.key then
       ok, err = moveBetweenChunkAnchors(plan, route.currentKey, walkStep.key, y, "mining")
@@ -503,6 +591,10 @@ local function runChunkPlanStep(job)
       markBlocked("Chunk transit failed: " .. tostring(err)); return
     end
     route.currentKey = walkStep.key
+    if route.breadcrumbs[#route.breadcrumbs] ~= walkStep.key then
+      route.breadcrumbs[#route.breadcrumbs + 1] = walkStep.key
+      while #route.breadcrumbs > 128 do table.remove(route.breadcrumbs, 1) end
+    end
     if walkStep.first then
       route.phase, route.localCursor = "mine", 0
     else
@@ -513,6 +605,13 @@ local function runChunkPlanStep(job)
   end
 
   if route.phase == "mine" then
+    if job.transitSet and job.transitSet[chunk.key] and not (job.assignmentSet and job.assignmentSet[chunk.key]) then
+      -- Transit-only chunks exist to keep the assigned region connected.  We
+      -- walk through them for service safety but never count or mine cells.
+      route.phase, route.localCursor = "return", 0
+      saveState("transit_chunk")
+      return
+    end
     local count = quarry.chunkCellCount(chunk)
     if route.localCursor >= count then
       route.phase = "return"
@@ -523,6 +622,10 @@ local function runChunkPlanStep(job)
     if samePosePosition(state.pose, target) then
       route.localCursor = route.localCursor + 1
       job.cursor = (job.cursor or 0) + 1
+      if layerBoundary(job) then
+        local layerGPS, layerGPSError = verifyGPS(true)
+        if not layerGPS then markBlocked("GPS verification at recovered chunk layer boundary failed: " .. tostring(layerGPSError)); return end
+      end
       saveState()
       if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or ((route.localCursor >= count) and "row" or nil)) then return end
       return
@@ -543,6 +646,10 @@ local function runChunkPlanStep(job)
     end
     route.localCursor = route.localCursor + 1
     job.cursor = (job.cursor or 0) + 1
+    if layerBoundary(job) then
+      local layerGPS, layerGPSError = verifyGPS(true)
+      if not layerGPS then markBlocked("GPS verification at chunk layer boundary failed: " .. tostring(layerGPSError)); return end
+    end
     saveState()
     if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or ((route.localCursor >= count) and "row" or nil)) then return end
     return
@@ -575,6 +682,20 @@ local function runMiningStep()
     return
   end
 
+  local compactEvery = profileCompactEvery()
+  local moves = tonumber(state.stats.moves) or 0
+  if compactEvery > 0 and moves > 0 and moves % math.floor(compactEvery) == 0
+    and tonumber(state.stats.lastCompressionMove or -1) ~= moves then
+    compressInventoryAtField()
+    state.stats.lastCompressionMove = moves
+    saveState("field_compress")
+  end
+
+  local discardOK, discardError = discardAtField()
+  if not discardOK and discardError then
+    state.lastError = tostring(discardError)
+  end
+
   local serviceNeeded, reason = shouldService()
   if serviceNeeded then beginAutomaticService(reason); return end
   state.phase, state.status, state.lastError = "mining", "working", nil
@@ -583,7 +704,7 @@ end
 
 local function displayLocalStatus()
   common.clear(colors and colors.black or nil, colors and colors.white or nil)
-  print("CC Miner V3 Worker " .. common.VERSION)
+  print("CC Miner V4 Worker " .. common.VERSION)
   print("ID: " .. os.getComputerID() .. "  " .. tostring(config.workerName))
   print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
   print(("Pose: x=%d y=%d z=%d d=%d"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir))

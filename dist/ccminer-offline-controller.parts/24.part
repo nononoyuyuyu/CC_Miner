@@ -1,0 +1,208 @@
+    workerIds = common.copy(ids),
+    dockId = options.dockId or previous.dockId,
+    bayId = options.bayId or previous.bayId,
+    -- Per-worker overrides are maps keyed by worker ID.  A shared dock/bay
+    -- remains a convenient default for legacy group registrations.
+    workerBays = common.copy(options.workerBays or previous.workerBays or {}),
+    workerDocks = common.copy(options.workerDocks or previous.workerDocks or {}),
+    mode = mode,
+    partition = partition,
+    staggerSeconds = math.max(0, tonumber(options.staggerSeconds or previous.staggerSeconds) or tonumber(db.groupScheduler.staggerSeconds) or 0),
+    replenishConcurrency = math.max(1, math.floor(tonumber(options.replenishConcurrency or previous.replenishConcurrency) or tonumber(db.groupScheduler.replenishConcurrency) or 1)),
+    updatedAt = common.nowSeconds(),
+  }
+  db.groups[groupId] = persistentGroupValue(group)
+  saveControllerDb()
+  return true, db.groups[groupId]
+end
+
+local function selectedGroupRecord()
+  local ids = orderedGroupIds()
+  local id = ids[selectedGroup]
+  return id, id and groupRecord(id) or nil
+end
+
+local function activeGroupJob(groupId)
+  local latest
+  for id, job in pairs(db.groupJobs or {}) do
+    if type(job) == "table" and tostring(job.groupId or id) == tostring(groupId) then
+      if not latest or tonumber(job.updatedAt or job.startedAt or 0) > tonumber(latest.updatedAt or latest.startedAt or 0) then latest = job end
+    end
+  end
+  return latest
+end
+
+local function groupWorkersTerminalAtHome(groupJob, requireAll)
+  if type(groupJob) ~= "table" then return true end
+  local group = groupRecord(groupJob.groupId)
+  local partialStart = groupJob.status == "PARTIAL_START" and requireAll ~= true
+  for _, id in ipairs(groupWorkerIds(group)) do
+    local key = tostring(id)
+    -- A PARTIAL_START must wait only for workers that actually accepted the
+    -- assignment.  Unstarted/offline targets have no physical lease or
+    -- return route and must not hold finalization forever.
+    if not (partialStart and not (groupJob.started and groupJob.started[key])) then
+      local worker = workers[id]
+      local data = worker and worker.data or {}
+      if statusOf(worker) == "offline" then return false end
+      if groupJob.awaitingAck and groupJob.awaitingAck[key] then return false end
+      local status = tostring(data.status or data.phase or "unknown")
+      if status ~= "complete" and status ~= "completed" and status ~= "aborted" and status ~= "idle" then return false end
+      if data.atHome ~= true then return false end
+    end
+  end
+  return true
+end
+
+local function maybeFinalizeGroup(groupJob)
+  if type(groupJob) ~= "table" then return false end
+  if (groupJob.status == "aborting" or groupJob.status == "clear_requested" or groupJob.status == "PARTIAL_START") and groupWorkersTerminalAtHome(groupJob) then
+    local clear = groupJob.status == "clear_requested"
+    groupJob.status = clear and "cleared" or "aborted"
+    groupJob.finishedAt = common.nowSeconds()
+    releaseGroupLeases(groupJob)
+    if not groupJob.historyRecorded then
+      db.history[#db.history + 1] = { id = tostring(groupJob.groupJobId), kind = "group", groupJobId = groupJob.groupJobId, groupId = groupJob.groupId, worker = groupName(groupRecord(groupJob.groupId), groupJob.groupId), name = groupJob.name, status = groupJob.status, reason = groupJob.returnReason or groupJob.status, startedAt = groupJob.startedAt, finishedAt = groupJob.finishedAt, metrics = common.copy(groupJob.metrics or groupJob.report or {}) }
+      groupJob.historyRecorded = true
+    end
+    return true
+  end
+  return false
+end
+
+finalizePendingReassignment = function(groupJob, workerId, data)
+  local pending = groupJob and groupJob.pendingReassignment
+  if type(pending) ~= "table" or tonumber(pending.targetWorkerId) ~= tonumber(workerId) then return false end
+  local job = data and data.job or {}
+  -- A status response can arrive late (or be the target's pre-dispatch idle
+  -- snapshot).  Never treat that as acceptance of a pending reassignment:
+  -- the echoed assignment and parent group identity are mandatory, and the
+  -- worker must report an actually accepted/running job state.
+  local assignmentId = data and (data.assignmentId or job.assignmentId) or nil
+  if assignmentId == nil or tostring(assignmentId) ~= tostring(pending.assignmentId) then return false end
+  local reportedGroupJobId = data and (data.groupJobId or (data.group and data.group.groupJobId)) or nil
+  reportedGroupJobId = reportedGroupJobId or (job and (job.groupJobId or job.parentGroupJobId))
+  if reportedGroupJobId == nil or tostring(reportedGroupJobId) ~= tostring(groupJob.groupJobId) then return false end
+  local status = tostring((data and (data.status or data.phase)) or ""):lower()
+  local acceptedStates = {
+    accepted = true, starting = true, working = true, mining = true, transit = true,
+    servicing = true, service = true, service_requested = true, waiting_fuel = true,
+    waiting_output = true, waiting_seal = true, waiting_torch = true, waiting_water = true,
+  }
+  if not acceptedStates[status] then return false end
+  local source = groupJob.assignments and (groupJob.assignments[tostring(pending.sourceWorkerId)] or groupJob.assignments[pending.sourceWorkerId])
+  if not source then return false end
+  local targetKey = tostring(pending.targetWorkerId)
+  local target = groupJob.assignments[targetKey] or {
+    workerId = pending.targetWorkerId, groupJobId = groupJob.groupJobId, parentJobId = groupJob.groupJobId,
+    jobId = groupJob.groupJobId .. "/reassign-" .. targetKey, assignmentId = pending.assignmentId, chunkKeys = {}, transitKeys = {},
+  }
+  target.chunkKeys = common.copy(pending.chunkKeys or {})
+  target.transitKeys = common.copy(pending.transitKeys or {})
+  target.assignmentResumeToken = pending.assignmentResumeToken and common.copy(pending.assignmentResumeToken) or nil
+  target.status, target.reassignedFrom, target.reassignedAt = "reassigned", pending.sourceWorkerId, common.nowSeconds()
+  target.bay, target.bayId, target.dock, target.dockId = pending.bay, pending.bayId, common.copy(pending.dock or {}), pending.dockId
+  target.homeWorld, target.maxDepth, target.facing = common.copy(pending.homeWorld), pending.maxDepth, pending.facing
+  groupJob.assignments[targetKey] = target
+  source.chunkKeys, source.status = {}, "reassigned"
+  groupJob.pendingReassignment = nil
+  groupJob.alerts = groupJob.alerts or {}
+  groupJob.alerts[#groupJob.alerts + 1] = "REASSIGNED:#" .. tostring(pending.sourceWorkerId) .. "->#" .. targetKey
+  for _, collection in ipairs({ db.leases or {}, db.groupLeases or {} }) do
+    for _, lease in ipairs(collection) do
+      if tostring(lease.groupJobId or "") == tostring(groupJob.groupJobId) and tostring(lease.assignmentId or "") == tostring(source.assignmentId) then
+        lease.workerId = pending.targetWorkerId
+        lease.assignmentId = pending.assignmentId
+        lease.jobId = target.jobId
+        lease.chunks = common.copy(lease.kind == "transit" and pending.transitKeys or pending.chunkKeys or {})
+      end
+    end
+  end
+  updateGroupAggregate(groupJob)
+  saveControllerDb()
+  return true
+end
+
+acceptGroupStart = function(groupJob, workerId, assignmentId)
+  if type(groupJob) ~= "table" then return false end
+  local key = tostring(workerId)
+  local assignment = groupJob.assignments and (groupJob.assignments[key] or groupJob.assignments[workerId])
+  if not assignment then return false end
+  if assignmentId and tostring(assignment.assignmentId or "") ~= tostring(assignmentId) then return false end
+  assignment.status, assignment.acceptedAt = "started", common.nowSeconds()
+  groupJob.started = groupJob.started or {}; groupJob.started[key] = true
+  groupJob.awaitingAck = groupJob.awaitingAck or {}; groupJob.awaitingAck[key] = nil
+  groupJob.pending = groupJob.pending or {}; groupJob.pending[key] = nil
+  groupJob.acks = groupJob.acks or {}; groupJob.acks[key] = { ok = true, command = "START", at = common.nowSeconds() }
+  local remaining = false
+  for _, candidate in ipairs(sortedJobAssignments(groupJob)) do
+    local candidateKey = tostring(candidate.workerId)
+    if not groupJob.started[candidateKey] and not groupJob.failed[candidateKey] then remaining = true; break end
+  end
+  if not remaining and not groupJob.pendingReassignment then groupJob.status = "working"; groupJob.startedAt = groupJob.startedAt or common.nowSeconds() end
+  groupJob.updatedAt = common.nowSeconds()
+  updateGroupAggregate(groupJob)
+  saveControllerDb()
+  return true
+end
+
+rejectGroupStart = function(groupJob, workerId, reason)
+  if type(groupJob) ~= "table" then return false end
+  local key = tostring(workerId)
+  local assignment = groupJob.assignments and (groupJob.assignments[key] or groupJob.assignments[workerId])
+  if assignment then assignment.status, assignment.error = "failed", reason or "start_rejected" end
+  groupJob.failed = groupJob.failed or {}; groupJob.failed[key] = true
+  groupJob.awaitingAck = groupJob.awaitingAck or {}; groupJob.awaitingAck[key] = nil
+  groupJob.pending = groupJob.pending or {}; groupJob.pending[key] = nil
+  groupJob.status = "PARTIAL_START"
+  for startedKey in pairs(groupJob.started or {}) do groupSafeStop(groupJob, startedKey, "start_rejected") end
+  releaseGroupLeases(groupJob, true)
+  groupJob.alerts = groupJob.alerts or {}
+  groupJob.alerts[#groupJob.alerts + 1] = "PARTIAL_START"
+  groupJob.alerts[#groupJob.alerts + 1] = "worker #" .. key .. ": " .. tostring(reason or "start rejected")
+  updateGroupAggregate(groupJob)
+  saveControllerDb()
+  return false
+end
+
+local function groupJobIdForWorker(id, data)
+  local job = data and data.job or {}
+  local candidate = data and (data.groupJobId or data.group and data.group.groupJobId) or nil
+  candidate = candidate or job.groupJobId or job.parentGroupJobId or job.groupId
+  if candidate then return tostring(candidate) end
+  for key, groupJob in pairs(db.groupJobs or {}) do
+    if type(groupJob) == "table" then
+      for _, assignment in pairs(groupJob.assignments or {}) do
+        if type(assignment) == "table" and tonumber(assignment.workerId) == tonumber(id) and (not job.id or tostring(assignment.jobId or "") == tostring(job.id or "") or tostring(assignment.assignmentId or "") == tostring(job.assignmentId or "")) then
+          return tostring(groupJob.groupJobId or groupJob.id or key)
+        end
+      end
+    end
+  end
+  return nil
+end
+
+local function groupStatusLabel(status)
+  status = tostring(status or "unknown")
+  if status == "completed" then return "complete" end
+  if status == "waiting" or status == "service_requested" then return "service" end
+  return status
+end
+
+local function updateGroupAggregate(groupJob)
+  if type(groupJob) ~= "table" then return nil end
+  local group = groupRecord(groupJob.groupId)
+  local ids = groupWorkerIds(group)
+  local aggregate = { total = #ids, online = 0, active = 0, complete = 0, blocked = 0, waiting = 0, percent = 0, minFuel = nil, warnings = {}, acks = 0, ackTotal = #ids }
+  local weightedDone, weightedTotal = 0, 0
+  local seenWarning = {}
+  for _, id in ipairs(ids) do
+    local worker = workers[id]
+    local data = worker and worker.data or nil
+    local status = statusOf(worker)
+    if status ~= "offline" then aggregate.online = aggregate.online + 1 else aggregate.warnings[#aggregate.warnings + 1] = "offline:#" .. tostring(id) end
+    if status == "complete" or status == "completed" then aggregate.complete = aggregate.complete + 1 end
+    if status == "blocked" then aggregate.blocked = aggregate.blocked + 1 end
+    if status == "waiting_fuel" or status == "waiting_output" or status == "waiting_seal" or status == "waiting_torch" or status == "waiting_water" or status == "service" then aggregate.waiting = aggregate.waiting + 1 end
+    if status == "working" or status == "mining" or status == "starting" then aggregate.active = aggregate.active + 1 end
+    local fuel = data and tonumber(data.fuel or data.materials and data.materials.fuel)

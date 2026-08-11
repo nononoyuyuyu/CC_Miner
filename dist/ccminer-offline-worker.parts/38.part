@@ -1,0 +1,263 @@
+  if not plan or not route then markBlocked("Chunk plan state is missing."); return end
+  route.layer = tonumber(route.layer) or 0
+  route.walkIndex = tonumber(route.walkIndex) or 1
+  route.localCursor = tonumber(route.localCursor) or 0
+  route.phase = route.phase or "travel"
+  route.breadcrumbs = route.breadcrumbs or {}
+  if route.currentKey and route.breadcrumbs[#route.breadcrumbs] ~= route.currentKey then
+    route.breadcrumbs[#route.breadcrumbs + 1] = route.currentKey
+    while #route.breadcrumbs > 128 do table.remove(route.breadcrumbs, 1) end
+  end
+
+  if route.walkIndex > #plan.walk then
+    if route.layer + 1 >= job.depth then completeJob("completed"); return end
+    local ok, err = moveOne("down", "mining")
+    if not ok then
+      if handleMoveFailure("Cannot descend to the next layer", err, true) then return end
+      markBlocked("Cannot descend to the next layer: " .. tostring(err))
+      return
+    end
+    route.layer = route.layer + 1
+    route.walkIndex, route.localCursor, route.phase = 1, 0, "travel"
+    route.currentKey = plan.rootKey
+    local layerGPS, layerGPSError = verifyGPS(true)
+    if not layerGPS then markBlocked("GPS verification after layer change failed: " .. tostring(layerGPSError)); return end
+    saveState()
+    return
+  end
+
+  local walkStep = plan.walk[route.walkIndex]
+  local chunk = plan.chunks[walkStep.key]
+  if not chunk then markBlocked("Chunk plan references an unknown chunk: " .. tostring(walkStep.key)); return end
+  local y = -route.layer
+  local anchor = { x = chunk.anchor.x, y = y, z = chunk.anchor.z }
+
+  if route.phase == "travel" then
+    local ok, err
+    if not quarry.findChunk(plan, state.pose.x, state.pose.z) then
+      -- The physical dock (0,0) is outside the quarry footprint.  The first
+      -- trip must bridge home -> dock and then follow the assigned
+      -- dock/transit BFS route, never a direct home -> seed shortcut.
+      ok, err = navigateChunkPlanWork(anchor, "mining")
+    elseif samePosePosition(state.pose, anchor) then
+      ok = true
+    elseif route.currentKey and route.currentKey ~= walkStep.key then
+      ok, err = moveBetweenChunkAnchors(plan, route.currentKey, walkStep.key, y, "mining")
+    else
+      ok, err = navigateTo(anchor, "inside", "mining")
+    end
+    if not ok then
+      if handleMoveFailure("Chunk transit failed", err, false) then return end
+      markBlocked("Chunk transit failed: " .. tostring(err)); return
+    end
+    route.currentKey = walkStep.key
+    if route.breadcrumbs[#route.breadcrumbs] ~= walkStep.key then
+      route.breadcrumbs[#route.breadcrumbs + 1] = walkStep.key
+      while #route.breadcrumbs > 128 do table.remove(route.breadcrumbs, 1) end
+    end
+    if walkStep.first then
+      route.phase, route.localCursor = "mine", 0
+    else
+      route.walkIndex = route.walkIndex + 1
+    end
+    saveState()
+    return
+  end
+
+  if route.phase == "mine" then
+    if job.transitSet and job.transitSet[chunk.key] and not (job.assignmentSet and job.assignmentSet[chunk.key]) then
+      -- Transit-only chunks exist to keep the assigned region connected.  We
+      -- walk through them for service safety but never count or mine cells.
+      route.phase, route.localCursor = "return", 0
+      saveState("transit_chunk")
+      return
+    end
+    local count = quarry.chunkCellCount(chunk)
+    if route.localCursor >= count then
+      route.phase = "return"
+      saveState()
+      return
+    end
+    local target = quarry.chunkCell(chunk, route.localCursor, y)
+    if samePosePosition(state.pose, target) then
+      route.localCursor = route.localCursor + 1
+      job.cursor = (job.cursor or 0) + 1
+      if layerBoundary(job) then
+        local layerGPS, layerGPSError = verifyGPS(true)
+        if not layerGPS then markBlocked("GPS verification at recovered chunk layer boundary failed: " .. tostring(layerGPSError)); return end
+      end
+      saveState()
+      if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or ((route.localCursor >= count) and "row" or nil)) then return end
+      return
+    end
+    local direction, targetDir = requiredDirectionTo(target)
+    if not direction then
+      markBlocked(("Chunk cell path mismatch in %s at local cell %d."):format(chunk.key, route.localCursor))
+      return
+    end
+    if targetDir ~= nil then
+      local turned, turnError = turnTo(targetDir)
+      if not turned then markBlocked("Chunk turn failed: " .. tostring(turnError)); return end
+    end
+    local moved, moveError = moveOne(direction, "mining")
+    if not moved then
+      if handleMoveFailure("Chunk mining failed", moveError, false) then return end
+      markBlocked("Chunk mining failed: " .. tostring(moveError)); return
+    end
+    route.localCursor = route.localCursor + 1
+    job.cursor = (job.cursor or 0) + 1
+    if layerBoundary(job) then
+      local layerGPS, layerGPSError = verifyGPS(true)
+      if not layerGPS then markBlocked("GPS verification at chunk layer boundary failed: " .. tostring(layerGPSError)); return end
+    end
+    saveState()
+    if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or ((route.localCursor >= count) and "row" or nil)) then return end
+    return
+  end
+
+  if route.phase == "return" then
+    local ok, err = navigateTo(anchor, "inside", "mining")
+    if not ok then
+      if handleMoveFailure("Cannot return to chunk anchor", err, false) then return end
+      markBlocked("Cannot return to chunk anchor: " .. tostring(err)); return
+    end
+    route.phase, route.localCursor = "travel", 0
+    job.completedChunks = (job.completedChunks or 0) + 1
+    route.walkIndex = route.walkIndex + 1
+    route.currentKey = walkStep.key
+    saveState()
+    return
+  end
+
+  markBlocked("Unknown chunk route phase: " .. tostring(route.phase))
+end
+
+local function runMiningStep()
+  if handlePendingRequest() then return end
+  if state.service then continueService(); return end
+  if not state.job then
+    state.status = "idle"
+    state.phase = isHome() and "home" or "unknown_position"
+    saveState()
+    return
+  end
+
+  local compactEvery = profileCompactEvery()
+  local moves = tonumber(state.stats.moves) or 0
+  if compactEvery > 0 and moves > 0 and moves % math.floor(compactEvery) == 0
+    and tonumber(state.stats.lastCompressionMove or -1) ~= moves then
+    compressInventoryAtField()
+    state.stats.lastCompressionMove = moves
+    saveState("field_compress")
+  end
+
+  local discardOK, discardError = discardAtField()
+  if not discardOK and discardError then
+    state.lastError = tostring(discardError)
+  end
+
+  local serviceNeeded, reason = shouldService()
+  if serviceNeeded then beginAutomaticService(reason); return end
+  state.phase, state.status, state.lastError = "mining", "working", nil
+  if state.job.strategy == "chunk_plan" then runChunkPlanStep(state.job) else runSerpentineStep(state.job) end
+end
+
+local function displayLocalStatus()
+  common.clear(colors and colors.black or nil, colors and colors.white or nil)
+  print("CC Miner V4 Worker " .. common.VERSION)
+  print("ID: " .. os.getComputerID() .. "  " .. tostring(config.workerName))
+  print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
+  print(("Pose: x=%d y=%d z=%d d=%d"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir))
+  if state.gps and state.gps.lastFix then
+    print(("GPS: %d,%d,%d%s"):format(
+      state.gps.lastFix.x, state.gps.lastFix.y, state.gps.lastFix.z,
+      gpsCalibration() and " calibrated" or " uncalibrated"
+]] },
+  { source = [[src/ccminer/worker_parts/05.part]], target = [[worker_parts/05.part]], digest = [[7807e70cc70294234d8716894ee8580dd4b068ac3c3a829759a736bc524d06ed]], content = [[    ))
+  else
+    print("GPS: " .. (gpsCalibration() and "no fix" or "not calibrated"))
+  end
+  print("Fuel: " .. tostring(fuelLevel()) .. " / " .. tostring(fuelLimit()))
+  local used, empty, items = inventoryStats()
+  print(("Inventory: %d used, %d empty, %d items"):format(used, empty, items))
+  print(("Lava seal: %d/%d (%s)"):format(sealMaterialCount(), tonumber(config.sealTarget) or 64, config.lavaMode or "seal"))
+  local lightMode, lightInterval = effectiveLighting()
+  print(("Lighting: %s every %d, torches=%d, placed=%d"):format(
+    lightMode, lightInterval, torchMaterialCount(), state.stats.torchesPlaced or 0
+  ))
+  print(("Water: %s, detected=%d sealed=%d"):format(
+    waterMode(), state.stats.waterDetected or 0, state.stats.waterSealed or 0
+  ))
+  local throughput = throughputSnapshot()
+  local returnInfo = returnSnapshot()
+  print(("Throughput: %.2f/s  Return: %s d=%d t=%ds"):format(
+    throughput.perSecond or 0, tostring(returnInfo.reason or "-"),
+    tonumber(returnInfo.distance) or 0, tonumber(returnInfo.seconds) or 0
+  ))
+  local discard = state.discardStats or state.discard or {}
+  print(("Discard: %s stacks=%d items=%d"):format(
+    tostring((config.discard and config.discard.mode) or discard.mode or "KEEP_ALL"),
+    tonumber(discard.stacks) or 0, tonumber(discard.items or discard.discarded) or 0
+  ))
+  if state.group and (state.group.groupJobId or state.group.assignmentId or state.group.bay) then
+    print(("Group: %s bay=%s"):format(
+      tostring(state.group.groupJobId or state.group.groupId or "-"), tostring(state.group.bay or state.group.bayId or "-")))
+  end
+  if state.job then
+    print(("Job: %s %dx%dx%d [%s]"):format(
+      tostring(state.job.name), state.job.width, state.job.length, state.job.depth, state.job.strategy or "serpentine"
+    ))
+    print(("Progress: %d/%d (%d%%)"):format(
+      state.job.cursor or 0, state.job.total or 0, common.percent(state.job.cursor or 0, state.job.total or 0)
+    ))
+  else
+    print("Job: none")
+  end
+  if state.lastError then print("Error: " .. common.fit(state.lastError, 50)) end
+  print("")
+  print("Remote control active. Hold Ctrl+T to stop locally.")
+end
+
+local function inspectPendingSide(kind)
+  if common.startsWith(kind, "torch_floor") then return turtle.inspectDown() end
+  if common.endsWith(kind, "_up") then return turtle.inspectUp() end
+  if common.endsWith(kind, "_down") then return turtle.inspectDown() end
+  if common.endsWith(kind, "_forward") then return turtle.inspect() end
+  -- Torch wall actions record the relative side.  Re-inspect in the same
+  -- deterministic order used for placement; no turn result is assumed.
+  return nil, nil
+end
+
+local function resolveNonMovementPending(pending)
+  local kind = tostring(pending.kind or "")
+  if common.startsWith(kind, "discard_") or common.startsWith(kind, "refill_")
+    or common.startsWith(kind, "refuel_") or kind == "unload_home" then
+    -- A drop/suck transfer can change inventory while the pose stays fixed;
+    -- GPS cannot distinguish "before" from "after".  Stop for explicit
+    -- inventory/world revalidation instead of silently retrying or counting
+    -- a stack twice after power loss.
+    return false, "Pending inventory transfer requires manual revalidation before continuing."
+  end
+  if common.startsWith(kind, "dig_") then
+    local present, data = inspectPendingSide(kind)
+    if present then
+      local expected = pending.details and pending.details.block
+      if not expected or blockName(data) == expected then
+        return false, "Pending dig target is still present; refusing a blind retry."
+      end
+      return false, "Pending dig target changed to " .. blockName(data) .. "."
+    end
+    return true
+  end
+  if common.startsWith(kind, "seal_") then
+    local present, data = inspectPendingSide(kind)
+    if present and (isLava(data) or isWater(data)) then
+      return false, "Pending fluid seal target remains present; refusing a blind retry."
+    end
+    local direction = kind:match("_(forward|up|down)$")
+    if direction then
+      state.fluidSealRun = (tonumber(state.fluidSealRun) or 0) + 1
+      state.water.continuousSeals = state.fluidSealRun
+      state.fluidSealMarker = {
+        kind = (pending.details and pending.details.fluidKind) or (common.startsWith(kind, "seal_water") and "water" or "lava"),
+        direction = direction,

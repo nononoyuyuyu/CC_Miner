@@ -1,0 +1,293 @@
+  buildNeighborGraph(chunks, keys)
+
+  -- Keep the original DFS parent tree and walk for recovery/checkpoint
+  -- compatibility.  The explicit stack avoids recursive overflow on large jobs.
+  local visited, walk = {}, {}
+  visited[rootKey] = true
+  chunks[rootKey].parent = nil
+  walk[1] = { key = rootKey, first = true }
+  local stack = { { key = rootKey, next = 1 } }
+  while #stack > 0 do
+    local frame = stack[#stack]
+    local chunk = chunks[frame.key]
+    local neighbor
+    while frame.next <= #chunk.neighbors do
+      local candidate = chunk.neighbors[frame.next]
+      frame.next = frame.next + 1
+      if not visited[candidate] then neighbor = candidate; break end
+    end
+    if neighbor then
+      visited[neighbor] = true
+      chunks[neighbor].parent = frame.key
+      walk[#walk + 1] = { key = neighbor, first = true }
+      stack[#stack + 1] = { key = neighbor, next = 1 }
+    else
+      stack[#stack] = nil
+      if #stack > 0 then walk[#walk + 1] = { key = stack[#stack].key, first = false } end
+    end
+  end
+
+  local visitedCount = 0
+  for _ in pairs(visited) do visitedCount = visitedCount + 1 end
+  if visitedCount ~= #keys then
+    local unreachable = {}
+    for _, key in ipairs(keys) do if not visited[key] then unreachable[#unreachable + 1] = key end end
+    return nil, "Excluded chunks split the quarry into disconnected regions: " .. table.concat(unreachable, ", ")
+  end
+
+  if contains(chunks[rootKey], 0, 1) then chunks[rootKey].anchor = { x = 0, z = 1 } end
+  local optimized, optimizedOrder = optimizedWalk(chunks, keys, rootKey)
+  return {
+    mode = mode,
+    width = validWidth,
+    length = validLength,
+    depth = validDepth,
+    rootKey = rootKey,
+    chunks = chunks,
+    walk = walk,
+    -- optimizedWalk is deliberately separate: worker recovery still uses the
+    -- DFS parent/walk representation above.
+    optimizedWalk = optimized,
+    optimizedRoute = optimizedOrder,
+    -- `route` is a legacy alias.  It must be a separate array because the
+    -- runtime state is saved with textutils.serialize, which rejects shared
+    -- table references even when the values are otherwise valid.
+    route = (function()
+      local copy = {}
+      for index, key in ipairs(optimizedOrder) do copy[index] = key end
+      return copy
+    end)(),
+    columns = columns,
+    selectedChunks = #keys,
+    excludedCount = excludedCount,
+    catalogCount = #catalog,
+  }
+end
+
+function M.chunkCellCount(chunk)
+  if type(chunk) ~= "table" then return nil, "invalid_chunk" end
+  local minX, maxX = integerValue(chunk.minX), integerValue(chunk.maxX)
+  local minZ, maxZ = integerValue(chunk.minZ), integerValue(chunk.maxZ)
+  if not minX or not maxX or not minZ or not maxZ or maxX < minX or maxZ < minZ then return nil, "invalid_chunk" end
+  local count = (maxX - minX + 1) * (maxZ - minZ + 1)
+  if count > MAX_COLUMNS then return nil, "chunk_too_large" end
+  return count
+end
+
+function M.chunkCell(chunk, index, y)
+  local count, countError = M.chunkCellCount(chunk)
+  if not count then return nil, countError end
+  index = integerValue(index, 0)
+  if not index or index >= count then return nil, "index_out_of_range" end
+  local width = chunk.maxX - chunk.minX + 1
+  local length = chunk.maxZ - chunk.minZ + 1
+  local row = math.floor(index / length)
+  local column = index % length
+  local z = row % 2 == 0 and (chunk.minZ + column) or (chunk.maxZ - column)
+  return { x = chunk.minX + row, y = numberValue(y) or 0, z = z }
+end
+
+function M.findChunk(plan, x, z)
+  if not plan or type(plan.chunks) ~= "table" then return nil end
+  x, z = numberValue(x), numberValue(z)
+  if not x or not z then return nil end
+  for key, chunk in pairs(plan.chunks) do
+    if contains(chunk, x, z) then return key, chunk end
+  end
+  return nil
+end
+
+function M.pathToRoot(plan, key)
+  local path, seen = {}, {}
+  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
+  if type(key) == "table" then key = key.key end
+  key = key and tostring(key) or nil
+  while key do
+    if seen[key] then return nil, "parent_cycle" end
+    seen[key] = true
+    path[#path + 1] = key
+    local chunk = plan.chunks[key]
+    if not chunk then return nil, "unknown_chunk:" .. tostring(key) end
+    key = chunk.parent
+  end
+  if path[#path] ~= plan.rootKey then return nil, "root_not_reached" end
+  return path
+end
+
+function M.pathFromRoot(plan, key)
+  local path, err = M.pathToRoot(plan, key)
+  if not path then return nil, err end
+  local reversed = {}
+  for index = #path, 1, -1 do reversed[#reversed + 1] = path[index] end
+  return reversed
+end
+
+-- Return a point on each side of one adjacent chunk edge.  The old recovery
+-- walk intentionally starts at a chunk's minimum corner; service traffic must
+-- not do that because it can add a full-corner detour on every transition.
+-- Selecting the midpoint of the shared edge is deterministic and minimises the
+-- worst-case distance for either side.  `edgeTransition` is kept independent
+-- from a plan's mutable anchor/parent fields so it remains safe after a state
+-- file is resumed on another worker.
+local function edgeTransitionPoints(left, right, y)
+  local pointY = numberValue(y) or 0
+  if left.maxX + 1 == right.minX then
+    local low, high = math.max(left.minZ, right.minZ), math.min(left.maxZ, right.maxZ)
+    if low <= high then
+      local z = math.floor((low + high) / 2)
+      return { x = left.maxX, y = pointY, z = z }, { x = right.minX, y = pointY, z = z }
+    end
+  elseif right.maxX + 1 == left.minX then
+    local low, high = math.max(left.minZ, right.minZ), math.min(left.maxZ, right.maxZ)
+    if low <= high then
+      local z = math.floor((low + high) / 2)
+      return { x = left.minX, y = pointY, z = z }, { x = right.maxX, y = pointY, z = z }
+    end
+  elseif left.maxZ + 1 == right.minZ then
+    local low, high = math.max(left.minX, right.minX), math.min(left.maxX, right.maxX)
+    if low <= high then
+      local x = math.floor((low + high) / 2)
+      return { x = x, y = pointY, z = left.maxZ }, { x = x, y = pointY, z = right.minZ }
+    end
+  elseif right.maxZ + 1 == left.minZ then
+    local low, high = math.max(left.minX, right.minX), math.min(left.maxX, right.maxX)
+    if low <= high then
+      local x = math.floor((low + high) / 2)
+      return { x = x, y = pointY, z = left.minZ }, { x = x, y = pointY, z = right.maxZ }
+    end
+  end
+  return nil, nil
+end
+
+local function normalizePlanKey(plan, value)
+  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
+  local key
+  if type(value) == "table" then
+    key = value.chunkKey or value.chunk or value.key
+    if key == nil and value.cx ~= nil and value.cz ~= nil then
+      local cx, cz = integerValue(value.cx), integerValue(value.cz)
+      if cx and cz then key = chunkKey(plan.mode, cx, cz) end
+    end
+  else
+    key = value
+  end
+  if key == nil then return nil, "invalid_chunk" end
+  key = tostring(key)
+  if not plan.chunks[key] then return nil, "unknown_chunk:" .. key end
+  return key
+end
+
+function M.edgeTransition(plan, fromKey, toKey, y)
+  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
+  local from, fromError = normalizePlanKey(plan, fromKey)
+  if not from then return nil, fromError end
+  local to, toError = normalizePlanKey(plan, toKey)
+  if not to then return nil, toError end
+  local pointY = numberValue(y)
+  if y ~= nil and not pointY then return nil, "invalid_y" end
+  if from == to then return nil, "chunks_not_adjacent" end
+  local left, right = plan.chunks[from], plan.chunks[to]
+  local fromPoint, toPoint = edgeTransitionPoints(left, right, pointY or 0)
+  if not fromPoint then return nil, "chunks_not_adjacent" end
+  return {
+    from = { x = fromPoint.x, y = fromPoint.y, z = fromPoint.z },
+    to = { x = toPoint.x, y = toPoint.y, z = toPoint.z },
+    -- Numeric entries keep older worker adapters (which consumed a waypoint
+    -- array) compatible.  They are independent point tables, never aliases of
+    -- the named fields.
+    [1] = { x = fromPoint.x, y = fromPoint.y, z = fromPoint.z, kind = "from" },
+    [2] = { x = toPoint.x, y = toPoint.y, z = toPoint.z, kind = "to" },
+    fromKey = from,
+    toKey = to,
+    distance = math.abs(toPoint.x - fromPoint.x) + math.abs(toPoint.y - fromPoint.y) + math.abs(toPoint.z - fromPoint.z),
+  }
+end
+
+M.chunkTransition = M.edgeTransition
+M.neighborTransition = M.edgeTransition
+M.transitionPoint = M.edgeTransition
+
+local function routePointForChunk(chunk, y)
+  local pointY = numberValue(y) or 0
+  -- Integer midpoint keeps a route interior to the chunk for both odd and
+  -- even dimensions.  It is deliberately not the historical min corner.
+  return {
+    x = math.floor((chunk.minX + chunk.maxX) / 2),
+    y = pointY,
+    z = math.floor((chunk.minZ + chunk.maxZ) / 2),
+  }
+end
+
+local function normalizeRoutePose(plan, value, defaultKey, defaultY)
+  local key, point
+  if value == nil then
+    key = defaultKey
+  elseif type(value) == "string" or type(value) == "number" then
+    key = tostring(value)
+  elseif type(value) == "table" then
+    key = value.chunkKey or value.chunk or value.key
+    if key == nil and value.cx ~= nil and value.cz ~= nil then
+      local cx, cz = integerValue(value.cx), integerValue(value.cz)
+      if cx and cz then key = chunkKey(plan.mode, cx, cz) end
+    end
+    local nested = value.point or value.pose or value.position
+    local source = type(nested) == "table" and nested or value
+    local x, z = numberValue(source.x), numberValue(source.z)
+    local y = numberValue(source.y)
+    if x and z then point = { x = x, y = y or (numberValue(defaultY) or 0), z = z } end
+    if key == nil and x and z then key = M.findChunk(plan, x, z) end
+  end
+  if key == nil then return nil, nil, "invalid_pose" end
+  key = tostring(key)
+  local chunk = plan.chunks[key]
+  if not chunk then return nil, nil, "unknown_chunk:" .. key end
+  if point == nil then point = routePointForChunk(chunk, defaultY) end
+  if not contains(chunk, point.x, point.z) then
+    return nil, nil, "pose_outside_chunk"
+  end
+  return key, point
+end
+
+local function parentFallbackPath(plan, fromKey, toKey)
+  local fromRoot, fromError = M.pathFromRoot(plan, fromKey)
+  if not fromRoot then return nil, fromError end
+  local toRoot, toError = M.pathFromRoot(plan, toKey)
+  if not toRoot then return nil, toError end
+  local index = {}
+  for i, key in ipairs(fromRoot) do index[key] = i end
+  local commonFrom, commonTo
+  for i = #toRoot, 1, -1 do
+    if index[toRoot[i]] then commonFrom, commonTo = index[toRoot[i]], i; break end
+  end
+  if not commonFrom then return nil, "root_not_reached" end
+  local path = {}
+  -- pathFromRoot is ordered root -> node.  Walk the source node back to the
+  -- common ancestor, then continue down the target branch.
+  for i = #fromRoot, commonFrom, -1 do path[#path + 1] = fromRoot[i] end
+  for i = commonTo + 1, #toRoot do path[#path + 1] = toRoot[i] end
+  return path
+end
+
+local function appendRouteWaypoint(list, key, point, kind)
+  list[#list + 1] = {
+    chunkKey = tostring(key),
+    key = tostring(key),
+    x = point.x,
+    y = point.y,
+    z = point.z,
+    kind = kind,
+  }
+end
+
+function M.shortestServiceRoute(plan, fromPose, toPose, options)
+  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
+  options = type(options) == "table" and options or {}
+  local routeY = options.y
+  if routeY == nil and type(fromPose) == "table" then routeY = fromPose.y end
+  if routeY == nil and type(toPose) == "table" then routeY = toPose.y end
+  routeY = numberValue(routeY) or 0
+  if fromPose == nil and plan.rootKey and plan.chunks[plan.rootKey] and contains(plan.chunks[plan.rootKey], 0, 1) then
+    fromPose = { chunkKey = plan.rootKey, x = 0, y = routeY, z = 1 }
+  end
+  local fromKey, fromPoint, fromError = normalizeRoutePose(plan, fromPose, plan.rootKey, routeY)
+  if not fromKey then return nil, fromError end

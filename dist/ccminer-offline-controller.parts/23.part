@@ -1,0 +1,276 @@
+  -- Keep the compatibility field, but never point it at `leases`: CC's
+  -- serializer rejects repeated table references.
+  db.activeLeases = common.copy(db.leases or {})
+  -- Group tables may have been assembled from live worker payloads.  Copy
+  -- each top-level value independently so `groups`/`groupJobs`/leases never
+  -- share a table reference in the serialized database.
+  local persistedGroups, persistedDocks, persistedBays, persistedJobs, persistedGroupLeases = {}, {}, {}, {}, {}
+  for key, value in pairs(db.groups or {}) do persistedGroups[key] = persistentGroupValue(value) end
+  for key, value in pairs(db.docks or {}) do persistedDocks[key] = persistentGroupValue(value) end
+  for key, value in pairs(db.bays or {}) do persistedBays[key] = persistentGroupValue(value) end
+  for key, value in pairs(db.groupJobs or {}) do persistedJobs[key] = persistentGroupValue(value) end
+  for key, value in pairs(db.groupLeases or {}) do persistedGroupLeases[key] = persistentGroupValue(value) end
+  -- Do not replace the live tables with sanitized copies: callers may hold a
+  -- reference to a group job while saving an ACK or scheduler transition.
+  -- Build a detached root exclusively for serialization instead.
+  local persistedDb = {}
+  for key, value in pairs(db) do persistedDb[key] = common.copy(value) end
+  persistedDb.groups, persistedDb.docks, persistedDb.bays = persistedGroups, persistedDocks, persistedBays
+  persistedDb.groupJobs, persistedDb.groupLeases = persistedJobs, persistedGroupLeases
+  persistedDb.groupScheduler = persistentDraft(db.groupScheduler or {})
+  persistedDb.activeLeases = common.copy(db.leases or {})
+  local ok, err = common.saveTable(DB_PATH, persistedDb)
+  if not ok then dbError = err end
+  return ok, err
+end
+
+loadControllerDb()
+
+local workers = {}
+local selected = 1
+local selectedGroup = 1
+local groupMode = false
+local groupDraft = nil
+local groupCommandAcks = {}
+local groupSchedulerLast = 0
+local normalizedProfile, normalizedWaterMode, normalizedLighting
+local releaseGroupLeases
+local finalizePendingReassignment
+local acceptGroupStart, rejectGroupStart
+local sortedJobAssignments, groupSafeStop
+local notice = dbError and ("Controller DB recovered: " .. tostring(dbError)) or "Controller ready. Touch DISCOVER or press D."
+local noticeIsError = false
+local lastDiscovery = 0
+local running = true
+local mode = "dashboard"
+local draft = nil
+local confirmState = nil
+local hitboxes = {}
+local renderCache = {}
+local dirty = true
+local monitors = common.findPeripherals("monitor")
+local speakers = common.findPeripherals("speaker")
+local redstoneDevices = common.findPeripherals("redstoneIntegrator")
+local alertLedger = {}
+local alertTimers = {}
+local lastSorting = 0
+local sortingWarned = false
+
+for _, entry in ipairs(monitors) do
+  if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end
+end
+
+local function invalidate()
+  dirty = true
+end
+
+local function setNotice(text, isError)
+  notice, noticeIsError = tostring(text or ""), isError == true
+  invalidate()
+end
+
+local function orderedIds()
+  local ids = {}
+  for id in pairs(workers) do ids[#ids + 1] = tonumber(id) or id end
+  table.sort(ids, function(a, b)
+    if type(a) == type(b) then return a < b end
+    return tostring(a) < tostring(b)
+  end)
+  if #ids == 0 then selected = 1 else selected = common.clamp(selected, 1, #ids) end
+  return ids
+end
+
+local function selectedWorker()
+  local ids = orderedIds()
+  local id = ids[selected]
+  return id, id and workers[id] or nil
+end
+
+local function statusOf(worker)
+  if not worker then return "offline" end
+  if common.nowSeconds() - (worker.lastSeen or 0) > (config.workerTimeoutSeconds or 10) then return "offline" end
+  local data = worker.data or {}
+  return tostring(data.status or data.phase or "unknown")
+end
+
+local function workerLabel(worker, id)
+  if worker and worker.data and worker.data.label then return worker.data.label end
+  return "Miner-" .. tostring(id)
+end
+
+local function workerData(id)
+  local worker = workers[id]
+  return worker and worker.data or nil
+end
+
+-- Group registry ---------------------------------------------------------
+-- Groups are controller-owned durable records.  Keeping worker IDs in the
+-- record (rather than storing live worker tables) makes the database safe to
+-- serialize and lets discovery update status without mutating group config.
+local function orderedGroupIds()
+  local ids = {}
+  for id, group in pairs(db.groups or {}) do
+    if type(group) == "table" then ids[#ids + 1] = tostring(group.id or id) end
+  end
+  table.sort(ids)
+  if #ids == 0 then selectedGroup = 1 else selectedGroup = common.clamp(selectedGroup, 1, #ids) end
+  return ids
+end
+
+local function groupRecord(groupId)
+  if groupId == nil then return nil end
+  local key = tostring(groupId)
+  local direct = db.groups and (db.groups[groupId] or db.groups[key])
+  if type(direct) == "table" then return direct end
+  for id, group in pairs(db.groups or {}) do
+    if type(group) == "table" and tostring(group.id or id) == key then return group end
+  end
+  return nil
+end
+
+local function groupWorkerIds(group)
+  local out, seen = {}, {}
+  if type(group) ~= "table" then return out end
+  local source = type(group.workerIds) == "table" and group.workerIds or group.workers
+  if type(source) ~= "table" then return out end
+  for _, value in ipairs(source) do
+    local id = tonumber(value) or value
+    local key = tostring(id)
+    if key ~= "" and not seen[key] then seen[key] = true; out[#out + 1] = id end
+  end
+  if #out == 0 then
+    for key, value in pairs(source) do
+      local id = tonumber(value) or tonumber(key) or value
+      local text = tostring(id)
+      if text ~= "" and not seen[text] then seen[text] = true; out[#out + 1] = id end
+    end
+  end
+  table.sort(out, function(a, b) return tostring(a) < tostring(b) end)
+  return out
+end
+
+local function groupName(group, groupId)
+  return type(group) == "table" and tostring(group.name or group.id or groupId) or ("Group-" .. tostring(groupId or "?"))
+end
+
+local function groupWorkerResourceId(group, id, kind)
+  local source = kind == "bay" and (group and (group.workerBays or group.bays)) or (group and (group.workerDocks or group.docks))
+  local value = type(source) == "table" and (source[tostring(id)] or source[id]) or nil
+  if type(value) == "table" then value = value.id or value.bayId or value.dockId end
+  if value == nil then value = kind == "bay" and group and group.bayId or group and group.dockId end
+  if value == nil then
+    local data = workerData(id) or {}
+    value = kind == "bay" and (data.bayId or data.bay) or (data.dockId or data.dock)
+    if type(value) == "table" then value = value.id or value.bayId or value.dockId end
+  end
+  return value and tostring(value) or nil
+end
+
+local function groupWorkerResource(group, id, kind)
+  local resourceId = groupWorkerResourceId(group, id, kind)
+  if not resourceId then return nil, nil end
+  local registry = kind == "bay" and db.bays or db.docks
+  local value = registry and (registry[resourceId] or registry[tonumber(resourceId)]) or nil
+  return resourceId, type(value) == "table" and value or nil
+end
+
+local function normalizeFacingValue(value)
+  if value == nil or value == "" then return nil end
+  if type(value) == "number" then
+    local n = math.floor(value)
+    if n >= 0 and n <= 3 and n == value then return n end
+    return nil
+  end
+  local text = tostring(value):lower():gsub("[%s%-]", "_")
+  local names = { south = 0, front = 0, east = 1, right = 1, north = 2, back = 2, west = 3, left = 3 }
+  if names[text] ~= nil then return names[text] end
+  local n = tonumber(text)
+  if n and math.floor(n) == n and n >= 0 and n <= 3 then return n end
+  return nil
+end
+
+local function normalizeRegisteredResource(value)
+  if type(value) ~= "table" then return nil, "resource_value_required" end
+  local world = value.world or value.position
+  if type(world) ~= "table" then return nil, "world_coordinates_required" end
+  local x, y, z = tonumber(world.x), tonumber(world.y), tonumber(world.z)
+  if not x or not y or not z or x ~= math.floor(x) or y ~= math.floor(y) or z ~= math.floor(z) then
+    return nil, "world_coordinates_must_be_integers"
+  end
+  local normalized = common.copy(value)
+  normalized.world = { x = x, y = y, z = z }
+  normalized.position = nil
+  local facing = normalizeFacingValue(value.facing or value.direction)
+  if (value.facing ~= nil or value.direction ~= nil) and facing == nil then return nil, "invalid_facing" end
+  normalized.facing, normalized.direction = facing, nil
+  if value.maxDepth ~= nil then
+    local maxDepth = tonumber(value.maxDepth)
+    if not maxDepth or maxDepth < 1 or maxDepth ~= math.floor(maxDepth) then return nil, "maxDepth_must_be_positive_integer" end
+    normalized.maxDepth = maxDepth
+  end
+  return normalized
+end
+
+local function registerDock(dockId, value)
+  dockId = common.trim(dockId or "")
+  if dockId == "" then return false, "dock_id_required" end
+  local normalized, err = normalizeRegisteredResource(value)
+  if not normalized then return false, err end
+  value = normalized
+  value.id, value.updatedAt = dockId, common.nowSeconds()
+  db.docks[dockId] = persistentGroupValue(value)
+  saveControllerDb()
+  return true
+end
+
+local function registerBay(bayId, value)
+  bayId = common.trim(bayId or "")
+  if bayId == "" then return false, "bay_id_required" end
+  local normalized, err = normalizeRegisteredResource(value)
+  if not normalized then return false, err end
+  value = normalized
+  value.id, value.updatedAt = bayId, common.nowSeconds()
+  db.bays[bayId] = persistentGroupValue(value)
+  saveControllerDb()
+  return true
+end
+
+local function registerGroup(groupId, workerIds, options)
+  groupId = common.trim(groupId or "")
+  if groupId == "" then return false, "group_id_required" end
+  options = type(options) == "table" and options or {}
+  local ids, seen = {}, {}
+  for _, value in ipairs(workerIds or {}) do
+    local id = tonumber(value) or value
+    if tostring(id) ~= "" and not seen[tostring(id)] then seen[tostring(id)] = true; ids[#ids + 1] = id end
+  end
+  if #ids == 0 then return false, "group_workers_required" end
+  local maxWorkers = tonumber(config.group and config.group.maxWorkers)
+  if maxWorkers and #ids > maxWorkers then return false, "group_max_workers_exceeded:" .. tostring(maxWorkers) end
+  table.sort(ids, function(a, b) return tostring(a) < tostring(b) end)
+  local previous = groupRecord(groupId) or {}
+  local mode = tostring(options.mode or previous.mode or "world"):lower()
+  if mode ~= "world" and mode ~= "local" then return false, "group_mode_unsupported:" .. mode end
+  local partition = tostring(options.partition or previous.partition or (config.group and config.group.partitionMode) or "stripe"):lower()
+  if partition ~= "stripe" and partition ~= "round_robin" then return false, "partition_mode_unsupported:" .. partition end
+  local allowedWorkers = {}
+  for _, id in ipairs(ids) do allowedWorkers[tostring(id)] = true end
+  local function validateResourceMap(source, name)
+    if source == nil then return true end
+    if type(source) ~= "table" then return false, name .. "_map_invalid" end
+    for key, raw in pairs(source) do
+      local id = tostring(key)
+      if not allowedWorkers[id] then return false, name .. "_worker_unknown:" .. id end
+      local value = raw
+      if type(value) == "table" then value = value.id or value.bayId or value.dockId end
+      if value == nil or common.trim(value) == "" then return false, name .. "_value_empty:" .. id end
+    end
+    return true
+  end
+  local mapOK, mapError = validateResourceMap(options.workerBays or previous.workerBays, "worker_bay")
+  if not mapOK then return false, mapError end
+  mapOK, mapError = validateResourceMap(options.workerDocks or previous.workerDocks, "worker_dock")
+  if not mapOK then return false, mapError end
+  local group = {
+    id = groupId,
+    name = tostring(options.name or previous.name or groupId),

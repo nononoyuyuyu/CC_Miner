@@ -1,0 +1,257 @@
+          tostring(key), tostring(row.id or row.jobId or row.workerId or "-"),
+          tostring(row.status or row.result or row.outcome or "-"),
+          tostring(row.stopMode or row.mode or row.command or "-"),
+          tostring(row.updatedAt or row.finishedAt or row.completedAt or row.at or "-")))
+        if rowGroup ~= nil or rowBottomY ~= nil or rowDiscard ~= nil or rowThroughput ~= nil or rowReturn ~= nil then
+          print(("      group=%s BOTTOM Y=%s discard=%s throughput=%s return=%s"):format(
+            tostring(rowGroup or "-"), tostring(rowBottomY or "-"), valueString(rowDiscard or "-"),
+            valueString(rowThroughput or "-"), valueString(rowReturn or "-")))
+        end
+      else print("  #" .. tostring(key) .. " " .. valueString(row)) end
+      shown = shown + 1
+      if shown >= 10 then break end
+    end
+  end
+end
+
+local function runReport()
+  local config = loadConfigForCommand()
+  if not config then return end
+  if config.role == "worker" then
+    local rawState, stateError = readTableNoWrite(common.STATE_PATH)
+    local state = type(rawState) == "table" and rawState or {}
+    if stateError and stateError ~= "missing" then print("State read warning: " .. tostring(stateError)) end
+    printWorkerReport(state, config)
+  elseif config.role == "controller" then
+    printControllerReport(config)
+  else
+    print("Report is available on worker or controller roles.")
+  end
+end
+
+local function peripheralIsType(name, wanted)
+  if not peripheral or not name then return false end
+  local matches = false
+  if peripheral.getType then
+    local ok, value = pcall(peripheral.getType, name)
+    matches = ok and value == wanted
+  end
+  if not matches and peripheral.hasType then
+    local ok, value = pcall(peripheral.hasType, name, wanted)
+    matches = ok and value == true
+  end
+  return matches
+end
+
+local function wirelessModems()
+  local names = {}
+  if not peripheral or type(peripheral.getNames) ~= "function" then return names end
+  local ok, all = pcall(peripheral.getNames)
+  if not ok or type(all) ~= "table" then return names end
+  for _, name in ipairs(all) do
+    if peripheralIsType(name, "modem") then
+      local wireless = false
+      local wrapped = peripheral.wrap and peripheral.wrap(name) or nil
+      if wrapped and type(wrapped.isWireless) == "function" then
+        local wirelessOk, result = pcall(wrapped.isWireless)
+        wireless = wirelessOk and result == true
+      end
+      if wireless then names[#names + 1] = tostring(name) end
+    end
+  end
+  return names
+end
+
+local function inventoryAvailable(side)
+  if not side or side == "" then return false end
+  if peripheralIsType(side, "inventory") then return true end
+  if peripheral and peripheral.wrap then
+    local ok, wrapped = pcall(peripheral.wrap, side)
+    if ok and wrapped and (type(wrapped.list) == "function" or type(wrapped.size) == "function") then return true end
+  end
+  return false
+end
+
+local function inventorySlots(side)
+  if not side or not peripheral or not peripheral.wrap then return nil end
+  local ok, wrapped = pcall(peripheral.wrap, side)
+  if not ok or not wrapped then return nil end
+  if type(wrapped.size) == "function" then
+    local sizeOk, result = pcall(wrapped.size)
+    if sizeOk then return tonumber(result) end
+  end
+  return nil
+end
+
+local function fuelStatus()
+  if not turtle or type(turtle.getFuelLevel) ~= "function" then return nil, nil end
+  local ok, level = pcall(turtle.getFuelLevel)
+  local limitOk, limit = false, nil
+  if type(turtle.getFuelLimit) == "function" then limitOk, limit = pcall(turtle.getFuelLimit) end
+  if not ok then return nil, nil end
+  if limitOk ~= true then limit = nil end
+  return level, limit
+end
+
+local function countInventorySlots()
+  if not turtle or type(turtle.getItemCount) ~= "function" then return nil, nil end
+  local used, empty = 0, 0
+  for slot = 1, 16 do
+    local ok, count = pcall(turtle.getItemCount, slot)
+    count = ok and tonumber(count) or 0
+    if count > 0 then used = used + 1 else empty = empty + 1 end
+  end
+  return used, empty
+end
+
+local function configuredReservedSlots(config)
+  local result, seen = {}, {}
+  local function add(value)
+    if type(value) ~= "table" then return end
+    for key, item in pairs(value) do
+      local candidate
+      if type(key) == "number" and type(item) == "boolean" then candidate = key
+      elseif type(key) == "number" and tonumber(item) then candidate = tonumber(item)
+      elseif type(key) == "number" then candidate = key
+      elseif tonumber(item) then candidate = tonumber(item) end
+      if candidate and candidate >= 1 and candidate <= 16 then
+        candidate = math.floor(candidate)
+        if not seen[candidate] then seen[candidate] = true; result[#result + 1] = candidate end
+      end
+    end
+  end
+  local materials = type(config.materials) == "table" and config.materials or {}
+  local recycle = type(config.recycle) == "table" and config.recycle or {}
+  local lighting = type(config.lighting) == "table" and config.lighting or {}
+  add(config.reservedSlots); add(materials.reservedSlots); add(materials.sealSlots)
+  add(materials.torchSlots); add(materials.fuelReserveSlots); add(recycle.reservedSlots)
+  add(lighting.preferredSlots); add(config.sealSlots); add(config.torchSlots)
+  table.sort(result)
+  return result
+end
+
+local function coordinateTable(value)
+  if type(value) ~= "table" then return false end
+  return tonumber(value.x) ~= nil and tonumber(value.y) ~= nil and tonumber(value.z) ~= nil
+end
+
+local function coordinateText(value)
+  if not coordinateTable(value) then return valueString(value) end
+  return ("%s,%s,%s"):format(tostring(value.x), tostring(value.y), tostring(value.z))
+end
+
+local function doctorJournal(config, state, finding)
+  local journalConfig = type(config.journal) == "table" and config.journal or {}
+  local journalState = type(state) == "table" and type(state.journal) == "table" and state.journal or {}
+  if journalConfig.enabled == false or journalState.enabled == false then
+    finding("PASS", "journal", "disabled")
+    return
+  end
+  local path = journalConfig.path or journalState.path or journalState.journalPath or "/ccminer/data/state.journal"
+  local text, readError = readTextNoWrite(path)
+  local seqValue, sequenceValue = tonumber(journalState.seq), tonumber(journalState.sequence)
+  local expectedSeq = seqValue or sequenceValue
+  local writes = tonumber(journalState.writes)
+  local entries = tonumber(journalState.entries)
+  if seqValue and sequenceValue and seqValue ~= sequenceValue then
+    finding("FAIL", "journal", "state seq/sequence counters disagree")
+  elseif writes and entries and (writes < 0 or entries < 0 or entries > writes) then
+    finding("FAIL", "journal", "state writes/entries counters are inconsistent")
+  end
+  if not text then
+    if readError == "missing" and (not writes or writes == 0) then
+      finding("WARN", "journal", "enabled but no entries yet (" .. tostring(path) .. ")")
+    elseif readError == "missing" then
+      finding("FAIL", "journal", "missing after " .. tostring(writes) .. " writes: " .. tostring(path))
+    else
+      finding("FAIL", "journal", tostring(path) .. ": " .. tostring(readError))
+    end
+  else
+    local count, malformed, previousSeq, lastSeq = 0, 0, nil, nil
+    for line in (text .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+      if line ~= "" then
+        count = count + 1
+        local decoded
+        if type(textutils) == "table" and type(textutils.unserialize) == "function" then
+          local ok, value = pcall(textutils.unserialize, line)
+          if ok and type(value) == "table" then decoded = value end
+        end
+        local sequence = decoded and tonumber(decoded.seq or decoded.sequence) or nil
+        if not decoded or sequence == nil then
+          malformed = malformed + 1
+        elseif previousSeq and sequence <= previousSeq then
+          malformed = malformed + 1
+        else
+          previousSeq, lastSeq = sequence, sequence
+        end
+      end
+    end
+    if malformed > 0 then
+      finding("FAIL", "journal", ("%s malformed/non-monotonic entries=%d"):format(path, malformed))
+    elseif expectedSeq and lastSeq and lastSeq > expectedSeq then
+      finding("FAIL", "journal", ("latest seq %s exceeds state seq %s"):format(tostring(lastSeq), tostring(expectedSeq)))
+    elseif expectedSeq and lastSeq and lastSeq < expectedSeq then
+      finding("WARN", "journal", ("latest seq %s behind state seq %s (rotation/checkpoint may be pending)"):format(tostring(lastSeq), tostring(expectedSeq)))
+    elseif entries and entries ~= count then
+      finding("WARN", "journal", ("file entries=%d state entries=%d"):format(count, entries))
+    else
+      finding("PASS", "journal", ("%s entries=%d seq=%s"):format(path, count, tostring(lastSeq or expectedSeq or 0)))
+    end
+  end
+
+  local checkpointPath = journalConfig.checkpointPath or journalState.checkpointPath or "/ccminer/data/state.checkpoint.db"
+  if fs and fs.exists and fs.exists(checkpointPath) then
+    local checkpoint, checkpointError = readTableNoWrite(checkpointPath)
+    if not checkpoint then finding("FAIL", "journal.checkpoint", tostring(checkpointPath) .. ": " .. tostring(checkpointError or "invalid"))
+    else
+      local checkpointSeq = tonumber(checkpoint.seq or checkpoint.sequence or tableValue(checkpoint.journal, "seq") or tableValue(checkpoint.journal, "sequence"))
+      if expectedSeq and checkpointSeq and checkpointSeq > expectedSeq then
+        finding("FAIL", "journal.checkpoint", "checkpoint sequence is ahead of state")
+      else finding("PASS", "journal.checkpoint", tostring(checkpointSeq or "unsequenced")) end
+    end
+  elseif expectedSeq and expectedSeq > 0 then
+    local every = math.max(1, tonumber(journalConfig.checkpointEvery) or 32)
+    local checkpoints = tonumber(journalState.checkpoints) or 0
+    if checkpoints > 0 or expectedSeq >= every then
+      finding("WARN", "journal.checkpoint", "checkpoint file is missing")
+    else
+      finding("PASS", "journal.checkpoint", "not due yet")
+    end
+  end
+end
+
+local function doctorDiscardAllowlist(config, finding)
+  local discard = type(config.discard) == "table" and config.discard or nil
+  local recycle = type(config.recycle) == "table" and config.recycle or nil
+  local allowlist = config.discardAllowlist or (discard and (discard.allowlist or discard.allowed or discard.items))
+    or (discard and type(discard.items) == "table" and discard.items.allowlist)
+    or (recycle and (recycle.discardAllowlist or recycle.allowlist or recycle.discardItems))
+    or (recycle and type(recycle.discard) == "table" and (recycle.discard.allowlist or recycle.discard.allowed))
+  local mode = tostring((discard and (discard.mode or discard.policy)) or config.discardMode or "KEEP_ALL"):upper()
+  local enabled = discard and discard.enabled
+  if enabled == nil then enabled = config.discardEnabled end
+  if allowlist == nil then
+    if enabled == true then finding("FAIL", "discard.allowlist", "discard is enabled but allowlist is missing")
+    else finding("PASS", "discard.allowlist", "not configured") end
+    return
+  end
+  if type(allowlist) ~= "table" then
+    finding("FAIL", "discard.allowlist", "allowlist must be a table")
+    return
+  end
+  local protected = type(config.protectedBlocks) == "table" and config.protectedBlocks or {}
+  local count, unsafe = 0, 0
+  for key, value in pairs(allowlist) do
+    local name
+    if type(key) == "number" then name = value else name = key end
+    if type(name) ~= "string" or name == "" or name:find("[%c%s]") or name:find("%*")
+      or (type(key) ~= "number" and value ~= true) then
+      unsafe = unsafe + 1
+    elseif protected[name] == true then
+      unsafe = unsafe + 1
+    else
+      count = count + 1
+    end
+  end
+  if unsafe > 0 then finding("FAIL", "discard.allowlist", ("%d unsafe entries (protected/empty/wildcard)"):format(unsafe))
+  elseif count == 0 and mode == "KEEP_ALL" then finding("PASS", "discard.allowlist", "KEEP_ALL (empty allowlist)")

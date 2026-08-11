@@ -17,7 +17,7 @@ end
 
 local protocol = realDofile(root .. "/src/ccminer/lib/protocol.lua")
 local message = protocol.message("command", "shared-key", { command = "pause" }, 7)
-assert(message.magic == common.MAGIC and message.schema == 3 and message.version == "3.0.0")
+assert(message.magic == common.MAGIC and message.schema == 4 and message.version == "4.0.0")
 assert(message.sender == 42 and message.target == 7 and type(message.id) == "string")
 assert(protocol.validate(message, "shared-key", 7, 42))
 
@@ -34,8 +34,8 @@ local function rejected(mutator, expectedError)
 end
 
 rejected(function(candidate) candidate.magic = "OTHER" end, "bad_magic")
-rejected(function(candidate) candidate.schema = 2 end, "bad_schema")
-rejected(function(candidate) candidate.version = "2.1.0" end, "bad_version")
+rejected(function(candidate) candidate.schema = 3 end, "bad_schema")
+rejected(function(candidate) candidate.version = "3.0.0" end, "bad_version")
 rejected(function(candidate) candidate.kind = 99 end, "bad_kind")
 rejected(function(candidate) candidate.id = "" end, "bad_id")
 rejected(function(candidate) candidate.payload = "pause" end, "bad_payload")
@@ -52,4 +52,4 @@ numericEnvelope.sender = "42"
 numericEnvelope.target = "7"
 assert(protocol.validate(numericEnvelope, "shared-key", 7, 42))
 
-print("protocol V3 positive and adversarial envelope tests passed")
+print("protocol V4 positive and adversarial envelope tests passed")

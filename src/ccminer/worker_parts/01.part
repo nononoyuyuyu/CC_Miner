@@ -1,4 +1,4 @@
--- CC Miner V3 - autonomous quarry worker
+-- CC Miner V4 - autonomous quarry worker
 -- Home=(0,0,0), forward=+Z, right=+X, down=-Y.
 
 local common = dofile("/ccminer/lib/common.lua")
@@ -13,12 +13,21 @@ if not config or config.role ~= "worker" then
   error(configError or "Worker configuration not found. Run: ccm setup worker", 0)
 end
 
--- Accept both the V3 nested defaults and older flat V2 settings.  This is
+-- Forward declaration: statusPayload is defined before the assignment resume
+-- helpers below, but Lua lexical scope otherwise resolves that call globally.
+local assignmentResumeSnapshot
+
+-- Accept both the V4 nested defaults and older flat V2 settings.  This is
 -- intentionally in-memory so an old config remains readable by V2 tooling.
 config.materials = config.materials or {}
 config.lighting = config.lighting or {}
 config.water = config.water or {}
 config.journal = config.journal or {}
+config.performance = config.performance or {}
+config.gps = config.gps or {}
+config.discard = config.discard or config.materials.discard or {}
+config.dock = config.dock or {}
+config.group = config.group or {}
 if config.lighting.mode == nil then config.lighting.mode = config.lightMode or "off" end
 if config.lighting.interval == nil then config.lighting.interval = config.torchInterval or 32 end
 if config.lighting.preferredSlots == nil then config.lighting.preferredSlots = config.torchSlots end
@@ -32,6 +41,51 @@ if config.materials.sealSlots == nil then config.materials.sealSlots = config.se
 if config.materials.torchSlots == nil then config.materials.torchSlots = config.torchSlots end
 if config.materials.recycleMinedBlocks == nil then config.materials.recycleMinedBlocks = true end
 if config.materials.retainSealTarget == nil then config.materials.retainSealTarget = config.retainSealTarget or config.sealTarget end
+if tonumber(config.sealTarget) == nil or tonumber(config.sealTarget) < 1 then config.sealTarget = 64 end
+config.sealTarget = math.max(1, math.floor(tonumber(config.sealTarget) or 64))
+-- Disposal is deliberately opt-in.  Legacy V2 configurations used a
+-- recycle flag but had no authority to throw arbitrary items away; map those
+-- settings to the safe KEEP_ALL policy until an explicit mode is present.
+local discardMode = config.discard.mode or config.discard.policy or config.discardPolicy
+discardMode = tostring(discardMode or "KEEP_ALL"):upper()
+if discardMode ~= "KEEP_ALL" and discardMode ~= "DISCARD_EXCESS_STONE" and discardMode ~= "CUSTOM_ALLOWLIST" then
+  discardMode = "KEEP_ALL"
+end
+config.discard.mode = discardMode
+local configuredSealTarget = tonumber(
+  config.discard.retainSealTarget or config.materials.retainSealTarget or config.sealTarget
+)
+if not configuredSealTarget or configuredSealTarget < 1 then configuredSealTarget = 64 end
+config.discard.retainSealTarget = math.floor(configuredSealTarget)
+config.discard.triggerEmptySlots = math.max(0, math.floor(tonumber(
+  config.discard.triggerEmptySlots or config.reserveEmptySlots
+) or 3))
+config.discard.maxStacksPerPass = math.max(1, math.floor(tonumber(config.discard.maxStacksPerPass) or 8))
+if type(config.discard.allowlist) ~= "table" then config.discard.allowlist = {} end
+if type(config.discard.stoneAllowlist) ~= "table" then
+  config.discard.stoneAllowlist = {
+    ["minecraft:stone"] = true,
+    ["minecraft:cobblestone"] = true,
+    ["minecraft:cobbled_deepslate"] = true,
+  }
+end
+-- Keep a canonical alias for callers that still read materials.discard, but
+-- never share the table itself: CC's serializer rejects recursive aliases.
+config.materials.discard = common.copy(config.discard)
+config.materials.retainSealTarget = config.discard.retainSealTarget
+config.gps.verifyEveryMoves = math.max(1, math.floor(tonumber(
+  config.performance.gpsVerifyEveryMoves or config.gps.verifyEveryMoves
+) or 32))
+config.performance.gpsVerifyEveryMoves = config.gps.verifyEveryMoves
+config.performance.lightweightCheckpointEveryMoves = math.max(1, math.floor(tonumber(
+  config.performance.lightweightCheckpointEveryMoves or config.journal.checkpointEvery
+) or 16))
+config.performance.checkpointEveryMoves = math.max(1, math.floor(tonumber(
+  config.performance.checkpointEveryMoves or config.journal.checkpointEvery
+) or 32))
+-- Seal stock is a hard safety invariant.  An absent/invalid legacy target is
+-- migrated to 64 rather than allowing a zero-target refill to run dry.
+if tonumber(config.discard.retainSealTarget) < 1 then config.discard.retainSealTarget = 64 end
 if config.water.mode == nil then config.water.mode = config.waterMode or "ignore" end
 if config.journal.enabled == nil then config.journal.enabled = true end
 
@@ -53,6 +107,8 @@ local function ensureV3State()
     waterDetected = 0, waterSealed = 0, waterBlocked = 0,
     recycled = 0, sealOverflow = 0, compressions = 0,
     serviceReturns = 0, journalWrites = 0,
+    discardPasses = 0, discardedBlocks = 0, discardSkipped = 0,
+    discardUnknown = 0, routeMoves = 0, routeDistance = 0,
   }
   for key, value in pairs(counters) do
     if state.stats[key] == nil then state.stats[key] = value end
@@ -69,14 +125,73 @@ local function ensureV3State()
     enabled = true, held = 0, cap = 64, overflow = 0,
     compressed = 0, byName = {},
   }
+  -- State migrations intentionally copy, rather than alias, legacy tables.
+  -- CC's serializer rejects recursive aliases and a power-loss recovery must
+  -- be able to distinguish discardStats from its report shorthand.
+  local discardDefaults = {
+    enabled = config.discard.mode ~= "KEEP_ALL", mode = config.discard.mode,
+    passes = 0, attempts = 0, stacks = 0, discarded = 0, items = 0,
+    skipped = 0, held = 0, unknown = 0, overflow = 0, byName = {},
+    lastAt = nil, lastError = nil, triggerEmptySlots = config.discard.triggerEmptySlots,
+  }
+  local legacyDiscard = state.discardStats or state.discard
+  state.discardStats = common.merge(discardDefaults, legacyDiscard)
+  state.discard = common.merge(discardDefaults, state.discardStats)
+  state.discard.mode = config.discard.mode
+  state.discard.triggerEmptySlots = config.discard.triggerEmptySlots
+  state.discard.maxStacksPerPass = config.discard.maxStacksPerPass
+  state.routeMetrics = state.routeMetrics or { moves = 0, turns = 0, distance = 0, routeLength = 0, detours = 0, services = 0 }
+  state.timeMetrics = state.timeMetrics or { startedAt = nil, updatedAt = nil, elapsedSeconds = 0, activeSeconds = 0, serviceSeconds = 0, returnSeconds = 0 }
+  state.metrics = state.metrics or { route = common.copy(state.routeMetrics), time = common.copy(state.timeMetrics) }
+  state.returnReason = state.returnReason or nil
+  state.lastReturnReason = state.lastReturnReason or nil
+  state.resumeToken = state.resumeToken or nil
+  state.assignmentResumeToken = state.assignmentResumeToken or nil
+  state.group = state.group or nil
+  state.dock = state.dock or nil
   state.fluidSealRun = tonumber(state.fluidSealRun) or 0
   state.fluidSealMarker = state.fluidSealMarker or nil
   if state.stagedStop == nil then state.stagedStop = false end
   state.report = state.report or nil
   state.estimate = state.estimate or { estimated = 0, actual = 0, variance = 0 }
   state.journal = state.journal or { seq = 0, writes = 0, checkpoints = 0 }
+  state.journal.lightweight = state.journal.lightweight or {
+    enabled = true, seq = 0, writes = 0, checkpoints = 0, lastAt = nil, lastError = nil,
+  }
 end
 ensureV3State()
+
+local function recoverPendingSnapshot()
+  local journalConfig = config.journal or {}
+  if journalConfig.enabled == false or not common.loadTable then return end
+  local path = journalConfig.pendingPath or "/ccminer/data/state.pending"
+  local pending, pendingError = common.loadTable(path, nil)
+  if pendingError or type(pending) ~= "table" then return end
+  local pendingJobId = pending.jobId
+  local currentJobId = state.job and state.job.id or nil
+  if pendingJobId and currentJobId and tostring(pendingJobId) == tostring(currentJobId) then
+    if pending.pose then state.pose = common.copy(pending.pose) end
+    for _, key in ipairs({ "status", "phase", "request", "service", "checkpoint", "resumeToken", "assignmentResumeToken", "stagedStop", "pendingAction" }) do
+      if pending[key] ~= nil then state[key] = common.copy(pending[key]) end
+    end
+    if state.job then
+      if pending.cursor ~= nil then state.job.cursor = tonumber(pending.cursor) or state.job.cursor end
+      if pending.route then state.job.route = common.merge(state.job.route or {}, pending.route) end
+    end
+    state.journal = state.journal or {}
+    state.journal.lightweight = state.journal.lightweight or {}
+    state.journal.lightweight.recovered = true
+    state.journal.recovered = true
+  elseif pending.pendingAction and not currentJobId then
+    -- A pending physical action without a matching full job is ambiguous;
+    -- retain it and force the normal recovery wizard at preflight.
+    state.pendingAction = common.copy(pending.pendingAction)
+    state.status, state.phase = "blocked", "recovery_required"
+    state.lastError = "Pending physical action has no matching full checkpoint."
+  end
+end
+
+recoverPendingSnapshot()
 
 local lastHeartbeat = 0
 local networkReady = false
@@ -120,6 +235,18 @@ local function appendJournal(event)
       dir = (tonumber(state.pose and state.pose.dir) or 0) % 4,
     },
     cursor = state.job and state.job.cursor or nil,
+    -- Keep the ambiguous physical operation in the compact journal too.  A
+    -- full checkpoint may lag this record, but replay can still force a
+    -- safety stop instead of guessing whether a dig/move happened.
+    pendingAction = state.pendingAction and {
+      kind = state.pendingAction.kind,
+      startedAt = state.pendingAction.startedAt,
+    } or nil,
+    route = state.job and state.job.route and {
+      layer = state.job.route.layer, walkIndex = state.job.route.walkIndex,
+      localCursor = state.job.route.localCursor, phase = state.job.route.phase,
+      currentKey = state.job.route.currentKey,
+    } or nil,
   }
   local ok, serialized = pcall(textutils.serialize, entry)
   if ok then handle.writeLine(serialized) end
@@ -136,23 +263,118 @@ local function appendJournal(event)
     end)
   end
   if state.stats then state.stats.journalWrites = (state.stats.journalWrites or 0) + 1 end
+  state.journal.lightweight = state.journal.lightweight or {}
+  state.journal.lightweight.seq = (tonumber(state.journal.lightweight.seq) or 0) + 1
+  state.journal.lightweight.writes = (tonumber(state.journal.lightweight.writes) or 0) + 1
+  state.journal.lightweight.lastAt = entry.at
   return true
+end
+
+local function saveLightweightCheckpoint(reason)
+  local journalConfig = config.journal or {}
+  if journalConfig.enabled == false then return true end
+  local path = journalConfig.pendingPath or "/ccminer/data/state.pending"
+  if not fs or not fs.open then return false end
+  if common.ensureDir then common.ensureDir(fs.getDir(path)) end
+  local compact = {
+    schema = common.SCHEMA,
+    at = common.nowSeconds(),
+    reason = tostring(reason or "state"),
+    pose = {
+      x = tonumber(state.pose and state.pose.x) or 0,
+      y = tonumber(state.pose and state.pose.y) or 0,
+      z = tonumber(state.pose and state.pose.z) or 0,
+      dir = (tonumber(state.pose and state.pose.dir) or 0) % 4,
+    },
+    pendingAction = state.pendingAction and common.copy(state.pendingAction) or nil,
+    status = state.status, phase = state.phase,
+    jobId = state.job and state.job.id or nil,
+    cursor = state.job and state.job.cursor or nil,
+    route = state.job and state.job.route and common.copy(state.job.route) or nil,
+    request = state.request,
+    service = state.service and common.copy(state.service) or nil,
+    checkpoint = state.checkpoint and common.copy(state.checkpoint) or nil,
+    resumeToken = state.resumeToken and common.copy(state.resumeToken) or nil,
+    assignmentResumeToken = state.assignmentResumeToken and common.copy(state.assignmentResumeToken) or nil,
+    stagedStop = state.stagedStop and common.copy(state.stagedStop) or state.stagedStop,
+  }
+  -- Use the same writeAllAtomic path as state.db.  A direct fs.open("w")
+  -- leaves a truncated pending file if the turtle loses power mid-write.
+  local ok = common.saveTable(path, compact)
+  if not ok then return false end
+  state.journal.lightweight = state.journal.lightweight or {}
+  state.journal.lightweight.checkpoints = (tonumber(state.journal.lightweight.checkpoints) or 0) + 1
+  state.journal.lightweight.lastMove = tonumber(state.stats and state.stats.moves) or 0
+  state.journal.lightweight.lastReason = tostring(reason or "state")
+  return true
+end
+
+local function lightweightWriteDue(reason)
+  local journalConfig = config.journal or {}
+  if journalConfig.enabled == false then return true end
+  local light = state.journal and state.journal.lightweight or {}
+  if light.force == true or state.pendingAction ~= nil then return true end
+  local status = tostring(state.status or "")
+  if status == "idle" or status == "paused" or status == "blocked" or status == "complete"
+    or status == "aborted" or state.request ~= nil or state.service ~= nil then
+    return true
+  end
+  local every = math.max(1, tonumber(config.performance and config.performance.lightweightCheckpointEveryMoves) or 16)
+  local moves = tonumber(state.stats and state.stats.moves) or 0
+  local lastMove = tonumber(light.lastMove) or 0
+  if moves - lastMove >= every then return true end
+  local text = tostring(reason or "")
+  return text == "field_compress" or text == "field_discard" or text == "field_discard_inventory"
+    or text == "discard_inventory_error" or text == "unload_start" or text == "unload_done"
 end
 
 local function saveJournalCheckpoint()
   local journalConfig = config.journal or {}
   if journalConfig.enabled == false then return true end
-  local every = math.max(1, tonumber(journalConfig.checkpointEvery) or 32)
+  local every = math.max(1, tonumber(config.performance and config.performance.checkpointEveryMoves) or tonumber(journalConfig.checkpointEvery) or 32)
   state.journal = state.journal or {}
   local writes = tonumber(state.journal.writes) or 0
   if writes == 0 or writes % every ~= 0 then return true end
   local path = journalConfig.checkpointPath or "/ccminer/data/state.checkpoint.db"
   local ok, err = common.saveTable(path, state)
-  if ok then state.journal.checkpoints = (tonumber(state.journal.checkpoints) or 0) + 1 end
+  if ok then
+    state.journal.checkpoints = (tonumber(state.journal.checkpoints) or 0) + 1
+    state.journal.lastCheckpointAt = common.nowSeconds()
+    state.journal.lastCheckpointMove = tonumber(state.stats and state.stats.moves) or 0
+  end
   return ok, err
 end
 
-local function saveState(reason)
+local function stateSaveNeedsFull(reason, explicit)
+  local journalConfig = config.journal or {}
+  if journalConfig.enabled == false then return true end
+  if explicit == true then return true end
+  local status = tostring(state.status or "")
+  if not state.job or status == "idle" or status == "paused" or status == "blocked"
+    or status == "complete" or status == "aborted" or status == "calibrating"
+    or status == "waiting_output" or status == "waiting_fuel" or status == "waiting_seal" or status == "waiting_torch"
+    or state.request ~= nil then
+    return true
+  end
+  if state.service then
+    local phase = tostring(state.phase or "")
+    if phase == "service_requested" or phase == "unloading" or phase == "refueling"
+      or phase == "refilling_seal" or phase == "refilling_torch"
+      or phase == "waiting_output" or phase == "waiting_fuel" or phase == "waiting_seal" or phase == "waiting_torch" then
+      return true
+    end
+  end
+  local moveEvery = math.max(1, tonumber(config.performance and config.performance.checkpointEveryMoves) or 32)
+  local lastMove = tonumber(state.journal and state.journal.lastCheckpointMove) or 0
+  if (tonumber(state.stats and state.stats.moves) or 0) - lastMove >= moveEvery then return true end
+  local text = tostring(reason or "")
+  return text:find("start", 1, true) ~= nil or text:find("complete", 1, true) ~= nil
+    or text:find("blocked", 1, true) ~= nil or text:find("recovery", 1, true) ~= nil
+    or text:find("stop", 1, true) ~= nil or text:find("pause", 1, true) ~= nil
+    or text:find("rehome", 1, true) ~= nil or text:find("clear", 1, true) ~= nil
+end
+
+local function saveState(reason, explicitFull)
   if state.estimate and state.job then
     state.estimate.actual = tonumber(state.job.cursor) or 0
     state.estimate.variance = state.estimate.actual - (tonumber(state.estimate.estimated) or state.estimate.actual)
@@ -160,15 +382,37 @@ local function saveState(reason)
   state.schema = common.SCHEMA
   state.version = common.VERSION
   state.updatedAt = common.nowSeconds()
-  local ok, err = common.saveTable(common.STATE_PATH, state)
+  local full = stateSaveNeedsFull(reason, explicitFull)
+  local ok, err = true, nil
+  if full then
+    ok, err = common.saveTable(common.STATE_PATH, state)
+    if ok then
+      state.journal = state.journal or {}
+      state.journal.lastCheckpointMove = tonumber(state.stats and state.stats.moves) or 0
+      state.journal.lastCheckpointAt = state.updatedAt
+      local pendingPath = (config.journal or {}).pendingPath or "/ccminer/data/state.pending"
+      if fs and fs.exists and fs.exists(pendingPath) then pcall(fs.delete, pendingPath) end
+    end
+  end
   if not ok then
     common.log("ERROR", "State save failed: " .. tostring(err))
     error("State save failed: " .. tostring(err), 0)
   end
-  if not appendJournal(reason) then
-    common.log("WARN", "State journal append failed; atomic state remains authoritative.")
+  local writeLightweight = full or lightweightWriteDue(reason)
+  if writeLightweight then
+    if not appendJournal(reason) then
+      common.log("WARN", "State journal append failed; atomic state remains authoritative.")
+    end
+    if (not full) and not saveLightweightCheckpoint(reason) then
+      state.journal.lightweight = state.journal.lightweight or {}
+      state.journal.lightweight.lastError = "pending journal write failed"
+      state.status, state.phase = "blocked", "journal_error"
+      state.lastError = "Atomic pending journal write failed; physical work is stopped."
+      error(state.lastError, 0)
+    end
+    if state.journal and state.journal.lightweight then state.journal.lightweight.force = false end
   end
-  saveJournalCheckpoint()
+  if full then saveJournalCheckpoint() end
 end
 
 local function poseCopy(pose)
@@ -185,6 +429,37 @@ local function samePosePosition(a, b)
   return tonumber(a and a.x) == tonumber(b and b.x)
     and tonumber(a and a.y) == tonumber(b and b.y)
     and tonumber(a and a.z) == tonumber(b and b.z)
+end
+
+-- A resume token is a durable route cursor, not merely a coordinate.  The
+-- service path may revisit a chunk anchor, so preserving layer/cursor/phase
+-- prevents mining the same cell twice after a return or a power loss.
+local function checkpointToken()
+  local token = {
+    pose = poseCopy(),
+    x = tonumber(state.pose and state.pose.x) or 0,
+    y = tonumber(state.pose and state.pose.y) or 0,
+    z = tonumber(state.pose and state.pose.z) or 0,
+    dir = (tonumber(state.pose and state.pose.dir) or 0) % 4,
+  }
+  local job = state.job
+  local route = job and job.route
+  if route then
+    token.layer = tonumber(route.layer) or 0
+    token.walkIndex = tonumber(route.walkIndex) or 1
+    token.localCursor = tonumber(route.localCursor) or 0
+    token.phase = route.phase or "travel"
+    token.currentKey = route.currentKey
+  end
+  token.cursor = job and tonumber(job.cursor) or nil
+  token.jobId = job and job.id or nil
+  return token
+end
+
+local function installCheckpointToken(token)
+  if type(token) ~= "table" then return end
+  state.resumeToken = common.copy(token)
+  state.checkpoint = common.copy(token)
 end
 
 local function beginPhysicalAction(kind, details, poseAfter)
@@ -204,11 +479,17 @@ end
 
 local function cancelPhysicalAction()
   state.pendingAction = nil
+  state.journal = state.journal or {}
+  state.journal.lightweight = state.journal.lightweight or {}
+  state.journal.lightweight.force = true
   saveState()
 end
 
 local function commitPhysicalAction()
   state.pendingAction = nil
+  state.journal = state.journal or {}
+  state.journal.lightweight = state.journal.lightweight or {}
+  state.journal.lightweight.force = true
   saveState()
 end
 
@@ -532,6 +813,13 @@ local function jobSnapshot()
   return {
     id = state.job.id,
     assignmentId = state.job.assignmentId,
+    groupJobId = state.job.groupJobId,
+    groupId = state.job.groupId,
+    bay = state.job.bay or state.job.bayId,
+    dock = state.job.dock and common.copy(state.job.dock) or nil,
+    seedKey = state.job.seedKey,
+    dockKey = state.job.dockKey,
+    lease = state.job.lease and common.copy(state.job.lease) or nil,
     profile = state.job.profile,
     name = state.job.name,
     kind = state.job.kind,
@@ -551,6 +839,49 @@ local function jobSnapshot()
     currentChunk = currentChunk,
     completedChunks = state.job.completedChunks or 0,
     assignmentChunks = state.job.assignmentChunks and #state.job.assignmentChunks or 0,
+    assignmentChunkKeys = state.job.assignmentChunks and common.copy(state.job.assignmentChunks) or nil,
+    transitChunkKeys = state.job.assignmentTransitChunks and common.copy(state.job.assignmentTransitChunks) or nil,
+    assignmentCatalog = state.job.assignmentCatalog and {
+      mode = state.job.assignmentCatalog.mode,
+      rootKey = state.job.assignmentCatalog.rootKey,
+      chunkCount = state.job.assignmentCatalog.chunks and #state.job.assignmentCatalog.chunks or nil,
+    } or nil,
+  }
+end
+
+local function throughputSnapshot()
+  local now = common.nowSeconds()
+  local started = tonumber(state.job and state.job.startedAt)
+    or tonumber(state.timeMetrics and state.timeMetrics.startedAt)
+  local elapsed = started and math.max(0, now - started) or 0
+  local blocks = tonumber(state.job and state.job.cursor) or tonumber(state.stats and state.stats.blocksDug) or 0
+  local perSecond = elapsed > 0 and blocks / elapsed or 0
+  state.timeMetrics = state.timeMetrics or {}
+  state.timeMetrics.updatedAt = now
+  state.timeMetrics.elapsedSeconds = elapsed
+  return {
+    blocks = blocks,
+    elapsedSeconds = elapsed,
+    perSecond = perSecond,
+    cellsPerSecond = perSecond,
+    startedAt = started,
+  }
+end
+
+local function returnSnapshot()
+  local service = state.service or {}
+  local metrics = state.serviceReturn or {}
+  local started = tonumber(metrics.startedAt or service.startedAt)
+  local ended = tonumber(metrics.endedAt)
+  local seconds = tonumber(metrics.seconds)
+  if started and not seconds then seconds = math.max(0, (ended or common.nowSeconds()) - started) end
+  return {
+    reason = state.returnReason or service.reason or state.lastReturnReason,
+    distance = tonumber(metrics.distance or service.returnDistance) or 0,
+    seconds = seconds or tonumber(metrics.returnSeconds) or 0,
+    startedAt = started,
+    endedAt = ended,
+    active = state.service ~= nil,
   }
 end
 
@@ -572,6 +903,16 @@ local function statusPayload()
   end
   local lightMode, lightInterval = effectiveLightingValues()
   local waterMode = tostring((config.waterMode or (config.water and config.water.mode) or state.water.mode or "ignore"))
+  local discardStatus = common.copy(state.discardStats or state.discard or {})
+  discardStatus.mode = config.discard and config.discard.mode or discardStatus.mode or "KEEP_ALL"
+  discardStatus.triggerEmptySlots = tonumber(config.discard and config.discard.triggerEmptySlots) or discardStatus.triggerEmptySlots or 3
+  discardStatus.maxStacksPerPass = tonumber(config.discard and config.discard.maxStacksPerPass) or discardStatus.maxStacksPerPass or 8
+  discardStatus.retainSealTarget = tonumber(config.discard and config.discard.retainSealTarget) or 64
+  discardStatus.allowlist = config.discard and common.copy(config.discard.allowlist or {}) or {}
+  local assignmentResume = state.assignmentResumeToken and common.copy(state.assignmentResumeToken)
+  if not assignmentResume and state.status ~= "complete" then
+    assignmentResume = assignmentResumeSnapshot(state.resumeToken or state.checkpoint)
+  end
   return {
     id = os.getComputerID(),
     label = config.workerName or common.safeComputerLabel("Miner"),
@@ -610,6 +951,40 @@ local function statusPayload()
       retained = state.recycle and state.recycle.held or 0,
       overflow = state.recycle and state.recycle.overflow or 0,
     },
+    discard = discardStatus,
+    assignmentResumeToken = assignmentResume,
+    throughput = throughputSnapshot(),
+    performance = {
+      gpsVerifyEveryMoves = tonumber(config.performance and config.performance.gpsVerifyEveryMoves) or 32,
+      lightweightCheckpointEveryMoves = tonumber(config.performance and config.performance.lightweightCheckpointEveryMoves) or 16,
+      checkpointEveryMoves = tonumber(config.performance and config.performance.checkpointEveryMoves) or 32,
+      effective = {
+        gpsVerifyEveryMoves = tonumber(config.performance and config.performance.gpsVerifyEveryMoves) or 32,
+        lightweightCheckpointEveryMoves = tonumber(config.performance and config.performance.lightweightCheckpointEveryMoves) or 16,
+        checkpointEveryMoves = tonumber(config.performance and config.performance.checkpointEveryMoves) or 32,
+      },
+    },
+    returnRoute = returnSnapshot(),
+    ["return"] = returnSnapshot(),
+    lastReturn = returnSnapshot(),
+    returnReason = state.returnReason or state.lastReturnReason,
+    serviceReason = state.service and state.service.reason or state.lastReturnReason,
+    service = state.service and {
+      reason = state.service.reason,
+      startedAt = state.service.startedAt,
+      returnDistance = state.service.returnDistance,
+      returnSeconds = state.service.returnSeconds,
+      adaptive = config.service and config.service.adaptive == true,
+    } or nil,
+    group = state.group and common.copy(state.group) or (state.job and {
+      groupJobId = state.job.groupJobId, groupId = state.job.groupId,
+      assignmentId = state.job.assignmentId, bay = state.job.bay, bayId = state.job.bayId,
+      dock = state.job.dock and common.copy(state.job.dock) or nil,
+      lease = state.job.lease and common.copy(state.job.lease) or nil,
+      bottomY = state.job.bottomY, maxDepth = state.job.maxDepth,
+    } or nil),
+    dock = state.dock and common.copy(state.dock) or (config.dock and common.copy(config.dock) or nil),
+    bay = state.job and (state.job.bay or state.job.bayId) or state.group and (state.group.bay or state.group.bayId) or nil,
     stagedStop = state.stagedStop == false and false or (state.stagedStop and common.copy(state.stagedStop) or nil),
     progress = progress,
     report = state.report and common.copy(state.report) or nil,
@@ -621,7 +996,7 @@ local function statusPayload()
       gpsCalibration = true,
       lavaSeal = true,
       chunkExclusions = true,
-      worldPartition = false,
+      worldPartition = true,
       localPartition = false,
       touchController = true,
       lighting = true,
@@ -630,6 +1005,10 @@ local function statusPayload()
       stagedStop = true,
       stateJournal = true,
       completionReport = true,
+      discardPolicy = true,
+      shortestServiceRoute = type(quarry.shortestServiceRoute) == "function",
+      edgeTransition = type(quarry.edgeTransition) == "function",
+      groupAssignment = true,
     },
     job = jobSnapshot(),
     fuel = fuelLevel(),
@@ -660,11 +1039,19 @@ local function sendStatus(target, request)
 end
 
 local function sendAck(target, request, ok, text)
-  return protocol.reply(target, config.networkKey, request, "ack", {
+  local payload = request and type(request.payload) == "table" and request.payload or {}
+  local ack = {
     ok = ok == true,
     message = tostring(text or ""),
     status = statusPayload(),
-  })
+    -- Echo only sanitized assignment identity fields so a controller can
+    -- correlate negative/duplicate ACKs with the intended group dispatch.
+    command = payload.command and tostring(payload.command) or nil,
+    groupJobId = payload.groupJobId and tostring(payload.groupJobId) or nil,
+    assignmentId = payload.assignmentId and tostring(payload.assignmentId) or nil,
+    groupId = payload.groupId and tostring(payload.groupId) or nil,
+  }
+  return protocol.reply(target, config.networkKey, request, "ack", ack)
 end
 
 local function markBlocked(message)
@@ -723,7 +1110,9 @@ local function verifyGPS(force)
     if gpsConfig().required then return false, "GPS is required but the worker is not calibrated." end
     return true
   end
-  local interval = math.max(1, tonumber(gpsConfig().verifyEveryMoves) or 16)
+  local interval = math.max(1, tonumber(
+    (config.performance and config.performance.gpsVerifyEveryMoves) or gpsConfig().verifyEveryMoves
+  ) or 32)
   if not force and ((state.stats.moves or 0) % interval ~= 0) then return true end
   local fix, fixError = locateGPS()
   if not fix then
@@ -748,6 +1137,184 @@ local function assignmentChunkKey(entry, mode)
     return quarry.chunkKey(entry.mode == "world" and "world" or mode, cx, cz)
   end
   return nil
+end
+
+local function localDirectionToWorld(calibration, dir)
+  if not geo.validCalibration(calibration) then return (tonumber(dir) or 0) % 4 end
+  local forward = calibration.forward or {}
+  local right = geo.rightVector(calibration) or { x = 1, z = 0 }
+  local localDir = (tonumber(dir) or 0) % 4
+  local vectors = {
+    [0] = { x = forward.x, z = forward.z },
+    [1] = { x = right.x, z = right.z },
+    [2] = { x = -forward.x, z = -forward.z },
+    [3] = { x = -right.x, z = -right.z },
+  }
+  local vector = vectors[localDir]
+  if vector.x == 0 and vector.z == 1 then return 0 end
+  if vector.x == 1 and vector.z == 0 then return 1 end
+  if vector.x == 0 and vector.z == -1 then return 2 end
+  if vector.x == -1 and vector.z == 0 then return 3 end
+  return localDir
+end
+
+local function worldDirectionToLocal(calibration, dir)
+  if not geo.validCalibration(calibration) then return (tonumber(dir) or 0) % 4 end
+  local forward = calibration.forward or {}
+  local right = geo.rightVector(calibration) or { x = 1, z = 0 }
+  local worldDir = (tonumber(dir) or 0) % 4
+  local vectors = {
+    [0] = { x = 0, z = 1 }, [1] = { x = 1, z = 0 },
+    [2] = { x = 0, z = -1 }, [3] = { x = -1, z = 0 },
+  }
+  local vector = vectors[worldDir]
+  if vector.x == forward.x and vector.z == forward.z then return 0 end
+  if vector.x == right.x and vector.z == right.z then return 1 end
+  if vector.x == -forward.x and vector.z == -forward.z then return 2 end
+  if vector.x == -right.x and vector.z == -right.z then return 3 end
+  return worldDir
+end
+
+assignmentResumeSnapshot = function(source)
+  local job = state.job
+  if not job or not job.groupJobId or not job.assignmentId then return nil end
+  local token = type(source) == "table" and source or checkpointToken()
+  local localPose = token.pose and poseCopy(token.pose) or poseCopy()
+  local calibration = gpsCalibration()
+  if not calibration then return nil end
+  local worldPose = geo.localToWorld(calibration, localPose)
+  if not worldPose then return nil end
+  worldPose.dir = localDirectionToWorld(calibration, localPose.dir)
+  local route = token.route or {
+    layer = job.route and job.route.layer,
+    walkIndex = job.route and job.route.walkIndex,
+    localCursor = job.route and job.route.localCursor,
+    phase = job.route and job.route.phase,
+    currentKey = job.route and job.route.currentKey,
+  }
+  return {
+    schema = common.SCHEMA,
+    jobId = tostring(job.id),
+    -- Controller-side reassignment validation uses the source worker identity
+    -- to prevent a token copied from another miner from being accepted.
+    workerId = tonumber(os.getComputerID and os.getComputerID() or nil) or config.workerId,
+    groupJobId = tostring(job.groupJobId),
+    assignmentId = tostring(job.assignmentId),
+    cursor = tonumber(token.cursor) or tonumber(job.cursor) or 0,
+    route = {
+      layer = tonumber(route.layer) or 0,
+      walkIndex = tonumber(route.walkIndex) or 1,
+      localCursor = tonumber(route.localCursor) or 0,
+      phase = route.phase or "travel",
+      currentKey = route.currentKey,
+    },
+    worldPose = worldPose,
+  }
+end
+
+local function validateAssignmentResumeToken(value, job)
+  if value == nil then return nil end
+  if type(value) ~= "table" then return nil, "assignmentResumeToken must be a table." end
+  if not job or not job.groupJobId or not job.assignmentId or not job.chunkPlan then
+    return nil, "assignmentResumeToken requires a group assignment plan."
+  end
+  if value.jobId == nil or tostring(value.jobId) == "" then
+    return nil, "assignmentResumeToken jobId is required."
+  end
+  if tostring(value.jobId) ~= tostring(job.id) then
+    return nil, "assignmentResumeToken jobId mismatch."
+  end
+  local selfWorkerId = tonumber(os.getComputerID and os.getComputerID() or config.workerId)
+  local tokenWorkerId = tonumber(value.workerId)
+  if tokenWorkerId == nil then
+    return nil, "assignmentResumeToken workerId is required."
+  end
+  if selfWorkerId == nil or tokenWorkerId ~= selfWorkerId then
+    return nil, "assignmentResumeToken workerId does not match this worker."
+  end
+  -- Reassignment carries the source identity for controller auditing.  It
+  -- may legitimately differ from the target worker, but must remain a
+  -- scalar worker id when supplied (initial starts omit it).
+  if value.sourceWorkerId ~= nil and tonumber(value.sourceWorkerId) == nil then
+    return nil, "assignmentResumeToken sourceWorkerId is invalid."
+  end
+  if tostring(value.groupJobId or "") ~= tostring(job.groupJobId)
+    or tostring(value.assignmentId or "") ~= tostring(job.assignmentId) then
+    return nil, "assignmentResumeToken group/assignment identity mismatch."
+  end
+  local world = value.worldPose or value.workWorldPose
+  if type(world) ~= "table" or tonumber(world.x) == nil or tonumber(world.y) == nil or tonumber(world.z) == nil then
+    return nil, "assignmentResumeToken requires an integer worldPose."
+  end
+  for _, coordinate in ipairs({ world.x, world.y, world.z }) do
+    if tonumber(coordinate) ~= math.floor(tonumber(coordinate)) then return nil, "assignmentResumeToken worldPose must be integral." end
+  end
+  local calibration = gpsCalibration()
+  if not calibration then return nil, "assignmentResumeToken requires GPS calibration." end
+  local worldDir = tonumber(world.dir)
+  if worldDir == nil then return nil, "assignmentResumeToken worldPose.dir is required." end
+  if worldDir ~= math.floor(worldDir) or worldDir < 0 or worldDir > 3 then
+    return nil, "assignmentResumeToken worldPose.dir is invalid."
+  end
+  worldDir = math.floor(worldDir) % 4
+  local localDir = worldDirectionToLocal(calibration, worldDir)
+  local localPose, localError = geo.worldToLocal(calibration, {
+    x = tonumber(world.x), y = tonumber(world.y), z = tonumber(world.z),
+  }, localDir)
+  if not localPose then return nil, tostring(localError or "assignmentResumeToken world pose is invalid") end
+  local route = value.route
+  if type(route) ~= "table" then return nil, "assignmentResumeToken route is required." end
+  local layer, walkIndex, localCursor = tonumber(route.layer), tonumber(route.walkIndex), tonumber(route.localCursor)
+  if not layer or layer ~= math.floor(layer) or layer < 0 or layer >= job.depth then return nil, "assignmentResumeToken layer is invalid." end
+  local walkCount = #(job.chunkPlan.walk or {})
+  if not walkIndex or walkIndex ~= math.floor(walkIndex) or walkIndex < 1 or walkIndex > walkCount + 1 then return nil, "assignmentResumeToken walkIndex is invalid." end
+  if not localCursor or localCursor ~= math.floor(localCursor) or localCursor < 0 then return nil, "assignmentResumeToken localCursor is invalid." end
+  local currentKey = route.currentKey and tostring(route.currentKey) or job.chunkPlan.rootKey
+  if not ((job.assignmentSet and job.assignmentSet[currentKey]) or (job.transitSet and job.transitSet[currentKey])) then
+    return nil, "assignmentResumeToken currentKey is outside the assignment."
+  end
+  local walkStep = job.chunkPlan.walk and job.chunkPlan.walk[walkIndex]
+  local terminalWalk = walkIndex == walkCount + 1
+  local walkKey = walkStep and tostring(walkStep.key) or (terminalWalk and tostring(job.chunkPlan.walk[walkCount] and job.chunkPlan.walk[walkCount].key) or nil)
+  if not walkKey then return nil, "assignmentResumeToken walk step is missing." end
+  local phase = tostring(route.phase or "travel")
+  if terminalWalk and (phase ~= "travel" or currentKey ~= walkKey) then
+    return nil, "assignmentResumeToken terminal walk state is inconsistent."
+  end
+  if phase ~= "travel" and currentKey ~= walkKey then
+    return nil, "assignmentResumeToken currentKey does not match route walk step."
+  end
+  if phase == "travel" and currentKey ~= walkKey then
+    local previous = walkIndex > 1 and job.chunkPlan.walk[walkIndex - 1]
+    if not previous or tostring(previous.key) ~= currentKey then
+      return nil, "assignmentResumeToken travel key does not match route walk step."
+    end
+  end
+  local foundKey = quarry.findChunk(job.chunkPlan, localPose.x, localPose.z)
+  if foundKey ~= currentKey then return nil, "assignmentResumeToken worldPose is outside current assignment chunk." end
+  if localPose.y ~= -layer then return nil, "assignmentResumeToken worldPose layer does not match route." end
+  local currentChunk = job.chunkPlan.chunks[currentKey]
+  local count = currentChunk and quarry.chunkCellCount(currentChunk) or 0
+  if localCursor > (tonumber(count) or 0) then return nil, "assignmentResumeToken localCursor is outside chunk." end
+  local cursor = tonumber(value.cursor)
+  if not cursor or cursor ~= math.floor(cursor) or cursor < 0 or cursor > (tonumber(job.total) or 0) then
+    return nil, "assignmentResumeToken cursor is invalid."
+  end
+  if phase ~= "travel" and phase ~= "mine" and phase ~= "return" then return nil, "assignmentResumeToken phase is invalid." end
+  return {
+    pose = localPose,
+    x = localPose.x, y = localPose.y, z = localPose.z, dir = localPose.dir,
+    layer = layer, walkIndex = walkIndex, localCursor = localCursor,
+    phase = phase, currentKey = currentKey, cursor = cursor,
+    route = {
+      layer = layer, walkIndex = walkIndex, localCursor = localCursor,
+      phase = phase, currentKey = currentKey,
+    },
+    jobId = tostring(value.jobId or ""), groupJobId = tostring(value.groupJobId), assignmentId = tostring(value.assignmentId),
+    worldPose = {
+      x = math.floor(tonumber(world.x)), y = math.floor(tonumber(world.y)), z = math.floor(tonumber(world.z)), dir = worldDir,
+    },
+  }
 end
 
 local function validateJob(payload)
@@ -799,15 +1366,29 @@ local function validateJob(payload)
     return nil, "World-aligned chunk exclusion requires GPS calibration."
   end
 
-  if payload.assignmentChunks ~= nil then
-    return nil, "Multi-worker chunk partitioning is disabled in this release; dispatch independent jobs."
+  local assignment = type(payload.assignment) == "table" and payload.assignment or nil
+  local assignmentChunks = payload.assignmentChunks
+    or (assignment and (assignment.chunkKeys or assignment.chunks or assignment.assignmentChunks))
+  local function assignmentListCount(value)
+    if type(value) ~= "table" then return tonumber(value) or 0 end
+    if #value > 0 then return #value end
+    local count = 0
+    for _, enabled in pairs(value) do if enabled then count = count + 1 end end
+    return count
+  end
+  if assignmentChunks ~= nil and requestedChunkMode ~= "world" then
+    local count = assignmentListCount(assignmentChunks)
+    if count > 1 then
+      return nil, "Local automatic assignment/splitting is disabled; use explicit world chunk assignments."
+    end
   end
   local assignmentTotal = tonumber(payload.assignmentTotal or payload.assignmentCount)
-  if assignmentTotal and assignmentTotal > 1 then
+  if assignmentTotal and assignmentTotal > 1 and requestedChunkMode ~= "world" then
     return nil, "Multi-worker assignments are disabled in this release; dispatch independent jobs."
   end
-  if type(payload.assignment) == "table" and tonumber(payload.assignment.total or payload.assignment.count) and tonumber(payload.assignment.total or payload.assignment.count) > 1 then
-    return nil, "Multi-worker assignments are disabled in this release; dispatch independent jobs."
+  if assignment and tonumber(assignment.total or assignment.count) and tonumber(assignment.total or assignment.count) > 1
+    and requestedChunkMode ~= "world" then
+    return nil, "Local automatic assignment/splitting is disabled; use explicit world chunk assignments."
   end
 
   local profile = payload.profile
@@ -818,6 +1399,16 @@ local function validateJob(payload)
     end
   end
 
+  local groupJobId = payload.groupJobId or payload.groupId or (assignment and (assignment.groupJobId or assignment.groupId))
+  local bay = payload.bay or payload.bayId or (assignment and (assignment.bay or assignment.bayId))
+  local dock = payload.dock or (assignment and assignment.dock) or config.dock
+  local lease = payload.lease or (assignment and assignment.lease)
+  local assignmentId = payload.assignmentId or (assignment and assignment.assignmentId)
+  local assignmentName = assignment and assignment.name or nil
+  local assignmentWorker = assignment and (assignment.workerId or assignment.worker) or nil
+  local assignmentWorld = payload.homeWorld
+    or (assignment and (assignment.world or assignment.homeWorld))
+    or nil
   local job = {
     kind = "quarry",
     id = tostring(payload.jobId or ("job-" .. common.nowMillis())),
@@ -829,14 +1420,86 @@ local function validateJob(payload)
     startedAt = common.nowSeconds(),
     excludedChunks = exclusions,
     chunkMode = chunkMode,
-    assignmentId = payload.assignmentId and tostring(payload.assignmentId) or nil,
+    assignmentId = assignmentId and tostring(assignmentId) or nil,
+    groupJobId = groupJobId and tostring(groupJobId) or nil,
+    groupId = payload.groupId and tostring(payload.groupId) or (assignment and assignment.groupId and tostring(assignment.groupId) or nil),
+    assignment = assignment and common.copy(assignment) or nil,
+    assignmentName = assignmentName and tostring(assignmentName) or nil,
+    assignmentWorker = assignmentWorker and tostring(assignmentWorker) or nil,
+    bay = bay and tostring(bay) or nil,
+    bayId = payload.bayId and tostring(payload.bayId) or (assignment and assignment.bayId and tostring(assignment.bayId) or nil),
+    dock = dock and common.copy(dock) or nil,
+    lease = lease and common.copy(lease) or nil,
+    homeWorld = assignmentWorld and common.copy(assignmentWorld) or (dock and dock.homeWorld and common.copy(dock.homeWorld) or nil),
+    bottomY = tonumber(payload.bottomY or (assignment and assignment.bottomY) or (dock and dock.bottomY)),
+    maxDepth = tonumber(payload.maxDepth or (assignment and assignment.maxDepth) or (dock and dock.maxDepth)),
+    facing = payload.facing or (assignment and assignment.facing) or (dock and (dock.facing or dock.direction)),
     profile = profile,
     targetY = targetY,
     lighting = type(payload.lighting) == "table" and common.copy(payload.lighting) or nil,
     waterMode = payload.waterMode and tostring(payload.waterMode) or nil,
-    assignmentChunks = nil,
-    assignmentProvided = false,
+    assignmentChunks = assignmentChunks and common.copy(assignmentChunks) or nil,
+    assignmentTransitChunks = common.copy(payload.transitKeys
+      or payload.assignmentTransitChunks
+      or (assignment and (assignment.transitKeys or assignment.transitChunks or assignment.transit))
+      or {}),
+    seedKey = payload.seedKey or (assignment and assignment.seedKey) or nil,
+    dockKey = payload.dockKey or (assignment and assignment.dockKey) or nil,
+    assignmentProvided = assignment ~= nil or assignmentChunks ~= nil,
   }
+  if job.maxDepth and depth > job.maxDepth then return nil, "Assignment depth exceeds maxDepth." end
+  if job.bottomY and targetY and targetY ~= job.bottomY then return nil, "Assignment bottomY does not match targetY." end
+  if job.bottomY == nil and targetY ~= nil then job.bottomY = targetY end
+  if requestedChunkMode == "local" and job.groupJobId and assignmentChunks and assignmentListCount(assignmentChunks) > 1 then
+    return nil, "Local group assignments cannot be automatically split."
+  end
+
+  local assignmentCatalog = payload.assignmentCatalog or payload.catalog or payload.groupCatalog
+  if assignment and type(assignment.catalog) == "table" then assignmentCatalog = assignment.catalog end
+  if assignment and type(assignment.worldCatalog) == "table" then assignmentCatalog = assignment.worldCatalog end
+  local assignmentPlanRequested = type(assignmentChunks) == "table" and assignmentListCount(assignmentChunks) > 0
+  -- Never turn an explicit assignment into a full-footprint plan.  A world
+  -- assignment is valid only with the controller's authoritative catalog;
+  -- absence of the planner is also a safe refusal, not a legacy fallback.
+  if assignmentPlanRequested and requestedChunkMode ~= "world" then
+    return nil, "Explicit group assignments require chunkMode=world."
+  end
+  if assignmentPlanRequested and type(assignmentCatalog) ~= "table" then
+    return nil, "Group assignment requires the authoritative chunk catalog."
+  end
+  if assignmentPlanRequested and type(quarry.buildAssignedChunkPlan) ~= "function" then
+    return nil, "Assigned chunk planning API unavailable; refusing unsafe group job."
+  end
+  if (job.groupJobId or job.assignmentId or assignment ~= nil) and not assignmentPlanRequested then
+    return nil, "Group assignment keys are required; refusing full-footprint fallback."
+  end
+  if assignmentPlanRequested then
+    local assignedSet, transitSet = {}, {}
+    local function collectAssignmentKeys(value, target)
+      if type(value) ~= "table" then return end
+      if #value > 0 then
+        for _, item in ipairs(value) do
+          local key = assignmentChunkKey(item, requestedChunkMode) or tostring(item)
+          target[key] = true
+        end
+      else
+        for item, enabled in pairs(value) do
+          if enabled then
+            local key = assignmentChunkKey(item, requestedChunkMode) or tostring(item)
+            target[key] = true
+          end
+        end
+      end
+    end
+    collectAssignmentKeys(assignmentChunks, assignedSet)
+    collectAssignmentKeys(job.assignmentTransitChunks, transitSet)
+    job.assignmentSet, job.transitSet = assignedSet, transitSet
+    -- The authoritative assigned planner receives the full catalog and
+    -- emits only mine/transit chunks.  Do not manufacture a giant exclusion
+    -- complement here: it is redundant, can exceed legacy exclusion limits,
+    -- and risks using the worker's local calibration as a world partition.
+    job.assignmentCatalog = assignmentCatalog and common.copy(assignmentCatalog) or nil
+  end
 
   if job.waterMode ~= nil and job.waterMode ~= "ignore" and job.waterMode ~= "stop" and job.waterMode ~= "seal" then
     return nil, "waterMode must be ignore, stop, or seal."
@@ -854,19 +1517,125 @@ local function validateJob(payload)
     end
   end
 
-  if #exclusions > 0 then
-    local plan, planError = quarry.buildChunkPlan(job, gpsCalibration())
+  if #exclusions > 0 or assignmentPlanRequested then
+    local planCalibration = (assignmentCatalog and assignmentCatalog.calibrationSeed) or gpsCalibration()
+    local plan, planError
+    if assignmentPlanRequested then
+      -- The assigned planner owns world-catalog validation, connectivity,
+      -- transit leases, and the dock-to-seed service route.  Keep this call
+      -- to its single canonical signature; broad compatibility attempts can
+      -- silently reinterpret the catalog as a job and mine the full region.
+      local assignment = job.assignment or {}
+      local assignmentOptions = {
+        transitKeys = job.assignmentTransitChunks or {},
+        seedKey = payload.seedKey or assignment.seedKey or job.seedKey,
+        rootKey = assignmentCatalog.rootKey,
+        dockKey = payload.dockKey or assignment.dockKey or assignmentCatalog.dockKey,
+        workerId = payload.workerId or assignment.workerId,
+        groupJobId = job.groupJobId,
+        bottomY = job.bottomY or targetY,
+        y = job.bottomY or targetY or 0,
+        referenceCalibration = assignmentCatalog.calibrationSeed,
+        workerCalibration = gpsCalibration(),
+        dockPose = { x = 0, y = 0, z = 1 },
+      }
+      local ok, assignedPlan = pcall(quarry.buildAssignedChunkPlan,
+        assignmentCatalog, assignmentChunks, assignmentOptions)
+      if not ok or type(assignedPlan) ~= "table" or type(assignedPlan.chunks) ~= "table" then
+        return nil, tostring(ok and assignedPlan or assignedPlan or "assigned plan failed")
+      end
+      plan = assignedPlan
+      planError = nil
+    else
+      plan, planError = quarry.buildChunkPlan(job, planCalibration)
+    end
     if not plan then return nil, planError end
     job.strategy = "chunk_plan"
     job.chunkPlan = plan
-    job.total = plan.columns * depth
-    job.route = { layer = 0, walkIndex = 1, phase = "travel", localCursor = 0 }
+    local selectedCells = plan.columns or 0
+    if assignmentPlanRequested then
+      -- The planner returns independent arrays (serializer-safe); normalize
+      -- them into lookup sets used by the runtime's transit-only guard.
+      local assignedKeys = plan.assignedKeys or plan.mineChunkKeys or assignmentChunks
+      local transitKeys = plan.transitKeys or plan.transitRouteKeys or job.assignmentTransitChunks or {}
+      job.assignmentChunks = common.copy(assignedKeys)
+      job.assignmentTransitChunks = common.copy(transitKeys)
+      job.assignmentSet, job.transitSet = {}, {}
+      for _, key in ipairs(assignedKeys or {}) do job.assignmentSet[tostring(key)] = true end
+      for _, key in ipairs(transitKeys or {}) do
+        key = tostring(key)
+        if not job.assignmentSet[key] then job.transitSet[key] = true end
+      end
+      selectedCells = tonumber(plan.columns) or 0
+      if selectedCells <= 0 then return nil, "Group assignment selects no mineable chunks." end
+    end
+    job.total = selectedCells * depth
+    job.route = {
+      layer = 0, walkIndex = 1, phase = "travel", localCursor = 0,
+      currentKey = plan.rootKey, breadcrumbs = {},
+    }
   else
     job.strategy = "serpentine"
     job.total = fullVolume
   end
   if job.total <= 0 then return nil, "The exclusion mask leaves no blocks to mine." end
+  if payload.assignmentResumeToken ~= nil then
+    local resumeToken, resumeError = validateAssignmentResumeToken(payload.assignmentResumeToken, job)
+    if not resumeToken then return nil, resumeError end
+    job.assignmentResumeToken = resumeToken
+  end
   return job
+end
+
+local function facingNumber(value)
+  if type(value) == "number" then return math.floor(value) % 4 end
+  local text = tostring(value or ""):lower()
+  local names = { south = 0, east = 1, north = 2, west = 3,
+    forward = 0, right = 1, back = 2, left = 3 }
+  return names[text]
+end
+
+local function verifyAssignmentDock(job)
+  if type(job) ~= "table" then return true end
+  if not job.groupJobId and not job.groupId and not job.assignmentId and not job.homeWorld then return true end
+  local dock = type(job.dock) == "table" and job.dock or {}
+  local expected = job.homeWorld or dock.homeWorld or dock.world
+  if type(expected) == "table" and tonumber(expected.x) == nil and tonumber(expected.y) == nil and tonumber(expected.z) == nil then expected = nil end
+  local facing = facingNumber(dock.facing or dock.direction or job.facing)
+  local bottomY = tonumber(job.bottomY or dock.bottomY)
+  local maxDepth = tonumber(job.maxDepth or dock.maxDepth)
+  if maxDepth and tonumber(job.depth) and tonumber(job.depth) > maxDepth then
+    return false, "Group assignment depth exceeds dock maxDepth."
+  end
+  if not expected and facing == nil and not bottomY then return true end
+  local calibration = gpsCalibration()
+  if not calibration then return false, "Group/world assignment requires GPS calibration." end
+  local fix, fixError = locateGPS()
+  if not fix then return false, "Group/world dock GPS verification failed: " .. tostring(fixError) end
+  if expected then
+    local x, y, z = tonumber(expected.x), tonumber(expected.y), tonumber(expected.z)
+    if not x or not y or not z then return false, "Group dock homeWorld is invalid." end
+    if fix.x ~= math.floor(x) or fix.y ~= math.floor(y) or fix.z ~= math.floor(z) then
+      return false, ("Group dock mismatch: expected %d,%d,%d, located %d,%d,%d."):format(
+        x, y, z, fix.x, fix.y, fix.z)
+    end
+  else
+    local home = calibration.home or {}
+    if home.x and home.y and home.z and (fix.x ~= home.x or fix.y ~= home.y or fix.z ~= home.z) then
+      return false, "GPS fix is not at the calibrated group dock."
+    end
+  end
+  if facing ~= nil and tonumber(state.pose.dir) ~= facing then
+    return false, ("Group dock facing mismatch: expected dir %d, current dir %d."):format(facing, state.pose.dir)
+  end
+  local homeY = tonumber(calibration.home and calibration.home.y)
+  if bottomY and homeY and tonumber(job.depth) then
+    local derivedBottom = homeY - tonumber(job.depth) + 1
+    if bottomY ~= derivedBottom then
+      return false, ("Group bottomY mismatch: expected %d from depth, received %d."):format(derivedBottom, bottomY)
+    end
+  end
+  return true
 end
 
 local function startJob(payload)
@@ -888,14 +1657,48 @@ local function startJob(payload)
   end
   local job, err = validateJob(payload)
   if not job then return false, err end
+  local dockOK, dockError = verifyAssignmentDock(job)
+  if not dockOK then return false, dockError end
+  local assignmentResume = job.assignmentResumeToken and common.copy(job.assignmentResumeToken) or nil
   state.job = job
+  state.group = {
+    groupJobId = job.groupJobId,
+    groupId = job.groupId,
+    assignmentId = job.assignmentId,
+    assignment = job.assignment and common.copy(job.assignment) or nil,
+    assignmentChunks = job.assignmentChunks and common.copy(job.assignmentChunks) or nil,
+    transitChunks = job.assignmentTransitChunks and common.copy(job.assignmentTransitChunks) or nil,
+    bay = job.bay,
+    bayId = job.bayId,
+    dock = job.dock and common.copy(job.dock) or nil,
+    lease = job.lease and common.copy(job.lease) or nil,
+    homeWorld = job.homeWorld and common.copy(job.homeWorld) or nil,
+    bottomY = job.bottomY,
+    maxDepth = job.maxDepth,
+  }
+  state.dock = job.dock and common.copy(job.dock) or state.dock
   state.stats.jobsStarted = (state.stats.jobsStarted or 0) + 1
   state.checkpoint = nil
+  state.resumeToken = nil
+  state.assignmentResumeToken = nil
+  if assignmentResume then
+    state.job.cursor = assignmentResume.cursor
+    state.job.route = state.job.route or {}
+    for _, key in ipairs({ "layer", "walkIndex", "localCursor", "phase", "currentKey" }) do
+      if assignmentResume[key] ~= nil then state.job.route[key] = assignmentResume[key] end
+    end
+    -- Keep the physical turtle at home while the service phase navigates to
+    -- the validated world checkpoint.  The token pose is a destination, not
+    -- an in-memory claim that the turtle already moved there.
+    state.resumeToken = common.copy(assignmentResume)
+    state.checkpoint = common.copy(assignmentResume)
+    state.assignmentResumeToken = common.copy(job.assignmentResumeToken)
+  end
   state.service = {
     resumeAfter = true,
     finalStatus = "working",
     preserveCheckpoint = false,
-    reason = "job_start",
+    reason = assignmentResume and "assignment_resume" or "job_start",
     startedAt = common.nowSeconds(),
   }
   state.request = nil

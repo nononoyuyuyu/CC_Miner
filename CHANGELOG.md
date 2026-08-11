@@ -1,5 +1,15 @@
 # Changelog
 
+## 4.0.0
+
+- 日本語マニュアルを `docs/index.html` 入口の静的 HTML へ全面再構成。共通目次、パンくず、前後リンク、モバイル／印刷／キーボード／high contrast／`prefers-reduced-motion` に対応
+- GPS 塔、座標軸、ワーカー装備、単一／複数 bay、controller、chunk grid、DFS 帰還経路を semantic HTML + CSS grid/flex の図へ移行（画像・SVG・canvas なし）
+- P0/P1/P2、group partition、discard policy、throughput、絶対 BOTTOM Y、chunk load 非対応、low-space update の運用手順を追加
+- V4.0.0 / schema 4 の role 別オンライン・オフライン配布（worker／controller／gps loader と 2 桁連番・12,000 B 以下の各 parts、互換 dispatcher）、loader の parts 自動削除、role／config.role 検証、オンライン role 自動判定 update、`version/role/next/phase` marker と `.tmp`／`.bak` atomic fallback 再開を追記
+- controller CLI の `dock/bay/group register`、workerBays／workerDocks map、group-job touch 画面、bay chunk/floor/orientation/forward-footprint preflight、own assignment の経路分離、REASSIGN resume を追記
+- `optimizedWalk` は計算結果・見積互換として保持し、runtime の実行順は復旧可能な DFS `walk`、補給・帰還の `shortestServiceRoute` だけ BFS とする境界を明記
+- 旧 Markdown 文書と `docs/images/*.svg` を削除し、README は GitHub landing と HTML マニュアルへのリンクに整理
+
 ## 3.0.0
 
 - 1 タイル = 1 チャンクのタッチ式グリッドを追加。個別、RECT（二点矩形）、ALL、CLEAR、INVERT、入口固定、進捗色を提供
@@ -11,7 +21,7 @@
 - たいまつ自動照明を追加。seal 材チェストの反対側に専用 torch チェスト（既定 seal=右／torch=左）を置き、1×1 坑道の左右 niche を使用。両側不可は安全停止、custom floor fallback は任意・非致命
 - 採掘石の封鎖材再利用、水／溶岩封鎖、連続封鎖上限、段階停止、復旧 wizard、アンロード中断からの再ロード復帰を追加
 - speaker／redstone 通知と、controller の任意 Wired Modem source→valuable／bulk／seal 仕分けを追加。満杯時は残留して次 tick に再試行
-- 通常 serpentine の高速化、除外時 DFS／グラフ計算の高速化、adaptive service、render cache、stack compression を追加。未使用の optimizedWalk は採用しない
+- 通常 serpentine の高速化、除外時 DFS／グラフ計算の高速化、adaptive service、render cache、stack compression を追加。`optimizedWalk` は物理実行順には採用しない
 - ACK/status の保持と再試行、補助 journal（maxEntries／size rotate／checkpoint）を追加。journal は state.db の代替ではない
 - チャンクロード状態の取得・表示・自動化、管理者機能、単一フットプリントの自動分割は提供しない
 - setup が生成する startup marker の改行欠落による line 4 構文エラーを修正し、回帰テストを追加

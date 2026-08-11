@@ -1,4 +1,4 @@
--- CC Miner command launcher (V2/V3 compatible)
+-- CC Miner command launcher (V2/V4 compatible)
 
 local args = { ... }
 local common = dofile("/ccminer/lib/common.lua")
@@ -27,6 +27,13 @@ local function printHelp()
   print("ccm preset(s) [list|save|use|delete] [args...]")
   print("ccm stop <id> <now|row|layer|home|abort>")
   print("ccm pause|resume|recall|service|abort|clear <id>")
+  print("ccm group list")
+  print("ccm group show <id>")
+  print("ccm group register <id> <workerIds comma> [name dock bay mode partition workerBayMap workerDockMap]")
+  print("ccm group start|pause|resume|return|service|abort|clear <id>")
+  print("ccm group reassign <id> <stopped> [target]")
+  print("ccm dock|bay list")
+  print("ccm dock|bay register <id> <x> <y> <z> [facing] [maxDepth]")
   print("ccm gps <id>                    Request GPS fix")
   print("ccm calibrate <id>              Calibrate worker GPS")
   print("ccm rehome <id> RESET")
@@ -64,6 +71,16 @@ local function readTableNoWrite(path)
   local ok, value = pcall(textutils.unserialize, text)
   if not ok or type(value) ~= "table" then return nil, "invalid" end
   return value
+end
+
+local function readTextNoWrite(path)
+  if not fs or not fs.exists or not fs.exists(path) then return nil, "missing" end
+  if fs.isDir and fs.isDir(path) then return nil, "directory" end
+  local handle = fs.open(path, "r")
+  if not handle then return nil, "unreadable" end
+  local text = handle.readAll()
+  handle.close()
+  return text
 end
 
 local function tableValue(value, ...)
@@ -114,6 +131,139 @@ local function printStatusFeature(label, value, fallback)
   end
 end
 
+-- Status/report payloads grew a few additive fields during V4 (and workers
+-- can still be running an older payload).  Keep the CLI tolerant by looking
+-- through the known aliases and only printing a field when it is present.
+-- This deliberately does not stringify networkKey or any credential-like
+-- value; status output must retain the existing masked-key contract.
+local function firstNestedValue(roots, paths)
+  roots = roots or {}
+  -- `roots` intentionally contains optional entries; numeric iteration keeps
+  -- searching past nil job/report/service slots instead of stopping at the
+  -- first hole as `ipairs` would.
+  for index = 1, #roots do
+    local root = roots[index]
+    if type(root) == "table" then
+      for _, path in ipairs(paths or {}) do
+        local value = tableValue(root, unpackArgs(path))
+        if value ~= nil then return value end
+      end
+    end
+  end
+  return nil
+end
+
+local function printOperationalFields(root, config)
+  root = type(root) == "table" and root or {}
+  config = type(config) == "table" and config or {}
+  local job = type(root.job) == "table" and root.job or nil
+  local report = type(root.report) == "table" and root.report or nil
+  local lastReport = type(root.lastReport) == "table" and root.lastReport or nil
+  local service = type(root.service) == "table" and root.service or nil
+  local group = type(root.group) == "table" and root.group or nil
+  local stats = type(root.stats) == "table" and root.stats or nil
+  local roots = {}
+  local function addRoot(value)
+    if type(value) == "table" then roots[#roots + 1] = value end
+  end
+  addRoot(root); addRoot(job); addRoot(report); addRoot(lastReport)
+  addRoot(service); addRoot(group); addRoot(stats); addRoot(config)
+
+  local dock = firstNestedValue(roots, {
+    { "dock" }, { "dockInfo" }, { "location", "dock" },
+    { "gps", "calibration", "home" }, { "homeWorld" },
+  })
+  if dock ~= nil then printField("Dock", dock) end
+  local bay = firstNestedValue(roots, {
+    { "bay" }, { "bayInfo" }, { "location", "bay" },
+  })
+  if bay ~= nil then printField("Bay", bay) end
+
+  local groupId = firstNestedValue(roots, {
+    { "groupId" }, { "group", "id" }, { "group", "groupId" },
+  })
+  local groupJobId = firstNestedValue(roots, {
+    { "groupJobId" }, { "group", "groupJobId" }, { "group", "jobId" },
+    { "job", "groupJobId" },
+  })
+  local assignmentId = firstNestedValue(roots, {
+    { "assignmentId" }, { "assignment", "id" }, { "group", "assignmentId" },
+    { "job", "assignmentId" },
+  })
+  if groupId ~= nil then printField("Group", groupId) end
+  if groupJobId ~= nil then printField("Group job", groupJobId) end
+  if assignmentId ~= nil then printField("Assignment", assignmentId) end
+
+  local bottomY = firstNestedValue(roots, {
+    { "bottomY" }, { "bottom_y" }, { "targetY" },
+    { "job", "bottomY" }, { "job", "targetY" }, { "job", "bottom_y" },
+    { "dock", "bottomY" }, { "dock", "bottom_y" },
+  })
+  if bottomY ~= nil then printField("BOTTOM Y", bottomY) end
+
+  local completionReason = firstNestedValue(roots, {
+    { "return", "reason" }, { "lastReturn", "reason" },
+    { "returnRoute", "reason" }, { "service", "reason" },
+    { "report", "return", "reason" }, { "report", "returnRoute", "reason" },
+  })
+  if completionReason == nil then
+    completionReason = firstNestedValue(roots, {
+      { "returnReason" }, { "serviceReason" }, { "completionReason" },
+      { "reason" }, { "report", "reason" },
+    })
+  end
+  if completionReason ~= nil then printField("Return reason", completionReason) end
+
+  local returnInfo = firstNestedValue(roots, {
+    { "lastReturn" }, { "returnInfo" }, { "return" }, { "returnRoute" },
+    { "service", "return" }, { "service", "lastReturn" },
+  })
+  if returnInfo ~= nil and type(returnInfo) ~= "table" then printField("Return", returnInfo) end
+  local returnDistance = firstNestedValue(roots, {
+    { "returnDistance" }, { "returnBlocks" }, { "lastReturn", "distance" },
+    { "return", "distance" }, { "returnRoute", "distance" }, { "service", "returnDistance" },
+    { "service", "return", "distance" },
+  })
+  local returnSeconds = firstNestedValue(roots, {
+    { "returnSeconds" }, { "returnTime" }, { "lastReturn", "seconds" },
+    { "lastReturn", "elapsed" }, { "return", "seconds" },
+    { "return", "elapsed" }, { "returnRoute", "seconds" }, { "returnRoute", "elapsed" },
+    { "service", "returnSeconds" },
+    { "service", "return", "seconds" },
+  })
+  if returnDistance ~= nil then printField("Return distance", returnDistance) end
+  if returnSeconds ~= nil then printField("Return time", returnSeconds) end
+
+  local discard = firstNestedValue(roots, {
+    { "discard" }, { "discards" }, { "discardStats" },
+    { "stats", "discard" }, { "stats", "discarded" },
+    { "stats", "discardedBlocks" }, { "stats", "discardCount" },
+  })
+  if discard ~= nil then printField("Discard", discard) end
+
+  local performance = firstNestedValue(roots, {
+    { "performance" }, { "stats", "performance" },
+  })
+  if performance ~= nil then printField("Performance", performance) end
+  local throughput = firstNestedValue(roots, {
+    { "throughput" }, { "performance", "throughput" },
+    { "report", "throughput" }, { "stats", "throughput" },
+    { "blocksPerSecond" }, { "perSecond" },
+  })
+  if throughput ~= nil then printField("Throughput", throughput) end
+
+  local partial = firstNestedValue(roots, {
+    { "partialStart" }, { "partial" }, { "partialAssignment" },
+    { "group", "partialStart" }, { "group", "partial" },
+  })
+  if partial ~= nil then printField("Partial start", partial) end
+  local acks = firstNestedValue(roots, {
+    { "ackSummary" }, { "acks" }, { "ack" }, { "groupAcks" },
+    { "group", "acks" }, { "group", "ackSummary" },
+  })
+  if acks ~= nil then printField("ACK summary", acks) end
+end
+
 local function controllerDbCandidates(config)
   local paths, seen = {}, {}
   local function add(path)
@@ -146,7 +296,7 @@ local function historyFromDb(db)
   if type(db.jobs) == "table" then return db.jobs end
   if type(db.records) == "table" then return db.records end
   if type(db.entries) == "table" then return db.entries end
-  -- Some V3 snapshots are themselves a numeric history array.
+  -- Some V4 snapshots are themselves a numeric history array.
   if #db > 0 then return db end
   return nil
 end
@@ -167,18 +317,19 @@ local function printReportTable(prefix, report)
   if not printed then print(prefix .. ": " .. valueString(report)) end
 end
 
-local function printWorkerReport(state)
+local function printWorkerReport(state, config)
   print("Worker report")
   local current = state.currentReport or state.activeReport or state.progressReport or state.currentJobReport
   local last = state.lastReport or state.report or state.lastJobReport or state.completionReport
   if current then printReportTable("Current report", current) else print("Current report: none") end
   if last then printReportTable("Last report", last) else print("Last report: none") end
-  -- V3 keeps both names while older state files only have `report`; show both
+  -- V4 keeps both names while older state files only have `report`; show both
   -- when they are genuinely distinct so no completion data is hidden.
   if state.report and state.report ~= last then printReportTable("Report", state.report) end
   if state.jobReport and state.jobReport ~= last and state.jobReport ~= state.report then
     printReportTable("Job report", state.jobReport)
   end
+  printOperationalFields(state, config or state.config)
   local stats = type(state.stats) == "table" and state.stats or {}
   print("Stats")
   for _, key in ipairs(sortedKeys(stats)) do
@@ -192,6 +343,59 @@ local function printWorkerReport(state)
     ))
   else
     print("Job: none")
+  end
+end
+
+local function printControllerGroups(db)
+  if type(db) ~= "table" then return end
+  local groups = db.groups
+  local docks = db.docks
+  local bays = db.bays
+  local groupJobs = db.groupJobs or db.group_jobs
+  if type(groups) == "table" then
+    local count = 0
+    for _ in pairs(groups) do count = count + 1 end
+    print("Groups: " .. tostring(count))
+    for _, key in ipairs(sortedKeys(groups)) do
+      local group = groups[key]
+      if type(group) == "table" then
+        print(("  group=%s name=%s workers=%s dock=%s bay=%s mode=%s"):format(
+          tostring(group.id or key), tostring(group.name or "-"),
+          valueString(group.workerIds or group.workers or group.assignments or {}),
+          tostring(group.dockId or group.dock or "-"), tostring(group.bayId or group.bay or "-"),
+          tostring(group.mode or "-")))
+      else
+        print("  group=" .. tostring(key) .. " " .. valueString(group))
+      end
+    end
+  end
+  if type(docks) == "table" then
+    local count = 0; for _ in pairs(docks) do count = count + 1 end
+    print("Docks: " .. tostring(count))
+  end
+  if type(bays) == "table" then
+    local count = 0; for _ in pairs(bays) do count = count + 1 end
+    print("Bays: " .. tostring(count))
+  end
+  if type(groupJobs) == "table" then
+    local count = 0; for _ in pairs(groupJobs) do count = count + 1 end
+    print("Group jobs: " .. tostring(count))
+    for _, key in ipairs(sortedKeys(groupJobs)) do
+      local job = groupJobs[key]
+      if type(job) == "table" then
+        local assignments = job.assignments or job.assignmentCount or job.workers
+        local acks = job.acks or job.ackSummary or job.ackCount
+        local aggregate = type(job.aggregate) == "table" and job.aggregate or nil
+        local ackText = aggregate and ((tostring(aggregate.acks or 0)) .. "/" .. tostring(aggregate.ackTotal or "-")) or valueString(acks or "-")
+        local partial = job.partialStart or job.partial
+        print(("  groupJob=%s status=%s assignments=%s ACK=%s partial=%s bottomY=%s"):format(
+          tostring(job.groupJobId or job.id or key), tostring(job.status or "-"),
+          valueString(assignments or "-"), ackText, valueString(partial or "-"),
+          tostring(job.bottomY or job.targetY or "-")))
+      else
+        print("  groupJob=" .. tostring(key) .. " " .. valueString(job))
+      end
+    end
   end
 end
 
@@ -210,6 +414,7 @@ local function printControllerReport(config)
   end
   local history = historyFromDb(loaded)
   print("Database: " .. tostring(loadedPath))
+  printControllerGroups(loaded)
   if not history then
     print("History entries: 0")
     return
@@ -222,11 +427,24 @@ local function printControllerReport(config)
     for index = #history, 1, -1 do
       local row = history[index]
       if type(row) == "table" then
+        local rowReport = type(row.report) == "table" and row.report or row
+        local rowStats = type(row.stats) == "table" and row.stats or (type(rowReport.stats) == "table" and rowReport.stats or {})
+        local rowGroup = row.groupJobId or row.groupId or rowReport.groupJobId or rowReport.groupId
+        local rowBottomY = row.bottomY or row.targetY or rowReport.bottomY or rowReport.targetY
+        local rowDiscard = row.discard or row.discardStats or rowReport.discard or rowReport.discardStats
+          or rowStats.discarded or rowStats.discardedBlocks or rowStats.discardStats
+        local rowThroughput = row.throughput or rowReport.throughput or rowStats.throughput or row.performance or rowReport.performance
+        local rowReturn = row.lastReturn or row.returnInfo or row.returnRoute or rowReport.lastReturn or rowReport["return"] or rowReport.returnRoute
         print(("  #%d id=%s status=%s mode=%s at=%s"):format(
           index, tostring(row.id or row.jobId or row.workerId or "-"),
           tostring(row.status or row.result or row.outcome or "-"),
           tostring(row.stopMode or row.mode or row.command or "-"),
           tostring(row.updatedAt or row.finishedAt or row.completedAt or row.at or "-")))
+        if rowGroup ~= nil or rowBottomY ~= nil or rowDiscard ~= nil or rowThroughput ~= nil or rowReturn ~= nil then
+          print(("      group=%s BOTTOM Y=%s discard=%s throughput=%s return=%s"):format(
+            tostring(rowGroup or "-"), tostring(rowBottomY or "-"), valueString(rowDiscard or "-"),
+            valueString(rowThroughput or "-"), valueString(rowReturn or "-")))
+        end
       else
         print("  #" .. tostring(index) .. " " .. valueString(row))
       end
@@ -237,11 +455,24 @@ local function printControllerReport(config)
     for _, key in ipairs(sortedKeys(history)) do
       local row = history[key]
       if type(row) == "table" then
+        local rowReport = type(row.report) == "table" and row.report or row
+        local rowStats = type(row.stats) == "table" and row.stats or (type(rowReport.stats) == "table" and rowReport.stats or {})
+        local rowGroup = row.groupJobId or row.groupId or rowReport.groupJobId or rowReport.groupId
+        local rowBottomY = row.bottomY or row.targetY or rowReport.bottomY or rowReport.targetY
+        local rowDiscard = row.discard or row.discardStats or rowReport.discard or rowReport.discardStats
+          or rowStats.discarded or rowStats.discardedBlocks or rowStats.discardStats
+        local rowThroughput = row.throughput or rowReport.throughput or rowStats.throughput or row.performance or rowReport.performance
+        local rowReturn = row.lastReturn or row.returnInfo or row.returnRoute or rowReport.lastReturn or rowReport["return"] or rowReport.returnRoute
         print(("  #%s id=%s status=%s mode=%s at=%s"):format(
           tostring(key), tostring(row.id or row.jobId or row.workerId or "-"),
           tostring(row.status or row.result or row.outcome or "-"),
           tostring(row.stopMode or row.mode or row.command or "-"),
           tostring(row.updatedAt or row.finishedAt or row.completedAt or row.at or "-")))
+        if rowGroup ~= nil or rowBottomY ~= nil or rowDiscard ~= nil or rowThroughput ~= nil or rowReturn ~= nil then
+          print(("      group=%s BOTTOM Y=%s discard=%s throughput=%s return=%s"):format(
+            tostring(rowGroup or "-"), tostring(rowBottomY or "-"), valueString(rowDiscard or "-"),
+            valueString(rowThroughput or "-"), valueString(rowReturn or "-")))
+        end
       else print("  #" .. tostring(key) .. " " .. valueString(row)) end
       shown = shown + 1
       if shown >= 10 then break end
@@ -256,7 +487,7 @@ local function runReport()
     local rawState, stateError = readTableNoWrite(common.STATE_PATH)
     local state = type(rawState) == "table" and rawState or {}
     if stateError and stateError ~= "missing" then print("State read warning: " .. tostring(stateError)) end
-    printWorkerReport(state)
+    printWorkerReport(state, config)
   elseif config.role == "controller" then
     printControllerReport(config)
   else
@@ -365,6 +596,135 @@ local function configuredReservedSlots(config)
   return result
 end
 
+local function coordinateTable(value)
+  if type(value) ~= "table" then return false end
+  return tonumber(value.x) ~= nil and tonumber(value.y) ~= nil and tonumber(value.z) ~= nil
+end
+
+local function coordinateText(value)
+  if not coordinateTable(value) then return valueString(value) end
+  return ("%s,%s,%s"):format(tostring(value.x), tostring(value.y), tostring(value.z))
+end
+
+local function doctorJournal(config, state, finding)
+  local journalConfig = type(config.journal) == "table" and config.journal or {}
+  local journalState = type(state) == "table" and type(state.journal) == "table" and state.journal or {}
+  if journalConfig.enabled == false or journalState.enabled == false then
+    finding("PASS", "journal", "disabled")
+    return
+  end
+  local path = journalConfig.path or journalState.path or journalState.journalPath or "/ccminer/data/state.journal"
+  local text, readError = readTextNoWrite(path)
+  local seqValue, sequenceValue = tonumber(journalState.seq), tonumber(journalState.sequence)
+  local expectedSeq = seqValue or sequenceValue
+  local writes = tonumber(journalState.writes)
+  local entries = tonumber(journalState.entries)
+  if seqValue and sequenceValue and seqValue ~= sequenceValue then
+    finding("FAIL", "journal", "state seq/sequence counters disagree")
+  elseif writes and entries and (writes < 0 or entries < 0 or entries > writes) then
+    finding("FAIL", "journal", "state writes/entries counters are inconsistent")
+  end
+  if not text then
+    if readError == "missing" and (not writes or writes == 0) then
+      finding("WARN", "journal", "enabled but no entries yet (" .. tostring(path) .. ")")
+    elseif readError == "missing" then
+      finding("FAIL", "journal", "missing after " .. tostring(writes) .. " writes: " .. tostring(path))
+    else
+      finding("FAIL", "journal", tostring(path) .. ": " .. tostring(readError))
+    end
+  else
+    local count, malformed, previousSeq, lastSeq = 0, 0, nil, nil
+    for line in (text .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+      if line ~= "" then
+        count = count + 1
+        local decoded
+        if type(textutils) == "table" and type(textutils.unserialize) == "function" then
+          local ok, value = pcall(textutils.unserialize, line)
+          if ok and type(value) == "table" then decoded = value end
+        end
+        local sequence = decoded and tonumber(decoded.seq or decoded.sequence) or nil
+        if not decoded or sequence == nil then
+          malformed = malformed + 1
+        elseif previousSeq and sequence <= previousSeq then
+          malformed = malformed + 1
+        else
+          previousSeq, lastSeq = sequence, sequence
+        end
+      end
+    end
+    if malformed > 0 then
+      finding("FAIL", "journal", ("%s malformed/non-monotonic entries=%d"):format(path, malformed))
+    elseif expectedSeq and lastSeq and lastSeq > expectedSeq then
+      finding("FAIL", "journal", ("latest seq %s exceeds state seq %s"):format(tostring(lastSeq), tostring(expectedSeq)))
+    elseif expectedSeq and lastSeq and lastSeq < expectedSeq then
+      finding("WARN", "journal", ("latest seq %s behind state seq %s (rotation/checkpoint may be pending)"):format(tostring(lastSeq), tostring(expectedSeq)))
+    elseif entries and entries ~= count then
+      finding("WARN", "journal", ("file entries=%d state entries=%d"):format(count, entries))
+    else
+      finding("PASS", "journal", ("%s entries=%d seq=%s"):format(path, count, tostring(lastSeq or expectedSeq or 0)))
+    end
+  end
+
+  local checkpointPath = journalConfig.checkpointPath or journalState.checkpointPath or "/ccminer/data/state.checkpoint.db"
+  if fs and fs.exists and fs.exists(checkpointPath) then
+    local checkpoint, checkpointError = readTableNoWrite(checkpointPath)
+    if not checkpoint then finding("FAIL", "journal.checkpoint", tostring(checkpointPath) .. ": " .. tostring(checkpointError or "invalid"))
+    else
+      local checkpointSeq = tonumber(checkpoint.seq or checkpoint.sequence or tableValue(checkpoint.journal, "seq") or tableValue(checkpoint.journal, "sequence"))
+      if expectedSeq and checkpointSeq and checkpointSeq > expectedSeq then
+        finding("FAIL", "journal.checkpoint", "checkpoint sequence is ahead of state")
+      else finding("PASS", "journal.checkpoint", tostring(checkpointSeq or "unsequenced")) end
+    end
+  elseif expectedSeq and expectedSeq > 0 then
+    local every = math.max(1, tonumber(journalConfig.checkpointEvery) or 32)
+    local checkpoints = tonumber(journalState.checkpoints) or 0
+    if checkpoints > 0 or expectedSeq >= every then
+      finding("WARN", "journal.checkpoint", "checkpoint file is missing")
+    else
+      finding("PASS", "journal.checkpoint", "not due yet")
+    end
+  end
+end
+
+local function doctorDiscardAllowlist(config, finding)
+  local discard = type(config.discard) == "table" and config.discard or nil
+  local recycle = type(config.recycle) == "table" and config.recycle or nil
+  local allowlist = config.discardAllowlist or (discard and (discard.allowlist or discard.allowed or discard.items))
+    or (discard and type(discard.items) == "table" and discard.items.allowlist)
+    or (recycle and (recycle.discardAllowlist or recycle.allowlist or recycle.discardItems))
+    or (recycle and type(recycle.discard) == "table" and (recycle.discard.allowlist or recycle.discard.allowed))
+  local mode = tostring((discard and (discard.mode or discard.policy)) or config.discardMode or "KEEP_ALL"):upper()
+  local enabled = discard and discard.enabled
+  if enabled == nil then enabled = config.discardEnabled end
+  if allowlist == nil then
+    if enabled == true then finding("FAIL", "discard.allowlist", "discard is enabled but allowlist is missing")
+    else finding("PASS", "discard.allowlist", "not configured") end
+    return
+  end
+  if type(allowlist) ~= "table" then
+    finding("FAIL", "discard.allowlist", "allowlist must be a table")
+    return
+  end
+  local protected = type(config.protectedBlocks) == "table" and config.protectedBlocks or {}
+  local count, unsafe = 0, 0
+  for key, value in pairs(allowlist) do
+    local name
+    if type(key) == "number" then name = value else name = key end
+    if type(name) ~= "string" or name == "" or name:find("[%c%s]") or name:find("%*")
+      or (type(key) ~= "number" and value ~= true) then
+      unsafe = unsafe + 1
+    elseif protected[name] == true then
+      unsafe = unsafe + 1
+    else
+      count = count + 1
+    end
+  end
+  if unsafe > 0 then finding("FAIL", "discard.allowlist", ("%d unsafe entries (protected/empty/wildcard)"):format(unsafe))
+  elseif count == 0 and mode == "KEEP_ALL" then finding("PASS", "discard.allowlist", "KEEP_ALL (empty allowlist)")
+  elseif count == 0 then finding("WARN", "discard.allowlist", "allowlist is empty")
+  else finding("PASS", "discard.allowlist", tostring(count) .. " explicit entries") end
+end
+
 local function runDoctor()
   local counts = { PASS = 0, WARN = 0, FAIL = 0 }
   local function finding(level, name, message)
@@ -436,6 +796,8 @@ local function runDoctor()
   elseif role == "gps" then
     finding("PASS", "config.coordinates", ("%s, %s, %s"):format(tostring(config.x), tostring(config.y), tostring(config.z)))
   end
+
+  if role == "worker" then doctorDiscardAllowlist(config, finding) end
 
   local labelApi = os and type(os.getComputerLabel) == "function"
   local label = labelApi and os.getComputerLabel() or nil
@@ -541,6 +903,59 @@ local function runDoctor()
       else
         finding("PASS", "state.stagedStop", "none")
       end
+
+      local calibration = tableValue(config, "gps", "calibration") or tableValue(state, "gps", "calibration")
+      local dockMetadata = state.dock or config.dock
+      local dock = dockMetadata
+      if type(dockMetadata) == "table" and not coordinateTable(dockMetadata) then
+        dock = dockMetadata.homeWorld or dockMetadata.world or dockMetadata.position or dockMetadata.home
+      end
+      if dock == nil and type(calibration) == "table" then dock = calibration.home end
+      if dock == nil and type(dockMetadata) == "table" then finding("PASS", "dock", "metadata=" .. valueString(dockMetadata))
+      elseif dock == nil then finding("PASS", "dock", "not configured/calibrated")
+      elseif coordinateTable(dock) then finding("PASS", "dock", coordinateText(dock))
+      elseif type(dockMetadata) == "table" then finding("PASS", "dock", "metadata=" .. valueString(dockMetadata))
+      else finding("FAIL", "dock", "dock coordinates are malformed") end
+
+      local bay = state.bay or config.bay
+      if bay == nil then finding("PASS", "bay", "not configured")
+      elseif type(bay) ~= "table" then finding("FAIL", "bay", "bay metadata is malformed")
+      elseif bay.capacity ~= nil and (not tonumber(bay.capacity) or tonumber(bay.capacity) < 1) then
+        finding("FAIL", "bay", "capacity must be a positive number")
+      else finding("PASS", "bay", valueString(bay)) end
+
+      local group = state.group or config.group
+      if group == nil and state.groupId == nil and config.groupId == nil then
+        finding("PASS", "group", "not assigned")
+      elseif type(group) == "table" or state.groupId ~= nil or config.groupId ~= nil then
+        finding("PASS", "group", valueString(group or state.groupId or config.groupId))
+      else finding("FAIL", "group", "group metadata is malformed") end
+
+      local bottomY = state.bottomY or (type(state.job) == "table" and (state.job.bottomY or state.job.targetY) or nil)
+        or config.bottomY or config.targetY
+      local homeCoordinate = type(calibration) == "table" and (calibration.home or calibration.homeWorld) or nil
+      if not homeCoordinate and type(dock) == "table" then homeCoordinate = dock end
+      local homeY = homeCoordinate and tonumber(homeCoordinate.y) or nil
+      if homeY == nil then
+        if bottomY ~= nil or (type(config.gps) == "table" and config.gps.required == true) then
+          finding("FAIL", "gps.absoluteY", "absolute home Y is unavailable")
+        else finding("PASS", "gps.absoluteY", "not required/calibrated") end
+      elseif bottomY ~= nil then
+        -- A configured maxDepth is a capacity limit, not the active job's
+        -- depth.  Only compare the derived absolute BOTTOM Y when a job
+        -- carries its own depth value.
+        local depth = type(state.job) == "table" and tonumber(state.job.depth) or nil
+        local numericBottom = tonumber(bottomY)
+        local expectedDepth = numericBottom and math.floor(homeY - numericBottom + 1) or nil
+        if not numericBottom or numericBottom ~= math.floor(numericBottom) or numericBottom > homeY then
+          finding("FAIL", "gps.absoluteY", "BOTTOM Y is above calibrated home Y")
+        elseif depth and expectedDepth ~= depth then
+          finding("FAIL", "gps.absoluteY", ("BOTTOM Y/depth mismatch (derived %d, depth %s)"):format(expectedDepth, tostring(depth)))
+        else finding("PASS", "gps.absoluteY", ("homeY=%s bottomY=%s"):format(tostring(homeY), tostring(bottomY))) end
+      else
+        finding("PASS", "gps.absoluteY", "homeY=" .. tostring(homeY))
+      end
+      doctorJournal(config, state, finding)
     end
   elseif stateError and stateError ~= "missing" then
     finding("WARN", "state.file", "not applicable; read error " .. tostring(stateError))
@@ -558,6 +973,84 @@ local function runDoctor()
           for _ in pairs(history) do historyCount = historyCount + 1 end
           finding("PASS", "controller.db", tostring(path) .. " entries=" .. tostring(historyCount))
         else finding("WARN", "controller.db", tostring(path) .. " has no history table") end
+
+        local docks = type(db.docks) == "table" and db.docks or {}
+        local bays = type(db.bays) == "table" and db.bays or {}
+        local groups = db.groups
+        local groupJobs = db.groupJobs or db.group_jobs
+        if groups == nil then
+          finding("PASS", "group", "no groups configured")
+        elseif type(groups) ~= "table" then
+          finding("FAIL", "group", "groups table is malformed")
+        else
+          local groupCount = 0; local groupErrors = 0
+          for key, group in pairs(groups) do
+            groupCount = groupCount + 1
+            if type(group) ~= "table" then
+              groupErrors = groupErrors + 1
+            else
+              local workers = group.workerIds or group.workers
+              if workers ~= nil and type(workers) ~= "table" then groupErrors = groupErrors + 1 end
+              local dockId = group.dockId or (type(group.dock) == "string" and group.dock or nil)
+              local bayId = group.bayId or (type(group.bay) == "string" and group.bay or nil)
+              if dockId and docks[dockId] == nil and docks[tostring(dockId)] == nil then groupErrors = groupErrors + 1 end
+              if bayId and bays[bayId] == nil and bays[tostring(bayId)] == nil then groupErrors = groupErrors + 1 end
+              if group.bottomY ~= nil and not tonumber(group.bottomY) then groupErrors = groupErrors + 1 end
+            end
+          end
+          if groupErrors > 0 then finding("FAIL", "group", ("%d malformed of %d"):format(groupErrors, groupCount))
+          else finding("PASS", "group", tostring(groupCount) .. " configured") end
+        end
+        if db.docks == nil then finding("PASS", "dock", "no dock registry")
+        elseif type(db.docks) ~= "table" then finding("FAIL", "dock", "dock registry is malformed")
+        else
+          local errors, count = 0, 0
+          for _, dock in pairs(db.docks) do
+            count = count + 1
+            if type(dock) ~= "table" then errors = errors + 1
+            elseif dock.world and not coordinateTable(dock.world) then errors = errors + 1
+            elseif dock.x ~= nil and (not tonumber(dock.x) or not tonumber(dock.y) or not tonumber(dock.z)) then errors = errors + 1 end
+          end
+          if errors > 0 then finding("FAIL", "dock", ("%d malformed of %d"):format(errors, count))
+          else finding("PASS", "dock", tostring(count) .. " registered") end
+        end
+        if db.bays == nil then finding("PASS", "bay", "no bay registry")
+        elseif type(db.bays) ~= "table" then finding("FAIL", "bay", "bay registry is malformed")
+        else
+          local errors, count = 0, 0
+          for _, bay in pairs(db.bays) do
+            count = count + 1
+            if type(bay) ~= "table" then errors = errors + 1
+            elseif bay.world and not coordinateTable(bay.world) then errors = errors + 1
+            elseif bay.capacity ~= nil and (not tonumber(bay.capacity) or tonumber(bay.capacity) < 1) then errors = errors + 1 end
+          end
+          if errors > 0 then finding("FAIL", "bay", ("%d malformed of %d"):format(errors, count))
+          else finding("PASS", "bay", tostring(count) .. " registered") end
+        end
+        if groupJobs ~= nil and type(groupJobs) ~= "table" then
+          finding("FAIL", "group.ack", "groupJobs table is malformed")
+        elseif type(groupJobs) == "table" then
+          local ackWarnings = 0
+          for _, job in pairs(groupJobs) do
+            if type(job) == "table" then
+              local assignments = job.assignments or job.assignmentCount
+              local acks = job.acks or job.ackSummary or job.ackCount
+              local aggregate = type(job.aggregate) == "table" and job.aggregate or nil
+              local aggregateAcks = aggregate and tonumber(aggregate.acks) or nil
+              local aggregateTotal = aggregate and tonumber(aggregate.ackTotal or aggregate.total) or nil
+              if type(assignments) == "table" then assignments = #assignments end
+              if type(acks) == "table" then
+                local count = 0
+                for _ in pairs(acks) do count = count + 1 end
+                acks = count
+              end
+              if assignments and acks and tonumber(acks) and tonumber(assignments) and tonumber(acks) > tonumber(assignments) then ackWarnings = ackWarnings + 1 end
+              if aggregateAcks and aggregateTotal and (aggregateAcks < 0 or aggregateAcks > aggregateTotal) then ackWarnings = ackWarnings + 1 end
+            end
+          end
+          if ackWarnings > 0 then finding("FAIL", "group.ack", "ACK count exceeds assignments")
+          else finding("PASS", "group.ack", "group ACK summaries are consistent") end
+        else finding("PASS", "group.ack", "no group jobs") end
         break
       elseif dbError and dbError ~= "missing" then finding("WARN", "controller.db", tostring(path) .. ": " .. tostring(dbError)) end
     end
@@ -622,11 +1115,37 @@ elseif command == "rehome" then
   end
 elseif command == "start" or command == "pause" or command == "resume" or command == "recall"
   or command == "service" or command == "abort" or command == "clear" or command == "gps" or command == "calibrate"
-  or command == "queue" or command == "preset" or command == "presets" or command == "stop" then
+  or command == "queue" or command == "preset" or command == "presets" or command == "stop"
+  or command == "group" or command == "dock" or command == "bay" then
   local config = loadConfigForCommand()
   if config and config.role ~= "controller" then reportError("Run this command on the controller computer.")
   elseif config then
-    if command == "stop" then
+    if command == "group" then
+      local sub = string.lower(tostring(args[2] or "list"))
+      local groupCommands = {
+        list = true, show = true, register = true, start = true, pause = true, resume = true,
+        ["return"] = true, service = true, abort = true, clear = true, reassign = true,
+      }
+      if not groupCommands[sub] then
+        reportError("Usage: ccm group list|show <id>|register <id> <workerIds comma> [name dock bay mode partition workerBayMap workerDockMap]|start|pause|resume|return|service|abort|clear|reassign <id> <stopped> [target]")
+      else
+        -- Keep the complete argument vector intact.  The controller owns
+        -- group validation, worker selection, partial-start policy and ACK
+        -- aggregation; command.lua only preserves the legacy forwarding
+        -- boundary and role check.
+        forwardController()
+      end
+    elseif command == "dock" or command == "bay" then
+      local sub = string.lower(tostring(args[2] or "list"))
+      if sub ~= "list" and sub ~= "register" then
+        reportError("Usage: ccm " .. command .. " list|register <id> <x> <y> <z> [facing] [maxDepth]")
+      else
+        -- Registry validation and coordinate normalization stay in the
+        -- controller.  Preserve every argument so legacy and extended
+        -- register forms remain compatible.
+        forwardController()
+      end
+    elseif command == "stop" then
       local mode = string.lower(tostring(args[3] or ""))
       local stopModes = {
         now = "pause_now", row = "finish_row", layer = "finish_layer", home = "return_home",
@@ -673,6 +1192,7 @@ elseif command == "status" then
     printStatusFeature("Materials", state.materials, config.materials)
     printStatusFeature("Staged stop", state.stagedStop, config.stagedStop)
     if state.job then print(("Job: %s %s/%s [%s]"):format(tostring(state.job.name), tostring(state.job.cursor), tostring(state.job.total), tostring(state.job.strategy))) end
+    printOperationalFields(state, config)
     if state.lastError then print("Error: " .. tostring(state.lastError)) end
   elseif config.role == "gps" then
     print(("Coordinates: %s, %s, %s"):format(config.x, config.y, config.z))

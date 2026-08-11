@@ -1,0 +1,139 @@
+    if fs.exists(path) then pcall(fs.delete, path) end
+    if fs.exists(path) then return false, "Cannot clear recovery marker artifact: " .. path end
+  end
+  return true
+end
+local function lowSpaceFailure(message)
+  printError("LOW-SPACE UPDATE PAUSED")
+  fail(tostring(message) .. "\nRecovery marker: " .. LOW_SPACE_MARKER
+    .. "\nRe-transfer ccminer-offline-" .. ROLE .. ".lua and its parts, then rerun update-low-space.")
+end
+local function embeddedEntrypoint()
+  for _, file in ipairs(files) do
+    if file.target == ENTRYPOINT then return file.content end
+  end
+  lowSpaceFailure("Embedded role loader is missing: " .. ENTRYPOINT)
+end
+local function ensureUpdateSentinel()
+  local path = ROOT .. "/" .. ENTRYPOINT
+  if readFile(path) ~= UPDATE_SENTINEL then
+    local wrote, writeError = atomicWrite(path, UPDATE_SENTINEL)
+    if not wrote then lowSpaceFailure("Cannot install the update-incomplete sentinel: " .. tostring(writeError)) end
+  end
+  if readFile(path) ~= UPDATE_SENTINEL then
+    lowSpaceFailure("Update-incomplete sentinel could not be verified; runtime was not started.")
+  end
+end
+local function applyLowSpaceStep(step)
+  if step.kind == "runtime" then
+    local file = files[step.index]
+    if not file then return false, "Low-space runtime step has an invalid file index." end
+    local wrote, writeError = atomicWrite(ROOT .. "/" .. file.target, file.content)
+    if not wrote then return false, "Cannot atomically install " .. file.target .. ": " .. tostring(writeError) end
+    return true
+  end
+  if step.kind == "obsolete" then
+    local basePath = ROOT .. "/" .. step.target
+    for _, suffix in ipairs({ "", ".tmp", ".bak" }) do
+      local path = basePath .. suffix
+      if fs.exists(path) then pcall(fs.delete, path) end
+      if fs.exists(path) then return false, "Cannot remove obsolete runtime target: " .. path end
+    end
+    return true
+  end
+  return false, "Unknown low-space update step: " .. tostring(step.kind)
+end
+local function lowSpaceUpdate()
+  -- Everything is already in memory from the verified role bundle.  There is
+  -- deliberately no /ccminer.update staging tree in this path.  The runtime
+  -- entrypoint is first replaced by a fail-closed sentinel, so a power loss
+  -- cannot boot a mixed set of files.  The final entrypoint is committed only
+  -- after every non-loader write and obsolete-role deletion has completed.
+  validateLowSpaceStage()
+  ensureUpdateSentinel()
+  local marker, markerReadError = markerRead()
+  if markerReadError then lowSpaceFailure(markerReadError) end
+  if marker then
+    if marker.version ~= VERSION or marker.schema ~= SCHEMA or marker.role ~= ROLE then
+      lowSpaceFailure("Recovery marker does not match this role bundle.")
+    end
+    if marker.state ~= "ready" and marker.state ~= "committing" and marker.state ~= "final-ready" then
+      lowSpaceFailure("Recovery marker has an unknown state: " .. tostring(marker.state))
+    end
+  else
+    local marked, markerError = markerWrite("ready", 1)
+    if not marked then lowSpaceFailure("Cannot create recovery marker: " .. tostring(markerError)) end
+    marker, markerReadError = markerRead()
+    if markerReadError or not marker then
+      lowSpaceFailure(markerReadError or "Recovery marker was written but could not be read back.")
+    end
+  end
+  local first
+  if marker.state == "final-ready" then
+    -- final-ready explicitly skips every non-loader step on resume.
+    first = #LOW_SPACE_STEPS + 1
+  else
+    first = math.max(1, math.min(#LOW_SPACE_STEPS + 1, marker.next or 1))
+  end
+  local marked, markerError = markerWrite("ready", first)
+  if not marked then lowSpaceFailure("Cannot mark validated runtime: " .. tostring(markerError)) end
+  for index = first, #LOW_SPACE_STEPS do
+    local step = LOW_SPACE_STEPS[index]
+    marked, markerError = markerWrite("committing", index)
+    if not marked then lowSpaceFailure("Cannot record commit progress for step " .. tostring(index) .. ": " .. tostring(markerError)) end
+    local applied, applyError = applyLowSpaceStep(step)
+    if not applied then lowSpaceFailure(applyError) end
+    marked, markerError = markerWrite("committing", index + 1)
+    if not marked then lowSpaceFailure("Applied low-space step " .. tostring(index) .. ", but cannot advance recovery marker: " .. tostring(markerError)) end
+  end
+  local finalContent = embeddedEntrypoint()
+  marked, markerError = markerWrite("final-ready", #LOW_SPACE_STEPS + 1)
+  if not marked then lowSpaceFailure("Cannot mark the validated final role loader: " .. tostring(markerError)) end
+  local finalPath = ROOT .. "/" .. ENTRYPOINT
+  local wrote, writeError = atomicWrite(finalPath, finalContent)
+  if not wrote then lowSpaceFailure("Cannot atomically commit final role loader: " .. tostring(writeError)) end
+  if readFile(finalPath) ~= finalContent then
+    lowSpaceFailure("Final role loader could not be verified after atomic commit.")
+  end
+  local cleared, clearError = clearMarker()
+  if not cleared then lowSpaceFailure(clearError) end
+  print("Low-space update installed: " .. VERSION .. " (schema " .. SCHEMA .. ")")
+  print("User data under /ccminer was left in place. Run: reboot")
+end
+
+if action == "update-low-space" then
+  term.clear(); term.setCursorPos(1, 1)
+  print("CC MINER V4 OFFLINE UPDATE-LOW-SPACE / " .. ROLE); print("")
+  lowSpaceUpdate()
+  return
+end
+
+if fs.exists(BACKUP) then fs.delete(BACKUP) end
+local hadRoot = fs.exists(ROOT)
+if hadRoot then
+  local backedUp, backupError = moveChecked(ROOT, BACKUP)
+  if not backedUp then fs.delete(TEMP); fail("Cannot back up existing installation: " .. backupError) end
+end
+local moved, moveError = moveChecked(TEMP, ROOT)
+if not moved then
+  if fs.exists(ROOT) then fs.delete(ROOT) end
+  local restored, restoreError = true, nil
+  if hadRoot then
+    if fs.exists(BACKUP) then restored, restoreError = moveChecked(BACKUP, ROOT)
+    else restored, restoreError = false, "Backup directory is missing." end
+  end
+  if not restored then
+    fail("Install swap failed and rollback failed. Previous files remain at " .. BACKUP .. ": "
+      .. tostring(moveError) .. "; rollback: " .. tostring(restoreError))
+  end
+  fail("Install swap failed; previous installation was restored: " .. tostring(moveError))
+end
+print("")
+if action == "update" then
+  print("Offline update installed: " .. VERSION .. " (schema " .. SCHEMA .. ")")
+  print("Previous files: /ccminer.backup"); print("Run: reboot")
+else
+  local setupOk = shell.run(ROOT .. "/setup.lua", ROLE)
+  if not setupOk then printError("Setup did not complete. Run: " .. ROOT .. "/setup.lua " .. ROLE)
+  else print(""); print("Installation complete. Run: reboot") end
+end

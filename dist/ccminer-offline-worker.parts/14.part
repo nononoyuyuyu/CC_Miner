@@ -1,0 +1,298 @@
+  local row = math.floor(offset / validLength)
+  local column = offset % validLength
+  local z = row % 2 == 0 and (column + 1) or (validLength - column)
+  return { x = row, y = -layer, z = z }
+end
+
+function M.cellForJob(job, index)
+  if type(job) ~= "table" then return nil, "invalid_job" end
+  return M.cell(job.width, job.length, job.depth, index)
+end
+
+local function validCalibration(calibration)
+  if type(calibration) ~= "table" or type(calibration.home) ~= "table" or type(calibration.forward) ~= "table" then
+    return false
+  end
+  local fx, fz = numberValue(calibration.forward.x), numberValue(calibration.forward.z)
+  local hx, hy, hz = numberValue(calibration.home.x), numberValue(calibration.home.y), numberValue(calibration.home.z)
+  return fx ~= nil and fz ~= nil and hx ~= nil and hy ~= nil and hz ~= nil
+    and math.abs(fx) + math.abs(fz) == 1
+end
+
+local function localToWorld(calibration, x, z)
+  local forward = { x = numberValue(calibration.forward.x), z = numberValue(calibration.forward.z) }
+  local homeX, homeZ = numberValue(calibration.home.x), numberValue(calibration.home.z)
+  local rightX, rightZ = -forward.z, forward.x
+  return homeX + rightX * x + forward.x * z,
+    homeZ + rightZ * x + forward.z * z
+end
+
+-- Inverse of localToWorld for worker-local rebasing.  GPS calibrations are
+-- cardinal (one-block forward/right vectors), so the result remains integral
+-- for integral world positions while still accepting numeric coordinates for
+-- diagnostics.
+local function worldToLocalXZ(calibration, worldX, worldZ)
+  if not validCalibration(calibration) then return nil, nil, "gps_not_calibrated" end
+  worldX, worldZ = numberValue(worldX), numberValue(worldZ)
+  if not worldX or not worldZ then return nil, nil, "invalid_world_position" end
+  local forwardX, forwardZ = numberValue(calibration.forward.x), numberValue(calibration.forward.z)
+  local homeX, homeZ = numberValue(calibration.home.x), numberValue(calibration.home.z)
+  local dx, dz = worldX - homeX, worldZ - homeZ
+  local rightX, rightZ = -forwardZ, forwardX
+  return dx * rightX + dz * rightZ, dx * forwardX + dz * forwardZ
+end
+
+M.worldToLocalXZ = worldToLocalXZ
+function M.inverseWorldToLocal(calibration, worldX, worldZ)
+  if type(worldX) == "table" then worldZ, worldX = worldX.z, worldX.x end
+  local localX, localZ, inverseError = worldToLocalXZ(calibration, worldX, worldZ)
+  if not localX then return nil, inverseError end
+  return { x = localX, z = localZ }
+end
+function M.referenceLocalToWorld(calibration, x, z)
+  if not validCalibration(calibration) then return nil, "gps_not_calibrated" end
+  x, z = numberValue(x), numberValue(z)
+  if not x or not z then return nil, "invalid_position" end
+  local worldX, worldZ = localToWorld(calibration, x, z)
+  return { x = worldX, z = worldZ }
+end
+M.worldToLocal = M.inverseWorldToLocal
+
+local function chunkKey(mode, cx, cz)
+  return (mode == "world" and "W:" or "L:") .. tostring(cx) .. ":" .. tostring(cz)
+end
+
+M.chunkKey = chunkKey
+
+function M.chunkForCell(mode, calibration, x, z)
+  x, z = numberValue(x), numberValue(z)
+  if not x or not z then return nil, nil, "invalid_position" end
+  if mode == "world" then
+    if not validCalibration(calibration) then return nil, nil, "gps_not_calibrated" end
+    local wx, wz = localToWorld(calibration, x, z)
+    return math.floor(wx / 16), math.floor(wz / 16)
+  end
+  return math.floor(x / 16), math.floor((z - 1) / 16)
+end
+
+local function chunkComparator(a, b)
+  if a.cz ~= b.cz then return a.cz < b.cz end
+  if a.cx ~= b.cx then return a.cx < b.cx end
+  return tostring(a.key) < tostring(b.key)
+end
+
+function M.buildCatalog(width, length, mode, calibration)
+  local validWidth, validLength, _, columns = dimensions(width, length)
+  if not validWidth then return nil, validLength end
+  mode = mode == "world" and "world" or "local"
+  if mode == "world" and not validCalibration(calibration) then return nil, "gps_not_calibrated" end
+
+  local byKey, catalogSize = {}, 0
+  for x = 0, validWidth - 1 do
+    for z = 1, validLength do
+      local cx, cz, err = M.chunkForCell(mode, calibration, x, z)
+      if not cx then return nil, err end
+      local key = chunkKey(mode, cx, cz)
+      local chunk = byKey[key]
+      if not chunk then
+        catalogSize = catalogSize + 1
+        if catalogSize > MAX_CHUNKS then return nil, "too_many_chunks" end
+        chunk = {
+          key = key,
+          mode = mode,
+          cx = cx,
+          cz = cz,
+          minX = x,
+          maxX = x,
+          minZ = z,
+          maxZ = z,
+          cells = 0,
+        }
+        byKey[key] = chunk
+      end
+      if x < chunk.minX then chunk.minX = x end
+      if x > chunk.maxX then chunk.maxX = x end
+      if z < chunk.minZ then chunk.minZ = z end
+      if z > chunk.maxZ then chunk.maxZ = z end
+      chunk.cells = chunk.cells + 1
+    end
+  end
+
+  local catalog = {}
+  for _, chunk in pairs(byKey) do catalog[#catalog + 1] = chunk end
+  table.sort(catalog, chunkComparator)
+  return catalog
+end
+
+local function exclusionSet(exclusions, mode)
+  local set = {}
+  if exclusions == nil then return set end
+  if type(exclusions) ~= "table" then return nil, "invalid_exclusions" end
+  local seen = 0
+  for _, item in ipairs(exclusions) do
+    seen = seen + 1
+    if seen > MAX_CHUNKS then return nil, "too_many_exclusions" end
+    if type(item) == "string" then
+      if item ~= "" then set[item] = true end
+    elseif type(item) == "table" then
+      local itemMode = item.mode == "world" and "world" or item.mode == "local" and "local" or mode
+      local cx, cz = numberValue(item.cx), numberValue(item.cz)
+      if cx and cz and cx % 1 == 0 and cz % 1 == 0 then
+        set[chunkKey(itemMode, cx, cz)] = true
+      elseif item.key and tostring(item.key) ~= "" then
+        set[tostring(item.key)] = true
+      end
+    end
+  end
+  return set
+end
+
+local function overlaps(a1, a2, b1, b2)
+  return a1 <= b2 and b1 <= a2
+end
+
+local function adjacent(a, b)
+  if a.maxX + 1 == b.minX or b.maxX + 1 == a.minX then
+    return overlaps(a.minZ, a.maxZ, b.minZ, b.maxZ)
+  end
+  if a.maxZ + 1 == b.minZ or b.maxZ + 1 == a.minZ then
+    return overlaps(a.minX, a.maxX, b.minX, b.maxX)
+  end
+  return false
+end
+
+local function contains(chunk, x, z)
+  return x >= chunk.minX and x <= chunk.maxX and z >= chunk.minZ and z <= chunk.maxZ
+end
+
+local function appendIndex(index, value, key)
+  local list = index[value]
+  if not list then list = {}; index[value] = list end
+  list[#list + 1] = key
+end
+
+-- Build an edge-indexed graph.  The previous implementation compared every
+-- chunk with every other chunk; boundary indexes make normal rectangular jobs
+-- proportional to the number of chunks and their immediate candidates.
+local function buildNeighborGraph(chunks, keys)
+  local byMinX, byMaxX, byMinZ, byMaxZ = {}, {}, {}, {}
+  for _, key in ipairs(keys) do
+    local chunk = chunks[key]
+    appendIndex(byMinX, chunk.minX, key)
+    appendIndex(byMaxX, chunk.maxX, key)
+    appendIndex(byMinZ, chunk.minZ, key)
+    appendIndex(byMaxZ, chunk.maxZ, key)
+    chunk.neighbors = {}
+  end
+  local order = {}
+  for index, key in ipairs(keys) do order[key] = index end
+  local function addPair(leftKey, rightKey)
+    if leftKey == rightKey or order[leftKey] > order[rightKey] then return end
+    local left, right = chunks[leftKey], chunks[rightKey]
+    if not adjacent(left, right) then return end
+    left.neighbors[#left.neighbors + 1] = rightKey
+    right.neighbors[#right.neighbors + 1] = leftKey
+  end
+  for _, key in ipairs(keys) do
+    local chunk = chunks[key]
+    local candidates, seen = {}, {}
+    local function collect(list)
+      for _, candidate in ipairs(list or {}) do
+        if not seen[candidate] then seen[candidate] = true; candidates[#candidates + 1] = candidate end
+      end
+    end
+    collect(byMinX[chunk.maxX + 1])
+    collect(byMaxX[chunk.minX - 1])
+    collect(byMinZ[chunk.maxZ + 1])
+    collect(byMaxZ[chunk.minZ - 1])
+    table.sort(candidates, function(a, b) return order[a] < order[b] end)
+    for _, candidate in ipairs(candidates) do addPair(key, candidate) end
+  end
+  for _, key in ipairs(keys) do
+    table.sort(chunks[key].neighbors, function(left, right)
+      return order[left] < order[right]
+    end)
+  end
+end
+
+local function copyChunk(source)
+  local copy = {}
+  for key, value in pairs(source) do copy[key] = value end
+  copy.neighbors = {}
+  copy.parent = nil
+  copy.anchor = { x = copy.minX, z = copy.minZ }
+  return copy
+end
+
+-- Return a deterministic boundary cell on `chunk` closest to `previous`.
+-- `previous` may be a chunk, an anchor, or a point containing x/z.
+function M.chunkAnchor(chunk, previous)
+  if type(chunk) ~= "table" or not numberValue(chunk.minX) or not numberValue(chunk.maxX)
+      or not numberValue(chunk.minZ) or not numberValue(chunk.maxZ) then
+    return nil, "invalid_chunk"
+  end
+  local minX, maxX = chunk.minX, chunk.maxX
+  local minZ, maxZ = chunk.minZ, chunk.maxZ
+  local px, pz
+  if type(previous) == "table" then
+    px, pz = numberValue(previous.x), numberValue(previous.z)
+    if (not px or not pz) and previous.anchor then
+      px, pz = numberValue(previous.anchor.x), numberValue(previous.anchor.z)
+    end
+    if (not px or not pz) and previous.minX and previous.minZ then
+      px, pz = numberValue(previous.minX), numberValue(previous.minZ)
+    end
+  end
+  if not px or not pz then return { x = minX, z = minZ } end
+
+  local function clamp(value, low, high)
+    if value < low then return low end
+    if value > high then return high end
+    return value
+  end
+  local previousMinX, previousMaxX = numberValue(previous and previous.minX), numberValue(previous and previous.maxX)
+  local previousMinZ, previousMaxZ = numberValue(previous and previous.minZ), numberValue(previous and previous.maxZ)
+  if previousMinX and previousMaxX and previousMinZ and previousMaxZ then
+    if previousMaxX + 1 == minX and overlaps(minZ, maxZ, previousMinZ, previousMaxZ) then
+      return { x = minX, z = clamp(pz, math.max(minZ, previousMinZ), math.min(maxZ, previousMaxZ)) }
+    elseif maxX + 1 == previousMinX and overlaps(minZ, maxZ, previousMinZ, previousMaxZ) then
+      return { x = maxX, z = clamp(pz, math.max(minZ, previousMinZ), math.min(maxZ, previousMaxZ)) }
+    elseif previousMaxZ + 1 == minZ and overlaps(minX, maxX, previousMinX, previousMaxX) then
+      return { x = clamp(px, math.max(minX, previousMinX), math.min(maxX, previousMaxX)), z = minZ }
+    elseif maxZ + 1 == previousMinZ and overlaps(minX, maxX, previousMinX, previousMaxX) then
+      return { x = clamp(px, math.max(minX, previousMinX), math.min(maxX, previousMaxX)), z = maxZ }
+    end
+  end
+
+  -- For a non-adjacent reference, choose the closest point on the rectangle
+  -- perimeter, with a stable x-then-z tie break.
+  local candidates = {
+    { x = minX, z = clamp(pz, minZ, maxZ) },
+    { x = maxX, z = clamp(pz, minZ, maxZ) },
+    { x = clamp(px, minX, maxX), z = minZ },
+    { x = clamp(px, minX, maxX), z = maxZ },
+  }
+  local best, bestDistance
+  for _, candidate in ipairs(candidates) do
+    local distance = math.abs(candidate.x - px) + math.abs(candidate.z - pz)
+    if not best or distance < bestDistance or (distance == bestDistance and (candidate.x < best.x or (candidate.x == best.x and candidate.z < best.z))) then
+      best, bestDistance = candidate, distance
+    end
+  end
+  return best
+end
+
+M.selectChunkAnchor = M.chunkAnchor
+M.chooseChunkAnchor = M.chunkAnchor
+M.chunkEntry = M.chunkAnchor
+M.chunkEntrance = M.chunkAnchor
+
+local function shortestPathInternal(chunks, fromKey, toKey)
+  if not chunks or not chunks[fromKey] then return nil, "unknown_chunk:" .. tostring(fromKey) end
+  if not chunks[toKey] then return nil, "unknown_chunk:" .. tostring(toKey) end
+  if fromKey == toKey then return { fromKey } end
+  local queue, head, tail = { fromKey }, 1, 1
+  local previous, seen = {}, { [fromKey] = true }
+  while head <= tail do
+    local key = queue[head]; head = head + 1
+    for _, neighbor in ipairs(chunks[key].neighbors or {}) do

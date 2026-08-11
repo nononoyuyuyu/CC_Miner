@@ -1,0 +1,160 @@
+      for _, key in ipairs(assignment and assignment.chunkKeys or {}) do mineSet[tostring(key)] = true; selectedKeys[#selectedKeys + 1] = key end
+      if worldMode and spec.bayChunkKey and mineSet[tostring(spec.bayChunkKey)] then ownsBay = true end
+      if worldMode and not ownsBay then check("assignment bay chunk:#" .. tostring(spec.workerId), "bad", "assignment does not own worker bay chunk", true) end
+      for _, key in ipairs(assignment and assignment.transitKeys or {}) do
+        if not mineSet[tostring(key)] then check("transit ownership:#" .. tostring(spec.workerId), "bad", "transit chunk leaves worker assignment", true) end
+      end
+      if worldMode and spec.bayChunkKey and assignment and tostring(assignment.seedKey or "") ~= tostring(spec.bayChunkKey) then
+        check("assignment bay seed:#" .. tostring(spec.workerId), "bad", "assignment seed is not worker bay chunk", true)
+      end
+    end
+  end
+  local mineConflict = groupLeaseConflict(chunkMode, nil, selectedKeys, "mine", groupId)
+  if mineConflict then check("mine lease", "bad", "overlaps " .. tostring(mineConflict.groupJobId or mineConflict.jobId or "active"), true) else check("mine lease", "ok", "available", false) end
+  local transitKeys = {}
+  if assignments then for _, assignment in pairs(assignments) do for _, key in ipairs(assignment.transitKeys or {}) do transitKeys[#transitKeys + 1] = key end end end
+  local transitConflict = groupLeaseConflict(chunkMode, nil, transitKeys, "transit", groupId)
+  if transitConflict then check("transit lease", "bad", "overlaps " .. tostring(transitConflict.groupJobId or transitConflict.jobId or "active"), true) else check("transit lease", "ok", "available", false) end
+  if not minFuel then check("minimum fuel", "warn", "unknown / estimate " .. tostring(maxRequiredFuel) .. " (refill scheduler)", false) elseif minFuel < maxRequiredFuel then check("minimum fuel", "warn", tostring(minFuel) .. " < estimate " .. tostring(maxRequiredFuel) .. " (refill scheduler)", false) else check("minimum fuel", "ok", tostring(minFuel) .. " / estimate " .. tostring(maxRequiredFuel), false) end
+  local result = {
+    groupId = tostring(groupId), group = common.copy(group), value = common.copy(value), checks = checks, fatal = fatal,
+    catalog = catalog, catalogDescriptor = groupCatalogDescriptor(catalog, chunkMode, rootKey, specs), chunkMode = chunkMode, rootKey = rootKey, assignments = assignments,
+    workers = specs, bottomY = commonBottom, minLayers = minDepth, minFuel = minFuel, requiredFuel = maxRequiredFuel, partition = partitionStrategy,
+    totalChunks = #catalog, selectedChunks = #selectedKeys, warnings = {}, minimumFuel = minFuel, requiredFuel = maxRequiredFuel, computedAt = common.nowSeconds(),
+  }
+  for _, item in ipairs(checks) do if item.state == "warn" then result.warnings[#result.warnings + 1] = item.name .. ": " .. tostring(item.detail) end end
+  return result
+end
+
+local function groupLeaseEntries(job, assignment)
+  local entries = {}
+  for _, kind in ipairs({ "transit", "mine" }) do
+    local keys = kind == "transit" and (assignment.transitKeys or {}) or (assignment.chunkKeys or {})
+    entries[#entries + 1] = {
+      jobId = tostring(assignment.jobId), groupJobId = tostring(job.groupJobId), assignmentId = tostring(assignment.assignmentId), workerId = assignment.workerId,
+      kind = kind, mode = job.chunkMode, chunks = common.copy(keys), createdAt = common.nowSeconds(),
+    }
+  end
+  return entries
+end
+
+releaseGroupLeases = function(job, onlyPending)
+  if type(job) ~= "table" then return end
+  local removed = {}
+  local function keep(lease)
+    if tostring(lease.groupJobId or "") ~= tostring(job.groupJobId or "") then return true end
+    if onlyPending and job.started and job.started[tostring(lease.workerId)] then return true end
+    removed[#removed + 1] = lease
+    return false
+  end
+  local kept, keptGroup = {}, {}
+  for _, lease in ipairs(db.leases or {}) do if keep(lease) then kept[#kept + 1] = lease end end
+  for _, lease in ipairs(db.groupLeases or {}) do
+    if tostring(lease.groupJobId or "") ~= tostring(job.groupJobId or "") or (onlyPending and job.started and job.started[tostring(lease.workerId)]) then keptGroup[#keptGroup + 1] = lease end
+  end
+  db.leases, db.groupLeases = kept, keptGroup
+  db.activeLeases = common.copy(kept)
+  saveControllerDb()
+  return #removed
+end
+
+groupSafeStop = function(job, workerId, reason)
+  local payload = { scope = "group", group = true, groupId = job.groupId, groupJobId = job.groupJobId, groupCommand = "RETURN", mode = "return_home", safeStop = true, reason = reason or "partial_start" }
+  payload.targetWorkerId, payload.workerId = tonumber(workerId) or workerId, tonumber(workerId) or workerId
+  sendCommand(workerId, "stop", payload)
+end
+
+sortedJobAssignments = function(job)
+  local out = {}
+  for key, value in pairs(job and job.assignments or {}) do if type(value) == "table" then out[#out + 1] = value end end
+  table.sort(out, function(a, b) return tostring(a.workerId) < tostring(b.workerId) end)
+  return out
+end
+
+local function dispatchGroupJob(job, force)
+  if type(job) ~= "table" or (job.status ~= "starting" and job.status ~= "queued") then return false end
+  job.pending = job.pending or {}
+  job.started = job.started or {}
+  job.failed = job.failed or {}
+  job.awaitingAck = job.awaitingAck or {}
+  job.acks = job.acks or {}
+  for _ in pairs(job.awaitingAck) do return true end
+  local now = common.nowSeconds()
+  local stagger = math.max(0, tonumber(job.staggerSeconds) or 0)
+  for _, assignment in ipairs(sortedJobAssignments(job)) do
+    local key = tostring(assignment.workerId)
+    if not job.started[key] and not job.failed[key] and (force or not job.pending[key] or now >= (job.nextDispatchAt or 0)) then
+      local payload = {
+        scope = "group", group = true, groupId = tostring(job.groupId), groupJobId = tostring(job.groupJobId), parentGroupJobId = tostring(job.groupJobId), groupCommand = "START", requestedCommand = "start", assignmentCatalog = common.copy(job.catalog),
+        assignmentId = assignment.assignmentId, assignmentTotal = #sortedJobAssignments(job), assignmentChunks = common.copy(assignment.chunkKeys or {}), chunkKeys = common.copy(assignment.chunkKeys or {}), transitKeys = common.copy(assignment.transitKeys or {}), seedKey = assignment.seedKey, bayChunkKey = assignment.bayChunkKey,
+        homeY = assignment.homeY, bottomY = assignment.bottomY, targetY = assignment.bottomY, layers = assignment.layers, width = job.width, length = job.length, depth = assignment.layers or job.depth,
+        chunkMode = job.chunkMode, name = job.name, profile = job.profile, waterMode = job.waterMode, lighting = common.copy(job.lighting or {}), workerId = assignment.workerId, targetWorkerId = assignment.workerId,
+        bay = assignment.bay, bayId = assignment.bayId, dock = common.copy(assignment.dock or {}), dockId = assignment.dockId, homeWorld = common.copy(assignment.homeWorld), maxDepth = assignment.maxDepth, facing = assignment.facing,
+        lease = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) },
+        leases = { transit = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "transit", chunks = common.copy(assignment.transitKeys or {}) }, mine = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) } },
+      }
+      payload.command = "start"
+      payload.assignment = common.copy(assignment)
+      local ok = sendCommand(assignment.workerId, "start", payload)
+      job.pending[key] = nil
+      if ok then
+        job.awaitingAck[key] = { sentAt = now, attempts = tonumber(job.attempts and job.attempts[key] or 0) + 1, assignmentId = assignment.assignmentId }
+        job.attempts = job.attempts or {}; job.attempts[key] = job.awaitingAck[key].attempts
+        job.acks[key] = { ok = nil, command = "START", sentAt = now }
+        assignment.status = "sent"
+        assignment.sentAt = now
+        job.nextDispatchAt = now + stagger
+      else
+        job.failed[key] = true
+        assignment.status = "failed"
+        assignment.error = "start_send_failed"
+        job.status = "PARTIAL_START"
+        for startedKey in pairs(job.started) do groupSafeStop(job, startedKey, "partial_start") end
+        releaseGroupLeases(job, true)
+        job.alerts = job.alerts or {}
+        job.alerts[#job.alerts + 1] = "PARTIAL_START"
+        job.alerts[#job.alerts + 1] = "worker #" .. key .. " start failed"
+        updateGroupAggregate(job)
+        saveControllerDb()
+        return false
+      end
+      -- Wait for an explicit worker ACK/status before sending the next
+      -- assignment, even when staggerSeconds is zero.  This bounds bay
+      -- occupancy and makes a rejected start a deterministic PARTIAL_START.
+      break
+    end
+  end
+  updateGroupAggregate(job)
+  saveControllerDb()
+  return true
+end
+
+local function startGroup(groupId, value)
+  local group = groupRecord(groupId)
+  if not group then setNotice("Group not found: " .. tostring(groupId), true); return false end
+  value = type(value) == "table" and value or groupDraftDefaults(group)
+  local result, err = computeGroupPreflight(groupId, value)
+  if not result then setNotice("Group preflight unavailable: " .. tostring(err), true); return false end
+  if result.fatal then setNotice("Group start blocked by fatal preflight item.", true); return false end
+  local groupJobId = "g-" .. tostring(os.getComputerID()) .. "-" .. tostring(common.nowMillis())
+  local job = {
+    id = groupJobId, groupJobId = groupJobId, groupId = tostring(groupId), parentJobId = groupJobId, status = "starting", chunkMode = result.chunkMode,
+    width = tonumber(value.width), length = tonumber(value.length), depth = tonumber(value.depth), bottomY = result.bottomY, name = value.name,
+    profile = value.profile, waterMode = value.waterMode, lighting = common.copy(value.lighting or {}), partition = result.partition, staggerSeconds = tonumber(group.staggerSeconds) or tonumber(db.groupScheduler.staggerSeconds) or 0,
+    catalog = common.copy(result.catalogDescriptor), assignments = {}, started = {}, pending = {}, failed = {}, acks = {}, alerts = common.copy(result.warnings or {}), warnings = common.copy(result.warnings or {}), createdAt = common.nowSeconds(), updatedAt = common.nowSeconds(), preflight = { checks = common.copy(result.checks), bottomY = result.bottomY, partition = result.partition },
+  }
+  for _, spec in ipairs(result.workers or {}) do
+    local key = tostring(spec.workerId)
+    local raw = result.assignments and (result.assignments[key] or result.assignments[spec.workerId])
+    if not raw then setNotice("Group assignment missing worker #" .. key, true); return false end
+    local bayId, workerBay = groupWorkerResource(group, spec.workerId, "bay")
+    local dockId, workerDock = groupWorkerResource(group, spec.workerId, "dock")
+    local homeY = tonumber(raw.homeY or spec.homeY)
+    local bottomY = tonumber(raw.bottomY or result.bottomY)
+    local layers = tonumber(raw.layers) or (homeY and bottomY and math.floor(homeY - bottomY + 1) or value.depth)
+    local assignmentId = groupJobId .. ":" .. key
+    local assignment = {
+      workerId = spec.workerId, groupJobId = groupJobId, parentJobId = groupJobId, jobId = groupJobId .. "/" .. key, assignmentId = assignmentId,
+      chunkKeys = common.copy(raw.chunkKeys or {}), transitKeys = common.copy(raw.transitKeys or {}), seedKey = raw.seedKey, bayChunkKey = spec.bayChunkKey, estimatedCost = raw.estimatedCost, homeY = homeY, bottomY = bottomY, layers = layers, status = "queued",
+      bayId = bayId, bay = bayId, dockId = dockId,
+      dock = common.copy(workerDock or {}),

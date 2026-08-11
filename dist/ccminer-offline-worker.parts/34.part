@@ -1,0 +1,276 @@
+  if side == "up" then side = "top" end
+  if side == "down" then side = "bottom" end
+  local relative = { front = 0, right = 1, back = 2, left = 3 }
+  if relative[side] == nil then return nil end
+  return ((tonumber(baseDir) or 0) + relative[side]) % 4
+end
+
+local function recycleRetainTarget()
+  local materials, recycle = materialsConfig()
+  local target = materials.retainSealTarget
+    or recycle.maxHeld
+    or recycle.retainSealTarget
+    or config.retainSealTarget
+    or config.sealTarget
+    or 64
+  return math.max(0, math.floor(tonumber(target) or 64))
+end
+
+local function compressSealStacks()
+  local moved = 0
+  for destination = 1, 16 do
+    if not isReservedSlot(destination, "seal") and turtle.getItemCount(destination) > 0 and isSealItemName(itemName(destination)) then
+      local name = itemName(destination)
+      local space = turtle.getItemSpace(destination)
+      if space > 0 then
+        for source = 1, 16 do
+          if source ~= destination and not isReservedSlot(source, "seal")
+            and turtle.getItemCount(source) > 0 and itemName(source) == name then
+            turtle.select(source)
+            local before = turtle.getItemCount(source)
+            local ok = turtle.transferTo(destination, math.min(space, before))
+            local after = turtle.getItemCount(source)
+            if ok and after < before then
+              local amount = before - after
+              moved = moved + amount
+              space = turtle.getItemSpace(destination)
+              if space <= 0 then break end
+            end
+          end
+        end
+      end
+    end
+  end
+  if moved > 0 then
+    state.stats.compressions = (state.stats.compressions or 0) + 1
+    state.recycle.compressed = (state.recycle.compressed or 0) + moved
+  end
+  return moved
+end
+
+local function compressInventoryAtField()
+  -- compactEvery is a local inventory operation.  It must never create a
+  -- service/return merely to consolidate stacks, and it must not touch
+  -- protected reserve slots or split a stack while moving items.
+  local originalSlot = turtle.getSelectedSlot()
+  local moved = compressSealStacks()
+  for destination = 1, 16 do
+    if not isReservedSlot(destination) and turtle.getItemCount(destination) > 0 then
+      local name = itemName(destination)
+      if name then
+        local space = turtle.getItemSpace(destination)
+        if space > 0 then
+          for source = 1, 16 do
+            if source ~= destination and not isReservedSlot(source)
+              and turtle.getItemCount(source) > 0 and itemName(source) == name then
+              turtle.select(source)
+              local before = turtle.getItemCount(source)
+              local ok = turtle.transferTo(destination, math.min(space, before))
+              local after = turtle.getItemCount(source)
+              if ok and after < before then
+                local amount = before - after
+                moved = moved + amount
+                space = turtle.getItemSpace(destination)
+                if space <= 0 then break end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  turtle.select(originalSlot)
+  if moved > 0 then
+    state.stats.compressions = (state.stats.compressions or 0) + 1
+    state.recycle = state.recycle or {}
+    state.recycle.compressed = (state.recycle.compressed or 0) + moved
+    state.recycle.lastAt = common.nowSeconds()
+  end
+  state.stats.lastCompressionAt = common.nowSeconds()
+  return moved
+end
+
+local function updateRecycleInventoryState()
+  local held, byName = 0, {}
+  for slot = 1, 16 do
+    local name = itemName(slot)
+    if name and isSealItemName(name) then
+      local count = turtle.getItemCount(slot)
+      held = held + count
+      byName[name] = (byName[name] or 0) + count
+    end
+  end
+  state.recycle = state.recycle or {}
+  state.recycle.held, state.recycle.byName = held, byName
+  state.recycle.cap = recycleRetainTarget()
+  state.recycle.overflow = math.max(0, held - state.recycle.cap)
+  return held
+end
+
+local function inventoryPresent(side, inspectFunction)
+  if peripheral and peripheral.hasType then
+    local ok, result = pcall(peripheral.hasType, side, "inventory")
+    if ok and result == true then return true end
+  end
+  local wrapped = peripheral and peripheral.wrap(side) or nil
+  if wrapped and (type(wrapped.list) == "function" or type(wrapped.size) == "function") then return true end
+  if inspectFunction then
+    local ok, present, data = pcall(inspectFunction)
+    if ok and present and looksLikeInventoryBlock(data) then return true end
+  end
+  return false
+end
+
+local function sideFunctions(side)
+  local restoreDir = state.pose.dir
+  if side == "front" then
+    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
+  elseif side == "back" then
+    local ok, err = turnTo(2)
+    if not ok then return nil, nil, nil, restoreDir, err end
+    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
+  elseif side == "right" then
+    local ok, err = turnTo(1)
+    if not ok then return nil, nil, nil, restoreDir, err end
+    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
+  elseif side == "left" then
+    local ok, err = turnTo(3)
+    if not ok then return nil, nil, nil, restoreDir, err end
+    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
+  elseif side == "top" then
+    return turtle.inspectUp, turtle.suckUp, turtle.dropUp, restoreDir
+  elseif side == "bottom" then
+    return turtle.inspectDown, turtle.suckDown, turtle.dropDown, restoreDir
+  end
+  return nil, nil, nil, restoreDir, "Unsupported inventory side: " .. tostring(side)
+end
+
+local function restoreSideDirection(side, restoreDir)
+  if side == "front" or side == "back" or side == "right" or side == "left" then return turnTo(restoreDir) end
+  return true
+end
+
+local function runInventoryPhysicalAction(kind, details, action)
+  local prepared, prepareError = beginPhysicalAction(kind, details, poseCopy())
+  if not prepared then return false, prepareError end
+  local ok, result = pcall(action)
+  if not ok then
+    -- Leave pendingAction intact: an exception leaves inventory outcome
+    -- ambiguous and boot recovery must stop for manual revalidation.
+    return false, tostring(result)
+  end
+  commitPhysicalAction()
+  return result == true, result
+end
+
+local function unloadAtHome()
+  state.phase, state.status = "unloading", "working"
+  saveState("unload_start")
+  local originalSlot = turtle.getSelectedSlot()
+  local outputSide = config.outputSide or "back"
+  local outInspect, _, outDrop, outRestore, sideError = sideFunctions(outputSide)
+  if not outInspect then turtle.select(originalSlot); return false, sideError end
+  local outCheck = (outputSide == "top" and "top") or (outputSide == "bottom" and "bottom") or "front"
+  if not inventoryPresent(outCheck, outInspect) then
+    restoreSideDirection(outputSide, outRestore)
+    turtle.select(originalSlot)
+    return false, "Output inventory missing on configured side " .. outputSide .. "."
+  end
+
+  local policy, mode = discardPolicy()
+  local discardStats = discardStatsTable()
+  discardStats.lastError = nil
+  local _, emptySlots = inventoryStats()
+  local trigger = tonumber(policy.triggerEmptySlots) or 3
+  local discardEnabled = mode ~= "KEEP_ALL" and emptySlots <= trigger
+  local discardSide = policy.direction or "back"
+  if discardSide == "up" then discardSide = "top" end
+  if discardSide == "down" then discardSide = "bottom" end
+  local outputTargetDir = sideTargetDirection(outRestore, outputSide)
+  local discardTargetDir = sideTargetDirection(outRestore, discardSide)
+  local discardInspect, _, discardDrop, discardRestore
+  local discardReady, discardError = true, nil
+  if discardEnabled and discardSide ~= outputSide then
+    discardInspect, _, discardDrop, discardRestore, discardError = sideFunctions(discardSide)
+    if not discardInspect then discardReady = false end
+    local checkSide = (discardSide == "top" and "top") or (discardSide == "bottom" and "bottom") or "front"
+    if discardReady and not inventoryPresent(checkSide, discardInspect) then
+      discardReady, discardError = false, "Discard inventory missing on configured side " .. tostring(discardSide) .. "."
+    end
+  elseif discardEnabled then
+    discardInspect, discardDrop, discardRestore = outInspect, outDrop, outRestore
+  end
+  if discardEnabled and not discardReady then
+    restoreSideDirection(discardSide, discardRestore or outRestore)
+    turtle.select(originalSlot)
+    discardStats.lastError = discardError or "Discard inventory verification failed."
+    saveState("discard_inventory_error")
+    return false, discardStats.lastError
+  end
+
+  -- Consolidate locally before output.  This does not move the turtle and is
+  -- deliberately independent of compactEvery service returns.
+  compressSealStacks()
+  local retainedCount = updateRecycleInventoryState()
+  local maxStacks = math.max(1, math.floor(tonumber(policy.maxStacksPerPass) or 8))
+  local discardedStacks, allDropped = 0, true
+  local totalSeal = retainedCount
+
+  -- Drop each slot as a whole stack.  Protected/valuable/unknown items are
+  -- always routed to output, never the discard inventory.
+  for slot = 1, 16 do
+    local count, name = turtle.getItemCount(slot), itemName(slot)
+    if count > 0 then
+      local protected = discardProtectedItem(slot, name)
+      local keepReserved = isSealItemName(name) or isTorchItemName(name)
+        or (slotRoleContains(slot, "fuel") and isFuelItem(slot))
+      local candidate = discardEnabled and discardedStacks < maxStacks
+        and discardCandidate(slot, name, totalSeal, policy, mode)
+      if candidate and isSealItemName(name) and totalSeal - count < (tonumber(policy.retainSealTarget) or 64) then
+        candidate = false -- whole-stack semantics: never split below reserve
+      end
+      if candidate and discardDrop then
+        if discardTargetDir ~= nil then turnTo(discardTargetDir) else turnTo(outRestore) end
+        turtle.select(slot)
+        discardStats.attempts = (discardStats.attempts or 0) + 1
+        local before = turtle.getItemCount(slot)
+        local prepared, prepareError = beginPhysicalAction("discard_home", {
+          slot = slot, item = name, count = before, direction = discardSide,
+        }, poseCopy())
+        if not prepared then
+          allDropped = false
+          discardStats.lastError = prepareError or "Could not journal discard action."
+          break
+        end
+        local dropped = discardDrop() -- no count argument: one complete stack
+        local after = turtle.getItemCount(slot)
+        if dropped and after == 0 then
+          commitPhysicalAction()
+          discardedStacks = discardedStacks + 1
+          noteDiscard(name, before)
+          if isSealItemName(name) then totalSeal = totalSeal - before end
+        else
+          cancelPhysicalAction()
+          allDropped = false
+          noteDiscardSkip(name, isUnknownModItem(name))
+        end
+      elseif keepReserved then
+        -- Keep seal/torch/fuel material on the turtle.  It is never sent to
+        -- either output or discard, even when the output chest is available.
+      elseif not protected then
+        if outputTargetDir ~= nil then turnTo(outputTargetDir) else turnTo(outRestore) end
+        turtle.select(slot)
+        local before = turtle.getItemCount(slot)
+        local prepared, prepareError = beginPhysicalAction("unload_home", {
+          slot = slot, item = name, count = before, direction = outputSide,
+        }, poseCopy())
+        if not prepared then
+          allDropped = false
+          discardStats.lastError = prepareError or "Could not journal output action."
+          break
+        end
+        local dropped = outDrop() -- output receives all non-discard items
+        if dropped and turtle.getItemCount(slot) == 0 then commitPhysicalAction()
+        else cancelPhysicalAction(); allDropped = false end
+      else
+        -- Reserved seal/torch/fuel remain on the turtle.  Unknown and ore

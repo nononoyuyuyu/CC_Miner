@@ -85,4 +85,4 @@ local cx, cz = geo.worldChunk({ x = -17, z = -17 })
 assert(cx == -2 and cz == -2)
 assert(geo.chunkKey(-2, -2) == "-2:-2")
 
-print("GPS V3 transforms, all headings, and pending-action recovery tests passed")
+print("GPS V4 transforms, all headings, and pending-action recovery tests passed")
