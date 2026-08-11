@@ -1,3 +1,6 @@
+
+local function saveControllerDb()
+  db.schema, db.version, db.updatedAt = common.SCHEMA, common.VERSION, common.nowSeconds()
   -- Keep the compatibility field, but never point it at `leases`: CC's
   -- serializer rejects repeated table references.
   db.activeLeases = common.copy(db.leases or {})
@@ -270,7 +273,3 @@ local function registerGroup(groupId, workerIds, options)
   local mapOK, mapError = validateResourceMap(options.workerBays or previous.workerBays, "worker_bay")
   if not mapOK then return false, mapError end
   mapOK, mapError = validateResourceMap(options.workerDocks or previous.workerDocks, "worker_dock")
-  if not mapOK then return false, mapError end
-  local group = {
-    id = groupId,
-    name = tostring(options.name or previous.name or groupId),

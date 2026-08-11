@@ -1,3 +1,115 @@
+      adjustDraft(draft.selectedField or "width", -1)
+      invalidate()
+    elseif keys and keyCode == keys.right then
+      adjustDraft(draft.selectedField or "width", 1)
+      invalidate()
+    end
+  elseif mode == "job_grid" or mode == "job_chunks" then
+    if keys and keyCode == keys.left then
+      draft.gridPageX = math.max(1, (draft.gridPageX or 1) - 1)
+      invalidate()
+    elseif keys and keyCode == keys.right then
+      draft.gridPageX = (draft.gridPageX or 1) + 1
+      invalidate()
+    elseif keys and keyCode == keys.up then
+      draft.gridPageZ = math.max(1, (draft.gridPageZ or 1) - 1)
+      invalidate()
+    elseif keys and keyCode == keys.down then
+      draft.gridPageZ = (draft.gridPageZ or 1) + 1
+      invalidate()
+    elseif keys and keyCode == keys.enter then
+      local result = computePreflight()
+      if result then mode = "preflight" end
+      invalidate()
+    end
+  elseif mode == "preflight" then
+    if keys and keyCode == keys.enter and draft and draft.preflight and not draft.preflight.fatal then
+      startDraft()
+    elseif keys and keyCode == keys.q then
+      queueDraft()
+    end
+  elseif mode == "progress" or mode == "recovery" or mode == "report" or mode == "info" or mode == "stop_menu" then
+    if keys and (keyCode == keys.enter or keyCode == keys.backspace) then
+      mode = "dashboard"
+      invalidate()
+    end
+  elseif mode == "confirm" and keys and keyCode == keys.y then
+    processChar("y")
+  end
+end
+
+local function pumpFor(seconds)
+  local deadline = common.nowSeconds() + (seconds or 1)
+  while common.nowSeconds() <= deadline do
+    local sender, message = protocol.receive(0.25)
+    if sender then handleMessage(sender, message) end
+    groupSchedulerTick()
+  end
+end
+
+local function makeCliDraft(id, width, length, depth)
+  local previous = db.lastDraft or {}
+  local calibration = draftCalibration(id)
+  local targetY = calibration and calibration.home and tonumber(calibration.home.y) and (tonumber(calibration.home.y) - depth + 1) or nil
+  return {
+    workerId = id, width = width, length = length, depth = depth,
+    targetY = targetY,
+    lighting = normalizedLighting(previous.lighting),
+    waterMode = normalizedWaterMode(previous.waterMode), profile = normalizedProfile(previous.profile),
+    selectedField = "width", buffer = tostring(width), excluded = {},
+    gridPageX = 1, gridPageZ = 1, rectMode = false, autoAssign = false,
+    name = "CLI Quarry",
+  }
+end
+
+local function printQueue()
+  if #db.queue == 0 then print("Queue empty."); return end
+  for index, item in ipairs(db.queue) do print(("%d: #%s %dx%dx%d profile=%s queued=%s"):format(index, tostring(item.workerId or "-"), tonumber(item.width) or 0, tonumber(item.length) or 0, tonumber(item.depth) or 0, tostring(item.profile or "balanced"), tostring(item.queuedAt or "-"))) end
+end
+
+local function printHistory()
+  if #db.history == 0 then print("No history."); return end
+  for index = #db.history, 1, -1 do
+    local item = db.history[index]
+    print(("%s %-8s worker=%s job=%s reason=%s"):format(tostring(item.finishedAt or "-"), tostring(item.status or "-"), tostring(item.workerId or "-"), tostring(item.jobId or item.id or "-"), tostring(item.reason or "-")))
+  end
+end
+
+local function splitCsv(value)
+  local out = {}
+  for item in tostring(value or ""):gmatch("[^,]+") do out[#out + 1] = tonumber(item) or common.trim(item) end
+  return out
+end
+
+local function splitMap(value)
+  local out = {}
+  for item in tostring(value or ""):gmatch("[^,]+") do
+    local key, mapped = item:match("^([^=]+)=(.+)$")
+    if key and mapped then out[common.trim(key)] = common.trim(mapped) end
+  end
+  return out
+end
+
+local function printGroups()
+  local ids = orderedGroupIds()
+  if #ids == 0 then print("No groups."); return end
+  for _, gid in ipairs(ids) do
+    local group = groupRecord(gid)
+    local job = activeGroupJob(gid)
+    local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, online = 0, total = #groupWorkerIds(group), minFuel = "-", warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
+    print(("%s name=%s workers=%d/%d status=%s progress=%s%% minFuel=%s ACK=%d/%d warn=%s"):format(tostring(gid), groupName(group, gid), aggregate.online or 0, aggregate.total or 0, tostring(job and job.status or "idle"), tostring(aggregate.percent or 0), tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0, table.concat(aggregate.warnings or {}, ";")))
+  end
+end
+
+local function commandGroupMode()
+  local sub = string.lower(args[2] or "list")
+  if sub == "list" or sub == "status" then printGroups(); return true end
+  if sub == "show" then
+    local gid = args[3]
+    local group = gid and groupRecord(gid)
+    if not group then print("Group not found.") else
+      local job = activeGroupJob(gid)
+      local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, minFuel = "-", warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
       print(("%s name=%s mode=%s partition=%s dock=%s bay=%s progress=%s%% minFuel=%s ACK=%d/%d"):format(tostring(gid), groupName(group, gid), tostring(group.mode or "world"), tostring(group.partition or "stripe"), tostring(group.dockId or "-"), tostring(group.bayId or "-"), tostring(aggregate.percent or 0), tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0))
       print("workers=" .. table.concat(groupWorkerIds(group), ",") .. " warnings=" .. table.concat(aggregate.warnings or {}, ";"))
     end
@@ -88,91 +200,3 @@ local function commandLineMode()
     elseif sub == "clear" then db.queue = {}; saveControllerDb(); print("Queue cleared.")
     elseif sub == "remove" or sub == "delete" then local index = tonumber(args[3]); if index and db.queue[index] then table.remove(db.queue, index); saveControllerDb(); print("Queue item removed.") else print("Usage: queue remove <index>") end
     elseif sub == "add" then
-      local id, width, length, depth = tonumber(args[3]), tonumber(args[4]), tonumber(args[5]), tonumber(args[6])
-      if not id or not width or not length or not depth then print("Usage: queue add <id> <width> <length> <depth>") else discover(); pumpFor(1); local item = makeCliDraft(id, width, length, depth); item.queuedAt = common.nowSeconds(); draft = item; local ok = queueDraft(); draft = nil; print(ok and "Queued." or notice) end
-    elseif sub == "run" then
-      local index = tonumber(args[3]) or 1; local item = db.queue[index]
-      if not item then print("Queue item not found.") else item.retryAt = common.nowSeconds(); item.awaiting = nil; saveControllerDb(); lastQueueDispatch = 0; dispatchQueue(); print(notice) end
-    else print("Usage: queue list|add|run|remove|clear") end
-    return true
-  elseif command == "preset" or command == "presets" then
-    local sub = string.lower(args[2] or "list")
-    if sub == "list" then for _, preset in ipairs(db.presets) do print(tostring(preset.name)) end
-    elseif sub == "save" then local ok, err = savePreset(args[3], db.lastDraft or draft); print(ok and "Preset saved." or ("Preset error: " .. tostring(err)))
-    elseif sub == "use" or sub == "load" then print(applyPreset(args[3]) and "Preset selected." or "Preset not found.")
-    elseif sub == "delete" or sub == "remove" then local keep = {}; for _, preset in ipairs(db.presets) do if tostring(preset.name) ~= tostring(args[3]) then keep[#keep + 1] = preset end end; db.presets = keep; saveControllerDb(); print("Preset removed.")
-    else print("Usage: preset list|save|use|delete <name>") end
-    return true
-  elseif command == "report" or command == "history" then printHistory(); return true
-  elseif command == "doctor" then
-    print("CC Miner controller doctor")
-    print("network=" .. tostring(networkReady) .. " modems=" .. tostring(#(modemNames or {})))
-    print("db=" .. tostring(dbError and ("WARN " .. dbError) or "ok") .. " path=" .. DB_PATH)
-    print("workers=" .. tostring(#orderedIds()) .. " leases=" .. tostring(#(db.leases or {})) .. " queue=" .. tostring(#db.queue))
-    print("sorting=" .. tostring(config.sorting and config.sorting.enabled == true and "enabled" or "off"))
-    return true
-  end
-  return false
-end
-
-if #args > 0 and commandLineMode() then return end
-
-(function()
-  discover()
-  local refreshTimer = os.startTimer(1)
-  while running do
-    render()
-    local event, a, b, c = os.pullEvent()
-    if event == "rednet_message" and c == common.PROTOCOL then
-      handleMessage(a, b)
-    elseif event == "char" then
-      processChar(a)
-    elseif event == "key" then
-      processKey(a)
-    elseif event == "mouse_click" then
-      handlePointer("term", b, c)
-    elseif event == "monitor_touch" then
-      if config.touchEnabled ~= false then handlePointer(a, b, c) end
-    elseif event == "timer" then
-      if alertTimers[a] then
-        local alertOutput = alertTimers[a]; alertTimers[a] = nil
-        if alertOutput.global and redstone and redstone.setOutput then pcall(redstone.setOutput, alertOutput.side or "back", false) end
-        if alertOutput.relay and alertOutput.relay.setOutput then pcall(alertOutput.relay.setOutput, alertOutput.side or "back", false) end
-        for _, relay in ipairs(alertOutput.relays or {}) do if relay and relay.setOutput then pcall(relay.setOutput, alertOutput.side or "back", false) end end
-      elseif a == refreshTimer then
-        dispatchQueue()
-        groupSchedulerTick()
-        sortingTick()
-        if common.nowSeconds() - lastDiscovery >= (config.discoverySeconds or 5) then discover() end
-        dirty = true
-        refreshTimer = os.startTimer(1)
-      end
-    elseif event == "term_resize" or event == "monitor_resize" or event == "peripheral" or event == "peripheral_detach" then
-      monitors = common.findPeripherals("monitor")
-      speakers = common.findPeripherals("speaker")
-      redstoneDevices = common.findPeripherals("redstoneIntegrator")
-      for _, entry in ipairs(monitors) do if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end end
-      renderCache = {}; dirty = true
-    end
-  end
-
-  common.clear(colors and colors.black or nil, colors and colors.white or nil)
-  print("CC Miner controller stopped. Run 'ccm dashboard' to reopen it.")
-end)()
-]] },
-}
-local FILE_COUNT = 10
-local WORKER_PARTS = {}
-local CONTROLLER_PARTS = {[[controller_parts/01.part]], [[controller_parts/02.part]], [[controller_parts/03.part]]}
-local ENTRYPOINT = [[controller.lua]]
-local UPDATE_SENTINEL = [[-- CC Miner V4 update-incomplete sentinel for controller
-error("CC Miner runtime update is incomplete. Re-transfer the offline bundle and run update-low-space.", 0)
-]]
-local LOW_SPACE_STEPS = {
-  { kind = "runtime", index = 1 },
-  { kind = "runtime", index = 2 },
-  { kind = "runtime", index = 3 },
-  { kind = "runtime", index = 4 },
-  { kind = "runtime", index = 5 },
-  { kind = "runtime", index = 6 },
-  { kind = "runtime", index = 8 },

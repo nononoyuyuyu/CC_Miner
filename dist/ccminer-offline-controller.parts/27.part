@@ -1,3 +1,85 @@
+  local background = colors and (selectedButton and colors.lightBlue or enabled == false and colors.gray or colors.blue) or nil
+  local foreground = colors and (enabled == false and colors.lightGray or colors.white) or nil
+  common.writeAt(x, y, common.center(label, width), foreground, background)
+  if enabled ~= false and action then addHitbox(key, x, y, x + width - 1, y, action) end
+end
+
+local function buttonRow(key, y, width, definitions)
+  if width < 1 or y < 1 then return end
+  local count = math.max(1, #definitions)
+  local base = math.max(1, math.floor(width / count))
+  local x = 1
+  for index, definition in ipairs(definitions) do
+    local buttonWidth = index == count and (width - x + 1) or base
+    drawButton(key, x, y, buttonWidth, definition[1], definition[2], definition[3] ~= false, definition[4])
+    x = x + buttonWidth
+  end
+end
+
+local function draftWorker()
+  if not draft then return nil, nil end
+  return draft.workerId, workers[draft.workerId]
+end
+
+local function draftCalibration(workerId)
+  local worker
+  if workerId then worker = workers[workerId] else local _, selectedWorkerValue = draftWorker(); worker = selectedWorkerValue end
+  local gpsData = worker and worker.data and worker.data.gps
+  if gpsData and gpsData.calibrated and type(gpsData.calibration) == "table" then return gpsData.calibration end
+  return nil
+end
+
+local function cellKey(x, z)
+  return tostring(math.floor(x)) .. ":" .. tostring(math.floor(z))
+end
+
+local function parseCellKey(key)
+  local x, z = tostring(key):match("^(-?%d+):(-?%d+)$")
+  return tonumber(x), tonumber(z)
+end
+
+-- V4 selection is chunk-granular.  A short-lived V2 draft could contain the
+-- old cellExcluded map; migrate complete chunks, but keep a fatal marker for a
+-- partial chunk instead of silently dropping the user's selection.
+local function normalizeChunkMask(catalog, rootKey)
+  if not draft then return false end
+  draft.excluded = draft.excluded or {}
+  local legacy = draft.cellExcluded
+  if type(legacy) ~= "table" then return draft.partialMask == true end
+  local partial = draft.partialMask == true
+  for _, chunk in ipairs(catalog or {}) do
+    local total, selectedCells = 0, 0
+    for x = chunk.minX, chunk.maxX do
+      for z = chunk.minZ, chunk.maxZ do
+        total = total + 1
+        if legacy[cellKey(x, z)] then selectedCells = selectedCells + 1 end
+      end
+    end
+    if selectedCells > 0 and selectedCells < total then partial = true end
+    if selectedCells == total and chunk.key ~= rootKey then draft.excluded[chunk.key] = true end
+  end
+  draft.cellExcluded = nil
+  draft.partialMask = partial
+  return partial
+end
+
+local function buildDraftCatalog()
+  if not draft then return nil, "No draft." end
+  local calibration = draftCalibration()
+  local chunkMode = calibration and "world" or "local"
+  local catalog, err = quarry.buildCatalog(draft.width, draft.length, chunkMode, calibration)
+  if not catalog then return nil, err end
+  local rootKey
+  for _, chunk in ipairs(catalog) do
+    if 0 >= chunk.minX and 0 <= chunk.maxX and 1 >= chunk.minZ and 1 <= chunk.maxZ then rootKey = chunk.key end
+  end
+  return catalog, nil, chunkMode, calibration, rootKey
+end
+
+local function excludedChunksForDraft(catalog, chunkMode, rootKey)
+  local out = {}
+  local chunkExcluded = draft and draft.excluded or {}
+  for _, chunk in ipairs(catalog or {}) do
     if chunk.key ~= rootKey and chunkExcluded[chunk.key] == true then
       out[#out + 1] = { mode = chunkMode, cx = chunk.cx, cz = chunk.cz, key = chunk.key }
     end
@@ -92,6 +174,7 @@ local function computePreflight()
   if not estimate and estimateError then planError = estimateError end
   local id, worker = draftWorker()
   local data = worker and worker.data or {}
+  if id and worker then reconcileSingleWorkerLeases(id, data) end
   local checks = {}
   local function check(name, state, detail, fatal)
     checks[#checks + 1] = { name = name, state = state, detail = detail, fatal = fatal == true }
@@ -120,8 +203,18 @@ local function computePreflight()
   else
     check("GPS", "ok", "local mode (world features unavailable)", false)
   end
-  if id and worker and statusOf(worker) ~= "offline" then check("worker", "ok", workerLabel(worker, id), false)
+  local workerStatus = worker and statusOf(worker) or "offline"
+  if id and worker and workerStatus ~= "offline" then check("worker", "ok", workerLabel(worker, id), false)
   else check("worker", "bad", "offline or not selected", true) end
+  local startableStatus = workerStatus == "idle" or workerStatus == "complete" or workerStatus == "completed" or workerStatus == "aborted"
+  check("start state", startableStatus and "ok" or "bad", workerStatus, not startableStatus)
+  check("home", data.atHome == true and "ok" or "bad", data.atHome == true and "at home" or "worker is not at home", data.atHome ~= true)
+  local poseDir = tonumber(data.pose and data.pose.dir)
+  check("facing", poseDir == 0 and "ok" or "bad", poseDir == 0 and "facing quarry" or (poseDir and ("direction=" .. tostring(poseDir)) or "direction unknown"), poseDir ~= 0)
+  local recoveryRequired = data.recoveryRequired == true or data.pendingAction ~= nil
+  check("recovery", recoveryRequired and "bad" or "ok", recoveryRequired and "pending physical recovery" or "ready", recoveryRequired)
+  local unfinished = data.job ~= nil and workerStatus ~= "complete" and workerStatus ~= "completed" and workerStatus ~= "aborted"
+  check("existing job", unfinished and "bad" or "ok", unfinished and "abort or clear the unfinished job first" or "clear", unfinished)
   if fuel and fuel >= requiredFuel then
     check("worker fuel", "ok", ("available %s / need %d"):format(tostring(fuel), requiredFuel), false)
   elseif fuel then
@@ -134,79 +227,3 @@ local function computePreflight()
   else check("inventory", "warn", "unknown", false) end
   local seal = tonumber(data.materials and (data.materials.sealCount or data.materials.seal) or data.seal and data.seal.count)
   local torchStock = tonumber(data.lighting and data.lighting.torchCount or data.materials and data.materials.torchCount)
-  if draft.waterMode == "seal" and seal and seal <= 0 then check("seal material", "warn", "0 (dock refill expected)", false)
-  elseif draft.waterMode == "seal" then check("seal material", "warn", "seal stock unknown", false) end
-  if draft.lighting and draft.lighting.mode ~= "off" and torchStock and torchStock < torchNeed then check("torch material", "warn", tostring(torchStock) .. "/" .. tostring(torchNeed) .. " (dock refill expected)", false)
-  elseif draft.lighting and draft.lighting.mode ~= "off" then check("torch material", "warn", "torch stock unknown", false) end
-  local caps = data.capabilities or {}
-  if draft.waterMode ~= "ignore" then
-    if caps.waterHandling == false then check("water capability", "bad", "worker lacks waterHandling", true)
-    elseif caps.waterHandling == nil then check("water capability", "warn", "worker capability unknown", false)
-    else check("water capability", "ok", "ready", false) end
-  else check("water capability", "ok", "ignore", false) end
-  if draft.lighting and draft.lighting.mode ~= "off" then
-    if caps.lighting == false then check("lighting capability", "bad", "worker lacks lighting", true)
-    elseif caps.lighting == nil then check("lighting capability", "warn", "worker capability unknown", false)
-    else check("lighting capability", "ok", "ready", false) end
-  else check("lighting capability", "ok", "off", false) end
-  local selectedChunkKeys = {}
-  for _, chunk in ipairs(catalog) do
-    local excluded = false
-    for _, item in ipairs(excludedChunks) do if item.key == chunk.key then excluded = true; break end end
-    if not excluded then selectedChunkKeys[#selectedChunkKeys + 1] = chunk.key end
-  end
-  local leaseConflict = (not draft.queueing) and id and activeLeaseOverlap and activeLeaseOverlap(chunkMode, id, selectedChunkKeys)
-  if leaseConflict then check("lease", "bad", "overlaps active job " .. tostring(leaseConflict.jobId or "unknown"), true) end
-  local fatal = false
-  for _, item in ipairs(checks) do if item.fatal or item.state == "bad" and item.fatal then fatal = true end end
-  local result = {
-    checks = checks, fatal = fatal, catalog = catalog, plan = plan, planError = planError,
-    chunkMode = chunkMode, calibration = calibration, rootKey = rootKey,
-    excludedChunks = excludedChunks, cells = estimate and (estimate.surfaceCells or estimate.columns) or (cells - cellExcluded), blocks = estimate and (estimate.blocks or estimate.totalBlocks) or blocks,
-    chunks = plan and plan.catalogCount or #catalog, selectedChunks = (plan and plan.selectedChunks) or (#catalog - #excludedChunks), totalChunks = #catalog, exclusions = #excludedChunks,
-    torches = torchNeed, fuel = requiredFuel, baseFuel = baseFuelEstimate, estimate = estimate, jobDepth = jobDepth, targetY = targetY,
-    profile = profileInfo.profile, requestedInterval = profileInfo.requestedInterval, effectiveInterval = profileInfo.effectiveInterval,
-    fuelMultiplier = profileInfo.fuelMultiplier,
-  }
-  draft.preflight = result
-  return result
-end
-
-activeLeaseOverlap = function(mode, workerId, chunks)
-  for _, lease in ipairs(db.leases or {}) do
-    local leaseMode = lease.mode == "world" and "world" or "local"
-    if mode == "world" and leaseMode == "world" then
-      local set = {}
-      for _, key in ipairs(lease.chunks or {}) do set[tostring(key)] = true end
-      for _, key in ipairs(chunks or {}) do if set[tostring(key)] then return lease end end
-    elseif mode == "local" and leaseMode == "local" and tonumber(lease.workerId) == tonumber(workerId) then
-      return lease
-    end
-  end
-  return nil
-end
-
-local function reserveLease(jobId, workerId, mode, chunks, assignmentId)
-  local conflict = activeLeaseOverlap(mode, workerId, chunks)
-  if conflict then return nil, "Active lease overlap with " .. tostring(conflict.jobId or conflict.assignmentId) end
-  local lease = {
-    jobId = tostring(jobId), assignmentId = assignmentId, workerId = tonumber(workerId) or workerId,
-    mode = mode, chunks = common.copy(chunks or {}), createdAt = common.nowSeconds(),
-  }
-  db.leases[#db.leases + 1] = lease
-  db.activeLeases = common.copy(db.leases)
-  local ok, err = saveControllerDb()
-  if not ok then table.remove(db.leases); return nil, err or "Could not persist active lease" end
-  return lease
-end
-
-local function chunkKeySet(catalog)
-  local set = {}
-  for _, chunk in ipairs(catalog or {}) do set[chunk.key] = true end
-  return set
-end
-
-local function deterministicPartition(chunks, count)
-  local out = {}
-  count = math.max(1, tonumber(count) or 1)
-  for index = 1, count do out[index] = {} end

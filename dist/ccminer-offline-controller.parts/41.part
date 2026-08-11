@@ -1,3 +1,115 @@
+  if action == "worker" and not turtle then fail("Worker installation requires a turtle.") end
+  if (action == "update" or action == "update-low-space") then
+    local configRole, configError = readConfigRole()
+    if not configRole then fail(configError) end
+    if configRole ~= ROLE then
+      fail("Refusing " .. action .. ": existing config role is " .. tostring(configRole)
+        .. ", but this bundle is fixed to " .. ROLE .. ".")
+    end
+  end
+  if action == "update" and fs.exists(LOW_SPACE_MARKER) then
+    fail("A low-space update is incomplete. Re-transfer the original "
+      .. "ccminer-offline-" .. ROLE .. ".lua and parts, then run update-low-space.")
+  end
+  return action
+end
+local function usage()
+  print("CC Miner V4 offline " .. ROLE .. " installer " .. VERSION .. " (schema " .. SCHEMA .. ")")
+  print("  ccminer-offline-" .. ROLE .. ".lua " .. ROLE)
+  print("  ccminer-offline-" .. ROLE .. ".lua update")
+  print("  ccminer-offline-" .. ROLE .. ".lua update-low-space")
+end
+
+local action = validateAction()
+if action == "" then usage(); return end
+if action ~= "update-low-space" then
+  term.clear(); term.setCursorPos(1, 1)
+  print("CC MINER V4 OFFLINE " .. string.upper(action) .. " / " .. ROLE); print("")
+  if fs.exists(TEMP) then fs.delete(TEMP) end
+  ensureDir(TEMP)
+  for index, file in ipairs(files) do
+    write(("[%d/%d] %s ... "):format(index, #files, file.target))
+    local ok, writeError = writeFile(TEMP .. "/" .. file.target, file.content)
+    if not ok then fs.delete(TEMP); fail(writeError) end
+    print("OK")
+  end
+  validateAll()
+end
+
+local preserved = {
+  { ROOT .. "/config.db", TEMP .. "/config.db" },
+  { ROOT .. "/config.db.bak", TEMP .. "/config.db.bak" },
+  { ROOT .. "/data/state.db", TEMP .. "/data/state.db" },
+  { ROOT .. "/data/state.db.bak", TEMP .. "/data/state.db.bak" },
+  { ROOT .. "/data/state.pending", TEMP .. "/data/state.pending" },
+  { ROOT .. "/data/state.journal", TEMP .. "/data/state.journal" },
+  { ROOT .. "/data/state.checkpoint.db", TEMP .. "/data/state.checkpoint.db" },
+  { ROOT .. "/data/controller.db", TEMP .. "/data/controller.db" },
+  { ROOT .. "/controller.db", TEMP .. "/controller.db" },
+  { ROOT .. "/data/ccminer.log", TEMP .. "/data/ccminer.log" },
+  { ROOT .. "/data/ccminer.log.1", TEMP .. "/data/ccminer.log.1" },
+}
+if action ~= "update-low-space" then
+  for _, pair in ipairs(preserved) do
+    local ok, copyError = copyIfPresent(pair[1], pair[2])
+    if not ok then fs.delete(TEMP); fail("Cannot preserve existing data: " .. tostring(copyError)) end
+  end
+end
+
+local function parseMarker(text)
+  if not text then return nil end
+  local version = text:match("version=([^\r\n]+)")
+  local schema = tonumber(text:match("schema=(%d+)"))
+  local role = text:match("role=([^\r\n]+)")
+  local state = text:match("state=([^\r\n]+)")
+  local nextIndex = tonumber(text:match("next=(%d+)"))
+  if not version or not schema or not role or not state or not nextIndex then return nil end
+  return { version = version, schema = schema, role = role, state = state, next = nextIndex }
+end
+local function markerRead()
+  local markerText = readFile(LOW_SPACE_MARKER)
+  local marker = parseMarker(markerText)
+  if marker then return marker, nil end
+  local backupPath, tempPath = LOW_SPACE_MARKER .. ".bak", LOW_SPACE_MARKER .. ".tmp"
+  local tempText = readFile(tempPath)
+  local temp = parseMarker(tempText)
+  if tempText and not temp then
+    return nil, "Recovery marker temporary file is corrupt; refusing to guess update progress."
+  end
+  local backupText = readFile(backupPath)
+  local backup = parseMarker(backupText)
+  if backup then
+    local restored, restoreError = atomicWrite(LOW_SPACE_MARKER, backupText)
+    if not restored then return nil, "Recovery marker backup is valid but could not be restored: " .. tostring(restoreError) end
+    local recovered = parseMarker(readFile(LOW_SPACE_MARKER))
+    if not recovered then return nil, "Recovery marker backup restore could not be verified." end
+    return recovered, nil
+  end
+  if temp then
+    local restored, restoreError = atomicWrite(LOW_SPACE_MARKER, tempText)
+    if not restored then return nil, "Recovery marker temporary file is valid but could not be restored: " .. tostring(restoreError) end
+    local recovered = parseMarker(readFile(LOW_SPACE_MARKER))
+    if not recovered then return nil, "Recovery marker temporary restore could not be verified." end
+    return recovered, nil
+  end
+  if markerText then return nil, "Recovery marker is corrupt and no valid atomic backup remains." end
+  if backupText then return nil, "Recovery marker backup is corrupt and cannot be trusted." end
+  return nil, nil
+end
+local function markerWrite(state, nextIndex)
+  local text = table.concat({
+    "version=" .. VERSION,
+    "schema=" .. tostring(SCHEMA),
+    "role=" .. ROLE,
+    "state=" .. tostring(state),
+    "next=" .. tostring(nextIndex or 1),
+    "",
+  }, "\n")
+  return atomicWrite(LOW_SPACE_MARKER, text)
+end
+local function clearMarker()
+  for _, suffix in ipairs({ "", ".tmp", ".bak" }) do
+    local path = LOW_SPACE_MARKER .. suffix
     if fs.exists(path) then pcall(fs.delete, path) end
     if fs.exists(path) then return false, "Cannot clear recovery marker artifact: " .. path end
   end

@@ -167,7 +167,7 @@ local program, compileError = loader(table.concat(source), "@/ccminer/controller
 if not program then error("Cannot assemble controller: " .. tostring(compileError), 0) end
 return program(...)
 ]] },
-  { source = [[src/ccminer/controller_parts/01.part]], target = [[controller_parts/01.part]], digest = [[02f1f6044fc308b45d66026423d449fda34a79b7a2627b32b5f82b37a40c6437]], content = [[-- CC Miner V4 - controller state, persistence and job orchestration.
+  { source = [[src/ccminer/controller_parts/01.part]], target = [[controller_parts/01.part]], digest = [[0c6f24368798740d52491508d36280c0ae21a7143b558f113eed2fa45c497346]], content = [[-- CC Miner V4 - controller state, persistence and job orchestration.
 -- The controller is deliberately tolerant of V2 worker payloads.  New
 -- fields are additive and every command has a legacy equivalent where one
 -- exists.
@@ -198,6 +198,7 @@ local function dbDefaults()
     queue = {},
     history = {},
     leases = {},
+    pendingStarts = {},
     activeLeases = {}, -- independent compatibility snapshot for V4 draft tools.
     -- Group state is deliberately additive.  The legacy queue/history/preset
     -- keys above remain authoritative for single-worker operation.
@@ -252,6 +253,7 @@ local function loadControllerDb()
     db.leases = common.copy(loaded.activeLeases)
   end
   db.leases = type(db.leases) == "table" and db.leases or {}
+  db.pendingStarts = type(db.pendingStarts) == "table" and db.pendingStarts or {}
   db.activeLeases = common.copy(db.leases)
   db.presets, db.queue, db.history = db.presets or {}, db.queue or {}, db.history or {}
   db.groups = type(db.groups) == "table" and db.groups or {}
@@ -267,6 +269,3 @@ local function loadControllerDb()
   db.groupScheduler.staggerSeconds = math.max(0, tonumber(db.groupScheduler.staggerSeconds) or 0)
   dbError = err
 end
-
-local function saveControllerDb()
-  db.schema, db.version, db.updatedAt = common.SCHEMA, common.VERSION, common.nowSeconds()

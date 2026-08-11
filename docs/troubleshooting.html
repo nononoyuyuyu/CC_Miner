@@ -27,6 +27,9 @@ shell.run("/ccminer/boot.lua")</code></pre></div></li><li><div><h3>再起動す�
 <h2 id="staging">[1/13] lib/common.lua ... FAILED / Staging verification failed</h2>
 <p>通常更新が作る一時コピーの空き容量不足、または古いCC環境で保存時に文字データが変換された状態です。空きが十分あるのに「expected」と「wrote」がほぼ同じ大きさなら、文字変換が原因です。最新版は取得・保存・再読込をバイナリ方式に統一し、正確なバイト数を表示します。空き容量が本当に不足している場合だけ、省容量更新へ自動で切り替わります。</p>
 <ol><li>最新版の <code>install.lua update</code> をもう一度実行します。</li><li><code>Switching automatically to update-low-space mode</code> と表示されたら、そのまま待ちます。</li><li>古い <code>/ccminer</code>、設定、作業記録は手で削除しません。</li><li>古いインストーラーのままなら、上の <code>update-low-space</code> コマンドを直接実行します。</li></ol>
+<h2 id="start-rejected">プレフライトは緑なのに採掘せず、次のSTARTが灰色になる</h2>
+<p>古いV4コントローラーが、1台だけの通常採掘へグループ採掘用の番号を付けて送り、ワーカーが安全のため拒否していた問題です。拒否後の採掘範囲予約も残るため、同じ範囲のSTARTが灰色になっていました。</p>
+<ol><li>コントローラーとワーカーを最新版へ更新し、両方を再起動します。</li><li>管理画面でDISCOVERを押し、ワーカーの状態を受け取ります。</li><li>最新版は、採掘を始めていないワーカーに残った古い予約を自動で片付けます。</li><li>もう一度NEW JOBから範囲を選び、プレフライトの「start state」「home」「facing」「recovery」「existing job」を確認してSTARTを押します。</li></ol>
 <h2 id="focus">タートルをクリックしても文字を入力できない</h2>
 <p>採掘タートルの画面がプログラムに使われている間は、通常の入力行が出ません。管理用コンピューターから操作するのが正常です。</p>
 <ol><li>採掘中なら管理画面からPAUSEまたはRETURN HOMEを選びます。</li><li>止まるまで待ちます。</li><li>設定を変えるなら管理画面またはセットアップを使います。</li><li>故障調査でどうしても終了する場合だけ、<kbd>Ctrl</kbd>と<kbd>T</kbd>を長押しします。安全処理中は終了を受け付けないことがあります。</li></ol>

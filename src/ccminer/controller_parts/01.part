@@ -29,6 +29,7 @@ local function dbDefaults()
     queue = {},
     history = {},
     leases = {},
+    pendingStarts = {},
     activeLeases = {}, -- independent compatibility snapshot for V4 draft tools.
     -- Group state is deliberately additive.  The legacy queue/history/preset
     -- keys above remain authoritative for single-worker operation.
@@ -83,6 +84,7 @@ local function loadControllerDb()
     db.leases = common.copy(loaded.activeLeases)
   end
   db.leases = type(db.leases) == "table" and db.leases or {}
+  db.pendingStarts = type(db.pendingStarts) == "table" and db.pendingStarts or {}
   db.activeLeases = common.copy(db.leases)
   db.presets, db.queue, db.history = db.presets or {}, db.queue or {}, db.history or {}
   db.groups = type(db.groups) == "table" and db.groups or {}
@@ -681,6 +683,71 @@ local function releaseLeasesForWorker(id, jobId)
   saveControllerDb()
 end
 
+-- A direct single-worker START is a two-phase operation: rednet.send only
+-- confirms that the packet was queued, not that the worker accepted it. Keep
+-- the lease until an ACK/status confirms acceptance, and release it
+-- immediately on an explicit rejection. This also repairs leases left by
+-- older controllers which treated a rejected packet as a started job.
+local function reconcileSingleWorkerLeases(id, data)
+  if not id or type(data) ~= "table" then return false end
+  local key = tostring(id)
+  local pending = db.pendingStarts and db.pendingStarts[key]
+  local activeId = activeJobId(data)
+  if pending and activeId and tostring(activeId) == tostring(pending.jobId) then
+    db.pendingStarts[key] = nil
+    saveControllerDb()
+    setNotice("Worker #" .. key .. " accepted the job.", false)
+    pending = nil
+  end
+  local status = tostring(data.status or "")
+  local safelyIdle = data.atHome == true and (status == "idle" or status == "complete" or status == "completed" or status == "aborted")
+  if not safelyIdle then return false end
+  local kept, removed = {}, 0
+  for _, lease in ipairs(db.leases or {}) do
+    local sameWorker = tonumber(lease.workerId) == tonumber(id)
+    local directLease = not lease.groupJobId
+    local matchesActive = activeId and tostring(lease.jobId or "") == tostring(activeId)
+    local matchesPending = pending and tostring(lease.jobId or "") == tostring(pending.jobId or "")
+    if sameWorker and directLease and not matchesActive and not matchesPending then
+      removed = removed + 1
+    else
+      kept[#kept + 1] = lease
+    end
+  end
+  if removed > 0 then
+    db.leases = kept
+    db.activeLeases = common.copy(kept)
+    saveControllerDb()
+    setNotice(("Cleared %d rejected/stale START reservation%s for worker #%s."):format(removed, removed == 1 and "" or "s", key), false)
+    return true
+  end
+  return false
+end
+
+local function handleSingleStartAck(sender, message, payload)
+  local key = tostring(sender)
+  local pending = db.pendingStarts and db.pendingStarts[key]
+  if not pending or tostring(payload.command or "") ~= "start" then return false end
+  if pending.messageId and message.replyTo and tostring(pending.messageId) ~= tostring(message.replyTo) then return false end
+  db.pendingStarts[key] = nil
+  if payload.ok == true then
+    saveControllerDb()
+    setNotice("START accepted by worker #" .. key .. ".", false)
+  else
+    for _, item in ipairs(db.queue or {}) do
+      local awaiting = item.awaiting
+      if awaiting and tonumber(awaiting.workerId) == tonumber(sender) and tostring(awaiting.jobId) == tostring(pending.jobId) then
+        item.awaiting = nil
+        item.retryAt = common.nowSeconds() + 15
+        item.lastError = tostring(payload.message or "worker rejected START")
+      end
+    end
+    releaseLeasesForWorker(sender, pending.jobId)
+    setNotice("START rejected by worker #" .. key .. ": " .. tostring(payload.message or "unknown reason"), true)
+  end
+  return true
+end
+
 local function acknowledgeQueuedStart(id, data)
   local job = data and data.job
   if not job then return end
@@ -755,6 +822,7 @@ local function handleMessage(sender, message)
     workers[id].data = payload
     workers[id].lastSeen = common.nowSeconds()
     workers[id].sender = sender
+    reconcileSingleWorkerLeases(id, payload)
     local groupJob = findGroupJobForWorker(id, payload)
     if groupJob then
       if groupJob.status == "starting" and payload.job and payload.job.assignmentId then acceptGroupStart(groupJob, id, payload.job.assignmentId) end
@@ -816,6 +884,7 @@ local function handleMessage(sender, message)
   elseif message.kind == "ack" then
     local payload = message.payload or {}
     setNotice((payload.ok and "OK: " or "ERROR: ") .. tostring(payload.message or ""), not payload.ok)
+    handleSingleStartAck(sender, message, payload)
     local ackGroupJobId = payload.groupJobId or payload.parentGroupJobId or payload.group and payload.group.groupJobId
     if ackGroupJobId and db.groupJobs[tostring(ackGroupJobId)] then
       local ackJob = db.groupJobs[tostring(ackGroupJobId)]
@@ -878,10 +947,11 @@ local function sendCommand(id, command, payload)
   if not id then setNotice("No worker selected.", true); return false end
   payload = payload or {}
   payload.command = command
-  local ok, err = protocol.send(id, protocol.message("command", config.networkKey, payload, id))
+  local wireMessage = protocol.message("command", config.networkKey, payload, id)
+  local ok, err = protocol.send(id, wireMessage)
   if ok then setNotice(("Command '%s' sent to #%s."):format(command, tostring(id)), false)
   else setNotice("Send failed: " .. tostring(err), true) end
-  return ok
+  return ok, err, wireMessage.id
 end
 
 local GROUP_WIRE_COMMAND = { start = "start", pause = "pause", resume = "resume", return_home = "recall", recall = "recall", service = "service", abort = "abort", clear = "clear" }
@@ -1153,6 +1223,7 @@ local function computePreflight()
   if not estimate and estimateError then planError = estimateError end
   local id, worker = draftWorker()
   local data = worker and worker.data or {}
+  if id and worker then reconcileSingleWorkerLeases(id, data) end
   local checks = {}
   local function check(name, state, detail, fatal)
     checks[#checks + 1] = { name = name, state = state, detail = detail, fatal = fatal == true }
@@ -1181,8 +1252,18 @@ local function computePreflight()
   else
     check("GPS", "ok", "local mode (world features unavailable)", false)
   end
-  if id and worker and statusOf(worker) ~= "offline" then check("worker", "ok", workerLabel(worker, id), false)
+  local workerStatus = worker and statusOf(worker) or "offline"
+  if id and worker and workerStatus ~= "offline" then check("worker", "ok", workerLabel(worker, id), false)
   else check("worker", "bad", "offline or not selected", true) end
+  local startableStatus = workerStatus == "idle" or workerStatus == "complete" or workerStatus == "completed" or workerStatus == "aborted"
+  check("start state", startableStatus and "ok" or "bad", workerStatus, not startableStatus)
+  check("home", data.atHome == true and "ok" or "bad", data.atHome == true and "at home" or "worker is not at home", data.atHome ~= true)
+  local poseDir = tonumber(data.pose and data.pose.dir)
+  check("facing", poseDir == 0 and "ok" or "bad", poseDir == 0 and "facing quarry" or (poseDir and ("direction=" .. tostring(poseDir)) or "direction unknown"), poseDir ~= 0)
+  local recoveryRequired = data.recoveryRequired == true or data.pendingAction ~= nil
+  check("recovery", recoveryRequired and "bad" or "ok", recoveryRequired and "pending physical recovery" or "ready", recoveryRequired)
+  local unfinished = data.job ~= nil and workerStatus ~= "complete" and workerStatus ~= "completed" and workerStatus ~= "aborted"
+  check("existing job", unfinished and "bad" or "ok", unfinished and "abort or clear the unfinished job first" or "clear", unfinished)
   if fuel and fuel >= requiredFuel then
     check("worker fuel", "ok", ("available %s / need %d"):format(tostring(fuel), requiredFuel), false)
   elseif fuel then
@@ -2049,13 +2130,23 @@ local function startDraft()
       chunkMode = result.chunkMode, excludedChunks = result.excludedChunks,
       lighting = payloadLighting, waterMode = draft.waterMode, profile = draft.profile,
       name = draft.name or ("Quarry %dx%dx%d"):format(draft.width, draft.length, payloadDepth),
-      jobId = assignment.jobId, assignmentId = assignment.assignmentId,
+      -- assignmentId is group-only wire metadata. Sending it for an ordinary
+      -- one-worker quarry makes the worker correctly demand assignmentChunks
+      -- and reject the otherwise valid full-footprint job.
+      jobId = assignment.jobId,
     }
     if result.chunkMode == "world" then payload.targetY = result.targetY end
-    if not sendCommand(assignment.workerId, "start", payload) then sent = false; break end
+    local sentOK, _, messageId = sendCommand(assignment.workerId, "start", payload)
+    if not sentOK then sent = false; break end
+    db.pendingStarts[tostring(assignment.workerId)] = {
+      workerId = assignment.workerId, jobId = assignment.jobId,
+      assignmentId = assignment.assignmentId, messageId = messageId,
+      sentAt = common.nowSeconds(),
+    }
     sentAssignments[#sentAssignments + 1] = assignment
   end
   if not sent then
+    for _, assignment in ipairs(assignments) do db.pendingStarts[tostring(assignment.workerId)] = nil end
     for _, assignment in ipairs(sentAssignments) do sendCommand(assignment.workerId, "stop", { mode = "abort", assignmentId = assignment.assignmentId }) end
     for _, assignment in ipairs(assignments) do releaseLeasesForWorker(assignment.workerId, assignment.jobId) end
     setNotice("One or more workers rejected the job; all assignments were stopped.", true)

@@ -38,6 +38,7 @@ for _, item in ipairs({
   { "bays = {},", "DB bays registry" },
   { "groupJobs = {},", "DB group jobs registry" },
   { "groupLeases = {},", "DB group leases registry" },
+  { "pendingStarts = {},", "single START ACK registry" },
   { "local function persistentGroupValue(source)", "group persistence copier" },
   { "local persistedGroups, persistedDocks, persistedBays, persistedJobs, persistedGroupLeases = {}, {}, {}, {}, {}", "detached group DB roots" },
   { "persistedDb.groups, persistedDb.docks, persistedDb.bays = persistedGroups, persistedDocks, persistedBays", "detached group/dock/bay save" },
@@ -47,6 +48,28 @@ for _, item in ipairs({
 }) do
   marker(controller, item[1], item[2])
 end
+
+-- A normal one-worker job is a full-footprint job, not a group assignment.
+-- It must not send group-only assignmentId metadata without assignmentChunks.
+-- The controller keeps an ACK ledger and releases the reserved footprint when
+-- the worker explicitly rejects START, so a retry does not stay greyed out.
+for _, item in ipairs({
+  { "local function handleSingleStartAck(sender, message, payload)", "single START ACK handler" },
+  { 'tostring(payload.command or "") ~= "start"', "single START ACK command correlation" },
+  { "releaseLeasesForWorker(sender, pending.jobId)", "rejected single START lease release" },
+  { "local function reconcileSingleWorkerLeases(id, data)", "stale single START lease reconciliation" },
+  { "db.pendingStarts[tostring(assignment.workerId)] = {", "single START pending ledger" },
+  { "local sentOK, _, messageId = sendCommand(assignment.workerId, \"start\", payload)", "single START message correlation" },
+}) do
+  marker(controller, item[1], item[2])
+end
+local directStartBegin = assert(controller:find("local function startDraft()", 1, true))
+local directStartEnd = assert(controller:find("local function queueDraft()", directStartBegin, true))
+local directStart = controller:sub(directStartBegin, directStartEnd - 1)
+local payloadBegin = assert(directStart:find("local payload = {", 1, true))
+local payloadEnd = assert(directStart:find("if result.chunkMode == \"world\"", payloadBegin, true))
+local directPayload = directStart:sub(payloadBegin, payloadEnd - 1)
+assert(not directPayload:find("assignmentId =", 1, true), "ordinary START still sends group-only assignmentId")
 
 -- Resource registration normalizes integer world coordinates, facing and depth;
 -- group registration validates worker limits, mode/partition and per-worker
