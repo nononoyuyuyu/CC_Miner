@@ -1,32 +1,31 @@
 # CC Miner V4
 
-CC: Restitched / CC:Tweaked 向けの CC Miner V4.0.0（schema 4）です。復旧可能な遠隔クアリーとして、Advanced Mining Turtle と Advanced Computer で 1 タイル = 1 チャンクの grid、preflight、補給・帰還、queue、group、GPS、report を扱います。
+CC Minerは、CC: Restitched / CC:Tweakedの採掘タートルを、管理用コンピューターから動かすプログラムです。
 
-## マニュアル
+初めて使う方は、コマンドを先に実行せず、次の手順書を上から順に読んでください。必要な物、ブロックの置き方、プログラムの入れ方、最初の採掘までを説明しています。
 
-導入から GPS 塔、単一／複数 bay、controller、group / discard、絶対 BOTTOM Y、性能、安全、復旧、検証までを日本語でまとめています。
+## 手順書
 
-**[CC Miner V4 マニュアルを開く](docs/index.html)**
+- **[はじめから読む](docs/index.html)**
+- **[最小構成ですぐ試す](docs/quickstart.html)**
+- **[困ったとき](docs/troubleshooting.html)**
 
-## 最短の導入
+基本の順番は次のとおりです。
 
-```lua
-wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua worker
-wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua controller
-```
+1. 必要な物をそろえる
+2. 採掘タートルの置き場を作る
+3. 管理用コンピューターを置く
+4. プログラムを入れる
+5. 小さい範囲で試す
+6. 成功してからGPS、たいまつ、穴埋め、複数台を追加する
 
-GPS を使う場合は 4 台以上の host を追加します。
+## 大切な注意
 
-```lua
-wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua gps
-```
+- 採掘中のタートルを手で動かさないでください。
+- 最初はGPSなし、たいまつなし、水・溶岩で停止する設定がおすすめです。
+- チャンクの読み込み状態は、CC Minerから確認・変更できません。
+- 設定の合言葉は強い暗号ではありません。画面写真や配信へ写さないでください。
 
-HTTP が使えない場合は、`dist/ccminer-offline-worker.lua` + `dist/ccminer-offline-worker.parts/`、`dist/ccminer-offline-controller.lua` + `dist/ccminer-offline-controller.parts/`、`dist/ccminer-offline-gps.lua` + `dist/ccminer-offline-gps.parts/` を役割ごとに対で転送してください。loader は組立・検証後に自身の parts を削除するため、原本は PC／外部媒体に保持します。互換 dispatcher `dist/ccminer-offline.lua` も利用できます。
+## 開発者向け
 
-role loader は role 名（または省略）で導入し、`update`／`update-low-space` は既存 `config.role` と一致する場合だけ実行します。オンラインの `install.lua update` は role を自動判定し、marker は失敗位置から再開します。
-
-チャンクロード管理、管理者権限、認証基盤、強い暗号化は提供しません。対応環境・構成・安全境界はマニュアルを確認してください。
-
-## 変更履歴
-
-[CHANGELOG.md](CHANGELOG.md) を参照してください。
+変更履歴は[CHANGELOG.md](CHANGELOG.md)、自動検査は[動作確認](docs/testing.html)を参照してください。

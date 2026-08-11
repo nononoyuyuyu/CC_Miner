@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="CC Minerの設定項目を初心者向けに説明"><title>設定を変える | CC Miner V4</title><link rel="stylesheet" href="assets/manual.css"></head>
+<body><a class="skip-link" href="#main">本文へ移動</a><header class="site-header"><div class="container header-inner"><a class="brand" href="index.html">CC Miner V4 手順書</a><span class="header-note">設定名、意味、おすすめ値</span><details class="nav-toggle"><summary>目次を開く</summary><nav class="site-nav" aria-label="ページ移動"><a data-page href="index.html">はじめに</a><a data-page href="quickstart.html">まず動かす</a><a data-page href="build-gps.html">ブロックを置く</a><a data-page href="install.html">プログラムを入れる</a><a data-page href="operation.html">採掘する</a><a data-page href="settings.html">設定を変える</a><a data-page href="worker-dock.html">タートルの置き方</a><a data-page href="controller.html">管理画面</a><a data-page href="groups.html">複数台</a><a data-page href="performance.html">速さと帰還</a><a data-page href="safety.html">安全</a><a data-page href="troubleshooting.html">困ったとき</a><a data-page href="overview.html">しくみ</a><a data-page href="testing.html">動作確認</a><a data-page href="sources.html">参考資料</a></nav></details></div></header>
+<div class="container layout"><aside class="toc" aria-label="マニュアル目次"><h2>読む順番</h2><ul><li><a data-page href="index.html">はじめに</a></li><li><a data-page href="quickstart.html">まず動かす</a></li><li><a data-page href="build-gps.html">ブロックを置く</a></li><li><a data-page href="install.html">プログラムを入れる</a></li><li><a data-page href="operation.html">採掘する</a></li><li><a data-page href="settings.html">設定を変える</a></li><li><a data-page href="worker-dock.html">タートルの詳しい置き方</a></li><li><a data-page href="controller.html">管理画面</a></li><li><a data-page href="groups.html">複数台を使う</a></li><li><a data-page href="performance.html">速さと帰還</a></li><li><a data-page href="safety.html">安全のために</a></li><li><a data-page href="troubleshooting.html">困ったとき</a></li><li><a data-page href="overview.html">しくみを知る</a></li><li><a data-page href="testing.html">動作確認</a></li><li><a data-page href="sources.html">参考資料</a></li></ul></aside>
+<main id="main" class="main"><nav class="breadcrumbs" aria-label="パンくず"><a href="index.html">手順書</a> / 設定を変える</nav>
+<section class="hero"><h1>設定を変える</h1><p class="lead">英語の設定名は、画面で同じ項目を見つけるためにだけ書いています。意味とおすすめ値は日本語で説明します。分からない項目は、おすすめ値のままにしてください。</p></section>
+<h2 id="profiles">動かし方を選ぶ</h2>
+<div class="table-wrap"><table><thead><tr><th>画面の名前</th><th>意味</th><th>おすすめ</th></tr></thead><tbody><tr><td>SAFE</td><td>燃料と空き枠を多めに残し、早めに戻ります。</td><td>初回、長時間見守れないとき</td></tr><tr><td>BALANCED</td><td>安全と速さの中間です。</td><td>試運転が成功した後の普段使い</td></tr><tr><td>TURBO</td><td>戻る回数を減らし、たいまつの間隔も広げます。</td><td>十分に試した場所だけ</td></tr></tbody></table></div>
+<h2 id="worker">採掘タートルの設定</h2>
+<div class="table-wrap"><table><thead><tr><th>設定名</th><th>やさしい説明</th><th>最初のおすすめ</th></tr></thead><tbody>
+<tr><td>networkKey</td><td>管理用コンピューターと同じにする合言葉。</td><td>他人に見せない、同じ文字</td></tr>
+<tr><td>profile</td><td>戻る早さと安全の度合い。</td><td>SAFE</td></tr>
+<tr><td>GPS enabled / required</td><td>GPSを使うか、使えないとき必ず止めるか。</td><td>最初は両方OFF</td></tr>
+<tr><td>lighting.mode</td><td>たいまつを置くか。offは置かない、safe/customは置く。</td><td>offで試運転</td></tr>
+<tr><td>lighting.interval</td><td>たいまつを何ブロックごとに置くか。</td><td>SAFEなら8</td></tr>
+<tr><td>torchSide</td><td>たいまつチェストを置く面。</td><td>left（左面）</td></tr>
+<tr><td>waterMode</td><td>水を見つけたとき、無視・停止・穴埋めのどれにするか。</td><td>stop</td></tr>
+<tr><td>lavaMode</td><td>溶岩を見つけたとき、停止・穴埋めのどちらにするか。</td><td>stop</td></tr>
+<tr><td>sealSide</td><td>穴埋め材チェストを置く面。</td><td>right（右面）</td></tr>
+<tr><td>maxContinuousSeal</td><td>続けて置いてよい穴埋め材の上限。異常な大量消費を止める。</td><td>32以下</td></tr>
+<tr><td>recycle.enabled</td><td>掘った石を穴埋め材として残す。</td><td>ON</td></tr>
+<tr><td>discard.mode</td><td>不要品をその場で捨てる方法。</td><td>KEEP_ALL</td></tr>
+<tr><td>discard.allowlist</td><td>捨ててよい物の完全なID。CUSTOM_ALLOWLISTでだけ使う。</td><td>空のまま</td></tr>
+<tr><td>discard.direction</td><td>捨てる方向。そこにチェストなどがあると、安全のため捨てない。</td><td>置き場と重ならない方向</td></tr>
+<tr><td>fuelBuffer</td><td>帰り道のために余分に残す燃料。</td><td>既定値</td></tr>
+<tr><td>reserveEmptySlots</td><td>拾った物のために空けておく持ち物枠。</td><td>既定値</td></tr>
+<tr><td>checkpointEveryMoves</td><td>詳しい進み具合を何回の移動ごとに保存するか。</td><td>既定値</td></tr>
+<tr><td>gpsVerifyEveryMoves</td><td>GPSで位置を確かめる間隔。</td><td>既定値</td></tr>
+</tbody></table></div>
+<h2 id="discard">不要品を捨てる設定</h2>
+<div class="table-wrap"><table><thead><tr><th>設定</th><th>何をするか</th><th>注意</th></tr></thead><tbody><tr><td>KEEP_ALL</td><td>何も捨てない。</td><td>最初はこれが安全です。</td></tr><tr><td>DISCARD_EXCESS_STONE</td><td>必要な穴埋め用の石を残し、余った普通の石を捨てる。</td><td>鉱石、燃料、たいまつ、穴埋め材は守ります。</td></tr><tr><td>CUSTOM_ALLOWLIST</td><td>自分が完全なIDで指定した物だけ捨てる候補にする。</td><td>入力を間違えると大切な物を失います。少量で試してください。</td></tr></tbody></table></div>
+<div class="callout danger"><strong>捨てた物は元に戻せません。</strong>知らないMODのアイテムを短い名前や「たぶん石」で登録しないでください。必ず <code>mod名:item名</code> の完全なIDを確認します。</div>
+<h2 id="controller">管理用コンピューターの設定</h2>
+<div class="table-wrap"><table><thead><tr><th>設定名</th><th>やさしい説明</th><th>おすすめ</th></tr></thead><tbody><tr><td>networkKey</td><td>採掘タートルと同じ合言葉。</td><td>完全に同じ文字</td></tr><tr><td>historyLimit</td><td>終わった作業を何件残すか。</td><td>既定値</td></tr><tr><td>queueEnabled</td><td>採掘作業を順番待ちに入れられるようにする。</td><td>1台で慣れてからON</td></tr><tr><td>group.maxWorkers</td><td>まとめて管理する最大台数。</td><td>必要な台数だけ</td></tr><tr><td>group.partitionMode</td><td>複数台へ採掘範囲を分ける方法。</td><td>stripe</td></tr><tr><td>group.maxConcurrentService</td><td>同時に置き場へ戻してよい台数。</td><td>1</td></tr><tr><td>dock.baySpacing</td><td>複数のタートル置き場を離す最低の目安。</td><td>4以上</td></tr><tr><td>alerts</td><td>音やレッドストーンで異常を知らせる。</td><td>動作確認後にON</td></tr></tbody></table></div>
+<h2 id="job">採掘作業ごとの設定</h2>
+<div class="table-wrap"><table><thead><tr><th>画面の名前</th><th>意味</th></tr></thead><tbody><tr><td>WIDTH</td><td>タートルから見て右方向の幅。</td></tr><tr><td>LENGTH</td><td>タートルから見て正面方向の長さ。</td></tr><tr><td>DEPTH</td><td>下へ何ブロック分掘るか。</td></tr><tr><td>BOTTOM Y</td><td>一番下のワールド高さ。GPSを使う作業だけで指定できます。</td></tr><tr><td>LIGHTING</td><td>たいまつを置くか。</td></tr><tr><td>WATER / LAVA</td><td>水や溶岩を見つけたときの動き。</td></tr></tbody></table></div>
+<details class="answer"><summary>設定をやり直すには</summary><p>端末で <code>/ccminer/setup.lua worker</code> または <code>/ccminer/setup.lua controller</code> を実行し、画面の質問に答えます。終わったら <code>reboot</code> します。</p></details>
+<nav class="pager" aria-label="ページ送り"><a href="operation.html">← 前へ：採掘する</a><a href="worker-dock.html">次へ：タートルの詳しい置き方 →</a></nav></main></div><footer class="site-footer"><div class="container">分からない設定は既定値のままにしてください。</div></footer><script src="assets/manual.js" defer></script></body></html>

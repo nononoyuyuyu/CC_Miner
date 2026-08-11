@@ -2,6 +2,10 @@
 
 ## 4.0.0
 
+- マニュアルを初心者向けの手順書として全面改稿。読む順番を「ブロック配置→プログラム導入→小規模試運転」に変更し、独立したクイックスタートと設定項目別の説明書を追加
+- コマンド欄の文字色、固定幅の帰還図、モバイル表示を修正。すべてのブロック面配置を「上面／左面・正面・右面／背面・底面」の共通3×3図に統一
+- worker、controller、checkpoint、preflight、dock、group等を本文では日本語中心に言い換え、実画面で必要な場合だけ英語を併記
+
 - 日本語マニュアルを `docs/index.html` 入口の静的 HTML へ全面再構成。共通目次、パンくず、前後リンク、モバイル／印刷／キーボード／high contrast／`prefers-reduced-motion` に対応
 - GPS 塔、座標軸、ワーカー装備、単一／複数 bay、controller、chunk grid、DFS 帰還経路を semantic HTML + CSS grid/flex の図へ移行（画像・SVG・canvas なし）
 - P0/P1/P2、group partition、discard policy、throughput、絶対 BOTTOM Y、chunk load 非対応、low-space update の運用手順を追加
