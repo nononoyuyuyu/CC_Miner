@@ -5,11 +5,17 @@
 <main id="main" class="main"><nav class="breadcrumbs" aria-label="パンくず"><a href="index.html">手順書</a> / まず動かす</nav>
 <section class="hero"><h1>まず動かす：最小構成</h1><p class="lead">このページだけを上から順に進めると、GPSを使わない最小構成で、1台のタートルに小さな範囲を採掘させられます。手順数は少なくしていますが、各手順の確認は省略しないでください。</p></section>
 <h2 id="items">1. 必要な物をそろえる</h2>
-<ul class="checklist"><li>Advanced Mining Turtle（上級採掘タートル）1台</li><li>Advanced Computer（上級コンピューター）1台</li><li>Wireless Modem（無線モデム）2個。タートル用と管理用です</li><li>チェスト2個。搬出用と燃料用です</li><li>石炭など、タートルが使える燃料</li><li>プログラムを取得できる通信環境</li></ul>
+<ul class="checklist"><li>Advanced Mining Turtle（上級採掘タートル）1台。右側のピッケルは外しません</li><li>Advanced Computer（上級コンピューター）1台</li><li>Wireless Modem（無線モデム）2個。タートル用と管理用です</li><li>チェスト2個。搬出用と燃料用です</li><li>石炭など、タートルが使える燃料</li><li>プログラムを取得できる通信環境</li></ul>
 <div class="callout warn"><strong>最初の試運転では：</strong>たいまつを置かず、水や溶岩を見つけたら停止する設定にします。穴埋め材とたいまつのチェストは、試運転が成功してから追加できます。</div>
 <h2 id="place">2. ブロックを置く</h2>
 <p>採掘タートルの正面を、これから掘りたい方向へ向けます。周りは、必ず次の形で考えます。</p>
 <div class="diagram" role="img" aria-label="中央の採掘タートルを展開した面配置。上面に燃料、正面は空け、背面に搬出チェスト"><p class="diagram-title">採掘タートルの面と、最小構成で置く物</p><div class="face-map"><div class="face blank" aria-hidden="true"></div><div class="face top">上面<small>燃料チェスト</small></div><div class="face blank" aria-hidden="true"></div><div class="face left">左面<small>今は空ける</small></div><div class="face front">正面<small>採掘方向・1マス以上空ける</small></div><div class="face right">右面<small>今は空ける</small></div><div class="face back">背面<small>搬出チェスト</small></div><div class="face bottom">底面<small>動かない床</small></div><div class="face blank" aria-hidden="true"></div></div><p class="diagram-alt">上面に燃料チェスト、背面に搬出チェストを置きます。正面は採掘方向なので空けます。左右は最初の試運転では空けます。底面には壊れない床を置きます。</p></div>
+<h3>タートルの左側へ無線モデムを装備する</h3>
+<ol><li>タートルの持ち物の1番へ無線モデムを入れます。</li><li>タートルの端末で <code>lua</code> と入力します。</li><li>表示されたLua入力画面で、次の3行を1行ずつ入力します。</li></ol>
+<pre><code>turtle.select(1)
+turtle.equipLeft()
+peripheral.getType("left")</code></pre>
+<p>2行目が <code>true</code>、最後が <code>modem</code> なら成功です。右側にもともと付いているピッケルは、そのまま残します。確認後は <kbd>Ctrl</kbd>と<kbd>T</kbd>を長押ししてLua入力画面を閉じます。</p>
 <p>管理用コンピューターは、タートルから無線が届く場所に置き、左側へ無線モデムを付けます。モニターはなくても動きます。</p>
 <h2 id="install">3. プログラムを入れる</h2>
 <p>採掘タートルを開き、次の1行を入力します。</p><p class="command-title">採掘タートルで入力</p><pre><code>wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua worker</code></pre>

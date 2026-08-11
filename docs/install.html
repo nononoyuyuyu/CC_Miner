@@ -8,7 +8,7 @@
 <p>採掘タートルと管理用コンピューターが、お互いを見分けるための文字です。紙などに控え、すべて同じ文字を入力します。画面では <code>network key</code> と表示されます。</p>
 <div class="callout danger"><strong>公開しないでください。</strong>配信や画面写真に合言葉を写さないでください。また、強い暗号ではないため、信頼できる人だけが入れるゲーム内ネットワークで使ってください。</div>
 <h2 id="worker">1. 採掘タートルへ入れる</h2>
-<ol class="steps"><li><div><h3>無線モデムを装備する</h3><p>採掘用の道具と無線モデムが付いていることを確認します。付けたあと、タートルを再起動してください。</p></div></li><li><div><h3>次の1行を入力する</h3><pre><code>wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua worker</code></pre><p class="copy-note">1行のまま入力し、<kbd>Enter</kbd>を押します。</p></div></li><li><div><h3>質問に答える</h3><p>初回は SAFE、不要品を捨てない、GPSは使わない、照明OFF、水と溶岩はSTOPがおすすめです。項目の説明は<a href="settings.html#worker">採掘タートルの設定</a>にあります。</p></div></li><li><div><h3>再起動する</h3><pre><code>reboot</code></pre><p>起動後、エラーを表示せず待機すれば完了です。</p></div></li></ol>
+<ol class="steps"><li><div><h3>左側へ無線モデムを装備する</h3><p>右側にもともと付いているピッケルは外しません。持ち物の1番へ無線モデムを入れ、Lua入力画面で <code>turtle.select(1)</code> と <code>turtle.equipLeft()</code> を実行します。<a href="worker-dock.html#modem">詳しい手順</a>どおり、左側が <code>modem</code> になったことを確認します。</p></div></li><li><div><h3>次の1行を入力する</h3><pre><code>wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua worker</code></pre><p class="copy-note">1行のまま入力し、<kbd>Enter</kbd>を押します。</p></div></li><li><div><h3>質問に答える</h3><p>初回は SAFE、不要品を捨てない、GPSは使わない、照明OFF、水と溶岩はSTOPがおすすめです。項目の説明は<a href="settings.html#worker">採掘タートルの設定</a>にあります。</p></div></li><li><div><h3>再起動する</h3><pre><code>reboot</code></pre><p>起動後、エラーを表示せず待機すれば完了です。</p></div></li></ol>
 <h2 id="controller">2. 管理用コンピューターへ入れる</h2>
 <ol class="steps"><li><div><h3>左面の無線モデムを確認する</h3><p>起動時から付いている必要があります。あとから付けた場合は再起動します。</p></div></li><li><div><h3>次の1行を入力する</h3><pre><code>wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua controller</code></pre></div></li><li><div><h3>同じ合言葉を入れる</h3><p>採掘タートルと1文字でも違うと見つかりません。大文字と小文字も同じにします。</p></div></li><li><div><h3>再起動し、管理画面を開く</h3><pre><code>reboot
 ccm dashboard</code></pre><p>採掘タートルの番号が表示されれば成功です。</p></div></li></ol>
@@ -25,7 +25,7 @@ ccminer-offline-gps.lua         と ccminer-offline-gps.parts</code></pre>
 <p class="command-title">通常の更新</p><pre><code>wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua update</code></pre>
 <p>「空き容量がない」「バックアップできない」と表示されたときは、古いフォルダーを手で消さず、次を使います。</p>
 <p class="command-title">空き容量が少ないとき</p><pre><code>wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua update-low-space</code></pre>
-<div class="callout warn"><strong>更新途中で止まった場合：</strong>同じコマンドをもう一度実行します。<code>/ccminer.update.low-space.marker</code> や <code>/ccminer</code> を手で削除しないでください。</div>
+<p>最新版の通常更新は、一時コピーを書き切れないとき、省容量更新へ自動で切り替わります。<code>Regular staging does not fit</code> と表示された後、そのまま処理が続くのは正常です。</p><div class="callout warn"><strong>更新途中で止まった場合：</strong>同じ省容量更新コマンドをもう一度実行します。<code>/ccminer.update.low-space.marker</code> や <code>/ccminer</code> を手で削除しないでください。</div>
 <h2 id="check">入れ終わったら確認する</h2>
 <ul class="checklist"><li>採掘タートルと管理用コンピューターを再起動した</li><li>両方の無線モデムが起動時から付いている</li><li>両方へ同じ合言葉を入れた</li><li><code>ccm dashboard</code> に採掘タートルの番号が出る</li><li>GPSを使う場合は4台が待機中で、GPS CALが成功した</li></ul>
 <nav class="pager" aria-label="ページ送り"><a href="build-gps.html">← 前へ：ブロックを置く</a><a href="operation.html">次へ：採掘する →</a></nav></main></div><footer class="site-footer"><div class="container">コマンドは濃い背景に白い文字で表示されます。</div></footer><script src="assets/manual.js" defer></script></body></html>

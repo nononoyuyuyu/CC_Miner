@@ -274,10 +274,34 @@ local function stageRegular(role)
     write(("[%d/%d] %s ... "):format(index, #selected, file.target))
     local body, err = download(BASE_URL .. file.source)
     if not body then printError("FAILED"); deleteKnown(base); return nil, nil, err end
-    local ok, writeError = writeFile(pathFor(base, file.target), body)
-    if not ok or readFile(pathFor(base, file.target)) ~= body then
+    local stagedPath = pathFor(base, file.target)
+    local freeBefore = freeSpace(base)
+    local required = #body + 4096
+    if freeBefore and freeBefore < required then
+      printError("NOT ENOUGH SPACE")
+      deleteKnown(base)
+      return nil, nil, ("Regular update staging needs at least %s for %s, but only %s is free. "
+        .. "The installer can continue with update-low-space mode."):format(
+          formatBytes(required), file.target, formatBytes(freeBefore)
+        ), nil, true
+    end
+    local ok, writeError = writeFile(stagedPath, body)
+    local stagedBody = readFile(stagedPath)
+    if not ok or stagedBody ~= body then
       printError("FAILED"); deleteKnown(base)
-      return nil, nil, writeError or ("Staging verification failed for " .. file.target)
+      local wrote = stagedBody and #stagedBody or 0
+      local likelyOutOfSpace = (freeBefore and freeBefore < required)
+        or (stagedBody ~= nil and wrote < #body)
+      local detail = ("Staging verification failed for %s (expected %s, wrote %s%s)."):format(
+        file.target, formatBytes(#body), formatBytes(wrote),
+        freeBefore and (", free before write " .. formatBytes(freeBefore)) or ""
+      )
+      if likelyOutOfSpace then
+        detail = detail .. " The file was truncated, which normally means the computer is out of space."
+      elseif writeError then
+        detail = detail .. " " .. tostring(writeError)
+      end
+      return nil, nil, detail, nil, likelyOutOfSpace
     end
     print("OK")
   end
@@ -813,7 +837,14 @@ if action == "update" then
   end
 end
 
-local base, selected, stageError, payloadBytes = stageRegular(role)
+local base, selected, stageError, payloadBytes, lowSpaceRecommended = stageRegular(role)
+if not base and action == "update" and lowSpaceRecommended then
+  printError(stageError)
+  print("Regular staging does not fit. Switching automatically to update-low-space mode.")
+  print("No complete second copy of /ccminer will be created.")
+  runLowSpace(role)
+  return
+end
 if not base then fail(stageError) end
 local committed, commitError = regularCommit(role, base, selected)
 if not committed then fail(commitError) end

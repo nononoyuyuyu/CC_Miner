@@ -134,6 +134,25 @@ requireText(installer, "local removedMarker, markerDeleteError = deleteKnown(LOW
 requireText(installer, "if not removedTmp or fs.exists(LOW_MARKER_TMP) then lowFailure", "online marker cleanup failure")
 requireText(installer, "User data under /ccminer", "online low-space user-data preservation")
 
+-- A regular update may not have enough room for a second complete runtime.
+-- Detect a truncated staged file, explain the expected/written sizes, and
+-- switch only updates (never first installs) to the fail-closed low-space
+-- transaction.
+local regularStage = block(installer, "local function stageRegular", "local function backupRuntime",
+  "online regular staging")
+requireText(regularStage, "local required = #body + 4096", "online regular staging reserve")
+requireText(regularStage, "if freeBefore and freeBefore < required then", "online regular free-space precheck")
+requireText(regularStage, "local stagedBody = readFile(stagedPath)", "online staged readback")
+requireText(regularStage, "stagedBody ~= nil and wrote < #body", "online truncated-file detection")
+requireText(regularStage, "expected %s, wrote %s", "online actionable staging error")
+requireText(installer, "if not base and action == \"update\" and lowSpaceRecommended then",
+  "online update-only automatic low-space fallback")
+requireOrdered(installer, {
+  "Regular staging does not fit. Switching automatically to update-low-space mode.",
+  "runLowSpace(role)",
+  "return",
+}, "online automatic low-space fallback")
+
 -- The offline generator embeds the same transaction as a source template.
 -- Read the Python source only: this test never imports it or regenerates dist/.
 local builder = read("tools/build_offline_bundle.py")
