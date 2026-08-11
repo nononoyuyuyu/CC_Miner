@@ -1,3 +1,9 @@
+      sentAt = common.nowSeconds(),
+    }
+    sentAssignments[#sentAssignments + 1] = assignment
+  end
+  if not sent then
+    for _, assignment in ipairs(assignments) do db.pendingStarts[tostring(assignment.workerId)] = nil end
     for _, assignment in ipairs(sentAssignments) do sendCommand(assignment.workerId, "stop", { mode = "abort", assignmentId = assignment.assignmentId }) end
     for _, assignment in ipairs(assignments) do releaseLeasesForWorker(assignment.workerId, assignment.jobId) end
     setNotice("One or more workers rejected the job; all assignments were stopped.", true)
@@ -235,7 +241,3 @@ local function dashboardAction(name)
       if id then
         setNotice(("Remote console is CLI-only: ccm remote %s [-- <command...>]"):format(tostring(id)), false)
       else
-        setNotice("Select a worker, then use ccm remote <workerId> in the terminal.", true)
-      end
-    elseif name == "progress" then
-      if id then mode = "progress" else setNotice("No worker selected.", true) end

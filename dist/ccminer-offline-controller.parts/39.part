@@ -1,3 +1,12 @@
+  if worldMode then local derived = effectiveJobDepth("world", draftCalibration()); shownDepth = derived or shownDepth end
+  local volume = (tonumber(draft.width) or 1) * (tonumber(draft.length) or 1) * (tonumber(shownDepth) or 1)
+  local profileInfo = profileParameters(draft.profile, draft.lighting)
+  local intervalText = profileInfo and ("torch=" .. tostring(profileInfo.effectiveInterval) .. "(" .. tostring(profileInfo.requestedInterval) .. ")") or "profile invalid"
+  local homeText = "HOME Y=-"
+  if worldMode then
+    local calibration = draftCalibration()
+    homeText = "HOME Y=" .. tostring(calibration and calibration.home and calibration.home.y or "-") .. " LAYERS=" .. tostring(shownDepth)
+  end
   common.writeAt(1, summaryY, common.fit(("%dx%dx%d=%s blocks | %s | %s profile=%s %s"):format(draft.width, draft.length, shownDepth, common.humanNumber(volume), worldMode and ("BOTTOM Y=" .. tostring(draft.targetY)) or "LOCAL DEPTH=" .. tostring(shownDepth), homeText, tostring(draft.profile), intervalText), width), colors and colors.lightGray or nil)
   local optionY = math.max(4, summaryY + 1)
   buttonRow(key, optionY, width, {
@@ -94,7 +103,7 @@ local function renderGrid(target, key)
   local byCoordinate, xValues, zValues, xIndex, zIndex = chunkGrid(catalog)
   local cellWidth = width >= 48 and 2 or 1
   local cols = common.clamp(math.floor((width - 3) / cellWidth), 1, math.max(1, #xValues))
-  local rows = common.clamp(height - (verticalStep == 2 and 10 or 8), 1, math.max(1, #zValues))
+  local rows = common.clamp(height - (verticalStep == 2 and 11 or 8), 1, math.max(1, #zValues))
   draft.gridPageX = common.clamp(draft.gridPageX or 1, 1, math.max(1, #xValues - cols + 1))
   draft.gridPageZ = common.clamp(draft.gridPageZ or 1, 1, math.max(1, #zValues - rows + 1))
   local pageX, pageZ = draft.gridPageX, draft.gridPageZ
@@ -118,20 +127,20 @@ local function renderGrid(target, key)
   end
   local _, excluded = draftCells(catalog, rootKey)
   local buttonTop = math.max(1, height - verticalStep * 2 - 1)
-  local gridSummaryY = math.max(3, buttonTop - (verticalStep == 1 and 2 or 1))
+  local gridSummaryY = math.max(3, buttonTop - (verticalStep == 1 and 2 or 2))
   common.writeAt(1, gridSummaryY, common.fit(("Mining chunks: %d/%d | E locked | page %d,%d%s"):format(#catalog - excluded, #catalog, pageX, pageZ, partialMask and " | legacy partial mask" or ""), width), partialMask and (colors and colors.red or nil) or (colors and colors.lightGray or nil))
   buttonRow(key, buttonTop, width, {
     { "ALL", function() allGrid(true) end }, { "CLEAR", function() allGrid(false) end }, { "INVERT", invertGrid }, { "RECT", function() draft.rectMode = not draft.rectMode; draft.rectStart = nil; invalidate() end },
-  })
+  }, verticalStep == 2)
   buttonRow(key, buttonTop + verticalStep, width, {
     { "<X", function() draft.gridPageX = math.max(1, draft.gridPageX - cols) end, pageX > 1 }, { "X>", function() draft.gridPageX = math.min(math.max(1, #xValues - cols + 1), draft.gridPageX + cols) end, pageX + cols <= #xValues },
     { "<Z", function() draft.gridPageZ = math.max(1, draft.gridPageZ - rows) end, pageZ > 1 }, { "Z>", function() draft.gridPageZ = math.min(math.max(1, #zValues - rows + 1), draft.gridPageZ + rows) end, pageZ + rows <= #zValues },
-  })
+  }, verticalStep == 2)
   buttonRow(key, buttonTop + verticalStep * 2, width, {
     { "BACK", function() mode = "job_dimensions" end },
     { "PREFLIGHT", function() local result = computePreflight(); if result then mode = "preflight" end end },
     { "START", function() local result = computePreflight(); if result then mode = "preflight" end end },
-  })
+  }, verticalStep == 2)
   noticeLine(target, height)
 end
 
@@ -162,20 +171,3 @@ local function renderPreflight(target, key)
   buttonRow(key, math.max(1, height - 2), width, {
     { "START", function() if canStart then startDraft() end end, canStart },
     { "QUEUE", function() queueDraft() end, canStart and config.queueEnabled ~= false },
-    { "BACK", function() mode = "job_grid" end, true },
-    { "CANCEL", function() mode, draft = "dashboard", nil end, true },
-  })
-  noticeLine(target, height)
-end
-
-local function progressChunkState(data, chunk, index, excludedSet)
-  local job = data and data.job
-  if not job then return "unknown" end
-  local progress = data.progress or {}
-  local map = progress.map or (data.report and data.report.map)
-  local explicit = type(map) == "table" and (map[chunk.key] or map[tostring(chunk.cx) .. ":" .. tostring(chunk.cz)] or map[tostring(chunk.cx) .. "," .. tostring(chunk.cz)])
-  if explicit then
-    local state = tostring(explicit)
-    if state == "completed" then state = "complete" elseif state == "waiting" or state == "service_requested" then state = "service" end
-    return state
-  end

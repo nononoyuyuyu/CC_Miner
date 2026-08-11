@@ -1,3 +1,27 @@
+      invalidate()
+    elseif keys and keyCode == keys.enter then
+      local result = computePreflight()
+      if result then mode = "preflight" end
+      invalidate()
+    end
+  elseif mode == "preflight" then
+    if keys and keyCode == keys.enter and draft and draft.preflight and not draft.preflight.fatal then
+      startDraft()
+    elseif keys and keyCode == keys.q then
+      queueDraft()
+    end
+  elseif mode == "progress" or mode == "recovery" or mode == "report" or mode == "info" or mode == "stop_menu" then
+    if keys and (keyCode == keys.enter or keyCode == keys.backspace) then
+      mode = "dashboard"
+      invalidate()
+    end
+  elseif mode == "confirm" and keys and keyCode == keys.y then
+    processChar("y")
+  end
+end
+
+local function pumpFor(seconds)
+  local deadline = common.nowSeconds() + (seconds or 1)
   while common.nowSeconds() <= deadline do
     local sender, message = protocol.receive(0.25)
     if sender then handleMessage(sender, message) end
@@ -176,11 +200,3 @@ local function commandLineMode()
     elseif sub == "remove" or sub == "delete" then local index = tonumber(args[3]); if index and db.queue[index] then table.remove(db.queue, index); saveControllerDb(); print("Queue item removed.") else print("Usage: queue remove <index>") end
     elseif sub == "add" then
       local id, width, length, depth = tonumber(args[3]), tonumber(args[4]), tonumber(args[5]), tonumber(args[6])
-      if not id or not width or not length or not depth then print("Usage: queue add <id> <width> <length> <depth>") else discover(); pumpFor(1); local item = makeCliDraft(id, width, length, depth); item.queuedAt = common.nowSeconds(); draft = item; local ok = queueDraft(); draft = nil; print(ok and "Queued." or notice) end
-    elseif sub == "run" then
-      local index = tonumber(args[3]) or 1; local item = db.queue[index]
-      if not item then print("Queue item not found.") else item.retryAt = common.nowSeconds(); item.awaiting = nil; saveControllerDb(); lastQueueDispatch = 0; dispatchQueue(); print(notice) end
-    else print("Usage: queue list|add|run|remove|clear") end
-    return true
-  elseif command == "preset" or command == "presets" then
-    local sub = string.lower(args[2] or "list")

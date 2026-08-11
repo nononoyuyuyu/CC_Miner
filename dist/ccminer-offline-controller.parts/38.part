@@ -1,3 +1,11 @@
+      local layers = assignment and assignment.layers or (homeY ~= "-" and result.bottomY and tonumber(homeY) and math.floor(tonumber(homeY) - tonumber(result.bottomY) + 1) or "-")
+      common.writeAt(1, row, common.fit(("#%s chunks=%d HOME Y=%s LAYERS=%s"):format(tostring(id), chunks, tostring(homeY), tostring(layers)), width), colors and colors.white or nil)
+      row = row + 1
+    end
+  else
+    common.writeAt(1, summaryY + 1, common.fit("PRECHECK required before START.", width), colors and colors.yellow or nil)
+  end
+  buttonRow(key, math.max(1, height - 4), width, {
     { "LIGHT " .. tostring(groupDraft.lighting and groupDraft.lighting.mode or "safe"), function() local modes = { "off", "safe", "custom" }; local now = groupDraft.lighting and groupDraft.lighting.mode or "safe"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; groupDraft.lighting.mode = modes[n % #modes + 1]; groupDraft.preflight = nil; invalidate() end },
     { "WATER " .. tostring(groupDraft.waterMode or "seal"), function() local modes = { "ignore", "stop", "seal" }; local now = groupDraft.waterMode or "seal"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; groupDraft.waterMode = modes[n % #modes + 1]; groupDraft.preflight = nil; invalidate() end },
     { "PROFILE " .. tostring(groupDraft.profile or "balanced"), function() local modes = { "safe", "balanced", "turbo" }; local now = groupDraft.profile or "balanced"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; groupDraft.profile = modes[n % #modes + 1]; groupDraft.preflight = nil; invalidate() end },
@@ -39,9 +47,9 @@ local function renderGroups(target, key)
     end
   end
   local bottom = math.max(1, height - verticalStep * 2 - 1)
-  buttonRow(key, bottom, width, { { "START", groupAction("start") }, { "PAUSE", groupAction("pause") }, { "RESUME", groupAction("resume") }, { "RETURN", groupAction("return") } })
-  buttonRow(key, bottom + verticalStep, width, { { "SERVICE", groupAction("service") }, { "ABORT", groupAction("abort") }, { "CLEAR", groupAction("clear") }, { "DRILLDOWN", function() mode = "group_info"; invalidate() end } })
-  buttonRow(key, bottom + verticalStep * 2, width, { { "BACK", function() mode = "dashboard" end }, { "REFRESH", function() local gid = selectedGroupRecord(); local job = gid and activeGroupJob(gid); if job then updateGroupAggregate(job) end; invalidate() end } })
+  buttonRow(key, bottom, width, { { "START", groupAction("start") }, { "PAUSE", groupAction("pause") }, { "RESUME", groupAction("resume") }, { "RETURN", groupAction("return") } }, verticalStep == 2)
+  buttonRow(key, bottom + verticalStep, width, { { "SERVICE", groupAction("service") }, { "ABORT", groupAction("abort") }, { "CLEAR", groupAction("clear") }, { "DRILLDOWN", function() mode = "group_info"; invalidate() end } }, verticalStep == 2)
+  buttonRow(key, bottom + verticalStep * 2, width, { { "BACK", function() mode = "dashboard" end }, { "REFRESH", function() local gid = selectedGroupRecord(); local job = gid and activeGroupJob(gid); if job then updateGroupAggregate(job) end; invalidate() end } }, verticalStep == 2)
   noticeLine(target, height)
 end
 
@@ -128,12 +136,3 @@ local function renderDimensions(target, key)
   end
   local summaryY = math.max(4, height - 5)
   local shownDepth = draft.depth
-  if worldMode then local derived = effectiveJobDepth("world", draftCalibration()); shownDepth = derived or shownDepth end
-  local volume = (tonumber(draft.width) or 1) * (tonumber(draft.length) or 1) * (tonumber(shownDepth) or 1)
-  local profileInfo = profileParameters(draft.profile, draft.lighting)
-  local intervalText = profileInfo and ("torch=" .. tostring(profileInfo.effectiveInterval) .. "(" .. tostring(profileInfo.requestedInterval) .. ")") or "profile invalid"
-  local homeText = "HOME Y=-"
-  if worldMode then
-    local calibration = draftCalibration()
-    homeText = "HOME Y=" .. tostring(calibration and calibration.home and calibration.home.y or "-") .. " LAYERS=" .. tostring(shownDepth)
-  end

@@ -1,3 +1,7 @@
+        setNotice("Select a worker, then use ccm remote <workerId> in the terminal.", true)
+      end
+    elseif name == "progress" then
+      if id then mode = "progress" else setNotice("No worker selected.", true) end
     elseif name == "recovery" then
       if id then mode = "recovery" else setNotice("No worker selected.", true) end
     elseif name == "report" then mode = "report"
@@ -44,7 +48,7 @@ local function sortingTick()
   end
 end
 ]] },
-  { source = [[src/ccminer/controller_parts/02.part]], target = [[controller_parts/02.part]], digest = [[745544ecf4416446715b65b43c68d2bbfa94c26f5c87894a79f497d04d82bda5]], content = [[-- CC Miner V4 - adaptive touch views.  Every view has a keyboard fallback and
+  { source = [[src/ccminer/controller_parts/02.part]], target = [[controller_parts/02.part]], digest = [[44d54bdddb23511621cfac15458b1adaae3698fc7d262e89142fffd1745f967e]], content = [[-- CC Miner V4 - adaptive touch views.  Every view has a keyboard fallback and
 -- uses bounded hitboxes, so a 20x8 monitor remains operable.
 
 local fieldOrder = { "width", "length", "depth", "targetY" }
@@ -212,7 +216,7 @@ local function renderDashboard(target, key)
   local headerY = 4
   common.writeAt(1, headerY, common.fit(width >= 48 and " ID    NAME           STATUS       PROGRESS       FUEL" or " ID NAME      STATUS   PROGRESS", width), colors and colors.yellow or nil)
   local verticalStep = height >= 10 and 2 or 1
-  local maxRows = math.max(1, height - (verticalStep == 2 and 8 or 7))
+  local maxRows = math.max(1, height - (verticalStep == 2 and 9 or 7))
   if #ids == 0 then
     common.writeAt(2, headerY + 2, common.fit("No workers. DISCOVER (D).", math.max(1, width - 2)), colors and colors.lightGray or nil)
   else
@@ -235,7 +239,3 @@ local function renderDashboard(target, key)
     end
   end
   local bottom = math.max(1, height - verticalStep - 1)
-  buttonRow(key, bottom, width, {
-    { "DISCOVER", dashboardAction("discover") }, { "NEW JOB", dashboardAction("new") },
-    { "PROGRESS", dashboardAction("progress") }, { "MORE", dashboardAction("more") },
-  })

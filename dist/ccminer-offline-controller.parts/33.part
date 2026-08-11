@@ -1,3 +1,4 @@
+        assignmentId = assignment.assignmentId, assignmentTotal = #sortedJobAssignments(job), assignmentChunks = common.copy(assignment.chunkKeys or {}), chunkKeys = common.copy(assignment.chunkKeys or {}), transitKeys = common.copy(assignment.transitKeys or {}), seedKey = assignment.seedKey, bayChunkKey = assignment.bayChunkKey,
         homeY = assignment.homeY, bottomY = assignment.bottomY, targetY = assignment.bottomY, layers = assignment.layers, width = job.width, length = job.length, depth = assignment.layers or job.depth,
         chunkMode = job.chunkMode, name = job.name, profile = job.profile, waterMode = job.waterMode, lighting = common.copy(job.lighting or {}), workerId = assignment.workerId, targetWorkerId = assignment.workerId,
         bay = assignment.bay, bayId = assignment.bayId, dock = common.copy(assignment.dock or {}), dockId = assignment.dockId, homeWorld = common.copy(assignment.homeWorld), maxDepth = assignment.maxDepth, facing = assignment.facing,
@@ -148,7 +149,3 @@ local function reassignGroupAssignment(groupJobId, stoppedWorkerId, targetWorker
   if not targetWorkerId then setNotice("No online target for residual range.", true); return false end
   local targetData, targetStatus = workerData(targetWorkerId) or {}, statusOf(workers[targetWorkerId])
   if not ((targetStatus == "idle" or targetStatus == "complete" or targetStatus == "aborted") and targetData.atHome == true) then setNotice("Reassign target must be idle/terminal and at home.", true); return false end
-  if job.chunkMode == "world" and not (targetData.gps and targetData.gps.calibration) then setNotice("Reassign target requires GPS calibration.", true); return false end
-  local group = groupRecord(job.groupId)
-  local bayId, bay = groupWorkerResource(group, targetWorkerId, "bay")
-  local dockId, dock = groupWorkerResource(group, targetWorkerId, "dock")

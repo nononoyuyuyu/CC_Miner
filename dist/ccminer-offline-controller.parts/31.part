@@ -1,3 +1,4 @@
+  local homeY = calibration and calibration.home and tonumber(calibration.home.y) or tonumber(firstData and firstData.homeY)
   local depth = tonumber(previous.depth) or 16
   local bottomY = tonumber(previous.bottomY or previous.targetY)
   if not bottomY and homeY then bottomY = homeY - depth + 1 end
@@ -172,5 +173,3 @@ local function computeGroupPreflight(groupId, value)
           end
         end
       end
-      if not workerBay then
-        check("bay:#" .. tostring(id), "bad", "registered bay metadata unavailable", true)

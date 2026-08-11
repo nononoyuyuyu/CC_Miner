@@ -1,7 +1,11 @@
+  buttonRow(key, bottom, width, {
+    { "DISCOVER", dashboardAction("discover") }, { "NEW JOB", dashboardAction("new") },
+    { "PROGRESS", dashboardAction("progress") }, { "MORE", dashboardAction("more") },
+  }, verticalStep == 2)
   buttonRow(key, bottom + verticalStep, width, {
     { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
     { "RETURN", dashboardAction("recall") }, { "STOP", dashboardAction("stop") },
-  })
+  }, verticalStep == 2)
   local groupIds = orderedGroupIds()
   if #groupIds > 0 then
     local gy = 3
@@ -19,19 +23,19 @@ noticeState.renderMore = function(target, key)
   local verticalStep = height >= 10 and 2 or 1
   local firstRow = 4
   writeHeader("MORE COMMANDS", target)
-  common.writeAt(1, 3, common.fit("Less-used commands are kept here.", width), colors and colors.lightGray or nil)
+  common.writeAt(1, 2, common.fit("Less-used commands are kept here.", width), colors and colors.lightGray or nil)
   buttonRow(key, firstRow, width, {
     { "INFO", dashboardAction("info") }, { "ITEMS", dashboardAction("items") },
     { "REPORT", dashboardAction("report") }, { "RECOVERY", dashboardAction("recovery") },
-  })
+  }, verticalStep == 2)
   buttonRow(key, firstRow + verticalStep, width, {
     { "GROUPS", dashboardAction("groups") }, { "REMOTE", dashboardAction("remote") },
     { "GPS", dashboardAction("gps") }, { "LAST ERR", dashboardAction("last_error") },
-  })
+  }, verticalStep == 2)
   buttonRow(key, firstRow + verticalStep * 2, width, {
     { "SERVICE", dashboardAction("service") }, { "CLEAR", dashboardAction("clear") },
     { "REHOME", dashboardAction("rehome") }, { "BACK", function() mode = "dashboard"; invalidate() end },
-  })
+  }, verticalStep == 2)
   noticeLine(target, height)
 end
 
@@ -87,13 +91,16 @@ noticeState.renderItems = function(target, key)
     local label, value = entry[1], entry[2]
     modeButtons[#modeButtons + 1] = { label, function() form.mode = value; invalidate() end, true, form.mode == value }
   end
-  buttonRow(key, 3, width, modeButtons)
+  local expanded = height >= 14
+  local modeY = expanded and 4 or 3
+  buttonRow(key, modeY, width, modeButtons, expanded)
   local roomy = height >= 12
-  local listStart, itemStep = roomy and 5 or 4, roomy and 2 or 1
+  local listStart, itemStep = expanded and 7 or roomy and 5 or 4, expanded and 3 or roomy and 2 or 1
   local summaryY, controlsY, backY
-  if roomy then summaryY, controlsY, backY = height - 5, height - 3, height - 1
+  if expanded then summaryY, controlsY, backY = height - 6, height - 3, height - 1
+  elseif roomy then summaryY, controlsY, backY = height - 5, height - 3, height - 1
   else summaryY, controlsY, backY = height - 3, height - 2, height - 1 end
-  local lastItemY = summaryY - (roomy and 2 or 1)
+  local lastItemY = summaryY - (expanded and 2 or roomy and 2 or 1)
   local rows = math.max(1, math.floor((lastItemY - listStart) / itemStep) + 1)
   local pages = math.max(1, math.ceil(#items / rows))
   form.page = common.clamp(tonumber(form.page) or 1, 1, pages)
@@ -108,7 +115,7 @@ noticeState.renderItems = function(target, key)
       form.selected[item.name] = not form.selected[item.name] or nil
       if form.selected[item.name] then form.mode = "CUSTOM_ALLOWLIST" end
       invalidate()
-    end, enabled, form.selected[item.name] == true)
+    end, enabled, form.selected[item.name] == true, expanded)
   end
   common.writeAt(1, summaryY, common.fit(("Page %d/%d | selected %d"):format(form.page, pages, common.tableCount(form.selected)), width), colors and colors.lightGray or nil)
   buttonRow(key, controlsY, width, {
@@ -121,8 +128,8 @@ noticeState.renderItems = function(target, key)
       sendCommand(id, "discard_config", { mode = form.mode, allowlist = allowlist })
       setNotice("Discard settings sent to worker #" .. tostring(id) .. ".", false)
     end },
-  })
-  drawButton(key, 1, backY, width, "BACK", function() mode = "more"; invalidate() end, true)
+  }, expanded)
+  drawButton(key, 1, backY, width, "BACK", function() mode = "more"; invalidate() end, true, false, expanded)
 end
 
 local function groupAction(groupCommandName)
@@ -211,11 +218,3 @@ local function renderGroupDimensions(target, key)
       local assignment = result.assignments and (result.assignments[tostring(id)] or result.assignments[id]) or nil
       local chunks = assignment and #(assignment.chunkKeys or {}) or 0
       local homeY = assignment and assignment.homeY or (workerData(id) or {}).homeY or "-"
-      local layers = assignment and assignment.layers or (homeY ~= "-" and result.bottomY and tonumber(homeY) and math.floor(tonumber(homeY) - tonumber(result.bottomY) + 1) or "-")
-      common.writeAt(1, row, common.fit(("#%s chunks=%d HOME Y=%s LAYERS=%s"):format(tostring(id), chunks, tostring(homeY), tostring(layers)), width), colors and colors.white or nil)
-      row = row + 1
-    end
-  else
-    common.writeAt(1, summaryY + 1, common.fit("PRECHECK required before START.", width), colors and colors.yellow or nil)
-  end
-  buttonRow(key, math.max(1, height - 4), width, {

@@ -1,3 +1,5 @@
+      if not workerBay then
+        check("bay:#" .. tostring(id), "bad", "registered bay metadata unavailable", true)
       elseif not workerBay.world then
         check("bay pose:#" .. tostring(id), "bad", "bay world pose unavailable", true)
       elseif workerBay.world then
@@ -159,4 +161,3 @@ local function dispatchGroupJob(job, force)
     if not job.started[key] and not job.failed[key] and (force or not job.pending[key] or now >= (job.nextDispatchAt or 0)) then
       local payload = {
         scope = "group", group = true, groupId = tostring(job.groupId), groupJobId = tostring(job.groupJobId), parentGroupJobId = tostring(job.groupJobId), groupCommand = "START", requestedCommand = "start", assignmentCatalog = common.copy(job.catalog),
-        assignmentId = assignment.assignmentId, assignmentTotal = #sortedJobAssignments(job), assignmentChunks = common.copy(assignment.chunkKeys or {}), chunkKeys = common.copy(assignment.chunkKeys or {}), transitKeys = common.copy(assignment.transitKeys or {}), seedKey = assignment.seedKey, bayChunkKey = assignment.bayChunkKey,

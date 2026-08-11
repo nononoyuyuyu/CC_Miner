@@ -1,3 +1,7 @@
+  if job.chunkMode == "world" and not (targetData.gps and targetData.gps.calibration) then setNotice("Reassign target requires GPS calibration.", true); return false end
+  local group = groupRecord(job.groupId)
+  local bayId, bay = groupWorkerResource(group, targetWorkerId, "bay")
+  local dockId, dock = groupWorkerResource(group, targetWorkerId, "dock")
   if job.chunkMode == "world" and (not bay or not dock) then setNotice("Reassign target bay/dock metadata unavailable.", true); return false end
   if bay and bay.world then
     local pos = targetData.world or targetData.position
@@ -176,9 +180,3 @@ local function startDraft()
     db.pendingStarts[tostring(assignment.workerId)] = {
       workerId = assignment.workerId, jobId = assignment.jobId,
       assignmentId = assignment.assignmentId, messageId = messageId,
-      sentAt = common.nowSeconds(),
-    }
-    sentAssignments[#sentAssignments + 1] = assignment
-  end
-  if not sent then
-    for _, assignment in ipairs(assignments) do db.pendingStarts[tostring(assignment.workerId)] = nil end

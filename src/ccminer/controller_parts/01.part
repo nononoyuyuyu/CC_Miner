@@ -1358,7 +1358,7 @@ local function addHitbox(key, x1, y1, x2, y2, action)
   }
 end
 
-local function drawButton(key, x, y, width, label, action, enabled, selectedButton)
+local function drawButton(key, x, y, width, label, action, enabled, selectedButton, expandUp)
   width = math.max(3, math.floor(width))
   local background = colors and (selectedButton and colors.yellow or enabled == false and colors.gray or colors.blue) or nil
   local foreground = colors and (selectedButton and colors.black or colors.white) or nil
@@ -1367,11 +1367,14 @@ local function drawButton(key, x, y, width, label, action, enabled, selectedButt
   -- from visually merging into the black screen around a narrow button.
   local rendered = width >= 5 and (" " .. common.center(label, width - 2) .. " ")
     or common.center(label, width)
+  if expandUp == true and y > 1 then
+    common.writeAt(x, y - 1, string.rep(" ", width), foreground, background)
+  end
   common.writeAt(x, y, rendered, foreground, background)
-  if enabled ~= false and action then addHitbox(key, x, y, x + width - 1, y, action) end
+  if enabled ~= false and action then addHitbox(key, x, expandUp == true and math.max(1, y - 1) or y, x + width - 1, y, action) end
 end
 
-local function buttonRow(key, y, width, definitions)
+local function buttonRow(key, y, width, definitions, expandUp)
   if width < 1 or y < 1 then return end
   local count = math.max(1, #definitions)
   local gap = width >= count * 5 + count - 1 and 1 or 0
@@ -1379,7 +1382,7 @@ local function buttonRow(key, y, width, definitions)
   local x = 1
   for index, definition in ipairs(definitions) do
     local buttonWidth = index == count and (width - x + 1) or base
-    drawButton(key, x, y, buttonWidth, definition[1], definition[2], definition[3] ~= false, definition[4])
+    drawButton(key, x, y, buttonWidth, definition[1], definition[2], definition[3] ~= false, definition[4], expandUp)
     x = x + buttonWidth + gap
   end
 end

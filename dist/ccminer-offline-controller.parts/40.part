@@ -1,3 +1,20 @@
+    { "BACK", function() mode = "job_grid" end, true },
+    { "CANCEL", function() mode, draft = "dashboard", nil end, true },
+  })
+  noticeLine(target, height)
+end
+
+local function progressChunkState(data, chunk, index, excludedSet)
+  local job = data and data.job
+  if not job then return "unknown" end
+  local progress = data.progress or {}
+  local map = progress.map or (data.report and data.report.map)
+  local explicit = type(map) == "table" and (map[chunk.key] or map[tostring(chunk.cx) .. ":" .. tostring(chunk.cz)] or map[tostring(chunk.cx) .. "," .. tostring(chunk.cz)])
+  if explicit then
+    local state = tostring(explicit)
+    if state == "completed" then state = "complete" elseif state == "waiting" or state == "service_requested" then state = "service" end
+    return state
+  end
   if excludedSet[chunk.key] then return "excluded" end
   if data.status == "blocked" then return "blocked" end
   if data.status == "waiting_fuel" or data.status == "waiting_output" or data.status == "waiting_seal" or data.phase == "service_requested" then return "service" end
@@ -80,9 +97,9 @@ local function renderStopMenu(target, key)
   local function action(stopMode, message)
     return function() setNotice(message, false); stageStop(id, stopMode); mode = "dashboard" end
   end
-  buttonRow(key, 4, width, { { "PAUSE NOW", action("pause_now", "Pause requested now.") }, { "FINISH ROW", action("finish_row", "Finish current row then stop.") } })
-  buttonRow(key, 4 + verticalStep, width, { { "FINISH LAYER", action("finish_layer", "Finish current layer then stop.") }, { "RETURN HOME", action("return_home", "Return-home stop requested.") } })
-  buttonRow(key, math.max(4 + verticalStep * 2, height - 2), width, { { "ABORT", action("abort", "Abort requested.") }, { "BACK", function() mode = "dashboard" end } })
+  buttonRow(key, 4, width, { { "PAUSE NOW", action("pause_now", "Pause requested now.") }, { "FINISH ROW", action("finish_row", "Finish current row then stop.") } }, verticalStep == 2)
+  buttonRow(key, 4 + verticalStep, width, { { "FINISH LAYER", action("finish_layer", "Finish current layer then stop.") }, { "RETURN HOME", action("return_home", "Return-home stop requested.") } }, verticalStep == 2)
+  buttonRow(key, math.max(4 + verticalStep * 2, height - 2), width, { { "ABORT", action("abort", "Abort requested.") }, { "BACK", function() mode = "dashboard" end } }, verticalStep == 2)
   noticeLine(target, height)
 end
 
@@ -95,8 +112,8 @@ local function renderRecovery(target, key)
   local explanation = data.lastError or (data.pendingAction and ("Pending action: " .. tostring(data.pendingAction.kind)) or "Worker needs recovery.")
   common.writeAt(1, 2, common.fit("State: " .. tostring(data.status or "unknown") .. " / " .. tostring(data.phase or "-"), width), colors and colors.yellow or nil)
   common.writeAt(1, 3, common.fit(explanation, width), colors and colors.white or nil)
-  buttonRow(key, 5, width, { { "GPS FIX", function() recoveryAction("gps_fix") end }, { "RETRY", function() recoveryAction("retry") end }, { "RESUME", function() recoveryAction("resume") end } })
-  buttonRow(key, 5 + verticalStep, width, { { "RETURN", function() recoveryAction("return") end }, { "REHOME RESET", function() recoveryAction("rehome") end }, { "BACK", function() mode = "dashboard" end } })
+  buttonRow(key, 5, width, { { "GPS FIX", function() recoveryAction("gps_fix") end }, { "RETRY", function() recoveryAction("retry") end }, { "RESUME", function() recoveryAction("resume") end } }, verticalStep == 2)
+  buttonRow(key, 5 + verticalStep, width, { { "RETURN", function() recoveryAction("return") end }, { "REHOME RESET", function() recoveryAction("rehome") end }, { "BACK", function() mode = "dashboard" end } }, verticalStep == 2)
   noticeLine(target, height)
 end
 
@@ -162,21 +179,3 @@ local function renderConfirm(target, key)
   buttonRow(key, math.max(1, height - 2), width, {
     { "YES", function()
       if confirmState and confirmState.twoStep and not confirmState.armed then
-        confirmState.armed = true; confirmState.message = "FINAL confirmation: press YES again to send REHOME RESET."; invalidate(); return
-      end
-      local id = selectedWorker()
-      if confirmState and id then
-        if confirmState.command == "stop" then stageStop(id, (confirmState.payload or {}).mode or "abort") else sendCommand(id, confirmState.command, confirmState.payload) end
-      end
-      confirmState, mode = nil, "dashboard"
-    end },
-    { "NO", function() confirmState, mode = nil, "dashboard"; setNotice("Cancelled.", false) end },
-  })
-end
-
-local function screenSignature(target, key)
-  local width, height = target.getSize()
-  local id, worker = selectedWorker()
-  local data = worker and worker.data or {}
-  local gid, group = selectedGroupRecord()
-  local groupJob = gid and activeGroupJob(gid) or nil

@@ -61,9 +61,12 @@ for _, item in ipairs({
   { 'enabled == false and colors.gray or colors.blue', "high contrast enabled button" },
   { 'selectedButton and colors.black or colors.white', "white normal button text" },
   { '" " .. common.center(label, width - 2) .. " "', "button frame side padding" },
+  { 'if expandUp == true and y > 1 then', "button upper padding row" },
+  { 'string.rep(" ", width), foreground, background', "button upper background fill" },
+  { 'expandUp == true and math.max(1, y - 1) or y', "expanded button hitbox" },
   { 'noticeState.configureMonitor = function(device)', "monitor palette setup" },
   { 'local verticalStep = height >= 10 and 2 or 1', "responsive vertical button spacing" },
-  { 'local listStart, itemStep = roomy and 5 or 4, roomy and 2 or 1', "spaced item rows" },
+  { 'local listStart, itemStep = expanded and 7 or roomy and 5 or 4, expanded and 3 or roomy and 2 or 1', "spaced item rows" },
 }) do
   marker(controller, item[1], item[2])
 end

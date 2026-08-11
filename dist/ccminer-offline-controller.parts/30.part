@@ -1,3 +1,4 @@
+  local unfinished = data.job ~= nil and workerStatus ~= "complete" and workerStatus ~= "completed" and workerStatus ~= "aborted"
   check("existing job", unfinished and "bad" or "ok", unfinished and "abort or clear the unfinished job first" or "clear", unfinished)
   if fuel and fuel >= requiredFuel then
     check("worker fuel", "ok", ("available %s / need %d"):format(tostring(fuel), requiredFuel), false)
@@ -208,4 +209,3 @@ local function groupDraftDefaults(group)
   local workerIds = groupWorkerIds(group)
   local firstData = workerIds[1] and workerData(workerIds[1]) or nil
   local calibration = firstData and firstData.gps and firstData.gps.calibration
-  local homeY = calibration and calibration.home and tonumber(calibration.home.y) or tonumber(firstData and firstData.homeY)
