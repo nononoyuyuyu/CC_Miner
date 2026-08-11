@@ -31,6 +31,7 @@ local partNames = {
   "28.part",
   "29.part",
   "30.part",
+  "31.part",
 }
 local running = shell and shell.getRunningProgram and shell.getRunningProgram() or "ccminer-offline.lua"
 local base = fs.getDir(running)

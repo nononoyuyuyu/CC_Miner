@@ -33,6 +33,22 @@ ccminer-offline.lua gps
 ccminer-offline.lua update
 ```
 
+## 空き容量が少ない環境での更新
+
+通常の `update` は `/ccminer` 全体をバックアップしてから入れ替えるため、旧環境と新環境の両方を置く空き容量が必要です。容量不足で通常更新に失敗した場合は、オンライン環境では次を実行します。
+
+```lua
+wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua update-low-space
+```
+
+オフライン環境では、同じ bundle の次のコマンドを使います。
+
+```lua
+ccminer-offline.lua update-low-space
+```
+
+この方式は runtime ファイルだけを一時領域へ全て取得して Lua 構文検証した後、1 ファイルずつ `/ccminer` へ反映します。`config.db`、`data/state.db`、checkpoint、journal、ログなど `/ccminer` 内のユーザーデータはコピー・削除しません。反映中に電源断や容量不足が起きた場合は `/ccminer.update.low-space.marker` を残して停止します。空きを確保して同じコマンドを再実行すると、マーカーの位置から再開できます。マーカーがある間は通常の `ccm update` を実行せず、画面に表示された low-space コマンドを使ってください。runtime の途中状態で停止する可能性があるため、再実行または復旧が完了するまで `reboot` 以外の操作で `/ccminer` を編集しないでください。
+
 初回セットアップが中断した場合は画面に表示された `/ccminer/setup.lua <role>` を実行し、完了後に `reboot` します。更新前の設定、状態、journal、ログは旧環境のバックアップを残してから入れ替えます。
 
 ## セットアップ項目

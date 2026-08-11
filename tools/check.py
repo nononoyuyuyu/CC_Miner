@@ -291,6 +291,7 @@ def main() -> None:
     lua = find_lua()
     check_lua_syntax(lua)
     run([lua, "tests/test_startup.lua", str(ROOT)])
+    run([lua, "tests/test_low_space_update.lua", str(ROOT)])
     run([lua, "tests/test_quarry.lua", str(ROOT)])
     run([lua, "tests/test_geo.lua", str(ROOT)])
     run([lua, "tests/test_common.lua", str(ROOT)])

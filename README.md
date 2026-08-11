@@ -53,6 +53,8 @@ wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lu
 
 HTTP を使えない場合は [`dist/ccminer-offline.lua`](dist/ccminer-offline.lua) と隣接する [`dist/ccminer-offline.parts/`](dist/ccminer-offline.parts/) をセットで転送します。既存環境の更新は `ccminer-offline.lua update` です。詳しい設定は [インストール](docs/03-install.md) を参照してください。
 
+空き容量不足で `ccm update` がバックアップ作成に失敗した場合は、オンラインでは `wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua update-low-space`、オフラインでは `ccminer-offline.lua update-low-space` を使います。途中停止時は表示された `/ccminer.update.low-space.marker` を残して再実行で復旧します。
+
 ## 初回運転（最短手順）
 
 1. ワーカーとコントローラーを同じネットワークキーでセットアップし、搬出・燃料・seal 材・torch チェストを補充します。

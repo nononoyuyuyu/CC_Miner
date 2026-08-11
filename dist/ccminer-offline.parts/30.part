@@ -91,24 +91,32 @@ local function usage()
   print("  ccminer-offline.lua controller")
   print("  ccminer-offline.lua gps")
   print("  ccminer-offline.lua update")
+  print("  ccminer-offline.lua update-low-space")
 end
 
 if action == "" then action = turtle and "worker" or "controller" end
-if action ~= "worker" and action ~= "controller" and action ~= "gps" and action ~= "update" then usage(); return end
+if action ~= "worker" and action ~= "controller" and action ~= "gps"
+    and action ~= "update" and action ~= "update-low-space" then usage(); return end
 if action == "worker" and not turtle then error("Worker installation requires a turtle.", 0) end
-if action == "update" and not fs.exists(ROOT .. "/config.db") then error("No existing installation found.", 0) end
-
-term.clear(); term.setCursorPos(1, 1)
-print("CC MINER V3 OFFLINE " .. string.upper(action)); print("")
-if fs.exists(TEMP) then fs.delete(TEMP) end
-ensureDir(TEMP)
-for index, file in ipairs(files) do
-  write(("[%d/%d] %s ... "):format(index, #files, file.target))
-  local ok, err = writeFile(TEMP .. "/" .. file.target, file.content)
-  if not ok then fs.delete(TEMP); printError("FAILED"); error(err, 0) end
-  print("OK")
+if (action == "update" or action == "update-low-space") and not fs.exists(ROOT .. "/config.db") then error("No existing installation found.", 0) end
+if action == "update" and fs.exists(LOW_SPACE_MARKER) then
+  error("A low-space update is incomplete. Resume it with: wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua update-low-space (marker: " .. LOW_SPACE_MARKER .. ")", 0)
 end
 
+if action ~= "update-low-space" then
+  term.clear(); term.setCursorPos(1, 1)
+  print("CC MINER V3 OFFLINE " .. string.upper(action)); print("")
+  if fs.exists(TEMP) then fs.delete(TEMP) end
+  ensureDir(TEMP)
+  for index, file in ipairs(files) do
+    write(("[%d/%d] %s ... "):format(index, #files, file.target))
+    local ok, err = writeFile(TEMP .. "/" .. file.target, file.content)
+    if not ok then fs.delete(TEMP); printError("FAILED"); error(err, 0) end
+    print("OK")
+  end
+end
+
+if action ~= "update-low-space" then
 for _, target in ipairs({
   "lib/common.lua", "lib/protocol.lua", "lib/geo.lua", "lib/quarry.lua",
   "worker.lua", "controller.lua", "gps_host.lua", "setup.lua", "boot.lua", "command.lua",
@@ -122,7 +130,9 @@ compileParts("worker", {
 compileParts("controller", {
   "controller_parts/01.part", "controller_parts/02.part", "controller_parts/03.part",
 })
+end
 
+if action ~= "update-low-space" then
 local preserved = {
   { ROOT .. "/config.db", TEMP .. "/config.db" },
   { ROOT .. "/config.db.bak", TEMP .. "/config.db.bak" },
@@ -135,31 +145,130 @@ for _, pair in ipairs(preserved) do
   local ok, err = copyIfPresent(pair[1], pair[2])
   if not ok then fs.delete(TEMP); error("Cannot preserve existing data: " .. tostring(err), 0) end
 end
-if fs.exists(BACKUP) then fs.delete(BACKUP) end
-local hadRoot = fs.exists(ROOT)
-if hadRoot then
-  local backedUp, backupError = moveChecked(ROOT, BACKUP)
-  if not backedUp then fs.delete(TEMP); error("Cannot back up existing installation: " .. backupError, 0) end
 end
-local moved, moveError = moveChecked(TEMP, ROOT)
-if not moved then
-  if fs.exists(ROOT) then pcall(fs.delete, ROOT) end
-  local restored, restoreError = true, nil
-  if hadRoot then
-    if fs.exists(BACKUP) then restored, restoreError = moveChecked(BACKUP, ROOT)
-    else restored, restoreError = false, "Backup directory is missing." end
+
+-- Low-space mode deliberately avoids moving or copying the complete
+-- /ccminer tree.  User data stays in place; only embedded runtime files are
+-- staged, validated, and committed one at a time with a recovery marker.
+local function lowSpaceFreeText()
+  if fs.getFreeSpace then
+    local ok, free = pcall(fs.getFreeSpace, ROOT)
+    if ok and free then return " Free space reported by the filesystem: " .. tostring(free) .. " bytes." end
   end
-  if not restored then
-    error("Install swap failed and rollback failed. Previous files remain at " .. BACKUP .. ": "
-      .. tostring(moveError) .. "; rollback: " .. tostring(restoreError), 0)
+  return ""
+end
+local function lowSpaceFailure(message)
+  printError("LOW-SPACE UPDATE PAUSED")
+  error(tostring(message) .. "\nRecovery marker: " .. LOW_SPACE_MARKER .. "."
+    .. lowSpaceFreeText() .. "\nFree space, then rerun the offline bundle with: ccminer-offline.lua update-low-space", 0)
+end
+local function readLowSpaceMarker()
+  local text = readFile(LOW_SPACE_MARKER)
+  if not text then return nil end
+  local version = text:match("version=([^\r\n]+)")
+  local state = text:match("state=([^\r\n]+)")
+  local nextIndex = tonumber(text:match("next=(%d+)")) or 1
+  if not state then return "invalid", nextIndex, version end
+  return state, nextIndex, version
+end
+local function writeLowSpaceMarker(state, nextIndex)
+  local marker = table.concat({
+    "version=" .. VERSION,
+    "state=" .. tostring(state),
+    "next=" .. tostring(nextIndex or 1),
+    "",
+  }, "\n")
+  local ok, wrote, writeError = pcall(writeFile, LOW_SPACE_MARKER, marker)
+  if not ok then return false, tostring(wrote) end
+  if not wrote then return false, tostring(writeError) end
+  return true
+end
+local function safeWrite(path, text)
+  local ok, wrote, writeError = pcall(writeFile, path, text)
+  if not ok then return false, tostring(wrote) end
+  if not wrote then return false, tostring(writeError) end
+  return true
+end
+local function validateLowSpaceFile(target)
+  local compiled, compileError = loadfile(TEMP .. "/" .. target)
+  if not compiled then return false, "Embedded file failed syntax validation: " .. target .. ": " .. tostring(compileError) end
+  return true
+end
+local function validateLowSpaceParts(label, targets)
+  local source = {}
+  for index, target in ipairs(targets) do
+    local text = readFile(TEMP .. "/" .. target)
+    if not text then return false, "Embedded runtime part is missing: " .. target end
+    source[index] = text
   end
-  error("Install swap failed; previous installation was restored: " .. tostring(moveError), 0)
+  local loader = loadstring or load
+  local compiled, compileError = loader(table.concat(source), "@" .. label .. ".assembled.lua")
+  if not compiled then return false, "Assembled source failed syntax validation: " .. label .. ": " .. tostring(compileError) end
+  return true
 end
-print("")
-if action == "update" then
-  print("Offline update installed: " .. VERSION); print("Previous files: /ccminer.backup"); print("Run: reboot")
-else
-  local setupOk = shell.run(ROOT .. "/setup.lua", action)
-  if not setupOk then printError("Setup did not complete. Run: " .. ROOT .. "/setup.lua " .. action)
-  else print(""); print("Installation complete. Run: reboot") end
+local function validateLowSpaceStage(firstIndex)
+  for index = firstIndex, #files do
+    local target = files[index].target
+    if not target:match("%.part$") then
+      local ok, validationError = validateLowSpaceFile(target)
+      if not ok then return false, validationError end
+    end
+  end
+  local workerParts = {
+    "worker_parts/01.part", "worker_parts/02.part", "worker_parts/03.part",
+    "worker_parts/04.part", "worker_parts/05.part",
+  }
+  local allWorkerParts = true
+  for _, target in ipairs(workerParts) do allWorkerParts = allWorkerParts and fs.exists(TEMP .. "/" .. target) end
+  if allWorkerParts then
+    local ok, validationError = validateLowSpaceParts("worker", workerParts)
+    if not ok then return false, validationError end
+  end
+  local controllerParts = {
+    "controller_parts/01.part", "controller_parts/02.part", "controller_parts/03.part",
+  }
+  local allControllerParts = true
+  for _, target in ipairs(controllerParts) do allControllerParts = allControllerParts and fs.exists(TEMP .. "/" .. target) end
+  if allControllerParts then
+    local ok, validationError = validateLowSpaceParts("controller", controllerParts)
+    if not ok then return false, validationError end
+  end
+  return true
 end
+local function lowSpaceStage(firstIndex, reset)
+  if reset then
+    if fs.exists(TEMP) then fs.delete(TEMP) end
+    ensureDir(TEMP)
+  elseif not fs.exists(TEMP) then
+    ensureDir(TEMP)
+  end
+  for index = firstIndex, #files do
+    local file = files[index]
+    local staged = TEMP .. "/" .. file.target
+    if not fs.exists(staged) then
+      if index == firstIndex and fs.exists(ROOT .. "/" .. file.target) then pcall(fs.delete, ROOT .. "/" .. file.target) end
+      write(("[%d/%d] %s ... "):format(index, #files, file.target))
+      local wrote, writeError = safeWrite(staged, file.content)
+      if not wrote then printError("FAILED"); return false, "Cannot stage " .. file.target .. ": " .. tostring(writeError) end
+      print("OK")
+      local marked, markerError = writeLowSpaceMarker("downloading", index + 1)
+      if not marked then return false, "Cannot update recovery marker: " .. tostring(markerError) end
+    end
+  end
+  return true
+end
+if action == "update-low-space" then
+  term.clear(); term.setCursorPos(1, 1)
+  print("CC MINER V3 OFFLINE UPDATE-LOW-SPACE"); print("")
+  local state, nextIndex, markerVersion = readLowSpaceMarker()
+  if markerVersion and markerVersion ~= VERSION then
+    lowSpaceFailure("Recovery marker version " .. tostring(markerVersion) .. " does not match this installer (" .. VERSION .. ").")
+  end
+  if state and state ~= "downloading" and state ~= "ready" and state ~= "committing" then
+    lowSpaceFailure("Recovery marker has an unknown state: " .. tostring(state) .. ". Do not delete /ccminer; inspect the marker and retry.")
+  end
+  if not state then
+    local marked, markerError = writeLowSpaceMarker("downloading", 1)
+    if not marked then lowSpaceFailure("Cannot create the recovery marker: " .. tostring(markerError) .. ". No runtime files were changed.") end
+    state, nextIndex = "downloading", 1
+  end

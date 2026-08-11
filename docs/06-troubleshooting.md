@@ -2,6 +2,16 @@
 
 最初にダッシュボードの worker 状態、preflight の項目、`ccm logs`、job report を確認します。停止理由が分からないまま `REHOME RESET` を実行すると復旧情報を失うため、wizard の案内を優先してください。
 
+## `Cannot back up existing installation` / 空き容量不足で更新できない
+
+通常の `ccm update` は旧 `/ccminer` のバックアップを作るため、runtime とバックアップを同時に置ける空き容量が必要です。`Cannot back up existing installation: ... Out of space` と表示された場合は、旧 `/ccminer` を削除せず、空きを少し確保してから次を実行してください。
+
+```lua
+wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua update-low-space
+```
+
+オフライン bundle を使っている場合は `ccminer-offline.lua update-low-space` を実行します。low-space 方式は runtime を全て取得・構文検証してから、ユーザーデータを触らずに反映します。途中で容量不足や電源断が起きると `/ccminer.update.low-space.marker` が残ります。マーカーが残っている間は通常の `ccm update` を再実行せず、空きを確保して同じ low-space コマンドを再実行してください。エラー表示の marker パスを確認し、`/ccminer` や `data/` を手動削除しないでください。
+
 ## worker が見つからない／offline
 
 - worker と controller のネットワークキーが一致している
