@@ -1,13 +1,3 @@
-  common.clear(colors and colors.black or nil, colors and colors.white or nil)
-  print("CC Miner V4 Worker " .. common.VERSION)
-  print("ID: " .. os.getComputerID() .. "  " .. tostring(config.workerName))
-  print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
-  print(("Pose: x=%d y=%d z=%d d=%d"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir))
-  if state.gps and state.gps.lastFix then
-    print(("GPS: %d,%d,%d%s"):format(
-      state.gps.lastFix.x, state.gps.lastFix.y, state.gps.lastFix.z,
-      gpsCalibration() and " calibrated" or " uncalibrated"
-]] },
   { source = [[src/ccminer/worker_parts/05.part]], target = [[worker_parts/05.part]], digest = [[7807e70cc70294234d8716894ee8580dd4b068ac3c3a829759a736bc524d06ed]], content = [[    ))
   else
     print("GPS: " .. (gpsCalibration() and "no fix" or "not calibrated"))
@@ -248,3 +238,18 @@ local FILE_COUNT = 13
 local WORKER_PARTS = {[[worker_parts/01.part]], [[worker_parts/02.part]], [[worker_parts/03.part]], [[worker_parts/04.part]], [[worker_parts/05.part]]}
 local CONTROLLER_PARTS = {}
 local ENTRYPOINT = [[worker.lua]]
+local UPDATE_SENTINEL = [[-- CC Miner V4 update-incomplete sentinel for worker
+error("CC Miner runtime update is incomplete. Re-transfer the offline bundle and run update-low-space.", 0)
+]]
+local LOW_SPACE_STEPS = {
+  { kind = "runtime", index = 1 },
+  { kind = "runtime", index = 2 },
+  { kind = "runtime", index = 3 },
+  { kind = "runtime", index = 4 },
+  { kind = "runtime", index = 5 },
+  { kind = "runtime", index = 6 },
+  { kind = "runtime", index = 7 },
+  { kind = "runtime", index = 9 },
+  { kind = "runtime", index = 10 },
+  { kind = "runtime", index = 11 },
+  { kind = "runtime", index = 12 },

@@ -1,7 +1,3 @@
-        if match then check("bay pose:#" .. tostring(id), "ok", "world pose verified", false) else check("bay pose:#" .. tostring(id), "bad", "worker is not at bay world pose", true) end
-        local facing = data.facing or data.pose and data.pose.dir
-        if facing == nil then check("bay facing:#" .. tostring(id), "bad", "worker facing unavailable", true)
-        elseif workerBay.facing ~= nil and tostring(facing) ~= tostring(workerBay.facing) then check("bay facing:#" .. tostring(id), "bad", "facing mismatch", true)
         else check("bay facing:#" .. tostring(id), "ok", tostring(facing), false) end
       end
     end
@@ -157,3 +153,5 @@ local function dispatchGroupJob(job, force)
         assignmentId = assignment.assignmentId, assignmentTotal = #sortedJobAssignments(job), assignmentChunks = common.copy(assignment.chunkKeys or {}), chunkKeys = common.copy(assignment.chunkKeys or {}), transitKeys = common.copy(assignment.transitKeys or {}), seedKey = assignment.seedKey, bayChunkKey = assignment.bayChunkKey,
         homeY = assignment.homeY, bottomY = assignment.bottomY, targetY = assignment.bottomY, layers = assignment.layers, width = job.width, length = job.length, depth = assignment.layers or job.depth,
         chunkMode = job.chunkMode, name = job.name, profile = job.profile, waterMode = job.waterMode, lighting = common.copy(job.lighting or {}), workerId = assignment.workerId, targetWorkerId = assignment.workerId,
+        bay = assignment.bay, bayId = assignment.bayId, dock = common.copy(assignment.dock or {}), dockId = assignment.dockId, homeWorld = common.copy(assignment.homeWorld), maxDepth = assignment.maxDepth, facing = assignment.facing,
+        lease = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) },

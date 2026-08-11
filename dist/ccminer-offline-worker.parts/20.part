@@ -1,12 +1,3 @@
-    -- between adjacent bay levels.  This keeps every stripe contiguous and
-    -- guarantees the worker whose bay is on a level owns that level.
-    local prefix, total = { [0] = 0 }, 0
-    for index, weight in ipairs(weights) do total = total + weight; prefix[index] = total end
-    local previousCut = 0
-    for rank = 1, #workers - 1 do
-      local workerIndex = workerOrder[rank]
-      local nextWorkerIndex = workerOrder[rank + 1]
-      local minimum = math.max(previousCut + 1, bayPositions[workerIndex])
       local maximum = math.min(bayPositions[nextWorkerIndex] - 1, #levels - (#workers - rank))
       if minimum > maximum then return nil, "stripe_bay_alignment_unavailable" end
       local target = total * rank / #workers
@@ -272,3 +263,12 @@ function M.partitionGroup(catalog, workersInput, options)
   if strategy ~= nil and strategy ~= "stripe" and strategy ~= "graph" and strategy ~= "growth" then
     return nil, "invalid_partition_strategy"
   end
+  if options.stripeAxis ~= nil and options.stripeAxis ~= "x" and options.stripeAxis ~= "z" then
+    return nil, "invalid_stripe_axis"
+  end
+  local distanceWeight = options.distanceWeight
+  if distanceWeight == nil then distanceWeight = 0.25 end
+  distanceWeight = numberValue(distanceWeight)
+  if not distanceWeight or distanceWeight < 0 or distanceWeight > MAX_DIMENSION then return nil, "invalid_distance_weight" end
+
+  local owner, owned, loads, strategyUsed, seeds, stripeAxisUsed

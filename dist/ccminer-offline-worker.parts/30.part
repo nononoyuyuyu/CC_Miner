@@ -1,14 +1,3 @@
-        workerId = payload.workerId or assignment.workerId,
-        groupJobId = job.groupJobId,
-        bottomY = job.bottomY or targetY,
-        y = job.bottomY or targetY or 0,
-        referenceCalibration = assignmentCatalog.calibrationSeed,
-        workerCalibration = gpsCalibration(),
-        dockPose = { x = 0, y = 0, z = 1 },
-      }
-      local ok, assignedPlan = pcall(quarry.buildAssignedChunkPlan,
-        assignmentCatalog, assignmentChunks, assignmentOptions)
-      if not ok or type(assignedPlan) ~= "table" or type(assignedPlan.chunks) ~= "table" then
         return nil, tostring(ok and assignedPlan or assignedPlan or "assigned plan failed")
       end
       plan = assignedPlan
@@ -246,3 +235,20 @@ local function calibrateGPS()
   local calibration, calibrationError = geo.calibrationFromFixes(homeFix, forwardFix)
   if not calibration then
     cancelPhysicalAction()
+    state.status, state.phase, state.lastError = "blocked", "gps_error", calibrationError
+    saveState()
+    return false, calibrationError
+  end
+  config.gps = config.gps or {}
+  config.gps.enabled = true
+  config.gps.calibration = calibration
+  local saved, saveError = common.saveConfig(config)
+  if not saved then
+    cancelPhysicalAction()
+    state.status, state.phase = "blocked", "gps_error"
+    state.lastError = "Could not save GPS calibration: " .. tostring(saveError)
+    saveState()
+    return false, state.lastError
+  end
+  state.gps.available = true
+  state.gps.lastFix = homeFix

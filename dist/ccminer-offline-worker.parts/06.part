@@ -217,7 +217,7 @@ end
 
 return M
 ]] },
-  { source = [[src/ccminer/setup.lua]], target = [[setup.lua]], digest = [[04982ea9bdb3e13d88a31696c333ff061f19fb67e16f62078666708d8f1bfb10]], content = [=[-- CC Miner V4 - interactive configuration
+  { source = [[src/ccminer/setup.lua]], target = [[setup.lua]], digest = [[5961c707e6a32ebfa1d5cdee8bd664ad34e271c922ac3ea2070b965c357a4352]], content = [=[-- CC Miner V4 - interactive configuration
 
 local args = { ... }
 local common = dofile("/ccminer/lib/common.lua")

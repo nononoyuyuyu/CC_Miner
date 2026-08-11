@@ -1,18 +1,3 @@
-  if not minX or not maxX or not minZ or not maxZ or maxX < minX or maxZ < minZ then return nil, "invalid_bounds" end
-  if (maxX - minX + 1) * (maxZ - minZ + 1) > MAX_COLUMNS then return nil, "bounds_too_large" end
-  return {
-    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
-    width = maxX - minX + 1, length = maxZ - minZ + 1,
-    cells = (maxX - minX + 1) * (maxZ - minZ + 1),
-  }
-end
-
-function M.gridBounds(value, length, options)
-  return boundsFrom(value, length, options)
-end
-
-M.getGridBounds = M.gridBounds
-M.bounds = M.gridBounds
 
 function M.gridPage(bounds, page, pageWidth, pageHeight)
   local normalized, boundsError = boundsFrom(bounds)
@@ -262,3 +247,20 @@ local function saveControllerDb()
   local persistedDb = {}
   for key, value in pairs(db) do persistedDb[key] = common.copy(value) end
   persistedDb.groups, persistedDb.docks, persistedDb.bays = persistedGroups, persistedDocks, persistedBays
+  persistedDb.groupJobs, persistedDb.groupLeases = persistedJobs, persistedGroupLeases
+  persistedDb.groupScheduler = persistentDraft(db.groupScheduler or {})
+  persistedDb.activeLeases = common.copy(db.leases or {})
+  local ok, err = common.saveTable(DB_PATH, persistedDb)
+  if not ok then dbError = err end
+  return ok, err
+end
+
+loadControllerDb()
+
+local workers = {}
+local selected = 1
+local selectedGroup = 1
+local groupMode = false
+local groupDraft = nil
+local groupCommandAcks = {}
+local groupSchedulerLast = 0

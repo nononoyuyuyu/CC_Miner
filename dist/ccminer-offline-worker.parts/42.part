@@ -1,18 +1,3 @@
-local UPDATE_SENTINEL = [[-- CC Miner V4 update-incomplete sentinel for worker
-error("CC Miner runtime update is incomplete. Re-transfer the offline bundle and run update-low-space.", 0)
-]]
-local LOW_SPACE_STEPS = {
-  { kind = "runtime", index = 1 },
-  { kind = "runtime", index = 2 },
-  { kind = "runtime", index = 3 },
-  { kind = "runtime", index = 4 },
-  { kind = "runtime", index = 5 },
-  { kind = "runtime", index = 6 },
-  { kind = "runtime", index = 7 },
-  { kind = "runtime", index = 9 },
-  { kind = "runtime", index = 10 },
-  { kind = "runtime", index = 11 },
-  { kind = "runtime", index = 12 },
   { kind = "runtime", index = 13 },
   { kind = "obsolete", target = [[controller.lua]] },
   { kind = "obsolete", target = [[controller_parts/01.part]] },
@@ -269,3 +254,23 @@ local function markerRead()
   if backupText then return nil, "Recovery marker backup is corrupt and cannot be trusted." end
   return nil, nil
 end
+local function markerWrite(state, nextIndex)
+  local text = table.concat({
+    "version=" .. VERSION,
+    "schema=" .. tostring(SCHEMA),
+    "role=" .. ROLE,
+    "state=" .. tostring(state),
+    "next=" .. tostring(nextIndex or 1),
+    "",
+  }, "\n")
+  return atomicWrite(LOW_SPACE_MARKER, text)
+end
+local function clearMarker()
+  for _, suffix in ipairs({ "", ".tmp", ".bak" }) do
+    local path = LOW_SPACE_MARKER .. suffix
+    if fs.exists(path) then pcall(fs.delete, path) end
+    if fs.exists(path) then return false, "Cannot clear recovery marker artifact: " .. path end
+  end
+  return true
+end
+local function lowSpaceFailure(message)

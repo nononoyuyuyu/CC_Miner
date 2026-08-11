@@ -1,16 +1,3 @@
-end
-local function usage()
-  print("CC Miner V4 offline " .. ROLE .. " installer " .. VERSION .. " (schema " .. SCHEMA .. ")")
-  print("  ccminer-offline-" .. ROLE .. ".lua " .. ROLE)
-  print("  ccminer-offline-" .. ROLE .. ".lua update")
-  print("  ccminer-offline-" .. ROLE .. ".lua update-low-space")
-end
-
-local action = validateAction()
-if action == "" then usage(); return end
-if action ~= "update-low-space" then
-  term.clear(); term.setCursorPos(1, 1)
-  print("CC MINER V4 OFFLINE " .. string.upper(action) .. " / " .. ROLE); print("")
   if fs.exists(TEMP) then fs.delete(TEMP) end
   ensureDir(TEMP)
   for index, file in ipairs(files) do

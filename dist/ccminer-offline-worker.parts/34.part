@@ -1,16 +1,3 @@
-    if not placedPrepared then return restoreContext(placedPrepareError) end
-    local placed, placeError = turtle.place()
-    if not placed then
-      cancelPhysicalAction()
-      return restoreContext(placeError or "torch_niche_place_failed")
-    end
-    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
-    state.lighting.placed = (state.lighting.placed or 0) + 1
-    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
-    commitPhysicalAction()
-    turtle.select(originalSlot)
-    local restored, restoreError = turnTo(originalDir)
-    if not restored then return false, restoreError end
     state.lighting.lastAt = common.nowSeconds()
     state.lighting.lastPose = poseCopy()
     return true
@@ -288,3 +275,16 @@ end
 local function moveBetweenChunkAnchors(plan, fromKey, toKey, y, context)
   local from = plan.chunks[fromKey]
   local target, err = chunkAnchor(plan, toKey, y)
+  if not from or not target then return false, err or "Missing chunk anchor." end
+  local adjacent = false
+  for _, key in ipairs(from.neighbors or {}) do if key == toKey then adjacent = true; break end end
+  if not adjacent then return false, "Chunk route is not adjacent: " .. tostring(fromKey) .. " -> " .. tostring(toKey) end
+  return navigateTo(target, "inside", context)
+end
+
+local function normalizeWaypoint(value, fallbackY)
+  if type(value) ~= "table" then return nil end
+  local pose = value.pose or value.position or value.target or value
+  if type(pose) ~= "table" then return nil end
+  local x, z = tonumber(pose.x), tonumber(pose.z)
+  if not x or not z then return nil end

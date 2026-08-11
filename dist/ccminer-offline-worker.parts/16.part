@@ -1,18 +1,3 @@
-  local queue, head, tail = { startKey }, 1, 1
-  local previous, seen = {}, { [startKey] = true }
-  while head <= tail do
-    local key = queue[head]; head = head + 1
-    for _, neighbor in ipairs(chunks[key].neighbors or {}) do
-      if not seen[neighbor] then
-        seen[neighbor] = true
-        previous[neighbor] = key
-        if not visited[neighbor] then
-          local path, current = { neighbor }, neighbor
-          while current ~= startKey do
-            current = previous[current]
-            path[#path + 1] = current
-          end
-          local reversed = {}
           for index = #path, 1, -1 do reversed[#reversed + 1] = path[index] end
           return reversed
         end
@@ -295,3 +280,19 @@ function M.edgeTransition(plan, fromKey, toKey, y)
     -- array) compatible.  They are independent point tables, never aliases of
     -- the named fields.
     [1] = { x = fromPoint.x, y = fromPoint.y, z = fromPoint.z, kind = "from" },
+    [2] = { x = toPoint.x, y = toPoint.y, z = toPoint.z, kind = "to" },
+    fromKey = from,
+    toKey = to,
+    distance = math.abs(toPoint.x - fromPoint.x) + math.abs(toPoint.y - fromPoint.y) + math.abs(toPoint.z - fromPoint.z),
+  }
+end
+
+M.chunkTransition = M.edgeTransition
+M.neighborTransition = M.edgeTransition
+M.transitionPoint = M.edgeTransition
+
+local function routePointForChunk(chunk, y)
+  local pointY = numberValue(y) or 0
+  -- Integer midpoint keeps a route interior to the chunk for both odd and
+  -- even dimensions.  It is deliberately not the historical min corner.
+  return {

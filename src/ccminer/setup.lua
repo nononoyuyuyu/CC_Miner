@@ -208,26 +208,28 @@ else
     -- Fresh setups enable only the exact read-only allowlist for controllers
     -- with the same network key. Arbitrary shell access remains a separate,
     -- pinned-controller opt-in.
-    print("【強い警告】遠隔コンソールは、管理用コンピューターからタートルへコマンドを送ります。")
-    print("同じ合言葉の管理用コンピューターは、既定で安全な確認コマンドだけを使えます。")
-    print("採掘を止め、タートルをドックへ戻してから使ってください。rednetは暗号化されません。")
+    print("REMOTE CONSOLE SAFETY")
+    print("Safe read-only access is ON by default.")
+    print("Controllers need the same network key.")
+    print("Use only while the turtle is stopped at its dock.")
+    print("rednet traffic is not encrypted.")
     remoteConsole.enabled = common.promptYesNo(
-      "安全な遠隔コンソールを有効にしますか（新規設定はON）",
+      "Enable safe remote console",
       remoteConsole.enabled == true
     )
     if remoteConsole.enabled then
-      print("controllerId=0 は、同じ合言葉を持つ管理用コンピューターを許可します。")
-      print("1台だけに限定する場合は、管理用コンピューターで id と入力して番号を確認します。")
+      print("ID 0 allows all controllers with this key.")
+      print("For one controller, run 'id' on it first.")
       config.controllerId = common.promptNumber(
-        "Allowed controller ID (0=same network key)", config.controllerId, 0, 65535
+        "Controller ID (0=same key)", config.controllerId, 0, 65535
       )
-      print("allowShell は任意のシェル実行を許可する別の危険設定です。通常はOFFにしてください。")
+      print("allowShell runs any command. Keep it OFF.")
       remoteConsole.allowShell = common.promptYesNo(
-        "allowShell（シェル実行）を許可しますか",
+        "Enable allowShell (unsafe)",
         remoteConsole.allowShell == true
       )
       if remoteConsole.allowShell and config.controllerId == 0 then
-        print("allowShellではcontrollerId=0を使えません。許可する管理用コンピューターを固定します。")
+        print("allowShell requires one fixed controller ID.")
         config.controllerId = common.promptNumber("Controller computer ID (1-65535)", 1, 1, 65535)
       end
     else
@@ -270,8 +272,9 @@ else
       0,
       16
     )
-    print("設定方向に inventory が見つかった場合は、誤投入防止のため world 廃棄をスキップします。")
-    discard.direction = enumPrompt("現場廃棄方向 (front/back/left/right/top/bottom)", discard.direction or config.outputSide or "back", {
+    print("Inventory on this side makes world drop skip.")
+    print("Sides: front back left right top bottom")
+    discard.direction = enumPrompt("Field discard side", discard.direction or config.outputSide or "back", {
       front = true, back = true, left = true, right = true, top = true, bottom = true,
     }, "back")
     discard.maxStacksPerPass = validInteger(discard.maxStacksPerPass, 8, 1, 64)

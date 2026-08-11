@@ -1,15 +1,3 @@
-  if character == "d" then discover()
-  elseif character == "n" then dashboardAction("new")()
-  elseif character == "p" then sendCommand(id, "pause")
-  elseif character == "r" then sendCommand(id, "resume")
-  elseif character == "h" then sendCommand(id, "recall")
-  elseif character == "s" then dashboardAction("stop")()
-  elseif character == "x" then dashboardAction("abort")()
-  elseif character == "c" then dashboardAction("clear")()
-  elseif character == "i" then dashboardAction("info")()
-  elseif character == "g" then dashboardAction("progress")()
-  elseif character == "o" then dashboardAction("remote")()
-  elseif character == "e" then dashboardAction("recovery")()
   elseif character == "t" then dashboardAction("report")()
   elseif character == "l" then dashboardAction("gps")()
   elseif character == "v" then dashboardAction("groups")()
@@ -237,3 +225,8 @@ local function commandLineMode()
     local sub, id = string.lower(args[2] or "list"), args[3]
     local registry = command == "dock" and db.docks or db.bays
     if sub == "list" then
+      for key, value in pairs(registry or {}) do print(("%s world=%s,%s,%s facing=%s maxDepth=%s"):format(tostring(key), tostring(value.world and value.world.x or "-"), tostring(value.world and value.world.y or "-"), tostring(value.world and value.world.z or "-"), tostring(value.facing or "-"), tostring(value.maxDepth or "-"))) end
+    elseif sub == "register" and id then
+      local value = { world = { x = tonumber(args[4]), y = tonumber(args[5]), z = tonumber(args[6]) }, facing = args[7], maxDepth = tonumber(args[8]) }
+      local ok, err = command == "dock" and registerDock(id, value) or registerBay(id, value)
+      print(ok and ((command == "dock" and "Dock" or "Bay") .. " saved.") or ("Register error: " .. tostring(err)))

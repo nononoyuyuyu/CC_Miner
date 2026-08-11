@@ -1,20 +1,3 @@
-  for _, key in ipairs(keys) do if not seen[key] then return false end end
-  return true
-end
-
-local function assignedWalk(chunks, keys, rootKey, assignedSet)
-  local visited, walk = {}, {}
-  visited[rootKey] = true
-  chunks[rootKey].parent = nil
-  walk[1] = {
-    key = rootKey,
-    first = true,
-    anchor = { x = chunks[rootKey].anchor.x, z = chunks[rootKey].anchor.z },
-  }
-  local stack = { { key = rootKey, next = 1 } }
-  while #stack > 0 do
-    local frame = stack[#stack]
-    local chunk = chunks[frame.key]
     local nextKey
     while frame.next <= #chunk.neighbors do
       local candidate = chunk.neighbors[frame.next]
@@ -236,3 +219,14 @@ function M.buildAssignedChunkPlan(catalog, assignedKeys, options)
   local mineCopies = {}
   for _, key in ipairs(mineKeys) do mineCopies[key] = cloneValue(chunks[key]); mineCopies[key].neighbors = {} end
   buildNeighborGraph(mineCopies, mineKeys)
+  local optimized, optimizedOrder = optimizedWalk(mineCopies, mineKeys, seedKey)
+  for _, key in ipairs(mineKeys) do
+    if mineCopies[key].optimizedAnchor then
+      chunks[key].optimizedAnchor = { x = mineCopies[key].optimizedAnchor.x, z = mineCopies[key].optimizedAnchor.z }
+    end
+  end
+  local routeCopy = {}
+  for index, key in ipairs(optimizedOrder) do routeCopy[index] = key end
+  local assignedColumns = 0
+  local assignedBounds
+  for _, key in ipairs(mineKeys) do assignedColumns = assignedColumns + chunks[key].cells end

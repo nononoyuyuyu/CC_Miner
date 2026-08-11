@@ -1,15 +1,3 @@
-  elseif command == "ping" or command == "status" then
-    return true, "Status sent."
-  end
-  return false, "Unknown command: " .. tostring(command)
-end
-
-local function handleMessage(sender, message)
-  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
-  if not valid then return end
-  if tonumber(config.controllerId or 0) > 0 and tonumber(sender) ~= tonumber(config.controllerId) then return end
-  if message.kind == "discover" then sendStatus(sender, message); return end
-  if message.kind ~= "command" then return end
   if tonumber(message.target) ~= tonumber(os.getComputerID()) then return end
   if commandSeen(message.id) then
     sendAck(sender, message, true, "Duplicate command ignored; previous result retained.")
@@ -305,3 +293,16 @@ local function tryPlaceTorchWall(relativeDir)
     local placedPrepared, placedPrepareError = beginPhysicalAction("torch_niche_forward", {
       side = relativeDir, material = itemName(slot),
     }, poseCopy())
+    if not placedPrepared then return restoreContext(placedPrepareError) end
+    local placed, placeError = turtle.place()
+    if not placed then
+      cancelPhysicalAction()
+      return restoreContext(placeError or "torch_niche_place_failed")
+    end
+    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
+    state.lighting.placed = (state.lighting.placed or 0) + 1
+    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
+    commitPhysicalAction()
+    turtle.select(originalSlot)
+    local restored, restoreError = turnTo(originalDir)
+    if not restored then return false, restoreError end

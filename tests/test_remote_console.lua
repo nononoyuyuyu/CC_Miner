@@ -69,13 +69,13 @@ marker(common, "config.controllerId = normalizeInteger(config.controllerId, 0, 6
 -- Arbitrary shell access remains a separate opt-in and requires a pin.
 for _, expected in ipairs({
   'local remoteConsole = ensureTable(config, "remoteConsole", workerDefaults.remoteConsole)',
-  "【強い警告】遠隔コンソールは",
-  "安全な遠隔コンソールを有効にしますか（新規設定はON）",
+  "REMOTE CONSOLE SAFETY",
+  "Enable safe remote console",
   "remoteConsole.allowShell = common.promptYesNo",
-  "allowShell（シェル実行）を許可しますか",
-  "controllerId=0 は、同じ合言葉を持つ管理用コンピューターを許可します。",
-  "allowShellではcontrollerId=0を使えません。",
-  "Allowed controller ID (0=same network key)",
+  "Enable allowShell (unsafe)",
+  "ID 0 allows all controllers with this key.",
+  "allowShell requires one fixed controller ID.",
+  "Controller ID (0=same key)",
   "Controller computer ID (1-65535)",
   "config.remoteConsole = common.normalizeRemoteConsoleConfig(remoteConsole)",
 }) do

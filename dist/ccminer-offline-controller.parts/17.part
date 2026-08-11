@@ -1,15 +1,3 @@
-    + math.abs(previousPoint.z - toPoint.z)
-  appendRouteWaypoint(waypoints, toKey, toPoint, "target")
-  local normalizedKeys = (function()
-    local copy = {}; for i, key in ipairs(chunkKeys) do copy[i] = tostring(key) end; return copy
-  end)()
-  local function copyKeys()
-    local copy = {}; for i, key in ipairs(normalizedKeys) do copy[i] = key end; return copy
-  end
-  return {
-    chunkKeys = normalizedKeys,
-    -- Compatibility names are independent arrays; never alias chunkKeys in a
-    -- table persisted through CC's serializer.
     keys = copyKeys(),
     path = copyKeys(),
     transitKeys = copyKeys(),
@@ -287,3 +275,17 @@ local function partitionChunks(catalog, workerIds)
     local distances = {}
     for _, seed in ipairs(seeds) do
       local fromSeed = graphDistances(chunks, seed)
+      for key, distance in pairs(fromSeed) do
+        if distances[key] == nil or distance < distances[key] then distances[key] = distance end
+      end
+    end
+    local selected
+    for _, key in ipairs(keys) do
+      if not seedSet[key] and (not selected or distances[key] > distances[selected] or (distances[key] == distances[selected] and chunkComparator(chunks[key], chunks[selected]))) then
+        selected = key
+      end
+    end
+    if not selected then return nil, "worker_seed_failed" end
+    seeds[#seeds + 1] = selected
+    seedSet[selected] = true
+  end

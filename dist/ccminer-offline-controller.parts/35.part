@@ -1,15 +1,3 @@
-    db.queue[draft.queueIndex].awaiting = { workerId = assignments[1].workerId, jobId = assignments[1].jobId, sentAt = common.nowSeconds() }
-    db.queue[draft.queueIndex].retryAt = common.nowSeconds() + 10
-  end
-  saveControllerDb()
-  mode, draft = "dashboard", nil
-  setNotice(("Job sent to %d worker%s."):format(#assignments, #assignments == 1 and "" or "s"), false)
-  return true
-end
-
-local function queueDraft()
-  if not draft then return false end
-  if config.queueEnabled == false then setNotice("Queue is disabled by controller configuration.", true); return false end
   local previousQueueing = draft.queueing
   draft.queueing = true
   local result = computePreflight()
@@ -236,3 +224,10 @@ local function dashboardAction(name)
     elseif name == "abort" then
       if id then confirmState = { command = "stop", payload = { mode = "abort" }, message = "Abort the active job and return home?" }; mode = "confirm" end
     elseif name == "clear" then
+      if id then confirmState = { command = "clear", message = "Clear the completed or aborted job record?" }; mode = "confirm" end
+    elseif name == "rehome" then
+      if id then confirmState = { command = "rehome", payload = { confirm = "RESET" }, twoStep = true, message = "REHOME RESET clears the active job. Press YES twice only when the turtle is physically in its dock." }; mode = "confirm" end
+    elseif name == "gps" then
+      if id then confirmState = { command = "calibrate_gps", message = "GPS calibration moves forward one block and back. Is the dock front clear?" }; mode = "confirm" end
+    elseif name == "quit" then running = false end
+    invalidate()

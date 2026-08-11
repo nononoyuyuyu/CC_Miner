@@ -1,22 +1,3 @@
-  state.pendingAction = nil
-  state.journal = state.journal or {}
-  state.journal.lightweight = state.journal.lightweight or {}
-  state.journal.lightweight.force = true
-  saveState()
-end
-
-local function isHome()
-  return state.pose.x == 0 and state.pose.y == 0 and state.pose.z == 0
-end
-
-local function distance(a, b)
-  a, b = a or state.pose, b or { x = 0, y = 0, z = 0 }
-  return math.abs((a.x or 0) - (b.x or 0))
-    + math.abs((a.y or 0) - (b.y or 0))
-    + math.abs((a.z or 0) - (b.z or 0))
-end
-
-local function inventoryStats()
   local used, empty, items = 0, 0, 0
   for slot = 1, 16 do
     local count = turtle.getItemCount(slot)
@@ -340,3 +321,14 @@ local function jobSnapshot()
     length = state.job.length,
     depth = state.job.depth,
     targetY = state.job.targetY,
+    cursor = state.job.cursor or 0,
+    total = state.job.total or 0,
+    percent = common.percent(state.job.cursor or 0, state.job.total or 0),
+    startedAt = state.job.startedAt,
+    chunkMode = state.job.chunkMode,
+    excludedChunks = state.job.excludedChunks and #state.job.excludedChunks or 0,
+    currentLayer = layer,
+    currentRow = row,
+    currentChunk = currentChunk,
+    completedChunks = state.job.completedChunks or 0,
+    assignmentChunks = state.job.assignmentChunks and #state.job.assignmentChunks or 0,

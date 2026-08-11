@@ -1,14 +1,3 @@
-    if descriptor.options and type(descriptor.options) == "table" then
-      local merged = {}
-      for key, value in pairs(descriptor.options) do merged[key] = value end
-      for key, value in pairs(options) do merged[key] = value end
-      options = merged
-      if worldSeed == nil then worldSeed = options.worldSeed end
-    end
-  end
-  local calibration = options.calibration
-  if not calibration then calibration = worldSeedCalibration(worldSeed, options) end
-  if not calibration then return nil, "gps_not_calibrated" end
   local catalog, catalogError = M.buildCatalog(width, length, "world", calibration)
   if not catalog then return nil, catalogError end
   -- Arrays may carry metadata fields in Lua.  Keep the reference GPS seed and
@@ -280,3 +269,12 @@ local function stripeOwner(chunks, keys, workers, options)
   local cuts = {}
   if bayAware then
     -- Choose each cut at the nearest weighted midpoint while constraining it
+    -- between adjacent bay levels.  This keeps every stripe contiguous and
+    -- guarantees the worker whose bay is on a level owns that level.
+    local prefix, total = { [0] = 0 }, 0
+    for index, weight in ipairs(weights) do total = total + weight; prefix[index] = total end
+    local previousCut = 0
+    for rank = 1, #workers - 1 do
+      local workerIndex = workerOrder[rank]
+      local nextWorkerIndex = workerOrder[rank + 1]
+      local minimum = math.max(previousCut + 1, bayPositions[workerIndex])

@@ -1,14 +1,3 @@
-    end
-    if pinnedController > 0 and tonumber(sender) ~= pinnedController then
-      return false, "Remote console sender is not the pinned controller.", nil, nil
-    end
-    if remoteSession then
-      if tonumber(remoteSession.sender) ~= tonumber(sender) then
-        return false, "Remote console session is already open for another controller.", nil, nil
-      end
-      -- Re-opening from the pinned controller is idempotent.  This recovers
-      -- when the OPEN ACK was lost without making the operator wait for the
-      -- whole session timeout or issuing a second shell session.
       local existing = {
         action = "open",
         sessionId = remoteSession.sessionId,
@@ -252,3 +241,15 @@ local function applyControlCommand(command, payload, sender)
     state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
     saveState()
     return true, "Local position reset to home."
+  elseif command == "ping" or command == "status" then
+    return true, "Status sent."
+  end
+  return false, "Unknown command: " .. tostring(command)
+end
+
+local function handleMessage(sender, message)
+  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
+  if not valid then return end
+  if tonumber(config.controllerId or 0) > 0 and tonumber(sender) ~= tonumber(config.controllerId) then return end
+  if message.kind == "discover" then sendStatus(sender, message); return end
+  if message.kind ~= "command" then return end

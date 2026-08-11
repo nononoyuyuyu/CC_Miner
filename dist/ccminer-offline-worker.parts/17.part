@@ -1,19 +1,3 @@
-    [2] = { x = toPoint.x, y = toPoint.y, z = toPoint.z, kind = "to" },
-    fromKey = from,
-    toKey = to,
-    distance = math.abs(toPoint.x - fromPoint.x) + math.abs(toPoint.y - fromPoint.y) + math.abs(toPoint.z - fromPoint.z),
-  }
-end
-
-M.chunkTransition = M.edgeTransition
-M.neighborTransition = M.edgeTransition
-M.transitionPoint = M.edgeTransition
-
-local function routePointForChunk(chunk, y)
-  local pointY = numberValue(y) or 0
-  -- Integer midpoint keeps a route interior to the chunk for both odd and
-  -- even dimensions.  It is deliberately not the historical min corner.
-  return {
     x = math.floor((chunk.minX + chunk.maxX) / 2),
     y = pointY,
     z = math.floor((chunk.minZ + chunk.maxZ) / 2),
@@ -277,3 +261,17 @@ local function catalogGraph(catalog)
     -- validation; never mutate the caller's table (the descriptor may be
     -- shared with another worker/controller).
     for mapKey, source in pairs(entries) do
+      if type(source) == "table" and (source.key == nil or tostring(source.key) == "") then
+        local copy = {}
+        for field, value in pairs(source) do copy[field] = value end
+        copy.key = tostring(mapKey)
+        sources[#sources + 1] = copy
+      else
+        sources[#sources + 1] = source
+      end
+    end
+  end
+  if #sources > MAX_CHUNKS then return nil, "too_many_chunks" end
+  for _, source in ipairs(sources) do
+    if type(source) ~= "table" then return nil, "invalid_chunk_catalog" end
+    local key = source.key and tostring(source.key) or nil

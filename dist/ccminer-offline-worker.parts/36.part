@@ -1,18 +1,3 @@
-  if name == "minecraft:chest" or name == "minecraft:trapped_chest" or name == "minecraft:barrel" then return true end
-  return name:match("^minecraft:[%w_]+shulker_box$") ~= nil
-end
-
-local function discardPolicy()
-  local policy = config.discard or {}
-  local mode = tostring(policy.mode or policy.policy or "KEEP_ALL"):upper()
-  if mode ~= "KEEP_ALL" and mode ~= "DISCARD_EXCESS_STONE" and mode ~= "CUSTOM_ALLOWLIST" then mode = "KEEP_ALL" end
-  return policy, mode
-end
-
-local function isOreOrRawMaterial(name)
-  name = string.lower(tostring(name or ""))
-  -- Keep all ores/raw materials regardless of the selected allowlist.  The
-  -- broad suffix/prefix checks intentionally err on the side of retention
   -- for modded names (an unknown resource is safer in the output chest).
   return name:find("_ore", 1, true) ~= nil
     or name:find("ore_", 1, true) ~= nil
@@ -287,3 +272,18 @@ local function unloadAtHome()
   if not inventoryPresent(outCheck, outInspect) then
     restoreSideDirection(outputSide, outRestore)
     turtle.select(originalSlot)
+    return false, "Output inventory missing on configured side " .. outputSide .. "."
+  end
+
+  local policy, mode = discardPolicy()
+  local discardStats = discardStatsTable()
+  discardStats.lastError = nil
+  local _, emptySlots = inventoryStats()
+  local trigger = tonumber(policy.triggerEmptySlots) or 3
+  local discardEnabled = mode ~= "KEEP_ALL" and emptySlots <= trigger
+  local discardSide = policy.direction or "back"
+  if discardSide == "up" then discardSide = "top" end
+  if discardSide == "down" then discardSide = "bottom" end
+  local outputTargetDir = sideTargetDirection(outRestore, outputSide)
+  local discardTargetDir = sideTargetDirection(outRestore, discardSide)
+  local discardInspect, _, discardDrop, discardRestore

@@ -1,15 +1,3 @@
-    return nil, state.gps.lastError
-  end
-  if not gps or type(gps.locate) ~= "function" then
-    state.gps.available = false
-    state.gps.lastError = "GPS API is unavailable."
-    return nil, state.gps.lastError
-  end
-  local ok, x, y, z = pcall(gps.locate, tonumber(gpsConfig().timeout) or 2, false)
-  if not ok then
-    local text = tostring(x)
-    -- gps.locate waits for events. Preserve Ctrl+T as a real local stop even
-    -- when it arrives during a GPS lookup instead of a rednet receive.
     if text == "Terminated" or text:find("Terminated", 1, true) then error(x, 0) end
   end
   if not ok or x == nil then
@@ -239,3 +227,16 @@ local function validateAssignmentResumeToken(value, job)
     },
     jobId = tostring(value.jobId or ""), groupJobId = tostring(value.groupJobId), assignmentId = tostring(value.assignmentId),
     worldPose = {
+      x = math.floor(tonumber(world.x)), y = math.floor(tonumber(world.y)), z = math.floor(tonumber(world.z)), dir = worldDir,
+    },
+  }
+end
+
+local function validateJob(payload)
+  payload = payload or {}
+  local width, length, depth = tonumber(payload.width), tonumber(payload.length), tonumber(payload.depth)
+  local targetY = tonumber(payload.targetY)
+  local requestedChunkMode = payload.chunkMode == "world" and "world" or "local"
+  if targetY ~= nil then
+    if targetY ~= math.floor(targetY) then return nil, "targetY must be a whole number." end
+    if requestedChunkMode ~= "world" then

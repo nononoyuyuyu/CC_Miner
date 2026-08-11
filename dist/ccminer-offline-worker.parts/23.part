@@ -1,14 +1,3 @@
-  local optimized, optimizedOrder = optimizedWalk(mineCopies, mineKeys, seedKey)
-  for _, key in ipairs(mineKeys) do
-    if mineCopies[key].optimizedAnchor then
-      chunks[key].optimizedAnchor = { x = mineCopies[key].optimizedAnchor.x, z = mineCopies[key].optimizedAnchor.z }
-    end
-  end
-  local routeCopy = {}
-  for index, key in ipairs(optimizedOrder) do routeCopy[index] = key end
-  local assignedColumns = 0
-  local assignedBounds
-  for _, key in ipairs(mineKeys) do assignedColumns = assignedColumns + chunks[key].cells end
   for _, key in ipairs(mineKeys) do
     local chunk = chunks[key]
     assignedBounds = assignedBounds or { minX = chunk.minX, maxX = chunk.maxX, minZ = chunk.minZ, maxZ = chunk.maxZ }
@@ -267,3 +256,16 @@ local config, configError = common.loadConfig()
 if not config or config.role ~= "worker" then
   error(configError or "Worker configuration not found. Run: ccm setup worker", 0)
 end
+
+-- Forward declaration: statusPayload is defined before the assignment resume
+-- helpers below, but Lua lexical scope otherwise resolves that call globally.
+local assignmentResumeSnapshot
+
+-- Accept both the V4 nested defaults and older flat V2 settings.  This is
+-- intentionally in-memory so an old config remains readable by V2 tooling.
+config.materials = config.materials or {}
+config.lighting = config.lighting or {}
+config.water = config.water or {}
+config.journal = config.journal or {}
+config.performance = config.performance or {}
+config.gps = config.gps or {}

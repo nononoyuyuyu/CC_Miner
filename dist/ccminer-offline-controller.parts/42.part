@@ -1,8 +1,3 @@
-      for key, value in pairs(registry or {}) do print(("%s world=%s,%s,%s facing=%s maxDepth=%s"):format(tostring(key), tostring(value.world and value.world.x or "-"), tostring(value.world and value.world.y or "-"), tostring(value.world and value.world.z or "-"), tostring(value.facing or "-"), tostring(value.maxDepth or "-"))) end
-    elseif sub == "register" and id then
-      local value = { world = { x = tonumber(args[4]), y = tonumber(args[5]), z = tonumber(args[6]) }, facing = args[7], maxDepth = tonumber(args[8]) }
-      local ok, err = command == "dock" and registerDock(id, value) or registerBay(id, value)
-      print(ok and ((command == "dock" and "Dock" or "Bay") .. " saved.") or ("Register error: " .. tostring(err)))
     else print("Usage: " .. command .. " list|register <id> <x> <y> <z> [facing=south|east|north|west|0..3] [maxDepth]") end
     return true
   end
@@ -207,3 +202,18 @@ local function validateEmbedded()
   }
   for index, file in ipairs(files) do
     if type(file.target) ~= "string" or type(file.content) ~= "string" or seen[file.target] then
+      fail("Embedded runtime order/target is invalid at index " .. tostring(index))
+    end
+    seen[file.target] = true
+    local actual, digestError = digest(file.content)
+    if not actual then fail(digestError) end
+    if actual ~= string.lower(file.digest or "") then
+      fail("Embedded runtime digest mismatch: " .. tostring(file.target))
+    end
+    aggregate[#aggregate + 1] = file.source; aggregate[#aggregate + 1] = "\0"
+    aggregate[#aggregate + 1] = file.target; aggregate[#aggregate + 1] = "\0"
+    aggregate[#aggregate + 1] = file.digest; aggregate[#aggregate + 1] = "\0"
+    aggregate[#aggregate + 1] = file.content; aggregate[#aggregate + 1] = "\0"
+  end
+  local aggregateDigest, aggregateError = digest(table.concat(aggregate))
+  if not aggregateDigest then fail(aggregateError) end

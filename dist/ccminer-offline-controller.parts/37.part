@@ -1,14 +1,3 @@
-  -- unchanged so old monitors and keyboard shortcuts continue to work.
-  buttonRow(key, math.max(1, bottom - 1), width, {
-    { "GROUPS", dashboardAction("groups") }, { "G START", dashboardAction("group_start") },
-    { "G PAUSE", dashboardAction("group_pause") }, { "G RETURN", dashboardAction("group_return") },
-  })
-  local groupIds = orderedGroupIds()
-  if #groupIds > 0 then
-    local gy = math.max(2, bottom - 2)
-    local gid, g = selectedGroupRecord()
-    local gj = gid and activeGroupJob(gid) or nil
-    local aggregate = gj and (gj.aggregate or updateGroupAggregate(gj)) or nil
     local line = ("Group %s %s %d workers %s%% minFuel=%s ACK=%s/%s"):format(tostring(gid), groupName(g, gid), #(groupWorkerIds(g)), tostring(aggregate and aggregate.percent or 0), tostring(aggregate and aggregate.minFuel or "-"), tostring(aggregate and aggregate.acks or 0), tostring(aggregate and aggregate.ackTotal or #groupWorkerIds(g)))
     common.writeAt(1, gy, common.fit(line, width), colors and colors.cyan or nil)
   end
@@ -164,3 +153,9 @@ local function renderGroupInfo(target, key)
     common.writeAt(1, 3, common.fit("No group selected.", width), colors and colors.yellow or nil)
   else
     local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, minFuel = nil, warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
+    common.writeAt(1, 2, common.fit(("%s (%s) mode=%s partition=%s"):format(groupName(group, gid), tostring(gid), tostring(group.mode or "world"), tostring(group.partition or "stripe")), width), colors and colors.lightGray or nil)
+    common.writeAt(1, 3, common.fit(("GROUP %s%% | BOTTOM Y=%s | minFuel=%s | ACK %d/%d | warnings=%d"):format(tostring(aggregate.percent or 0), tostring(job and job.bottomY or "-"), tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0, #(aggregate.warnings or {})), width), colors and colors.cyan or nil)
+    local row = 5
+    for _, workerId in ipairs(groupWorkerIds(group)) do
+      if row >= height - 5 then break end
+      local worker = workers[workerId]

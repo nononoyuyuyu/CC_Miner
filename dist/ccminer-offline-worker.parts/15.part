@@ -1,12 +1,3 @@
--- for integral world positions while still accepting numeric coordinates for
--- diagnostics.
-local function worldToLocalXZ(calibration, worldX, worldZ)
-  if not validCalibration(calibration) then return nil, nil, "gps_not_calibrated" end
-  worldX, worldZ = numberValue(worldX), numberValue(worldZ)
-  if not worldX or not worldZ then return nil, nil, "invalid_world_position" end
-  local forwardX, forwardZ = numberValue(calibration.forward.x), numberValue(calibration.forward.z)
-  local homeX, homeZ = numberValue(calibration.home.x), numberValue(calibration.home.z)
-  local dx, dz = worldX - homeX, worldZ - homeZ
   local rightX, rightZ = -forwardZ, forwardX
   return dx * rightX + dz * rightZ, dx * forwardX + dz * forwardZ
 end
@@ -304,3 +295,18 @@ end
 M.shortestPath = M.shortestChunkPath
 
 local function nearestUnvisitedPath(chunks, startKey, visited)
+  local queue, head, tail = { startKey }, 1, 1
+  local previous, seen = {}, { [startKey] = true }
+  while head <= tail do
+    local key = queue[head]; head = head + 1
+    for _, neighbor in ipairs(chunks[key].neighbors or {}) do
+      if not seen[neighbor] then
+        seen[neighbor] = true
+        previous[neighbor] = key
+        if not visited[neighbor] then
+          local path, current = { neighbor }, neighbor
+          while current ~= startKey do
+            current = previous[current]
+            path[#path + 1] = current
+          end
+          local reversed = {}

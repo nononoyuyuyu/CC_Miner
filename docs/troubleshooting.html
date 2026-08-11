@@ -8,6 +8,9 @@
 <ol class="steps"><li><div><h3>表示を写真やメモに残す</h3><p>エラーの最初の行と、ファイル名・行番号があれば一緒に残します。</p></div></li><li><div><h3>状態を見る</h3><pre><code>ccm status
 ccm doctor
 ccm logs</code></pre></div></li><li><div><h3>タートルの位置を変えない</h3><p>置き場、向き、チェスト、持ち物を見て、画面の状態と比べます。</p></div></li></ol>
+<h2 id="question-marks">セットアップ画面が「????」になる</h2>
+<p>CC:Tweakedのゲーム内画面は日本語を表示できません。古い版のセットアップに日本語が入っていたため、文字がすべて「?」になっていました。最新版ではゲーム内表示を短い英語だけにしています。</p>
+<ol><li>今のセットアップは <kbd>Ctrl</kbd> と <kbd>T</kbd> を長押しして終了します。</li><li><a href="install.html#update">最新版へ更新</a>します。</li><li><code>ccm setup worker</code> または <code>ccm setup controller</code> をもう一度実行します。</li><li>詳しい意味は、この日本語HTML手順書の<a href="settings.html">設定を変える</a>で確認します。</li></ol>
 <h2 id="not-found">採掘タートルが見つからない</h2>
 <ol class="steps"><li><div><h3>無線モデムを見る</h3><p>採掘タートルと管理用コンピューターの両方に無線モデムが必要です。起動後に付けた場合は両方を再起動します。</p></div></li><li><div><h3>合言葉を見る</h3><p>両方の <code>networkKey</code> を完全に同じにします。大文字・小文字、空白も確認します。</p></div></li><li><div><h3>古い管理番号の固定を外す</h3><p>以前の管理用コンピューターを使っていた採掘タートルは、<code>controllerId</code>を0にするか、今の管理用コンピューターの番号にします。</p></div></li><li><div><h3>同じ版へ更新する</h3><p>片方だけ古いと通信を安全のため拒否します。両方を同じ版へ更新し、再起動します。</p></div></li><li><div><h3>探し直す</h3><pre><code>ccm discover</code></pre></div></li></ol>
 <h2 id="history">history database not found</h2>

@@ -1,9 +1,3 @@
-    check("worker fuel", "warn", ("unknown / need %d"):format(requiredFuel), false)
-  end
-  if data.inventoryEmpty ~= nil then
-    check("inventory", tonumber(data.inventoryEmpty) > 0 and "ok" or "warn", tostring(data.inventoryEmpty or 0) .. " empty", false)
-  else check("inventory", "warn", "unknown", false) end
-  local seal = tonumber(data.materials and (data.materials.sealCount or data.materials.seal) or data.seal and data.seal.count)
   local torchStock = tonumber(data.lighting and data.lighting.torchCount or data.materials and data.materials.torchCount)
   if draft.waterMode == "seal" and seal and seal <= 0 then check("seal material", "warn", "0 (dock refill expected)", false)
   elseif draft.waterMode == "seal" then check("seal material", "warn", "seal stock unknown", false) end
@@ -214,3 +208,7 @@ local function groupDraftDefaults(group)
     bottomY = bottomY,
     targetY = bottomY,
     mode = group and group.mode or "world",
+    partition = group and group.partition or (config.group and config.group.partitionMode) or "stripe",
+    lighting = normalizedLighting and normalizedLighting(previous.lighting) or common.copy(previous.lighting or { mode = "safe", interval = 10 }),
+    waterMode = normalizedWaterMode and normalizedWaterMode(previous.waterMode) or tostring(previous.waterMode or "seal"),
+    profile = normalizedProfile and normalizedProfile(previous.profile) or tostring(previous.profile or "balanced"),

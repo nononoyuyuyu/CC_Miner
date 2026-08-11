@@ -1,16 +1,3 @@
-      x = math.floor(tonumber(world.x)), y = math.floor(tonumber(world.y)), z = math.floor(tonumber(world.z)), dir = worldDir,
-    },
-  }
-end
-
-local function validateJob(payload)
-  payload = payload or {}
-  local width, length, depth = tonumber(payload.width), tonumber(payload.length), tonumber(payload.depth)
-  local targetY = tonumber(payload.targetY)
-  local requestedChunkMode = payload.chunkMode == "world" and "world" or "local"
-  if targetY ~= nil then
-    if targetY ~= math.floor(targetY) then return nil, "targetY must be a whole number." end
-    if requestedChunkMode ~= "world" then
       return nil, "targetY requires chunkMode=world with GPS calibration."
     end
     local calibration = gpsCalibration()
@@ -217,3 +204,14 @@ local function validateJob(payload)
         seedKey = payload.seedKey or assignment.seedKey or job.seedKey,
         rootKey = assignmentCatalog.rootKey,
         dockKey = payload.dockKey or assignment.dockKey or assignmentCatalog.dockKey,
+        workerId = payload.workerId or assignment.workerId,
+        groupJobId = job.groupJobId,
+        bottomY = job.bottomY or targetY,
+        y = job.bottomY or targetY or 0,
+        referenceCalibration = assignmentCatalog.calibrationSeed,
+        workerCalibration = gpsCalibration(),
+        dockPose = { x = 0, y = 0, z = 1 },
+      }
+      local ok, assignedPlan = pcall(quarry.buildAssignedChunkPlan,
+        assignmentCatalog, assignmentChunks, assignmentOptions)
+      if not ok or type(assignedPlan) ~= "table" or type(assignedPlan.chunks) ~= "table" then

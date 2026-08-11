@@ -1,17 +1,3 @@
-    mode = mode,
-    width = validWidth,
-    length = validLength,
-    depth = validDepth,
-    rootKey = rootKey,
-    chunks = chunks,
-    walk = walk,
-    -- optimizedWalk is deliberately separate: worker recovery still uses the
-    -- DFS parent/walk representation above.
-    optimizedWalk = optimized,
-    optimizedRoute = optimizedOrder,
-    -- `route` is a legacy alias.  It must be a separate array because the
-    -- runtime state is saved with textutils.serialize, which rejects shared
-    -- table references even when the values are otherwise valid.
     route = (function()
       local copy = {}
       for index, key in ipairs(optimizedOrder) do copy[index] = key end
@@ -281,3 +267,15 @@ function M.shortestServiceRoute(plan, fromPose, toPose, options)
   end
   distance = distance + math.abs(previousPoint.x - toPoint.x)
     + math.abs(previousPoint.y - toPoint.y)
+    + math.abs(previousPoint.z - toPoint.z)
+  appendRouteWaypoint(waypoints, toKey, toPoint, "target")
+  local normalizedKeys = (function()
+    local copy = {}; for i, key in ipairs(chunkKeys) do copy[i] = tostring(key) end; return copy
+  end)()
+  local function copyKeys()
+    local copy = {}; for i, key in ipairs(normalizedKeys) do copy[i] = key end; return copy
+  end
+  return {
+    chunkKeys = normalizedKeys,
+    -- Compatibility names are independent arrays; never alias chunkKeys in a
+    -- table persisted through CC's serializer.

@@ -1,7 +1,3 @@
-    local progress = data and data.progress or {}
-    local cursor, total = tonumber(progress and progress.cursor or data and data.job and data.job.cursor), tonumber(progress and progress.total or data and data.job and data.job.total)
-    if cursor and total and total > 0 then weightedDone, weightedTotal = weightedDone + math.max(0, math.min(cursor, total)), weightedTotal + total end
-    local warning = data and (data.lastError or data.completionReason)
     if warning and not seenWarning[tostring(warning)] then seenWarning[tostring(warning)] = true; aggregate.warnings[#aggregate.warnings + 1] = tostring(warning) end
     local ack = groupJob.acks and groupJob.acks[tostring(id)]
     if ack and ack.ok ~= nil then aggregate.acks = aggregate.acks + 1 end
@@ -246,3 +242,9 @@ noticeState.remoteApi.ackMatches = function(sender, message, payload)
   local result = type(payload.result) == "table" and payload.result or nil
   local wireCommand = payload.command
   if tostring(wireCommand or ""):lower() ~= "remote_console" then return false end
+  local action = remoteAckField(payload, result, "action")
+    or remoteAckField(payload, result, "remoteAction")
+  if action ~= nil and tostring(action):lower() ~= tostring(pending.action):lower() then return false end
+  local sessionId = remoteAckField(payload, result, "sessionId")
+  local nonce = remoteAckField(payload, result, "nonce")
+  -- The worker creates fresh session credentials on OPEN and returns them in

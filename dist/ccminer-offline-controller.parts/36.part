@@ -1,10 +1,3 @@
-      if id then confirmState = { command = "clear", message = "Clear the completed or aborted job record?" }; mode = "confirm" end
-    elseif name == "rehome" then
-      if id then confirmState = { command = "rehome", payload = { confirm = "RESET" }, twoStep = true, message = "REHOME RESET clears the active job. Press YES twice only when the turtle is physically in its dock." }; mode = "confirm" end
-    elseif name == "gps" then
-      if id then confirmState = { command = "calibrate_gps", message = "GPS calibration moves forward one block and back. Is the dock front clear?" }; mode = "confirm" end
-    elseif name == "quit" then running = false end
-    invalidate()
   end
 end
 
@@ -243,3 +236,14 @@ local function renderDashboard(target, key)
     { "REHOME", dashboardAction("rehome") }, { "LAST ERR", dashboardAction("last_error") },
   })
   -- Group controls are additive; the legacy single-worker rows above remain
+  -- unchanged so old monitors and keyboard shortcuts continue to work.
+  buttonRow(key, math.max(1, bottom - 1), width, {
+    { "GROUPS", dashboardAction("groups") }, { "G START", dashboardAction("group_start") },
+    { "G PAUSE", dashboardAction("group_pause") }, { "G RETURN", dashboardAction("group_return") },
+  })
+  local groupIds = orderedGroupIds()
+  if #groupIds > 0 then
+    local gy = math.max(2, bottom - 2)
+    local gid, g = selectedGroupRecord()
+    local gj = gid and activeGroupJob(gid) or nil
+    local aggregate = gj and (gj.aggregate or updateGroupAggregate(gj)) or nil

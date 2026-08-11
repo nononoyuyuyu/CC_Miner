@@ -1,15 +1,3 @@
-
-common.clear(colors and colors.black or nil, colors and colors.white or nil)
-print("SETUP COMPLETE")
-print("")
-print("Role: " .. requestedRole)
-if requestedRole == "worker" then
-  print("Output chest: BEHIND the turtle")
-  print("Fuel chest: ABOVE the turtle")
-  if config.lavaMode == "seal" then print("Seal-block chest: " .. string.upper(config.sealSide) .. " of the turtle") end
-  if config.lighting and config.lighting.mode ~= "off" then
-    print("Torch chest: " .. string.upper(config.lighting.side or config.torchSide or "left") .. " of the turtle")
-  end
   print("Turtle front: quarry entrance")
   if config.gps.enabled then print("After GPS hosts are online: controller -> GPS CAL") end
 elseif requestedRole == "controller" then
@@ -302,3 +290,17 @@ local function printOperationalFields(root, config)
     { "stats", "discard" }, { "stats", "discarded" },
     { "stats", "discardedBlocks" }, { "stats", "discardCount" },
   })
+  if discard ~= nil then printField("Discard", discard) end
+
+  local performance = firstNestedValue(roots, {
+    { "performance" }, { "stats", "performance" },
+  })
+  if performance ~= nil then printField("Performance", performance) end
+  local throughput = firstNestedValue(roots, {
+    { "throughput" }, { "performance", "throughput" },
+    { "report", "throughput" }, { "stats", "throughput" },
+    { "blocksPerSecond" }, { "perSecond" },
+  })
+  if throughput ~= nil then printField("Throughput", throughput) end
+
+  local partial = firstNestedValue(roots, {
