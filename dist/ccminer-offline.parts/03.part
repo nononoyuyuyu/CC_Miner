@@ -1,4 +1,25 @@
--- CC Miner V2 - deterministic quarry paths and chunk exclusion plans.
+  local before = pending.poseBefore
+  local kind = tostring(pending.kind or "")
+  if M.samePosition(actual, before) then
+    return { outcome = "before", pose = {
+      x = before.x, y = before.y, z = before.z, dir = before.dir,
+    } }
+  end
+  local expected = pending.poseAfter
+  if type(expected) == "table" and M.samePosition(actual, expected) then
+    return { outcome = "after", pose = {
+      x = expected.x, y = expected.y, z = expected.z, dir = expected.dir,
+    } }
+  end
+  if kind:match("^dig_") or kind:match("^seal_") then
+    return nil, "position_changed_during_stationary_action"
+  end
+  return nil, "gps_position_matches_neither_side_of_pending_action"
+end
+
+return M
+]] },
+  { target = [[lib/quarry.lua]], content = [=[-- CC Miner V2 - deterministic quarry paths and chunk exclusion plans.
 
 local M = {}
 
@@ -261,3 +282,94 @@ function M.pathFromRoot(plan, key)
 end
 
 return M
+]=] },
+  { target = [[worker.lua]], content = [[-- CC Miner V2 - generated worker source loader.
+local parts = {
+  "/ccminer/worker_parts/01.part",
+  "/ccminer/worker_parts/02.part",
+  "/ccminer/worker_parts/03.part",
+  "/ccminer/worker_parts/04.part",
+  "/ccminer/worker_parts/05.part",
+}
+local source = {}
+for index, path in ipairs(parts) do
+  local handle = fs.open(path, "r")
+  if not handle then error("Missing runtime part: " .. path, 0) end
+  source[index] = handle.readAll()
+  handle.close()
+end
+local loader = loadstring or load
+local program, compileError = loader(table.concat(source), "@/ccminer/worker.assembled.lua")
+if not program then error("Cannot assemble worker: " .. tostring(compileError), 0) end
+return program(...)
+]] },
+  { target = [[worker_parts/01.part]], content = [[-- CC Miner V2 - autonomous quarry worker
+-- Home=(0,0,0), forward=+Z, right=+X, down=-Y.
+
+local common = dofile("/ccminer/lib/common.lua")
+local protocol = dofile("/ccminer/lib/protocol.lua")
+local quarry = dofile("/ccminer/lib/quarry.lua")
+local geo = dofile("/ccminer/lib/geo.lua")
+
+if not turtle then error("worker.lua must run on a turtle", 0) end
+
+local config, configError = common.loadConfig()
+if not config or config.role ~= "worker" then
+  error(configError or "Worker configuration not found. Run: ccm setup worker", 0)
+end
+
+local rawState, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
+local state = common.merge(common.defaultState(), rawState)
+if stateError then common.log("WARN", stateError) end
+
+local lastHeartbeat = 0
+local networkReady = false
+local pollNetwork
+
+local function saveState()
+  state.schema = common.SCHEMA
+  state.version = common.VERSION
+  state.updatedAt = common.nowSeconds()
+  local ok, err = common.saveTable(common.STATE_PATH, state)
+  if not ok then
+    common.log("ERROR", "State save failed: " .. tostring(err))
+    error("State save failed: " .. tostring(err), 0)
+  end
+end
+
+local function poseCopy(pose)
+  pose = pose or state.pose or {}
+  return {
+    x = tonumber(pose.x) or 0,
+    y = tonumber(pose.y) or 0,
+    z = tonumber(pose.z) or 0,
+    dir = (tonumber(pose.dir) or 0) % 4,
+  }
+end
+
+local function samePosePosition(a, b)
+  return tonumber(a and a.x) == tonumber(b and b.x)
+    and tonumber(a and a.y) == tonumber(b and b.y)
+    and tonumber(a and a.z) == tonumber(b and b.z)
+end
+
+local function beginPhysicalAction(kind, details, poseAfter)
+  if state.pendingAction then
+    return false, "An unresolved physical action is already recorded. Rehome the turtle before continuing."
+  end
+  state.pendingAction = {
+    kind = tostring(kind or "unknown"),
+    poseBefore = poseCopy(),
+    poseAfter = poseAfter and poseCopy(poseAfter) or nil,
+    details = details or {},
+    startedAt = common.nowSeconds(),
+  }
+  saveState()
+  return true
+end
+
+local function cancelPhysicalAction()
+  state.pendingAction = nil
+  saveState()
+end
+

@@ -1,0 +1,388 @@
+  if not wrapped then return false end
+  return type(wrapped.list) == "function" or type(wrapped.size) == "function"
+end
+
+function M.withTerm(target, callback)
+  if not target or not term or not term.redirect then return callback() end
+  local old = term.redirect(target)
+  local ok, a, b, c = pcall(callback)
+  term.redirect(old)
+  if not ok then error(a, 0) end
+  return a, b, c
+end
+
+function M.setColors(background, foreground)
+  if term and term.isColor and term.isColor() then
+    if background and term.setBackgroundColor then term.setBackgroundColor(background) end
+    if foreground and term.setTextColor then term.setTextColor(foreground) end
+  end
+end
+
+function M.clear(background, foreground)
+  M.setColors(background, foreground)
+  term.clear()
+  term.setCursorPos(1, 1)
+end
+
+function M.writeAt(x, y, text, foreground, background)
+  if background and term.isColor and term.isColor() then term.setBackgroundColor(background) end
+  if foreground and term.isColor and term.isColor() then term.setTextColor(foreground) end
+  term.setCursorPos(math.max(1, x), math.max(1, y))
+  term.write(tostring(text or ""))
+end
+
+function M.statusColor(status)
+  if not colors then return nil end
+  local map = {
+    idle = colors.lightGray,
+    working = colors.lime,
+    calibrating = colors.lightBlue,
+    paused = colors.yellow,
+    waiting_fuel = colors.orange,
+    waiting_output = colors.orange,
+    waiting_seal = colors.orange,
+    blocked = colors.red,
+    complete = colors.cyan,
+    aborted = colors.red,
+    offline = colors.gray,
+    hosting = colors.lime,
+  }
+  return map[status] or colors.white
+end
+
+function M.defaultWorkerConfig()
+  return {
+    schema = M.SCHEMA,
+    version = M.VERSION,
+    role = "worker",
+    networkKey = "CHANGE_ME",
+    workerName = M.safeComputerLabel("Miner"),
+    controllerId = 0,
+    reserveEmptySlots = 3,
+    fuelBuffer = 256,
+    fuelTarget = 12000,
+    moveRetries = 20,
+    moveRetryDelay = 0.4,
+    heartbeatSeconds = 2,
+    attackEntities = false,
+    maxWidth = 128,
+    maxLength = 512,
+    maxDepth = 128,
+    maxVolume = 2000000,
+    outputSide = "back",
+    fuelSide = "top",
+    lavaMode = "seal",
+    sealSide = "right",
+    sealTarget = 64,
+    sealReserve = 8,
+    sealBlocks = {
+      ["minecraft:cobblestone"] = true,
+      ["minecraft:cobbled_deepslate"] = true,
+      ["minecraft:stone"] = true,
+      ["minecraft:netherrack"] = true,
+      ["minecraft:dirt"] = true,
+    },
+    gps = {
+      enabled = true,
+      required = false,
+      timeout = 2,
+      verifyEveryMoves = 16,
+      autoResolvePending = true,
+      calibration = nil,
+    },
+    protectedBlocks = {
+      ["minecraft:bedrock"] = true,
+      ["minecraft:end_portal"] = true,
+      ["minecraft:end_portal_frame"] = true,
+      ["minecraft:nether_portal"] = true,
+      ["minecraft:reinforced_deepslate"] = true,
+      ["computercraft:turtle_normal"] = true,
+      ["computercraft:turtle_advanced"] = true,
+      ["computercraft:computer_normal"] = true,
+      ["computercraft:computer_advanced"] = true,
+    },
+  }
+end
+
+function M.defaultControllerConfig()
+  return {
+    schema = M.SCHEMA,
+    version = M.VERSION,
+    role = "controller",
+    networkKey = "CHANGE_ME",
+    controllerName = M.safeComputerLabel("Control"),
+    workerTimeoutSeconds = 10,
+    discoverySeconds = 5,
+    monitorTextScale = 0.5,
+    monitorName = "",
+    touchEnabled = true,
+  }
+end
+
+function M.defaultGPSConfig()
+  return {
+    schema = M.SCHEMA,
+    version = M.VERSION,
+    role = "gps",
+    gpsName = M.safeComputerLabel("GPS"),
+    x = 0,
+    y = 0,
+    z = 0,
+  }
+end
+
+function M.defaultState()
+  return {
+    schema = M.SCHEMA,
+    version = M.VERSION,
+    status = "idle",
+    phase = "home",
+    pose = { x = 0, y = 0, z = 0, dir = 0 },
+    gps = {
+      available = false,
+      lastFix = nil,
+      lastFixAt = nil,
+      lastError = nil,
+      corrections = 0,
+    },
+    job = nil,
+    checkpoint = nil,
+    request = nil,
+    service = nil,
+    lastError = nil,
+    completionReason = nil,
+    pendingAction = nil,
+    updatedAt = M.nowSeconds(),
+    stats = {
+      moves = 0,
+      turns = 0,
+      blocksDug = 0,
+      lavaSealed = 0,
+      gpsFixes = 0,
+      gpsRecoveries = 0,
+      unloads = 0,
+      refuels = 0,
+      sealRefills = 0,
+      jobsCompleted = 0,
+      startedAt = M.nowSeconds(),
+    },
+    recentCommands = {},
+  }
+end
+
+function M.loadConfig()
+  local raw, err = M.loadTable(M.CONFIG_PATH, {})
+  if err then return nil, err end
+  local role = raw and raw.role or nil
+  if role == "worker" then return M.merge(M.defaultWorkerConfig(), raw), nil end
+  if role == "controller" then return M.merge(M.defaultControllerConfig(), raw), nil end
+  if role == "gps" then return M.merge(M.defaultGPSConfig(), raw), nil end
+  return raw, nil
+end
+
+function M.saveConfig(config)
+  config.schema = M.SCHEMA
+  config.version = M.VERSION
+  return M.saveTable(M.CONFIG_PATH, config)
+end
+
+return M
+]] },
+  { target = [[lib/protocol.lua]], content = [[-- CC Miner V2 - rednet protocol helpers
+
+local common = dofile("/ccminer/lib/common.lua")
+local M = {}
+
+local function makeId(prefix)
+  local millis = common.nowMillis()
+  local randomPart = math.random(100000, 999999)
+  return ("%s-%d-%d-%d"):format(prefix or "msg", os.getComputerID(), millis, randomPart)
+end
+
+function M.message(kind, key, payload, target)
+  return {
+    magic = common.MAGIC,
+    schema = common.SCHEMA,
+    version = common.VERSION,
+    kind = kind,
+    key = key,
+    sender = os.getComputerID(),
+    target = target,
+    id = makeId(kind),
+    sentAt = common.nowSeconds(),
+    payload = payload or {},
+  }
+end
+
+function M.validate(message, expectedKey, expectedTarget)
+  if type(message) ~= "table" then return false, "not_table" end
+  if message.magic ~= common.MAGIC then return false, "bad_magic" end
+  if tonumber(message.schema) ~= common.SCHEMA then return false, "bad_schema" end
+  if type(message.kind) ~= "string" then return false, "bad_kind" end
+  if expectedKey and expectedKey ~= "" and message.key ~= expectedKey then return false, "bad_key" end
+  if expectedTarget and message.target and tonumber(message.target) ~= tonumber(expectedTarget) then
+    return false, "wrong_target"
+  end
+  return true
+end
+
+function M.open()
+  local opened = common.openWirelessModems()
+  return #opened > 0, opened
+end
+
+function M.send(target, message)
+  if not rednet then return false, "rednet_unavailable" end
+  local ok, result = pcall(rednet.send, tonumber(target), message, common.PROTOCOL)
+  if not ok then return false, tostring(result) end
+  return result == true, result == true and nil or "send_failed"
+end
+
+function M.broadcast(message)
+  if not rednet then return false, "rednet_unavailable" end
+  local ok, result = pcall(rednet.broadcast, message, common.PROTOCOL)
+  if not ok then return false, tostring(result) end
+  return result ~= false, result == false and "broadcast_failed" or nil
+end
+
+function M.receive(timeout)
+  if not rednet then return nil, nil, "rednet_unavailable" end
+  local ok, sender, message, protocolName = pcall(rednet.receive, common.PROTOCOL, timeout)
+  if not ok then return nil, nil, tostring(sender) end
+  if not sender then return nil, nil, nil end
+  return sender, message, protocolName
+end
+
+function M.reply(target, key, request, kind, payload)
+  local message = M.message(kind, key, payload, target)
+  if request and request.id then message.replyTo = request.id end
+  return M.send(target, message)
+end
+
+return M
+]] },
+  { target = [[lib/geo.lua]], content = [[-- CC Miner V2 - GPS and coordinate transforms.
+
+local M = {}
+
+local function rounded(value)
+  if type(value) ~= "number" then return nil end
+  if value >= 0 then return math.floor(value + 0.5) end
+  return math.ceil(value - 0.5)
+end
+
+function M.integerFix(x, y, z, tolerance)
+  tolerance = tonumber(tolerance) or 0.35
+  local rx, ry, rz = rounded(x), rounded(y), rounded(z)
+  if not rx or not ry or not rz then return nil, "invalid_fix" end
+  if math.abs(x - rx) > tolerance or math.abs(y - ry) > tolerance or math.abs(z - rz) > tolerance then
+    return nil, "non_block_fix"
+  end
+  return { x = rx, y = ry, z = rz }
+end
+
+function M.validCalibration(calibration)
+  if type(calibration) ~= "table" or type(calibration.home) ~= "table" or type(calibration.forward) ~= "table" then
+    return false
+  end
+  local fx, fz = tonumber(calibration.forward.x), tonumber(calibration.forward.z)
+  if not fx or not fz or math.abs(fx) + math.abs(fz) ~= 1 then return false end
+  return tonumber(calibration.home.x) ~= nil
+    and tonumber(calibration.home.y) ~= nil
+    and tonumber(calibration.home.z) ~= nil
+end
+
+function M.rightVector(calibration)
+  if not M.validCalibration(calibration) then return nil end
+  local forward = calibration.forward
+  return { x = -forward.z, z = forward.x }
+end
+
+function M.localToWorld(calibration, pose)
+  if not M.validCalibration(calibration) then return nil, "gps_not_calibrated" end
+  pose = pose or {}
+  local home, forward = calibration.home, calibration.forward
+  local right = M.rightVector(calibration)
+  local x, y, z = tonumber(pose.x) or 0, tonumber(pose.y) or 0, tonumber(pose.z) or 0
+  return {
+    x = home.x + right.x * x + forward.x * z,
+    y = home.y + y,
+    z = home.z + right.z * x + forward.z * z,
+  }
+end
+
+function M.worldToLocal(calibration, world, dir)
+  if not M.validCalibration(calibration) then return nil, "gps_not_calibrated" end
+  world = world or {}
+  local wx, wy, wz = tonumber(world.x), tonumber(world.y), tonumber(world.z)
+  if not wx or not wy or not wz then return nil, "invalid_world_position" end
+  local home, forward = calibration.home, calibration.forward
+  local right = M.rightVector(calibration)
+  local dx, dz = wx - home.x, wz - home.z
+  return {
+    x = dx * right.x + dz * right.z,
+    y = wy - home.y,
+    z = dx * forward.x + dz * forward.z,
+    dir = tonumber(dir) or 0,
+  }
+end
+
+function M.samePosition(a, b)
+  if type(a) ~= "table" or type(b) ~= "table" then return false end
+  return tonumber(a.x) == tonumber(b.x)
+    and tonumber(a.y) == tonumber(b.y)
+    and tonumber(a.z) == tonumber(b.z)
+end
+
+function M.poseAfterMove(pose, direction)
+  pose = {
+    x = tonumber(pose and pose.x) or 0,
+    y = tonumber(pose and pose.y) or 0,
+    z = tonumber(pose and pose.z) or 0,
+    dir = (tonumber(pose and pose.dir) or 0) % 4,
+  }
+  if direction == "up" then pose.y = pose.y + 1
+  elseif direction == "down" then pose.y = pose.y - 1
+  elseif direction == "forward" then
+    if pose.dir == 0 then pose.z = pose.z + 1
+    elseif pose.dir == 1 then pose.x = pose.x + 1
+    elseif pose.dir == 2 then pose.z = pose.z - 1
+    else pose.x = pose.x - 1 end
+  elseif direction == "back" then
+    if pose.dir == 0 then pose.z = pose.z - 1
+    elseif pose.dir == 1 then pose.x = pose.x - 1
+    elseif pose.dir == 2 then pose.z = pose.z + 1
+    else pose.x = pose.x + 1 end
+  end
+  return pose
+end
+
+function M.chunkCoord(value)
+  return math.floor((tonumber(value) or 0) / 16)
+end
+
+function M.chunkKey(cx, cz)
+  return tostring(math.floor(tonumber(cx) or 0)) .. ":" .. tostring(math.floor(tonumber(cz) or 0))
+end
+
+function M.worldChunk(world)
+  return M.chunkCoord(world.x), M.chunkCoord(world.z)
+end
+
+function M.calibrationFromFixes(home, forwardFix)
+  if type(home) ~= "table" or type(forwardFix) ~= "table" then return nil, "missing_fix" end
+  local dx, dy, dz = forwardFix.x - home.x, forwardFix.y - home.y, forwardFix.z - home.z
+  if dy ~= 0 or math.abs(dx) + math.abs(dz) ~= 1 then
+    return nil, "Forward calibration move was not exactly one horizontal block."
+  end
+  return {
+    home = { x = home.x, y = home.y, z = home.z },
+    forward = { x = dx, z = dz },
+    calibratedAt = os and os.epoch and os.epoch("utc") or 0,
+  }
+end
+
+function M.resolvePending(pending, fix, calibration)
+  if type(pending) ~= "table" or type(pending.poseBefore) ~= "table" then return nil, "invalid_pending" end
+  local actual, err = M.worldToLocal(calibration, fix, pending.poseBefore.dir)
+  if not actual then return nil, err end

@@ -1,65 +1,69 @@
-# CC Miner V2 for Create: Astral
+# CC Miner V2
 
-Create: Astral 上で、採掘タートルを「置いて設定するだけ」で矩形範囲の採掘、燃料補給、搬出、帰還、再開、遠隔監視まで行うための完成済みシステムです。
-
-対象は **Create: Astral v2.1.5a / Minecraft 1.18.2 / Fabric / CC: Restitched 1.100.8** です。ゲーム内の表示は文字化けを避けるため英語、構築手順は日本語で記載しています。
+CC: Restitched / CC:Tweaked 向けの、復旧可能な遠隔クアリーシステムです。Advanced Mining Turtle を複数台管理し、タッチ操作、任意GPS、溶岩の自動封鎖、チャンク単位の採掘除外、自動補給・搬出、電源断復旧を一つの配布物で扱います。
 
 ![システム全体図](docs/images/system-overview.svg)
 
-## 実装済み機能
+## V2.1 の主な機能
 
-- 幅 `W` × 長さ `L` × 深さ `D` の全セルを、途切れない3次元蛇行経路で採掘
-- 16スロットが埋まる前、または帰還燃料が不足する前に自動帰還
-- ホーム後方の搬出チェストへ全アイテムを搬出
-- ホーム上方の燃料チェストから、有効な燃料だけを1個ずつ補給
-- 補給後に保存済み地点へ戻り、同じジョブを継続
-- 複数タートルの無線検出、一覧監視、開始・停止・帰還・中止操作
-- 再起動後の状態復元、二重状態ファイル、物理動作ジャーナル
-- 溶岩、保護ブロック、チェスト等のインベントリ、エンティティに対する安全停止
-- オンライン導入、オフライン一括導入、設定を保持した更新、旧版バックアップ
-- 既存 `startup.lua` の退避と併用
+- **タッチ／クリック操作**: Advanced Monitor の `monitor_touch` とコントローラー画面のマウスクリックに対応。ワーカー選択、採掘寸法入力、数字キーパッド、チャンクマスク、GPS校正、帰還・中止・復旧まで画面内で操作できます。
+- **任意GPS**: 4基以上のGPSホストを同じ配布物から構築できます。ワーカーはドック位置と正面方向を1ブロック往復で校正し、定期的な位置検証と、電源断中の移動が成功したかどうかの判定に利用します。GPSなしでも従来どおり動作します。
+- **溶岩封鎖**: 進行方向の溶岩を検知すると、専用チェストから補給した固体ブロックを設置して流体を置換し、そのブロックを掘って進みます。封鎖材が少なくなると安全経路で自動帰還します。
+- **チャンク除外**: タッチ画面でチャンクを個別に採掘対象外へ設定できます。GPS校正済みならワールドチャンク、未校正なら採掘原点基準の16×16区画を使用します。除外後の領域が入口から連結していないジョブは開始前に拒否されます。
+- **安全な補給経路**: 除外ジョブでは許可済みチャンクのDFS親経路を使って帰還・復帰するため、補給中も除外チャンクへ入りません。
+- **耐電源断状態保存**: 移動・旋回・採掘・設置の直前に保留アクションを永続化します。GPSが利用できる移動／採掘／設置は起動時に自動判定し、旋回など判定不能な操作だけ手動REHOMEを要求します。
 
-## 最短導入
+## 対応構成
 
-最初に [必要素材とクラフト](docs/01-materials.md) と [配置と建築](docs/02-build.md) を読み、タートルの**後ろに搬出チェスト**、**上に燃料チェスト**を置いてください。
+- Minecraft 1.18.2 系の CC: Restitched / CC:Tweaked 1.100.x API
+- Advanced Mining Turtle + Wireless Modem
+- Advanced Computer + Wireless Modem
+- 任意: Advanced Monitor
+- 任意: GPSホスト用 Computer + Wireless Modem ×4以上
+- ドック用チェスト: 搬出（後ろ）、燃料（上）、溶岩封鎖材（右、設定で左へ変更可）
 
-採掘タートルで実行します。
+## 配置
 
-```text
+![採掘ドック上面図](docs/images/base-layout-top.svg)
+
+![採掘ドック側面図](docs/images/dock-side.svg)
+
+図中の色付きブロックは、SVGのマス目と同じ整数グリッド座標へ揃えています。1マスが1ブロックです。
+
+## オンライン導入
+
+採掘タートル:
+
+```lua
 wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua worker
 ```
 
-拠点コンピュータで実行します。
+タッチコントローラー:
 
-```text
+```lua
 wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua controller
 ```
 
-両方に同じネットワークキーを設定し、両方を再起動します。コントローラで `D` を押してタートルを検出し、`N` で採掘範囲を入力します。
+GPSホスト（4台以上でそれぞれ実行）:
 
-HTTPを使えない環境は、リポジトリの `dist/ccminer-offline.lua` をディスク経由で各機械へコピーして導入できます。詳細は [プログラム導入](docs/03-install.md) にあります。
+```lua
+wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua gps
+```
 
-## 手順書
+HTTPを使えない環境では、[`dist/ccminer-offline.lua`](dist/ccminer-offline.lua) と隣接する [`dist/ccminer-offline.parts/`](dist/ccminer-offline.parts/) ディレクトリをセットで各コンピューターへ転送し、`worker`、`controller`、`gps` のいずれかを指定します。分割ファイルの名前や配置は変更しないでください。
 
-1. [概要と座標の考え方](docs/00-overview.md)
-2. [必要素材・中間素材・クラフト](docs/01-materials.md)
-3. [ブロック配置と採掘範囲の作り方](docs/02-build.md)
-4. [オンライン／オフライン導入](docs/03-install.md)
-5. [実際の操作](docs/04-operation.md)
-6. [安全設計と制約](docs/05-safety.md)
-7. [トラブル復旧](docs/06-troubleshooting.md)
-8. [検証内容](docs/07-testing.md)
-9. [調査根拠とバージョン](docs/08-sources.md)
+## 最初の運転
 
-## 必ず守ること
+1. すべてのワーカーとコントローラーへ同じネットワークキーを設定します。
+2. 搬出・燃料・封鎖材チェストを図どおりに置きます。
+3. GPSを使う場合は4台以上のホストを起動し、コントローラーの **GPS CAL** を押します。タートル正面1ブロックは空けてください。
+4. **NEW JOB** から幅・長さ・深さを入力します。
+5. **CHUNK MASK** で除外対象を切り替えます。入口チャンクは安全上ロックされています。
+6. **START** で開始します。
 
-- ジョブ中のタートルを手で壊す、持ち上げる、押す、回す行為は禁止です。
-- タートルと採掘経路のチャンクをロードした状態に保ってください。
-- 搬出チェストには常に空きを作り、燃料チェストにはタートル燃料だけを入れてください。
-- `blocked / recovery_required` になった場合、勝手に再開せず [復旧手順](docs/06-troubleshooting.md) に従ってください。
-- Rednetのネットワークキーは誤操作防止用であり、暗号化や強固な認証ではありません。
+![チャンク除外例](docs/images/chunk-mask.svg)
 
-## 主なゲーム内コマンド
+## 主要コマンド
 
 ```text
 ccm dashboard
@@ -67,40 +71,33 @@ ccm discover
 ccm status
 ccm logs
 ccm update
-
-ccm start <TurtleID> <幅W> <長さL> <深さD>
-ccm pause <TurtleID>
-ccm resume <TurtleID>
-ccm recall <TurtleID>
-ccm service <TurtleID>
-ccm abort <TurtleID>
-ccm clear <TurtleID>
-ccm rehome <TurtleID> RESET
+ccm start <id> <width> <length> <depth>
+ccm pause|resume|recall|service|abort|clear <id>
+ccm gps <id>
+ccm calibrate <id>
+ccm rehome <id> RESET
 ```
 
-## 構成
+タートルを物理的にドックへ戻した場合のローカル復旧は `ccm rehome RESET` です。GPS校正済みの場合、ドック座標と一致しなければリセットを拒否します。
 
-```text
-install.lua                    オンライン導入・更新
-manifest.lua                   バージョンと配布対象
-src/ccminer/worker.lua         採掘タートル本体
-src/ccminer/controller.lua     遠隔コントローラ
-src/ccminer/setup.lua          初期設定
-src/ccminer/boot.lua           自動起動と異常再起動
-src/ccminer/command.lua        ccm コマンド
-src/ccminer/lib/               状態保存・通信・採掘経路
- dist/ccminer-offline.lua      オフライン一括導入版
- docs/                         日本語手順書と配置図
- tests/                        採掘経路・共通処理テスト
- tools/                        配布生成・一括検証
-```
+## 文書
+
+- [全体設計](docs/00-overview.md)
+- [必要資材](docs/01-materials.md)
+- [建築と配置](docs/02-build.md)
+- [インストール](docs/03-install.md)
+- [操作方法](docs/04-operation.md)
+- [安全設計](docs/05-safety.md)
+- [トラブルシューティング](docs/06-troubleshooting.md)
+- [検証](docs/07-testing.md)
+- [参照資料](docs/08-sources.md)
 
 ## 検証
 
-開発者向けの一括検証は次で実行できます。
+リポジトリのルートで次を実行します。
 
-```text
-make test
+```bash
+python3 tools/check.py
 ```
 
-Lua構文、全小型寸法の採掘経路、配布対象、オフライン版、文書リンク、許可されたGitHubリポジトリ以外へのURL混入を検査します。実Minecraft内での最終的な動作は、サーバ設定、チャンクロード、Create: Astral側のレシピ変更に依存するため、配置条件を手順どおり満たす必要があります。
+Lua構文、通常蛇行経路、GPS座標変換、除外チャンクの連結性とDFS経路、状態ファイル復旧、インストーラーの収録漏れ、Markdownリンク、SVGグリッド整合、オフライン配布物を検査します。

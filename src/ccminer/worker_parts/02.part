@@ -1,0 +1,354 @@
+  local blocked = turtle.inspect()
+  if blocked then return false, "The block directly in front of the dock must be empty for calibration." end
+
+  state.status, state.phase, state.lastError = "calibrating", "gps_calibration", nil
+  saveState()
+  local homeFix, homeError = locateGPS()
+  if not homeFix then
+    state.status, state.phase = "blocked", "gps_error"
+    state.lastError = homeError
+    saveState()
+    return false, homeError
+  end
+
+  local prepared, prepareError = beginPhysicalAction("gps_calibration", { home = homeFix })
+  if not prepared then return false, prepareError end
+  local moved, moveError = turtle.forward()
+  if not moved then
+    cancelPhysicalAction()
+    state.status, state.phase, state.lastError = "blocked", "gps_error", moveError or "Calibration move failed."
+    saveState()
+    return false, state.lastError
+  end
+  sleep(0.15)
+  local forwardFix, forwardError = locateGPS()
+  local returned, returnError = turtle.back()
+  if not returned then
+    state.status, state.phase = "blocked", "recovery_required"
+    state.lastError = "GPS calibration moved forward but could not return: " .. tostring(returnError)
+    saveState()
+    return false, state.lastError
+  end
+  if not forwardFix then
+    cancelPhysicalAction()
+    state.status, state.phase, state.lastError = "blocked", "gps_error", forwardError
+    saveState()
+    return false, forwardError
+  end
+
+  local calibration, calibrationError = geo.calibrationFromFixes(homeFix, forwardFix)
+  if not calibration then
+    cancelPhysicalAction()
+    state.status, state.phase, state.lastError = "blocked", "gps_error", calibrationError
+    saveState()
+    return false, calibrationError
+  end
+  config.gps = config.gps or {}
+  config.gps.enabled = true
+  config.gps.calibration = calibration
+  local saved, saveError = common.saveConfig(config)
+  if not saved then
+    cancelPhysicalAction()
+    state.status, state.phase = "blocked", "gps_error"
+    state.lastError = "Could not save GPS calibration: " .. tostring(saveError)
+    saveState()
+    return false, state.lastError
+  end
+  state.gps.available = true
+  state.gps.lastFix = homeFix
+  state.gps.lastFixAt = common.nowSeconds()
+  state.gps.lastError = nil
+  state.status, state.phase, state.lastError = "idle", "home", nil
+  commitPhysicalAction()
+  common.log("INFO", ("GPS calibrated at %d,%d,%d forward=%d,%d"):format(
+    homeFix.x, homeFix.y, homeFix.z, calibration.forward.x, calibration.forward.z
+  ))
+  return true, "GPS calibrated."
+end
+
+local function applyControlCommand(command, payload)
+  payload = payload or {}
+  if state.pendingAction and command ~= "rehome" and command ~= "ping" and command ~= "status" then
+    return false, "Recovery required: return the turtle to its dock and use REHOME, or reboot with working GPS recovery."
+  end
+  if command == "start" then
+    return startJob(payload)
+  elseif command == "pause" then
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
+      state.status = "paused"
+      state.phase = state.service and "service_paused" or "paused"
+      state.request = nil
+      saveState()
+      return true, "Pause accepted. Current route state was preserved."
+    end
+    return false, "Worker is not running."
+  elseif command == "resume" then
+    if state.status == "paused" or state.status == "blocked" then
+      state.lastError = nil
+      if state.service then
+        state.status, state.phase = "working", "service_requested"
+      elseif isHome() and state.checkpoint and state.job then
+        state.service = { resumeAfter = true, finalStatus = "working", preserveCheckpoint = false, reason = "resume" }
+        state.status, state.phase = "working", "resume_service"
+      else
+        state.status, state.phase = "working", "mining"
+      end
+      state.request = nil
+      saveState()
+      return true, "Resume accepted."
+    elseif state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
+      state.status = "working"
+      saveState()
+      return true, "Service retry accepted."
+    end
+    return false, "Worker is not paused or blocked."
+  elseif command == "recall" then
+    if not state.job then return false, "No active job." end
+    state.request = "recall"
+    if state.status ~= "working" then state.status = "working" end
+    saveState()
+    return true, "Recall accepted. Worker will return and pause."
+  elseif command == "service" then
+    if not state.job then return false, "No active job." end
+    state.request = "service"
+    if state.status ~= "working" then state.status = "working" end
+    saveState()
+    return true, "Service return accepted."
+  elseif command == "abort" then
+    if not state.job then return false, "No job to abort." end
+    state.request = "abort"
+    if state.status ~= "working" then state.status = "working" end
+    saveState()
+    return true, "Abort accepted. Worker will return home."
+  elseif command == "clear" then
+    if state.pendingAction then return false, "Cannot clear while physical position is uncertain." end
+    if not isHome() then return false, "Worker must be at home." end
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
+      return false, "Worker is busy."
+    end
+    state.job, state.checkpoint, state.service, state.request = nil, nil, nil, nil
+    state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
+    saveState()
+    return true, "Job record cleared."
+  elseif command == "calibrate_gps" then
+    return calibrateGPS()
+  elseif command == "gps_fix" then
+    local fix, err = locateGPS()
+    saveState()
+    if not fix then return false, err end
+    local verified, verifyError = verifyGPS(true)
+    if not verified then return false, verifyError end
+    return true, ("GPS fix: %d,%d,%d"):format(fix.x, fix.y, fix.z)
+  elseif command == "rehome" then
+    if payload.confirm ~= "RESET" then return false, "Rehome requires confirm=RESET." end
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
+      return false, "Stop the worker before rehoming."
+    end
+    local calibration = gpsCalibration()
+    if calibration then
+      local fix = locateGPS()
+      local expected = geo.localToWorld(calibration, { x = 0, y = 0, z = 0 })
+      if fix and not geo.samePosition(fix, expected) then
+        return false, ("GPS says the turtle is at %d,%d,%d, not the calibrated dock %d,%d,%d."):format(
+          fix.x, fix.y, fix.z, expected.x, expected.y, expected.z
+        )
+      end
+    end
+    state.pose = { x = 0, y = 0, z = 0, dir = 0 }
+    state.job, state.checkpoint, state.service, state.request, state.pendingAction = nil, nil, nil, nil, nil
+    state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
+    saveState()
+    return true, "Local position reset to home."
+  elseif command == "ping" or command == "status" then
+    return true, "Status sent."
+  end
+  return false, "Unknown command: " .. tostring(command)
+end
+
+local function handleMessage(sender, message)
+  local valid = protocol.validate(message, config.networkKey, os.getComputerID())
+  if not valid then return end
+  if tonumber(config.controllerId or 0) > 0 and tonumber(sender) ~= tonumber(config.controllerId) then return end
+  if message.kind == "discover" then sendStatus(sender, message); return end
+  if message.kind ~= "command" then return end
+  if commandSeen(message.id) then
+    sendAck(sender, message, true, "Duplicate command ignored; previous result retained.")
+    return
+  end
+  local payload = message.payload or {}
+  local command = tostring(payload.command or "")
+  local ok, text = applyControlCommand(command, payload)
+  sendAck(sender, message, ok, text)
+  if command == "status" or command == "ping" or command == "gps_fix" then sendStatus(sender, message) end
+end
+
+pollNetwork = function(timeout)
+  if not networkReady then return false end
+  local sender, message = protocol.receive(timeout)
+  if not sender then return false end
+  handleMessage(sender, message)
+  return true
+end
+
+local function drainNetwork(limit)
+  for _ = 1, limit or 8 do if not pollNetwork(0) then break end end
+end
+
+local function heartbeat(force)
+  local now = common.nowSeconds()
+  if force or now - lastHeartbeat >= (config.heartbeatSeconds or 2) then
+    sendStatus()
+    lastHeartbeat = now
+  end
+end
+
+local function turnRight()
+  local after = poseCopy()
+  after.dir = (after.dir + 1) % 4
+  local prepared, prepareError = beginPhysicalAction("turn_right", nil, after)
+  if not prepared then return false, prepareError end
+  local ok, err = turtle.turnRight()
+  if not ok then cancelPhysicalAction(); return false, err or "Turn right failed." end
+  state.pose.dir = after.dir
+  state.stats.turns = (state.stats.turns or 0) + 1
+  commitPhysicalAction()
+  heartbeat(false)
+  drainNetwork(2)
+  return true
+end
+
+local function turnLeft()
+  local after = poseCopy()
+  after.dir = (after.dir + 3) % 4
+  local prepared, prepareError = beginPhysicalAction("turn_left", nil, after)
+  if not prepared then return false, prepareError end
+  local ok, err = turtle.turnLeft()
+  if not ok then cancelPhysicalAction(); return false, err or "Turn left failed." end
+  state.pose.dir = after.dir
+  state.stats.turns = (state.stats.turns or 0) + 1
+  commitPhysicalAction()
+  heartbeat(false)
+  drainNetwork(2)
+  return true
+end
+
+local function turnTo(targetDir)
+  targetDir = targetDir % 4
+  local diff = (targetDir - state.pose.dir) % 4
+  if diff == 1 then return turnRight() end
+  if diff == 2 then
+    local ok, err = turnRight()
+    if not ok then return false, err end
+    return turnRight()
+  end
+  if diff == 3 then return turnLeft() end
+  return true
+end
+
+local movement = {
+  forward = {
+    move = turtle.forward, inspect = turtle.inspect, dig = turtle.dig,
+    place = turtle.place, attack = turtle.attack, side = "front",
+  },
+  up = {
+    move = turtle.up, inspect = turtle.inspectUp, dig = turtle.digUp,
+    place = turtle.placeUp, attack = turtle.attackUp, side = "top",
+  },
+  down = {
+    move = turtle.down, inspect = turtle.inspectDown, dig = turtle.digDown,
+    place = turtle.placeDown, attack = turtle.attackDown, side = "bottom",
+  },
+}
+
+local function blockName(data)
+  return type(data) == "table" and tostring(data.name or "unknown") or "unknown"
+end
+
+local function isProtected(data)
+  local name = blockName(data)
+  return config.protectedBlocks and config.protectedBlocks[name] == true, name
+end
+
+local function isLava(data)
+  return string.lower(blockName(data)):find("lava", 1, true) ~= nil
+end
+
+local function isInventoryBlock(side, data)
+  if peripheral and peripheral.hasType then
+    local ok, result = pcall(peripheral.hasType, side, "inventory")
+    if ok and result == true then return true end
+  end
+  local wrapped = peripheral and peripheral.wrap(side) or nil
+  if wrapped and (type(wrapped.list) == "function" or type(wrapped.size) == "function") then return true end
+  local name = string.lower(blockName(data))
+  for _, marker in ipairs({ "chest", "barrel", "shulker_box", "drawer", "crate", "vault" }) do
+    if name:find(marker, 1, true) then return true end
+  end
+  return false
+end
+
+local function movementInterrupted(context)
+  if context ~= "mining" and context ~= "service" then return false end
+  if state.status ~= "working" then return true end
+  return state.request ~= nil
+end
+
+local function updatePoseAfterMove(direction)
+  state.pose = geo.poseAfterMove(state.pose, direction)
+  state.stats.moves = (state.stats.moves or 0) + 1
+end
+
+local function sealLava(action, direction, data)
+  if (config.lavaMode or "seal") ~= "seal" then
+    return false, "lava:" .. blockName(data)
+  end
+  local originalSlot = turtle.getSelectedSlot()
+  local slot = selectSealMaterial()
+  if not slot then
+    turtle.select(originalSlot)
+    return false, "seal_material"
+  end
+  local material = itemName(slot)
+  local prepared, prepareError = beginPhysicalAction("seal_" .. direction, {
+    fluid = blockName(data), material = material,
+  }, poseCopy())
+  if not prepared then turtle.select(originalSlot); return false, prepareError end
+  local placed, placeReason = action.place()
+  turtle.select(originalSlot)
+  if not placed then
+    cancelPhysicalAction()
+    return false, "lava_seal_failed:" .. tostring(placeReason or blockName(data))
+  end
+  state.stats.lavaSealed = (state.stats.lavaSealed or 0) + 1
+  commitPhysicalAction()
+  sleep(0.15)
+  return true
+end
+
+local function moveOne(direction, context)
+  local action = movement[direction]
+  if not action then return false, "Unknown movement: " .. tostring(direction) end
+  local retries = tonumber(config.moveRetries) or 20
+  local retryDelay = tonumber(config.moveRetryDelay) or 0.4
+  local lastReason = "Movement failed."
+
+  for _ = 1, retries do
+    drainNetwork(3)
+    if movementInterrupted(context) then return false, "control_request" end
+
+    local level = fuelLevel()
+    if level ~= "unlimited" and tonumber(level or 0) <= 0 then return false, "out_of_fuel" end
+
+    local hasBlock, data = action.inspect()
+    if hasBlock then
+      local protected, name = isProtected(data)
+      if protected then return false, "protected:" .. name, data end
+      if isInventoryBlock(action.side, data) then return false, "protected_inventory:" .. name, data end
+      if isLava(data) then
+        local sealed, sealError = sealLava(action, direction, data)
+        if not sealed then return false, sealError, data end
+      else
+        local _, emptySlots = inventoryStats()
+        if emptySlots <= 0 then return false, "inventory_full" end
+        local prepared, prepareError = beginPhysicalAction("dig_" .. direction, { block = name }, poseCopy())
+        if not prepared then return false, prepareError end

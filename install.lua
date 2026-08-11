@@ -2,22 +2,31 @@
 -- Usage:
 --   wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua worker
 --   wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua controller
+--   wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua gps
 --   ccm update
 
 local args = { ... }
 local action = string.lower(tostring(args[1] or ""))
-local VERSION = "2.0.0"
+local VERSION = "2.1.0"
 local BASE_URL = "https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/"
-local ROOT = "/ccminer"
-local TEMP = "/ccminer.update"
-local BACKUP = "/ccminer.backup"
+local ROOT, TEMP, BACKUP = "/ccminer", "/ccminer.update", "/ccminer.backup"
 
 local files = {
   { source = "src/ccminer/lib/common.lua", target = "lib/common.lua" },
   { source = "src/ccminer/lib/protocol.lua", target = "lib/protocol.lua" },
+  { source = "src/ccminer/lib/geo.lua", target = "lib/geo.lua" },
   { source = "src/ccminer/lib/quarry.lua", target = "lib/quarry.lua" },
   { source = "src/ccminer/worker.lua", target = "worker.lua" },
+  { source = "src/ccminer/worker_parts/01.part", target = "worker_parts/01.part" },
+  { source = "src/ccminer/worker_parts/02.part", target = "worker_parts/02.part" },
+  { source = "src/ccminer/worker_parts/03.part", target = "worker_parts/03.part" },
+  { source = "src/ccminer/worker_parts/04.part", target = "worker_parts/04.part" },
+  { source = "src/ccminer/worker_parts/05.part", target = "worker_parts/05.part" },
   { source = "src/ccminer/controller.lua", target = "controller.lua" },
+  { source = "src/ccminer/controller_parts/01.part", target = "controller_parts/01.part" },
+  { source = "src/ccminer/controller_parts/02.part", target = "controller_parts/02.part" },
+  { source = "src/ccminer/controller_parts/03.part", target = "controller_parts/03.part" },
+  { source = "src/ccminer/gps_host.lua", target = "gps_host.lua" },
   { source = "src/ccminer/setup.lua", target = "setup.lua" },
   { source = "src/ccminer/boot.lua", target = "boot.lua" },
   { source = "src/ccminer/command.lua", target = "command.lua" },
@@ -34,18 +43,14 @@ local function readFile(path)
   if not fs.exists(path) or fs.isDir(path) then return nil end
   local handle = fs.open(path, "r")
   if not handle then return nil end
-  local text = handle.readAll()
-  handle.close()
-  return text
+  local text = handle.readAll(); handle.close(); return text
 end
 
 local function writeFile(path, text)
   ensureDir(fs.getDir(path))
   local handle = fs.open(path, "w")
   if not handle then return false, "Cannot write " .. path end
-  handle.write(text)
-  handle.close()
-  return true
+  handle.write(text); handle.close(); return true
 end
 
 local function download(url)
@@ -53,8 +58,7 @@ local function download(url)
   local ok, response = pcall(http.get, url, nil, true)
   if not ok or not response then return nil, "Request failed: " .. tostring(response) end
   local code = response.getResponseCode and response.getResponseCode() or 200
-  local body = response.readAll()
-  response.close()
+  local body = response.readAll(); response.close()
   if code < 200 or code >= 300 then return nil, "HTTP " .. tostring(code) .. " for " .. url end
   if not body or body == "" then return nil, "Empty download: " .. url end
   return body
@@ -68,59 +72,33 @@ end
 
 local function usage()
   print("CC Miner V2 installer " .. VERSION)
-  print("")
-  print("Install on a mining turtle:")
-  print("  install.lua worker")
-  print("")
-  print("Install on a controller computer:")
-  print("  install.lua controller")
-  print("")
-  print("Update an existing installation:")
-  print("  install.lua update")
+  print("  install.lua worker      Mining turtle")
+  print("  install.lua controller  Touch controller")
+  print("  install.lua gps         GPS host computer")
+  print("  install.lua update      Existing installation")
 end
 
-if action == "" then
-  if turtle then action = "worker" else action = "controller" end
-end
-
-if action ~= "worker" and action ~= "controller" and action ~= "update" then
-  usage()
-  return
-end
-
+if action == "" then action = turtle and "worker" or "controller" end
+if action ~= "worker" and action ~= "controller" and action ~= "gps" and action ~= "update" then usage(); return end
 if action == "worker" and not turtle then error("Worker installation requires a turtle.", 0) end
-if action == "controller" and turtle then print("Warning: controller role is normally installed on a computer, not a turtle.") end
-if action == "update" and not fs.exists(ROOT .. "/config.db") then
-  error("No existing installation found. Use worker or controller instead.", 0)
-end
+if action == "update" and not fs.exists(ROOT .. "/config.db") then error("No existing installation found.", 0) end
 
-term.clear()
-term.setCursorPos(1, 1)
+term.clear(); term.setCursorPos(1, 1)
 print("CC MINER V2 " .. string.upper(action))
 print("Source: nononoyuyuyu/CC_Miner")
 print("")
-
 if fs.exists(TEMP) then fs.delete(TEMP) end
 ensureDir(TEMP)
 
 for index, file in ipairs(files) do
   write(("[%d/%d] %s ... "):format(index, #files, file.target))
-  local body, err = download(BASE_URL .. file.source)
-  if not body then
-    printError("FAILED")
-    fs.delete(TEMP)
-    error(err, 0)
-  end
+  local body, downloadError = download(BASE_URL .. file.source)
+  if not body then fs.delete(TEMP); printError("FAILED"); error(downloadError, 0) end
   local ok, writeError = writeFile(TEMP .. "/" .. file.target, body)
-  if not ok then
-    printError("FAILED")
-    fs.delete(TEMP)
-    error(writeError, 0)
-  end
+  if not ok then fs.delete(TEMP); printError("FAILED"); error(writeError, 0) end
   print("OK")
 end
 
--- Preserve configuration, state, and logs during an update/reinstall.
 local preserved = {
   { ROOT .. "/config.db", TEMP .. "/config.db" },
   { ROOT .. "/config.db.bak", TEMP .. "/config.db.bak" },
@@ -130,24 +108,46 @@ local preserved = {
   { ROOT .. "/data/ccminer.log.1", TEMP .. "/data/ccminer.log.1" },
 }
 for _, pair in ipairs(preserved) do
-  local ok, err = copyIfPresent(pair[1], pair[2])
-  if not ok then
+  local ok, preserveError = copyIfPresent(pair[1], pair[2])
+  if not ok then fs.delete(TEMP); error("Cannot preserve existing data: " .. tostring(preserveError), 0) end
+end
+
+local function compileFile(target)
+  local compiled, compileError = loadfile(TEMP .. "/" .. target)
+  if not compiled then
     fs.delete(TEMP)
-    error("Cannot preserve existing data: " .. tostring(err), 0)
+    error("Downloaded file failed syntax validation: " .. target .. ": " .. tostring(compileError), 0)
   end
 end
 
--- Compile every downloaded Lua file before replacing the current release.
--- This catches truncated downloads and syntax errors while the working copy
--- and its state are still untouched.
-for _, file in ipairs(files) do
-  local target = TEMP .. "/" .. file.target
-  local compiled, compileError = loadfile(target)
+local function compileParts(label, targets)
+  local source = {}
+  for index, target in ipairs(targets) do
+    local text = readFile(TEMP .. "/" .. target)
+    if not text then fs.delete(TEMP); error("Downloaded runtime part is missing: " .. target, 0) end
+    source[index] = text
+  end
+  local loader = loadstring or load
+  local compiled, compileError = loader(table.concat(source), "@" .. label .. ".assembled.lua")
   if not compiled then
     fs.delete(TEMP)
-    error("Downloaded file failed syntax validation: " .. file.target .. ": " .. tostring(compileError), 0)
+    error("Assembled source failed syntax validation: " .. label .. ": " .. tostring(compileError), 0)
   end
 end
+
+for _, target in ipairs({
+  "lib/common.lua", "lib/protocol.lua", "lib/geo.lua", "lib/quarry.lua",
+  "worker.lua", "controller.lua", "gps_host.lua", "setup.lua", "boot.lua", "command.lua",
+}) do
+  compileFile(target)
+end
+compileParts("worker", {
+  "worker_parts/01.part", "worker_parts/02.part", "worker_parts/03.part",
+  "worker_parts/04.part", "worker_parts/05.part",
+})
+compileParts("controller", {
+  "controller_parts/01.part", "controller_parts/02.part", "controller_parts/03.part",
+})
 
 if fs.exists(BACKUP) then fs.delete(BACKUP) end
 if fs.exists(ROOT) then fs.move(ROOT, BACKUP) end
@@ -161,14 +161,10 @@ end
 print("")
 if action == "update" then
   print("Update installed successfully: " .. VERSION)
-  print("The previous files remain in /ccminer.backup.")
+  print("Previous files: /ccminer.backup")
   print("Reboot with: reboot")
 else
   local setupOk = shell.run(ROOT .. "/setup.lua", action)
-  if not setupOk then
-    printError("Setup did not complete. Run: " .. ROOT .. "/setup.lua " .. action)
-  else
-    print("")
-    print("Installation complete.")
-  end
+  if not setupOk then printError("Setup did not complete. Run: " .. ROOT .. "/setup.lua " .. action)
+  else print(""); print("Installation complete.") end
 end

@@ -1,0 +1,369 @@
+      return false, "Seal-block loading safety limit reached."
+    end
+    local slot = refillSlotForSeal()
+    if not slot then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "No inventory space for lava-seal blocks."
+    end
+    turtle.select(slot)
+    local need = math.min(target - sealMaterialCount(), turtle.getItemSpace(slot))
+    if need <= 0 then need = 1 end
+    local sucked = suckFunction(need)
+    if not sucked then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Lava-seal block inventory is empty."
+    end
+    if not isSealItemName(itemName(slot)) then
+      dropFunction()
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Seal inventory contains an unsupported item. Use configured solid blocks only."
+    end
+    state.stats.sealRefills = (state.stats.sealRefills or 0) + 1
+  end
+  local restored, restoreError = restoreSideDirection(side, restoreDir)
+  turtle.select(originalSlot)
+  if not restored then return false, restoreError end
+  saveState()
+  return true
+end
+
+local function beginService(resumeAfter, finalStatus, reason, preserveCheckpoint)
+  if not state.service then
+    if not isHome() and not state.checkpoint then state.checkpoint = poseCopy() end
+    state.service = {
+      resumeAfter = resumeAfter == true,
+      finalStatus = finalStatus or (resumeAfter and "working" or "paused"),
+      preserveCheckpoint = preserveCheckpoint == true,
+      reason = reason or "service",
+      startedAt = common.nowSeconds(),
+    }
+  else
+    if resumeAfter == false then state.service.resumeAfter = false end
+    if finalStatus then state.service.finalStatus = finalStatus end
+    if preserveCheckpoint ~= nil then state.service.preserveCheckpoint = preserveCheckpoint == true end
+    if reason then state.service.reason = reason end
+  end
+  state.status, state.phase, state.request = "working", "service_requested", nil
+  saveState()
+end
+
+local function finishService()
+  local service = state.service or {}
+  local finalStatus = service.finalStatus or (service.resumeAfter and "working" or "paused")
+  local preserveCheckpoint = service.preserveCheckpoint == true
+  state.service, state.request, state.lastError = nil, nil, nil
+  if finalStatus == "complete" then
+    state.stats.jobsCompleted = (state.stats.jobsCompleted or 0) + 1
+    state.checkpoint = nil
+    state.status, state.phase = "complete", "home"
+  elseif finalStatus == "aborted" then
+    state.checkpoint = nil
+    state.status, state.phase = "aborted", "home"
+  elseif finalStatus == "paused" then
+    if not preserveCheckpoint then state.checkpoint = nil end
+    state.status, state.phase = "paused", "home_paused"
+  else
+    state.checkpoint = nil
+    state.status, state.phase = "working", "mining"
+  end
+  saveState()
+  heartbeat(true)
+end
+
+local function continueService()
+  if not state.service then return true end
+  state.status = "working"
+  if not isHome() then
+    state.phase = "returning"
+    saveState()
+    local ok, err
+    if state.job and state.job.strategy == "chunk_plan" then
+      ok, err = navigateChunkPlanHome("service")
+    else
+      ok, err = navigateTo({ x = 0, y = 0, z = 0 }, "home", "service")
+    end
+    if not ok then
+      if err == "control_request" then return false end
+      markBlocked("Return to home failed: " .. tostring(err))
+      return false
+    end
+  end
+
+  local ok, err = turnTo(0)
+  if not ok then markBlocked("Cannot face quarry at home: " .. tostring(err)); return false end
+  if movementInterrupted("service") then return false end
+
+  ok, err = unloadAtHome()
+  if not ok then
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_output", "waiting_output", err
+    saveState(); heartbeat(true); return false
+  end
+  if movementInterrupted("service") then return false end
+
+  ok, err = refuelAtHome()
+  if not ok then
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_fuel", "waiting_fuel", err
+    saveState(); heartbeat(true); return false
+  end
+  if movementInterrupted("service") then return false end
+
+  ok, err = refillSealAtHome()
+  if not ok then
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_seal", "waiting_seal", err
+    saveState(); heartbeat(true); return false
+  end
+  if movementInterrupted("service") then return false end
+
+  if state.service.resumeAfter and state.checkpoint then
+    local checkpoint = poseCopy(state.checkpoint)
+    state.phase, state.status, state.lastError = "going_back", "working", nil
+    saveState()
+    if state.job and state.job.strategy == "chunk_plan" then
+      ok, err = navigateChunkPlanWork(checkpoint, "service")
+    else
+      ok, err = navigateTo(checkpoint, "work", "service")
+    end
+    if not ok then
+      if err == "control_request" then return false end
+      markBlocked("Return to work point failed: " .. tostring(err))
+      return false
+    end
+    ok, err = turnTo(checkpoint.dir)
+    if not ok then markBlocked("Cannot restore work direction: " .. tostring(err)); return false end
+    if movementInterrupted("service") then return false end
+    state.checkpoint = nil
+  end
+  finishService()
+  return true
+end
+
+local function requiredDirectionTo(target)
+  local dx, dy, dz = target.x - state.pose.x, target.y - state.pose.y, target.z - state.pose.z
+  local manhattan = math.abs(dx) + math.abs(dy) + math.abs(dz)
+  if manhattan ~= 1 then return nil, "path_desync:" .. tostring(manhattan) end
+  if dy == 1 then return "up", nil, dy end
+  if dy == -1 then return "down", nil, dy end
+  if dx == 1 then return "forward", 1, 0 end
+  if dx == -1 then return "forward", 3, 0 end
+  if dz == 1 then return "forward", 0, 0 end
+  if dz == -1 then return "forward", 2, 0 end
+  return nil, "invalid_delta"
+end
+
+local function shouldService()
+  local _, empty = inventoryStats()
+  if empty <= (tonumber(config.reserveEmptySlots) or 3) then return true, "inventory" end
+  local level = fuelLevel()
+  if level ~= "unlimited" then
+    local needed = distance(state.pose, { x = 0, y = 0, z = 0 }) + (tonumber(config.fuelBuffer) or 256)
+    if tonumber(level or 0) <= needed then return true, "fuel" end
+  end
+  if (config.lavaMode or "seal") == "seal" and sealMaterialCount() <= (tonumber(config.sealReserve) or 8) then
+    return true, "seal"
+  end
+  return false
+end
+
+local function handlePendingRequest()
+  if state.request == "recall" then beginService(false, "paused", "recall", true); return true end
+  if state.request == "service" then beginService(false, "paused", "manual_service", true); return true end
+  if state.request == "abort" then beginService(false, "aborted", "abort", false); return true end
+  return false
+end
+
+local function beginAutomaticService(reason)
+  beginService(true, "working", "automatic_" .. tostring(reason), false)
+  continueService()
+end
+
+local function handleMoveFailure(prefix, err, allowBedrock)
+  if err == "control_request" then return true end
+  if err == "seal_material" then beginAutomaticService("seal"); return true end
+  if err == "inventory_full" then beginAutomaticService("inventory"); return true end
+  if err == "out_of_fuel" then
+    markBlocked(prefix .. ": fuel was exhausted before the safety return threshold.")
+    return true
+  end
+  if allowBedrock and common.startsWith(err or "", "protected:minecraft:bedrock") then
+    state.completionReason = "bedrock_reached"
+    beginService(false, "complete", "bedrock", false)
+    continueService()
+    return true
+  end
+  return false
+end
+
+local function completeJob(reason)
+  state.completionReason = reason or "completed"
+  beginService(false, "complete", "job_complete", false)
+  continueService()
+end
+
+local function runSerpentineStep(job)
+  job.cursor = tonumber(job.cursor) or 0
+  job.total = tonumber(job.total) or (job.width * job.length * job.depth)
+  if job.cursor >= job.total then completeJob(state.completionReason or "completed"); return end
+
+  local target = quarry.cellForJob(job, job.cursor)
+  if samePosePosition(state.pose, target) then
+    -- GPS recovery may prove that an interrupted move completed before the
+    -- cursor update was persisted. Treat the occupied cell as completed.
+    job.cursor = job.cursor + 1
+    saveState()
+    return
+  end
+
+  local direction, targetDir, verticalDelta = requiredDirectionTo(target)
+  if not direction then
+    markBlocked("Quarry path/state mismatch at cell " .. tostring(job.cursor) .. ": " .. tostring(targetDir))
+    return
+  end
+  if targetDir ~= nil then
+    local ok, err = turnTo(targetDir)
+    if not ok then markBlocked("Turn failed: " .. tostring(err)); return end
+  end
+  local ok, err = moveOne(direction, "mining")
+  if not ok then
+    if handleMoveFailure("Mining stopped at cell " .. tostring(job.cursor), err, verticalDelta == -1) then return end
+    markBlocked("Mining stopped at cell " .. tostring(job.cursor) .. ": " .. tostring(err))
+    return
+  end
+  job.cursor = job.cursor + 1
+  saveState()
+  heartbeat(false)
+end
+
+local function runChunkPlanStep(job)
+  local plan, route = job.chunkPlan, job.route
+  if not plan or not route then markBlocked("Chunk plan state is missing."); return end
+  route.layer = tonumber(route.layer) or 0
+  route.walkIndex = tonumber(route.walkIndex) or 1
+  route.localCursor = tonumber(route.localCursor) or 0
+  route.phase = route.phase or "travel"
+
+  if route.walkIndex > #plan.walk then
+    if route.layer + 1 >= job.depth then completeJob("completed"); return end
+    local ok, err = moveOne("down", "mining")
+    if not ok then
+      if handleMoveFailure("Cannot descend to the next layer", err, true) then return end
+      markBlocked("Cannot descend to the next layer: " .. tostring(err))
+      return
+    end
+    route.layer = route.layer + 1
+    route.walkIndex, route.localCursor, route.phase = 1, 0, "travel"
+    route.currentKey = plan.rootKey
+    saveState()
+    return
+  end
+
+  local walkStep = plan.walk[route.walkIndex]
+  local chunk = plan.chunks[walkStep.key]
+  if not chunk then markBlocked("Chunk plan references an unknown chunk: " .. tostring(walkStep.key)); return end
+  local y = -route.layer
+  local anchor = { x = chunk.anchor.x, y = y, z = chunk.anchor.z }
+
+  if route.phase == "travel" then
+    local ok, err
+    if samePosePosition(state.pose, anchor) then
+      ok = true
+    elseif route.currentKey and route.currentKey ~= walkStep.key then
+      ok, err = moveBetweenChunkAnchors(plan, route.currentKey, walkStep.key, y, "mining")
+    else
+      ok, err = navigateTo(anchor, "inside", "mining")
+    end
+    if not ok then
+      if handleMoveFailure("Chunk transit failed", err, false) then return end
+      markBlocked("Chunk transit failed: " .. tostring(err)); return
+    end
+    route.currentKey = walkStep.key
+    if walkStep.first then
+      route.phase, route.localCursor = "mine", 0
+    else
+      route.walkIndex = route.walkIndex + 1
+    end
+    saveState()
+    return
+  end
+
+  if route.phase == "mine" then
+    local count = quarry.chunkCellCount(chunk)
+    if route.localCursor >= count then
+      route.phase = "return"
+      saveState()
+      return
+    end
+    local target = quarry.chunkCell(chunk, route.localCursor, y)
+    if samePosePosition(state.pose, target) then
+      route.localCursor = route.localCursor + 1
+      job.cursor = (job.cursor or 0) + 1
+      saveState()
+      return
+    end
+    local direction, targetDir = requiredDirectionTo(target)
+    if not direction then
+      markBlocked(("Chunk cell path mismatch in %s at local cell %d."):format(chunk.key, route.localCursor))
+      return
+    end
+    if targetDir ~= nil then
+      local turned, turnError = turnTo(targetDir)
+      if not turned then markBlocked("Chunk turn failed: " .. tostring(turnError)); return end
+    end
+    local moved, moveError = moveOne(direction, "mining")
+    if not moved then
+      if handleMoveFailure("Chunk mining failed", moveError, false) then return end
+      markBlocked("Chunk mining failed: " .. tostring(moveError)); return
+    end
+    route.localCursor = route.localCursor + 1
+    job.cursor = (job.cursor or 0) + 1
+    saveState()
+    return
+  end
+
+  if route.phase == "return" then
+    local ok, err = navigateTo(anchor, "inside", "mining")
+    if not ok then
+      if handleMoveFailure("Cannot return to chunk anchor", err, false) then return end
+      markBlocked("Cannot return to chunk anchor: " .. tostring(err)); return
+    end
+    route.phase, route.localCursor = "travel", 0
+    route.walkIndex = route.walkIndex + 1
+    route.currentKey = walkStep.key
+    saveState()
+    return
+  end
+
+  markBlocked("Unknown chunk route phase: " .. tostring(route.phase))
+end
+
+local function runMiningStep()
+  if handlePendingRequest() then return end
+  if state.service then continueService(); return end
+  if not state.job then
+    state.status = "idle"
+    state.phase = isHome() and "home" or "unknown_position"
+    saveState()
+    return
+  end
+
+  local serviceNeeded, reason = shouldService()
+  if serviceNeeded then beginAutomaticService(reason); return end
+  state.phase, state.status, state.lastError = "mining", "working", nil
+  if state.job.strategy == "chunk_plan" then runChunkPlanStep(state.job) else runSerpentineStep(state.job) end
+end
+
+local function displayLocalStatus()
+  common.clear(colors and colors.black or nil, colors and colors.white or nil)
+  print("CC Miner V2 Worker " .. common.VERSION)
+  print("ID: " .. os.getComputerID() .. "  " .. tostring(config.workerName))
+  print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
+  print(("Pose: x=%d y=%d z=%d d=%d"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir))
+  if state.gps and state.gps.lastFix then
+    print(("GPS: %d,%d,%d%s"):format(
+      state.gps.lastFix.x, state.gps.lastFix.y, state.gps.lastFix.z,
+      gpsCalibration() and " calibrated" or " uncalibrated"

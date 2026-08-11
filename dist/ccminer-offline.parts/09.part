@@ -1,0 +1,295 @@
+  if state.status ~= "working" then displayLocalStatus() end
+end
+]] },
+  { target = [[controller.lua]], content = [[-- CC Miner V2 - generated controller source loader.
+local parts = {
+  "/ccminer/controller_parts/01.part",
+  "/ccminer/controller_parts/02.part",
+  "/ccminer/controller_parts/03.part",
+}
+local source = {}
+for index, path in ipairs(parts) do
+  local handle = fs.open(path, "r")
+  if not handle then error("Missing runtime part: " .. path, 0) end
+  source[index] = handle.readAll()
+  handle.close()
+end
+local loader = loadstring or load
+local program, compileError = loader(table.concat(source), "@/ccminer/controller.assembled.lua")
+if not program then error("Cannot assemble controller: " .. tostring(compileError), 0) end
+return program(...)
+]] },
+  { target = [[controller_parts/01.part]], content = [[-- CC Miner V2 - touch-capable fleet controller dashboard.
+
+local args = { ... }
+local common = dofile("/ccminer/lib/common.lua")
+local protocol = dofile("/ccminer/lib/protocol.lua")
+local quarry = dofile("/ccminer/lib/quarry.lua")
+
+local config, configError = common.loadConfig()
+if not config or config.role ~= "controller" then
+  error(configError or "Controller configuration not found. Run: ccm setup controller", 0)
+end
+
+if not os.getComputerLabel or not os.getComputerLabel() then
+  if os.setComputerLabel then os.setComputerLabel(config.controllerName) end
+end
+
+local networkReady, modemNames = protocol.open()
+if not networkReady then error("No wireless modem found next to the controller.", 0) end
+
+local workers = {}
+local selected = 1
+local notice = "Controller ready. Touch DISCOVER or press D."
+local noticeIsError = false
+local lastDiscovery = 0
+local running = true
+local mode = "dashboard"
+local draft = nil
+local confirmState = nil
+local hitboxes = {}
+local monitors = common.findPeripherals("monitor")
+
+for _, entry in ipairs(monitors) do
+  if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end
+end
+
+local function setNotice(text, isError)
+  notice, noticeIsError = tostring(text or ""), isError == true
+end
+
+local function orderedIds()
+  local ids = {}
+  for id in pairs(workers) do ids[#ids + 1] = tonumber(id) or id end
+  table.sort(ids, function(a, b)
+    if type(a) == type(b) then return a < b end
+    return tostring(a) < tostring(b)
+  end)
+  if #ids == 0 then selected = 1 else selected = common.clamp(selected, 1, #ids) end
+  return ids
+end
+
+local function selectedWorker()
+  local ids = orderedIds()
+  local id = ids[selected]
+  return id, id and workers[id] or nil
+end
+
+local function statusOf(worker)
+  if not worker then return "offline" end
+  if common.nowSeconds() - (worker.lastSeen or 0) > (config.workerTimeoutSeconds or 10) then return "offline" end
+  return worker.data.status or "unknown"
+end
+
+local function workerLabel(worker, id)
+  if worker and worker.data and worker.data.label then return worker.data.label end
+  return "Miner-" .. tostring(id)
+end
+
+local function handleMessage(sender, message)
+  local valid = protocol.validate(message, config.networkKey, os.getComputerID())
+  if not valid then return false end
+  if message.kind == "status" then
+    local payload = message.payload or {}
+    local id = tonumber(payload.id) or tonumber(sender)
+    workers[id] = workers[id] or {}
+    workers[id].data = payload
+    workers[id].lastSeen = common.nowSeconds()
+    workers[id].sender = sender
+    return true
+  elseif message.kind == "ack" then
+    local payload = message.payload or {}
+    setNotice((payload.ok and "OK: " or "ERROR: ") .. tostring(payload.message or ""), not payload.ok)
+    if payload.status and payload.status.id then
+      local id = tonumber(payload.status.id) or tonumber(sender)
+      workers[id] = workers[id] or {}
+      workers[id].data = payload.status
+      workers[id].lastSeen = common.nowSeconds()
+      workers[id].sender = sender
+    end
+    return true
+  end
+  return false
+end
+
+local function discover()
+  protocol.broadcast(protocol.message("discover", config.networkKey, { controllerName = config.controllerName }))
+  lastDiscovery = common.nowSeconds()
+  setNotice("Discovery broadcast sent.", false)
+end
+
+local function sendCommand(id, command, payload)
+  if not id then setNotice("No worker selected.", true); return false end
+  payload = payload or {}
+  payload.command = command
+  local ok, err = protocol.send(id, protocol.message("command", config.networkKey, payload, id))
+  if ok then setNotice(("Command '%s' sent to #%s."):format(command, tostring(id)), false)
+  else setNotice("Send failed: " .. tostring(err), true) end
+  return ok
+end
+
+local function progressText(data)
+  if not data or not data.job then return "-" end
+  return ("%3d%% %s/%s"):format(
+    tonumber(data.job.percent) or 0,
+    common.humanNumber(data.job.cursor or 0),
+    common.humanNumber(data.job.total or 0)
+  )
+end
+
+local function resetHitboxes(key)
+  hitboxes[key] = {}
+end
+
+local function addHitbox(key, x1, y1, x2, y2, action)
+  hitboxes[key] = hitboxes[key] or {}
+  hitboxes[key][#hitboxes[key] + 1] = {
+    x1 = math.floor(x1), y1 = math.floor(y1), x2 = math.floor(x2), y2 = math.floor(y2), action = action,
+  }
+end
+
+local function drawButton(key, x, y, width, label, action, enabled, selectedButton)
+  width = math.max(3, math.floor(width))
+  local background = colors and (selectedButton and colors.lightBlue or enabled == false and colors.gray or colors.blue) or nil
+  local foreground = colors and (enabled == false and colors.lightGray or colors.white) or nil
+  common.writeAt(x, y, common.center(label, width), foreground, background)
+  if enabled ~= false and action then addHitbox(key, x, y, x + width - 1, y, action) end
+end
+
+local function buttonRow(key, y, width, definitions)
+  local count = #definitions
+  local base = math.floor(width / count)
+  local x = 1
+  for index, definition in ipairs(definitions) do
+    local buttonWidth = index == count and (width - x + 1) or base
+    drawButton(key, x, y, buttonWidth, definition[1], definition[2], definition[3] ~= false, definition[4])
+    x = x + buttonWidth
+  end
+end
+
+local function dashboardAction(name)
+  return function()
+    local id = selectedWorker()
+    if name == "discover" then discover()
+    elseif name == "new" then
+      local workerId, worker = selectedWorker()
+      if not workerId or not worker then setNotice("Select a worker first.", true); return end
+      if statusOf(worker) == "offline" then setNotice("Selected worker is offline.", true); return end
+      draft = {
+        workerId = workerId,
+        width = 8,
+        length = 32,
+        depth = 16,
+        selectedField = "width",
+        buffer = "8",
+        excluded = {},
+        chunkPage = 1,
+      }
+      mode = "job_dimensions"
+    elseif name == "info" then
+      if id then mode = "info" else setNotice("No worker selected.", true) end
+    elseif name == "pause" or name == "resume" or name == "recall" or name == "service" then
+      sendCommand(id, name)
+    elseif name == "abort" then
+      if id then confirmState = { command = "abort", message = "Abort the active job and return home?" }; mode = "confirm" end
+    elseif name == "clear" then
+      if id then confirmState = { command = "clear", message = "Clear the completed or aborted job record?" }; mode = "confirm" end
+    elseif name == "rehome" then
+      if id then confirmState = { command = "rehome", payload = { confirm = "RESET" }, message = "REHOME erases the active job. Is the turtle physically in its dock facing forward?" }; mode = "confirm" end
+    elseif name == "gps" then
+      if id then confirmState = { command = "calibrate_gps", message = "GPS calibration moves forward one block and back. Is the dock front clear?" }; mode = "confirm" end
+    elseif name == "quit" then running = false end
+  end
+end
+
+local function renderDashboard(target, key)
+  local width, height = target.getSize()
+  common.writeAt(1, 1, common.center("CC MINER V2 TOUCH CONTROL", width), colors and colors.black or nil, colors and colors.cyan or nil)
+  local ids = orderedIds()
+  local online = 0
+  for _, id in ipairs(ids) do if statusOf(workers[id]) ~= "offline" then online = online + 1 end end
+  common.writeAt(1, 2, common.fit(("Controller #%d | Workers %d/%d | v%s"):format(os.getComputerID(), online, #ids, common.VERSION), width), colors and colors.lightGray or nil)
+  local headerY = 4
+  if width >= 48 then
+    common.writeAt(1, headerY, common.fit("  ID    NAME           STATUS       PROGRESS          FUEL  SEAL", width), colors and colors.yellow or nil)
+  else
+    common.writeAt(1, headerY, common.fit("  ID   NAME       STATUS   PROGRESS", width), colors and colors.yellow or nil)
+  end
+
+  local maxRows = math.max(1, height - 9)
+  if #ids == 0 then
+    common.writeAt(2, headerY + 2, common.fit("No workers found. Touch DISCOVER.", width - 2), colors and colors.lightGray or nil)
+  else
+    local first = 1
+    if selected > maxRows then first = selected - maxRows + 1 end
+    for row = 1, maxRows do
+      local index = first + row - 1
+      local id = ids[index]
+      if not id then break end
+      local worker = workers[id]
+      local data = worker.data or {}
+      local status = statusOf(worker)
+      local marker = index == selected and ">" or " "
+      local line
+      if width >= 48 then
+        line = ("%s %-5s %-14s %-12s %-17s %-5s %-4s"):format(
+          marker, tostring(id), common.fit(workerLabel(worker, id), 14), common.fit(status, 12),
+          common.fit(progressText(data), 17), tostring(data.fuel or "-"), tostring(data.seal and data.seal.count or "-")
+        )
+      else
+        line = ("%s%-5s %-10s %-8s %s"):format(
+          marker, tostring(id), common.fit(workerLabel(worker, id), 10), common.fit(status, 8), progressText(data)
+        )
+      end
+      local foreground = index == selected and (colors and colors.black or nil) or common.statusColor(status)
+      local background = index == selected and (colors and colors.white or nil) or (colors and colors.black or nil)
+      local y = headerY + row
+      common.writeAt(1, y, common.fit(line, width), foreground, background)
+      addHitbox(key, 1, y, width, y, function() selected = index end)
+    end
+  end
+
+  buttonRow(key, height - 4, width, {
+    { "DISCOVER", dashboardAction("discover") }, { "NEW JOB", dashboardAction("new") },
+    { "GPS CAL", dashboardAction("gps") }, { "INFO", dashboardAction("info") },
+  })
+  buttonRow(key, height - 3, width, {
+    { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
+    { "RECALL", dashboardAction("recall") }, { "SERVICE", dashboardAction("service") },
+  })
+  buttonRow(key, height - 2, width, {
+    { "ABORT", dashboardAction("abort") }, { "CLEAR", dashboardAction("clear") },
+    { "REHOME", dashboardAction("rehome") }, { "QUIT", dashboardAction("quit") },
+  })
+  local noticeColor = noticeIsError and (colors and colors.red or nil) or (colors and colors.lime or nil)
+  common.writeAt(1, height, common.fit(notice, width), noticeColor)
+end
+
+local fieldOrder = { "width", "length", "depth" }
+local fieldLabels = { width = "WIDTH (right)", length = "LENGTH (forward)", depth = "DEPTH (down)" }
+local fieldLimits = { width = 128, length = 512, depth = 128 }
+
+local function commitDraftField()
+  if not draft then return end
+  local field = draft.selectedField or "width"
+  local value = tonumber(draft.buffer)
+  if not value then value = draft[field] or 1 end
+  value = common.clamp(math.floor(value), 1, fieldLimits[field])
+  draft[field], draft.buffer = value, tostring(value)
+end
+
+local function chooseDraftField(field)
+  commitDraftField()
+  draft.selectedField = field
+  draft.buffer = tostring(draft[field])
+end
+
+local function draftDigit(digit)
+  if not draft then return end
+  local buffer = tostring(draft.buffer or "")
+  if buffer == "0" then buffer = "" end
+  if #buffer < 4 then draft.buffer = buffer .. tostring(digit) end
+end
+
+local function draftBackspace()
+  if not draft then return end
