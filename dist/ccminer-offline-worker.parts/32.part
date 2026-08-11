@@ -1,3 +1,11 @@
+  local action = movement[direction]
+  if not action then return false, "Unknown movement: " .. tostring(direction) end
+  local retries = tonumber(config.moveRetries) or 20
+  local retryDelay = tonumber(config.moveRetryDelay) or 0.4
+  local lastReason = "Movement failed."
+
+  for _ = 1, retries do
+    drainNetwork(3)
     if movementInterrupted(context) then return false, "control_request" end
 
     local lit, lightError = maybePlaceTorch(context)
@@ -278,9 +286,3 @@ local function navigateServiceRoute(plan, fromPose, toPose, context, mode)
     })
     if ok and type(result) == "table" then routeResult = result end
   end
-  if routeResult and type(routeResult.waypoints) == "table" then
-    local waypoints = routeResult.waypoints
-    if waypoints.from and waypoints.to then waypoints = { waypoints.from, waypoints.to } end
-    for _, waypoint in ipairs(waypoints) do
-      local target = normalizeWaypoint(waypoint, toPose.y)
-      if target and not samePosePosition(state.pose, target) then

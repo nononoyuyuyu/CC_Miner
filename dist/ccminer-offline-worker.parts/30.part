@@ -1,3 +1,9 @@
+    payload.mode = command
+    command = "stop"
+  end
+  if state.pendingAction and command ~= "rehome" and command ~= "ping" and command ~= "status" and command ~= "gps_fix" then
+    return false, "Recovery required: return the turtle to its dock and use REHOME, or reboot with working GPS recovery."
+  end
   if command == "start" then
     return startJob(payload)
   elseif command == "stop" then
@@ -280,10 +286,3 @@ local function isInventoryBlock(side, data)
     if ok and result == true then return true end
   end
   local wrapped = peripheral and peripheral.wrap(side) or nil
-  if wrapped and (type(wrapped.list) == "function" or type(wrapped.size) == "function") then return true end
-  local name = string.lower(blockName(data))
-  for _, marker in ipairs({ "chest", "barrel", "shulker_box", "drawer", "crate", "vault" }) do
-    if name:find(marker, 1, true) then return true end
-  end
-  return false
-end

@@ -75,6 +75,16 @@ assert(not assignmentMetadataAccepted({ assignmentId = "assignment-empty", assig
 assert(assignmentMetadataAccepted({ groupJobId = "group-one", assignmentChunks = { "W:0:0" } }),
   "non-empty assignment metadata should be accepted by the gate")
 
+-- Local dock defaults (for example a configured facing) apply to ordinary
+-- one-worker jobs too, but must not make GPS mandatory. Only explicit group
+-- assignment metadata enters verifyAssignmentDock's GPS-backed checks.
+marker(worker, "local function verifyAssignmentDock(job)", "assignment dock verifier")
+marker(worker, "if not job.assignmentProvided and not job.groupJobId and not job.groupId and not job.assignmentId then return true end",
+  "ordinary local job GPS bypass")
+assert(not worker:find("if not job.groupJobId and not job.groupId and not job.assignmentId and not job.homeWorld then return true end", 1, true),
+  "dock homeWorld still makes an ordinary job require GPS")
+marker(worker, "Explicit group assignment requires GPS calibration.", "group-only GPS rejection")
+
 -- The worker calls the assigned planner with one canonical (catalog, keys,
 -- options) signature.  Keep this assertion close to the implementation so a
 -- compatibility retry cannot reinterpret a catalog as a normal job.

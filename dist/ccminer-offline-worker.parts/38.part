@@ -1,3 +1,15 @@
+  job.cursor = job.cursor + 1
+  if layerBoundary(job) then
+    local layerGPS, layerGPSError = verifyGPS(true)
+    if not layerGPS then markBlocked("GPS verification at layer boundary failed: " .. tostring(layerGPSError)); return end
+  end
+  saveState()
+  if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or (rowBoundary(job) and "row" or nil)) then return end
+  heartbeat(false)
+end
+
+local function runChunkPlanStep(job)
+  local plan, route = job.chunkPlan, job.route
   if not plan or not route then markBlocked("Chunk plan state is missing."); return end
   route.layer = tonumber(route.layer) or 0
   route.walkIndex = tonumber(route.walkIndex) or 1
@@ -252,12 +264,3 @@ local function resolveNonMovementPending(pending)
   if common.startsWith(kind, "seal_") then
     local present, data = inspectPendingSide(kind)
     if present and (isLava(data) or isWater(data)) then
-      return false, "Pending fluid seal target remains present; refusing a blind retry."
-    end
-    local direction = kind:match("_(forward|up|down)$")
-    if direction then
-      state.fluidSealRun = (tonumber(state.fluidSealRun) or 0) + 1
-      state.water.continuousSeals = state.fluidSealRun
-      state.fluidSealMarker = {
-        kind = (pending.details and pending.details.fluidKind) or (common.startsWith(kind, "seal_water") and "water" or "lava"),
-        direction = direction,

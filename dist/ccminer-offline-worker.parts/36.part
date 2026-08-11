@@ -1,3 +1,12 @@
+  { source = [[src/ccminer/worker_parts/04.part]], target = [[worker_parts/04.part]], digest = [[fbc125a385c7b9fe8ddbd65fc66320420dbdc3759a9df33db0b5523e2c96bee5]], content = [[      return false, "Seal-block loading safety limit reached."
+    end
+    local slot = refillSlotForSeal()
+    if not slot then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "No inventory space for lava-seal blocks."
+    end
+    turtle.select(slot)
     local need = math.min(target - sealMaterialCount(), turtle.getItemSpace(slot))
     if need <= 0 then need = 1 end
     local sucked = runInventoryPhysicalAction("refill_seal_suck", {
@@ -240,18 +249,3 @@ local function continueService()
     if returnDistance then state.service.returnDistance = returnDistance end
     saveState("service_return_start", true)
     local preReturnGPS, preReturnError = verifyGPS(true)
-    if not preReturnGPS then markBlocked("GPS verification before return failed: " .. tostring(preReturnError)); return false end
-    local ok, err
-    if state.job and state.job.strategy == "chunk_plan" then
-      ok, err = navigateChunkPlanHome("service")
-    else
-      ok, err = navigateTo({ x = 0, y = 0, z = 0 }, "home", "service")
-    end
-    if not ok then
-      if err == "control_request" then return false end
-      markBlocked("Return to home failed: " .. tostring(err))
-      return false
-    end
-  end
-
-  local ok, err = turnTo(0)

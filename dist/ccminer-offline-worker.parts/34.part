@@ -1,3 +1,11 @@
+  stats.skipped = (stats.skipped or 0) + 1
+  if unknown then stats.unknown = (stats.unknown or 0) + 1; state.stats.discardUnknown = (state.stats.discardUnknown or 0) + 1 end
+  state.stats.discardSkipped = (state.stats.discardSkipped or 0) + 1
+  stats.lastAt = common.nowSeconds()
+end
+
+local function sideTargetDirection(baseDir, side)
+  side = tostring(side or "front"):lower()
   if side == "up" then side = "top" end
   if side == "down" then side = "bottom" end
   local relative = { front = 0, right = 1, back = 2, left = 3 }
@@ -268,9 +276,3 @@ local function unloadAtHome()
           allDropped = false
           discardStats.lastError = prepareError or "Could not journal output action."
           break
-        end
-        local dropped = outDrop() -- output receives all non-discard items
-        if dropped and turtle.getItemCount(slot) == 0 then commitPhysicalAction()
-        else cancelPhysicalAction(); allDropped = false end
-      else
-        -- Reserved seal/torch/fuel remain on the turtle.  Unknown and ore

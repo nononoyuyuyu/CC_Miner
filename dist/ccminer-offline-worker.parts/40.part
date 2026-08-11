@@ -1,3 +1,17 @@
+  validateParts("worker", WORKER_PARTS)
+  validateParts("controller", CONTROLLER_PARTS)
+end
+-- Kept as a named boundary for source-contract checks and recovery logs.  The
+-- role bundle validates from memory, so no /ccminer.update staging tree is
+-- needed before a low-space commit.
+local function validateLowSpaceStage()
+  validateAll()
+end
+local function copyIfPresent(source, target)
+  local text = readFile(source)
+  if text then return writeFile(target, text) end
+  return true
+end
 local function moveChecked(source, target)
   local ok, moveError = pcall(fs.move, source, target)
   if not ok or not fs.exists(target) then
@@ -246,10 +260,3 @@ local function lowSpaceUpdate()
     local applied, applyError = applyLowSpaceStep(step)
     if not applied then lowSpaceFailure(applyError) end
     marked, markerError = markerWrite("committing", index + 1)
-    if not marked then lowSpaceFailure("Applied low-space step " .. tostring(index) .. ", but cannot advance recovery marker: " .. tostring(markerError)) end
-  end
-  local finalContent = embeddedEntrypoint()
-  marked, markerError = markerWrite("final-ready", #LOW_SPACE_STEPS + 1)
-  if not marked then lowSpaceFailure("Cannot mark the validated final role loader: " .. tostring(markerError)) end
-  local finalPath = ROOT .. "/" .. ENTRYPOINT
-  local wrote, writeError = atomicWrite(finalPath, finalContent)

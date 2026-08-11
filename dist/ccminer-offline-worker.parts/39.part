@@ -1,3 +1,12 @@
+      return false, "Pending fluid seal target remains present; refusing a blind retry."
+    end
+    local direction = kind:match("_(forward|up|down)$")
+    if direction then
+      state.fluidSealRun = (tonumber(state.fluidSealRun) or 0) + 1
+      state.water.continuousSeals = state.fluidSealRun
+      state.fluidSealMarker = {
+        kind = (pending.details and pending.details.fluidKind) or (common.startsWith(kind, "seal_water") and "water" or "lava"),
+        direction = direction,
         material = pending.details and pending.details.material or nil,
         pose = poseCopy(),
         at = common.nowSeconds(),
@@ -259,17 +268,3 @@ local function validateAll()
       if not ok then fail("Embedded file failed syntax validation: " .. file.target .. ": " .. compileError) end
     end
   end
-  validateParts("worker", WORKER_PARTS)
-  validateParts("controller", CONTROLLER_PARTS)
-end
--- Kept as a named boundary for source-contract checks and recovery logs.  The
--- role bundle validates from memory, so no /ccminer.update staging tree is
--- needed before a low-space commit.
-local function validateLowSpaceStage()
-  validateAll()
-end
-local function copyIfPresent(source, target)
-  local text = readFile(source)
-  if text then return writeFile(target, text) end
-  return true
-end

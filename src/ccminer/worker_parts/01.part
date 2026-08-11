@@ -1597,7 +1597,11 @@ end
 
 local function verifyAssignmentDock(job)
   if type(job) ~= "table" then return true end
-  if not job.groupJobId and not job.groupId and not job.assignmentId and not job.homeWorld then return true end
+  -- A normal single-worker job may inherit local dock preferences (facing,
+  -- depth limit, etc.) from config.dock. Those preferences do not turn it
+  -- into a GPS-backed group assignment. Only explicit assignment metadata is
+  -- allowed to enter the world dock verification path.
+  if not job.assignmentProvided and not job.groupJobId and not job.groupId and not job.assignmentId then return true end
   local dock = type(job.dock) == "table" and job.dock or {}
   local expected = job.homeWorld or dock.homeWorld or dock.world
   if type(expected) == "table" and tonumber(expected.x) == nil and tonumber(expected.y) == nil and tonumber(expected.z) == nil then expected = nil end
@@ -1609,7 +1613,7 @@ local function verifyAssignmentDock(job)
   end
   if not expected and facing == nil and not bottomY then return true end
   local calibration = gpsCalibration()
-  if not calibration then return false, "Group/world assignment requires GPS calibration." end
+  if not calibration then return false, "Explicit group assignment requires GPS calibration." end
   local fix, fixError = locateGPS()
   if not fix then return false, "Group/world dock GPS verification failed: " .. tostring(fixError) end
   if expected then

@@ -1,3 +1,18 @@
+    if not preReturnGPS then markBlocked("GPS verification before return failed: " .. tostring(preReturnError)); return false end
+    local ok, err
+    if state.job and state.job.strategy == "chunk_plan" then
+      ok, err = navigateChunkPlanHome("service")
+    else
+      ok, err = navigateTo({ x = 0, y = 0, z = 0 }, "home", "service")
+    end
+    if not ok then
+      if err == "control_request" then return false end
+      markBlocked("Return to home failed: " .. tostring(err))
+      return false
+    end
+  end
+
+  local ok, err = turnTo(0)
   if not ok then markBlocked("Cannot face quarry at home: " .. tostring(err)); return false end
   if movementInterrupted("service") then return false end
   local dockGPS, dockGPSError = verifyGPS(true)
@@ -260,15 +275,3 @@ local function runSerpentineStep(job)
     markBlocked("Mining stopped at cell " .. tostring(job.cursor) .. ": " .. tostring(err))
     return
   end
-  job.cursor = job.cursor + 1
-  if layerBoundary(job) then
-    local layerGPS, layerGPSError = verifyGPS(true)
-    if not layerGPS then markBlocked("GPS verification at layer boundary failed: " .. tostring(layerGPSError)); return end
-  end
-  saveState()
-  if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or (rowBoundary(job) and "row" or nil)) then return end
-  heartbeat(false)
-end
-
-local function runChunkPlanStep(job)
-  local plan, route = job.chunkPlan, job.route

@@ -1,3 +1,9 @@
+        end
+        local dropped = outDrop() -- output receives all non-discard items
+        if dropped and turtle.getItemCount(slot) == 0 then commitPhysicalAction()
+        else cancelPhysicalAction(); allDropped = false end
+      else
+        -- Reserved seal/torch/fuel remain on the turtle.  Unknown and ore
         -- stacks are retained in the output path when they are not reserved.
           if not keepReserved then
             if outputTargetDir ~= nil then turnTo(outputTargetDir) else turnTo(outRestore) end
@@ -271,12 +277,3 @@ local function refillSealAtHome()
       restoreSideDirection(side, restoreDir)
       turtle.select(originalSlot)
 ]=] },
-  { source = [[src/ccminer/worker_parts/04.part]], target = [[worker_parts/04.part]], digest = [[fbc125a385c7b9fe8ddbd65fc66320420dbdc3759a9df33db0b5523e2c96bee5]], content = [[      return false, "Seal-block loading safety limit reached."
-    end
-    local slot = refillSlotForSeal()
-    if not slot then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "No inventory space for lava-seal blocks."
-    end
-    turtle.select(slot)

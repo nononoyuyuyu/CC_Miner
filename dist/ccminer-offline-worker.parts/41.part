@@ -1,3 +1,10 @@
+    if not marked then lowSpaceFailure("Applied low-space step " .. tostring(index) .. ", but cannot advance recovery marker: " .. tostring(markerError)) end
+  end
+  local finalContent = embeddedEntrypoint()
+  marked, markerError = markerWrite("final-ready", #LOW_SPACE_STEPS + 1)
+  if not marked then lowSpaceFailure("Cannot mark the validated final role loader: " .. tostring(markerError)) end
+  local finalPath = ROOT .. "/" .. ENTRYPOINT
+  local wrote, writeError = atomicWrite(finalPath, finalContent)
   if not wrote then lowSpaceFailure("Cannot atomically commit final role loader: " .. tostring(writeError)) end
   if readFile(finalPath) ~= finalContent then
     lowSpaceFailure("Final role loader could not be verified after atomic commit.")

@@ -1,3 +1,9 @@
+  if routeResult and type(routeResult.waypoints) == "table" then
+    local waypoints = routeResult.waypoints
+    if waypoints.from and waypoints.to then waypoints = { waypoints.from, waypoints.to } end
+    for _, waypoint in ipairs(waypoints) do
+      local target = normalizeWaypoint(waypoint, toPose.y)
+      if target and not samePosePosition(state.pose, target) then
         local ok, err = navigateTo(target, "inside", context)
         if not ok then return false, err end
       end
@@ -253,11 +259,3 @@ end
 
 local function noteDiscardSkip(name, unknown)
   local stats = discardStatsTable()
-  stats.skipped = (stats.skipped or 0) + 1
-  if unknown then stats.unknown = (stats.unknown or 0) + 1; state.stats.discardUnknown = (state.stats.discardUnknown or 0) + 1 end
-  state.stats.discardSkipped = (state.stats.discardSkipped or 0) + 1
-  stats.lastAt = common.nowSeconds()
-end
-
-local function sideTargetDirection(baseDir, side)
-  side = tostring(side or "front"):lower()
