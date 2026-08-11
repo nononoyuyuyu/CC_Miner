@@ -1,3 +1,29 @@
+  if discard ~= nil then printField("Discard", discard) end
+
+  local performance = firstNestedValue(roots, {
+    { "performance" }, { "stats", "performance" },
+  })
+  if performance ~= nil then printField("Performance", performance) end
+  local throughput = firstNestedValue(roots, {
+    { "throughput" }, { "performance", "throughput" },
+    { "report", "throughput" }, { "stats", "throughput" },
+    { "blocksPerSecond" }, { "perSecond" },
+  })
+  if throughput ~= nil then printField("Throughput", throughput) end
+
+  local partial = firstNestedValue(roots, {
+    { "partialStart" }, { "partial" }, { "partialAssignment" },
+    { "group", "partialStart" }, { "group", "partial" },
+  })
+  if partial ~= nil then printField("Partial start", partial) end
+  local acks = firstNestedValue(roots, {
+    { "ackSummary" }, { "acks" }, { "ack" }, { "groupAcks" },
+    { "group", "acks" }, { "group", "ackSummary" },
+  })
+  if acks ~= nil then printField("ACK summary", acks) end
+end
+
+local function controllerDbCandidates(config)
   local paths, seen = {}, {}
   local function add(path)
     if type(path) == "string" and path ~= "" and not seen[path] then
@@ -233,33 +259,3 @@ local function peripheralIsType(name, wanted)
   local matches = false
   if peripheral.getType then
     local ok, value = pcall(peripheral.getType, name)
-    matches = ok and value == wanted
-  end
-  if not matches and peripheral.hasType then
-    local ok, value = pcall(peripheral.hasType, name, wanted)
-    matches = ok and value == true
-  end
-  return matches
-end
-
-local function wirelessModems()
-  local names = {}
-  if not peripheral or type(peripheral.getNames) ~= "function" then return names end
-  local ok, all = pcall(peripheral.getNames)
-  if not ok or type(all) ~= "table" then return names end
-  for _, name in ipairs(all) do
-    if peripheralIsType(name, "modem") then
-      local wireless = false
-      local wrapped = peripheral.wrap and peripheral.wrap(name) or nil
-      if wrapped and type(wrapped.isWireless) == "function" then
-        local wirelessOk, result = pcall(wrapped.isWireless)
-        wireless = wirelessOk and result == true
-      end
-      if wireless then names[#names + 1] = tostring(name) end
-    end
-  end
-  return names
-end
-
-local function inventoryAvailable(side)
-  if not side or side == "" then return false end

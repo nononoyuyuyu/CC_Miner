@@ -1,3 +1,23 @@
+    -- while CUSTOM_ALLOWLIST considers only complete IDs entered by the user.
+    discard.mode = discardModePrompt(discard.mode)
+    if discard.mode == "CUSTOM_ALLOWLIST" then
+      discard.allowlist = allowlistPrompt(discard.allowlist)
+    else
+      discard.allowlist = type(discard.allowlist) == "table" and discard.allowlist or {}
+    end
+    discard.retainSealTarget = validInteger(discard.retainSealTarget or config.retainSealTarget, 64, 1, 512)
+    discard.triggerEmptySlots = common.promptNumber(
+      "Discard when empty slots reach",
+      validInteger(discard.triggerEmptySlots, config.reserveEmptySlots or 3, 0, 16),
+      0,
+      16
+    )
+    print("設定方向に inventory が見つかった場合は、誤投入防止のため world 廃棄をスキップします。")
+    discard.direction = enumPrompt("現場廃棄方向 (front/back/left/right/top/bottom)", discard.direction or config.outputSide or "back", {
+      front = true, back = true, left = true, right = true, top = true, bottom = true,
+    }, "back")
+    discard.maxStacksPerPass = validInteger(discard.maxStacksPerPass, 8, 1, 64)
+    config.retainSealTarget = discard.retainSealTarget
     materials.retainSealTarget = discard.retainSealTarget
     materials.discard = common.copy(discard)
 
@@ -176,27 +196,3 @@ local commandOk, commandError = common.writeAllAtomic("/ccm.lua", [[
 shell.run("/ccminer/command.lua", ...)
 ]])
 if not commandOk then error("Cannot install ccm.lua: " .. tostring(commandError), 0) end
-
-common.clear(colors and colors.black or nil, colors and colors.white or nil)
-print("SETUP COMPLETE")
-print("")
-print("Role: " .. requestedRole)
-if requestedRole == "worker" then
-  print("Output chest: BEHIND the turtle")
-  print("Fuel chest: ABOVE the turtle")
-  if config.lavaMode == "seal" then print("Seal-block chest: " .. string.upper(config.sealSide) .. " of the turtle") end
-  if config.lighting and config.lighting.mode ~= "off" then
-    print("Torch chest: " .. string.upper(config.lighting.side or config.torchSide or "left") .. " of the turtle")
-  end
-  print("Turtle front: quarry entrance")
-  if config.gps.enabled then print("After GPS hosts are online: controller -> GPS CAL") end
-elseif requestedRole == "controller" then
-  print("Attach a wireless modem and optional Advanced Monitor.")
-  print("Monitor touches and terminal mouse clicks are enabled.")
-else
-  print(("GPS host coordinates: %d, %d, %d"):format(config.x, config.y, config.z))
-  print("Keep this computer and its wireless modem chunk-loaded.")
-end
-print("")
-print("Reboot with: reboot")
-]=] },

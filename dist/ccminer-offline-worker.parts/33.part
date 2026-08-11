@@ -1,3 +1,38 @@
+  elseif command == "ping" or command == "status" then
+    return true, "Status sent."
+  end
+  return false, "Unknown command: " .. tostring(command)
+end
+
+local function handleMessage(sender, message)
+  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
+  if not valid then return end
+  if tonumber(config.controllerId or 0) > 0 and tonumber(sender) ~= tonumber(config.controllerId) then return end
+  if message.kind == "discover" then sendStatus(sender, message); return end
+  if message.kind ~= "command" then return end
+  if tonumber(message.target) ~= tonumber(os.getComputerID()) then return end
+  if commandSeen(message.id) then
+    sendAck(sender, message, true, "Duplicate command ignored; previous result retained.")
+    return
+  end
+  local payload = message.payload
+  local command = tostring(payload.command or "")
+  local ok, text, result, session = applyControlCommand(command, payload, sender)
+  sendAck(sender, message, ok, text, result, session)
+  if command == "status" or command == "ping" or command == "gps_fix" then sendStatus(sender, message) end
+end
+
+pollNetwork = function(timeout)
+  if not networkReady then return false end
+  local sender, message = protocol.receive(timeout)
+  if not sender then return false end
+  handleMessage(sender, message)
+  return true
+end
+
+local function drainNetwork(limit)
+  for _ = 1, limit or 8 do if not pollNetwork(0) then break end end
+end
 
 local function heartbeat(force)
   local now = common.nowSeconds()
@@ -270,38 +305,3 @@ local function tryPlaceTorchWall(relativeDir)
     local placedPrepared, placedPrepareError = beginPhysicalAction("torch_niche_forward", {
       side = relativeDir, material = itemName(slot),
     }, poseCopy())
-    if not placedPrepared then return restoreContext(placedPrepareError) end
-    local placed, placeError = turtle.place()
-    if not placed then
-      cancelPhysicalAction()
-      return restoreContext(placeError or "torch_niche_place_failed")
-    end
-    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
-    state.lighting.placed = (state.lighting.placed or 0) + 1
-    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
-    commitPhysicalAction()
-    turtle.select(originalSlot)
-    local restored, restoreError = turnTo(originalDir)
-    if not restored then return false, restoreError end
-    state.lighting.lastAt = common.nowSeconds()
-    state.lighting.lastPose = poseCopy()
-    return true
-  end
-
-  local slot = selectTorchMaterial()
-  if not slot then return restoreContext("torch_material") end
-  local prepared, prepareError = beginPhysicalAction("torch_wall", {
-    side = relativeDir, material = itemName(slot), pose = poseCopy(),
-  }, poseCopy())
-  if not prepared then return restoreContext(prepareError) end
-  local placed, placeError = turtle.place()
-  if placed then
-    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
-    state.lighting.placed = (state.lighting.placed or 0) + 1
-    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
-    commitPhysicalAction()
-  else
-    cancelPhysicalAction()
-  end
-  turtle.select(originalSlot)
-  local restored, restoreError = turnTo(originalDir)

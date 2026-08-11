@@ -1,3 +1,15 @@
+  local existingTarget = job.assignments[targetKey]
+  local target = existingTarget and common.copy(existingTarget) or { workerId = tonumber(targetWorkerId) or targetWorkerId, groupJobId = job.groupJobId, parentJobId = job.groupJobId, jobId = job.groupJobId .. "/reassign-" .. targetKey, assignmentId = job.groupJobId .. ":reassign:" .. targetKey, chunkKeys = {}, transitKeys = {}, status = "pending_reassign" }
+  target.chunkKeys = common.copy(source.chunkKeys)
+  target.transitKeys = common.copy(source.transitKeys or {})
+  target.bay, target.bayId, target.dock, target.dockId = bayId, bayId, common.copy(dock or {}), dockId
+  target.homeWorld = dock and common.copy(dock.homeWorld or dock.world) or common.copy(target.homeWorld or targetData.world)
+  target.maxDepth = tonumber(dock and dock.maxDepth or target.maxDepth or config.maxDepth)
+  target.facing = targetData.facing or target.facing
+  if job.chunkMode == "world" and targetData.gps and targetData.gps.calibration and targetData.gps.calibration.home then
+    local targetHome = targetData.gps.calibration.home
+    if tonumber(targetHome.x) and tonumber(targetHome.z) then
+      target.bayChunkKey = quarry.chunkKey("world", math.floor(tonumber(targetHome.x) / 16), math.floor(tonumber(targetHome.z) / 16))
     end
   end
   target.homeY = target.homeY or source.homeY
@@ -172,28 +184,3 @@ local function startDraft()
   db.lastDraft = persistentDraft(draft)
   db.lastPreset = draft.profile or db.lastPreset
   if draft.queueIndex and db.queue[draft.queueIndex] then
-    db.queue[draft.queueIndex].awaiting = { workerId = assignments[1].workerId, jobId = assignments[1].jobId, sentAt = common.nowSeconds() }
-    db.queue[draft.queueIndex].retryAt = common.nowSeconds() + 10
-  end
-  saveControllerDb()
-  mode, draft = "dashboard", nil
-  setNotice(("Job sent to %d worker%s."):format(#assignments, #assignments == 1 and "" or "s"), false)
-  return true
-end
-
-local function queueDraft()
-  if not draft then return false end
-  if config.queueEnabled == false then setNotice("Queue is disabled by controller configuration.", true); return false end
-  local previousQueueing = draft.queueing
-  draft.queueing = true
-  local result = computePreflight()
-  draft.queueing = previousQueueing
-  if not result or result.fatal then setNotice("Cannot queue: preflight has a fatal item.", true); return false end
-  local queuedKeys = {}
-  for _, chunk in ipairs(result.catalog or {}) do
-    local excluded = false
-    for _, item in ipairs(result.excludedChunks or {}) do if item.key == chunk.key then excluded = true; break end end
-    if not excluded then queuedKeys[#queuedKeys + 1] = chunk.key end
-  end
-  if result.chunkMode == "world" then
-    local conflict = activeLeaseOverlap(result.chunkMode, draft.workerId, queuedKeys)

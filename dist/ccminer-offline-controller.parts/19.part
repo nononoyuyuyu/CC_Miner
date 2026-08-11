@@ -1,3 +1,22 @@
+      if id == nil then id = value.workerId end
+      if id == nil then id = value.name end
+      if id == nil then id = item.idKey end
+      homeY = value.homeY
+      homeYProvided = homeY ~= nil
+      if homeY == nil and type(value.home) == "table" then homeY = value.home.y end
+      if homeY ~= nil then homeYProvided = true end
+      if homeY == nil and type(value.calibration) == "table" and type(value.calibration.home) == "table" then
+        homeY = value.calibration.home.y
+        homeYProvided = true
+      end
+      bay = nestedPoint(value)
+      local bayInput = value.bay or value.bayWorld or value.world or value.worldSeed or value.position or value.homeWorld or value.gps
+      if bayInput == nil and type(value.seed) == "table" then bayInput = value.seed end
+      bayInvalid = bayInput ~= nil and bay == nil
+      seedKey = value.seedKey or value.chunkKey or value.chunk
+    else
+      id = value
+    end
     if id == nil or tostring(id) == "" then return nil, "invalid_worker_id" end
     key = tostring(id)
     if seen[key] then return nil, "duplicate_worker_id" end
@@ -268,21 +287,3 @@ local function graphOwner(chunks, keys, workers, strategyLabel, distanceWeight)
           local index = owner[neighbor]
           if index then candidateOwners[index] = true end
         end
-        for index in pairs(candidateOwners) do
-          local projected = math.abs((loads[index] + chunks[key].cells) - target)
-          local score = projected
-          if distanceWeight and workers[index].bay then
-            local chunk = chunks[key]
-            score = score + distanceWeight * (math.abs(workers[index].bay.x - (chunk.cx * 16 + 8))
-              + math.abs(workers[index].bay.z - (chunk.cz * 16 + 8)))
-          end
-          if not bestKey or score < bestScore or (score == bestScore and (chunkComparator(chunks[key], chunks[bestKey]) or (key == bestKey and index < bestOwner))) then
-            bestKey, bestOwner, bestScore, bestProjected = key, index, score, projected
-          end
-        end
-      end
-    end
-    if not bestKey then return nil, "chunk_catalog_disconnected" end
-    owner[bestKey] = bestOwner
-    owned[bestOwner][#owned[bestOwner] + 1] = bestKey
-    loads[bestOwner] = loads[bestOwner] + chunks[bestKey].cells

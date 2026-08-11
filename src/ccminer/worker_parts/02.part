@@ -307,10 +307,11 @@ local function remoteConsoleAction(sender, payload)
   local action = string.lower(common.trim(payload.action or payload.remoteAction or ""))
   remoteSessionExpired()
   if action == "open" then
-    if tonumber(config.controllerId or 0) <= 0 then
-      return false, "Remote console requires a pinned controllerId.", nil, nil
+    local pinnedController = tonumber(config.controllerId or 0) or 0
+    if config.remoteConsole.allowShell == true and pinnedController <= 0 then
+      return false, "Arbitrary remote shell requires a pinned controllerId.", nil, nil
     end
-    if tonumber(sender) ~= tonumber(config.controllerId) then
+    if pinnedController > 0 and tonumber(sender) ~= pinnedController then
       return false, "Remote console sender is not the pinned controller.", nil, nil
     end
     if remoteSession then

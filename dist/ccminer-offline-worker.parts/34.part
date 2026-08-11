@@ -1,3 +1,38 @@
+    if not placedPrepared then return restoreContext(placedPrepareError) end
+    local placed, placeError = turtle.place()
+    if not placed then
+      cancelPhysicalAction()
+      return restoreContext(placeError or "torch_niche_place_failed")
+    end
+    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
+    state.lighting.placed = (state.lighting.placed or 0) + 1
+    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
+    commitPhysicalAction()
+    turtle.select(originalSlot)
+    local restored, restoreError = turnTo(originalDir)
+    if not restored then return false, restoreError end
+    state.lighting.lastAt = common.nowSeconds()
+    state.lighting.lastPose = poseCopy()
+    return true
+  end
+
+  local slot = selectTorchMaterial()
+  if not slot then return restoreContext("torch_material") end
+  local prepared, prepareError = beginPhysicalAction("torch_wall", {
+    side = relativeDir, material = itemName(slot), pose = poseCopy(),
+  }, poseCopy())
+  if not prepared then return restoreContext(prepareError) end
+  local placed, placeError = turtle.place()
+  if placed then
+    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
+    state.lighting.placed = (state.lighting.placed or 0) + 1
+    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
+    commitPhysicalAction()
+  else
+    cancelPhysicalAction()
+  end
+  turtle.select(originalSlot)
+  local restored, restoreError = turnTo(originalDir)
   if not restored then return false, restoreError end
   if not placed then return false, placeError or "torch_wall_failed" end
   state.lighting.lastAt = common.nowSeconds()
@@ -253,33 +288,3 @@ end
 local function moveBetweenChunkAnchors(plan, fromKey, toKey, y, context)
   local from = plan.chunks[fromKey]
   local target, err = chunkAnchor(plan, toKey, y)
-  if not from or not target then return false, err or "Missing chunk anchor." end
-  local adjacent = false
-  for _, key in ipairs(from.neighbors or {}) do if key == toKey then adjacent = true; break end end
-  if not adjacent then return false, "Chunk route is not adjacent: " .. tostring(fromKey) .. " -> " .. tostring(toKey) end
-  return navigateTo(target, "inside", context)
-end
-
-local function normalizeWaypoint(value, fallbackY)
-  if type(value) ~= "table" then return nil end
-  local pose = value.pose or value.position or value.target or value
-  if type(pose) ~= "table" then return nil end
-  local x, z = tonumber(pose.x), tonumber(pose.z)
-  if not x or not z then return nil end
-  return { x = x, y = tonumber(pose.y) or tonumber(fallbackY) or 0, z = z,
-    dir = pose.dir ~= nil and ((tonumber(pose.dir) or 0) % 4) or nil }
-end
-
-local function routeChunkKeys(plan, fromKey, toKey)
-  if type(quarry.shortestChunkPath) == "function" then
-    local ok, path = pcall(quarry.shortestChunkPath, plan, fromKey, toKey)
-    if ok and type(path) == "table" then path = path.chunkKeys or path.path or path.keys end
-    if ok and type(path) == "table" and #path > 0 then return path, "bfs" end
-  end
-  if fromKey == toKey then return { fromKey }, "same" end
-  return nil
-end
-
--- Assigned plans intentionally do not persist mutable parent pointers, so a
--- worker that resumes with an older quarry module may not have pathToRoot.
--- Keep a bounded graph-only DFS fallback over the validated neighbor edges.

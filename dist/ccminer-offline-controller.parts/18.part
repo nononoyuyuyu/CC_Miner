@@ -1,3 +1,29 @@
+      for key, distance in pairs(fromSeed) do
+        if distances[key] == nil or distance < distances[key] then distances[key] = distance end
+      end
+    end
+    local selected
+    for _, key in ipairs(keys) do
+      if not seedSet[key] and (not selected or distances[key] > distances[selected] or (distances[key] == distances[selected] and chunkComparator(chunks[key], chunks[selected]))) then
+        selected = key
+      end
+    end
+    if not selected then return nil, "worker_seed_failed" end
+    seeds[#seeds + 1] = selected
+    seedSet[selected] = true
+  end
+  for index, seed in ipairs(seeds) do
+    owner[seed] = index
+    owned[index][#owned[index] + 1] = seed
+    loads[index] = loads[index] + chunks[seed].cells
+  end
+
+  local assigned = #seeds
+  local target = 0
+  for _, key in ipairs(keys) do target = target + chunks[key].cells end
+  target = target / #workers
+  while assigned < #keys do
+    local bestKey, bestOwner, bestDeficit, bestProjected
     for _, key in ipairs(keys) do
       if not owner[key] then
         local candidates, candidateSeen = {}, {}
@@ -227,22 +253,3 @@ local function groupWorkerList(values)
     local id, key, homeY, bay, seedKey, homeYProvided, bayInvalid
     if type(value) == "table" then
       id = value.id
-      if id == nil then id = value.workerId end
-      if id == nil then id = value.name end
-      if id == nil then id = item.idKey end
-      homeY = value.homeY
-      homeYProvided = homeY ~= nil
-      if homeY == nil and type(value.home) == "table" then homeY = value.home.y end
-      if homeY ~= nil then homeYProvided = true end
-      if homeY == nil and type(value.calibration) == "table" and type(value.calibration.home) == "table" then
-        homeY = value.calibration.home.y
-        homeYProvided = true
-      end
-      bay = nestedPoint(value)
-      local bayInput = value.bay or value.bayWorld or value.world or value.worldSeed or value.position or value.homeWorld or value.gps
-      if bayInput == nil and type(value.seed) == "table" then bayInput = value.seed end
-      bayInvalid = bayInput ~= nil and bay == nil
-      seedKey = value.seedKey or value.chunkKey or value.chunk
-    else
-      id = value
-    end

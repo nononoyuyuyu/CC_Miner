@@ -1,3 +1,28 @@
+    db.queue[draft.queueIndex].awaiting = { workerId = assignments[1].workerId, jobId = assignments[1].jobId, sentAt = common.nowSeconds() }
+    db.queue[draft.queueIndex].retryAt = common.nowSeconds() + 10
+  end
+  saveControllerDb()
+  mode, draft = "dashboard", nil
+  setNotice(("Job sent to %d worker%s."):format(#assignments, #assignments == 1 and "" or "s"), false)
+  return true
+end
+
+local function queueDraft()
+  if not draft then return false end
+  if config.queueEnabled == false then setNotice("Queue is disabled by controller configuration.", true); return false end
+  local previousQueueing = draft.queueing
+  draft.queueing = true
+  local result = computePreflight()
+  draft.queueing = previousQueueing
+  if not result or result.fatal then setNotice("Cannot queue: preflight has a fatal item.", true); return false end
+  local queuedKeys = {}
+  for _, chunk in ipairs(result.catalog or {}) do
+    local excluded = false
+    for _, item in ipairs(result.excludedChunks or {}) do if item.key == chunk.key then excluded = true; break end end
+    if not excluded then queuedKeys[#queuedKeys + 1] = chunk.key end
+  end
+  if result.chunkMode == "world" then
+    local conflict = activeLeaseOverlap(result.chunkMode, draft.workerId, queuedKeys)
     if conflict then setNotice("Cannot queue: world chunks overlap active job " .. tostring(conflict.jobId or "unknown"), true); return false end
     for _, queued in ipairs(db.queue or {}) do
       if queued.chunkMode == "world" and type(queued.chunkKeys) == "table" then
@@ -49,6 +74,10 @@ local function dispatchQueue()
         candidate.lighting = normalizedLighting(candidate.lighting)
         candidate.waterMode = normalizedWaterMode(candidate.waterMode)
         candidate.profile = normalizedProfile(candidate.profile)
+        -- computePreflight/startDraft still use the legacy shared `draft`
+        -- variable. A background queue tick must never destroy an operator's
+        -- NEW JOB form or leave its mode pointing at a nil draft.
+        local operatorDraft, operatorMode = draft, mode
         draft = candidate
         local result = computePreflight()
         local sent = false
@@ -59,7 +88,8 @@ local function dispatchQueue()
           db.queue[index].retryAt, db.queue[index].lastError = now + 15, result and "preflight blocked" or "preflight unavailable"
           saveControllerDb()
         end
-        if draft then draft = nil end
+        draft, mode = operatorDraft, operatorMode
+        invalidate()
         if sent then return end
       end
     end
@@ -206,30 +236,3 @@ local function dashboardAction(name)
     elseif name == "abort" then
       if id then confirmState = { command = "stop", payload = { mode = "abort" }, message = "Abort the active job and return home?" }; mode = "confirm" end
     elseif name == "clear" then
-      if id then confirmState = { command = "clear", message = "Clear the completed or aborted job record?" }; mode = "confirm" end
-    elseif name == "rehome" then
-      if id then confirmState = { command = "rehome", payload = { confirm = "RESET" }, twoStep = true, message = "REHOME RESET clears the active job. Press YES twice only when the turtle is physically in its dock." }; mode = "confirm" end
-    elseif name == "gps" then
-      if id then confirmState = { command = "calibrate_gps", message = "GPS calibration moves forward one block and back. Is the dock front clear?" }; mode = "confirm" end
-    elseif name == "quit" then running = false end
-    invalidate()
-  end
-end
-
-local function sortingTick()
-  local settings = config.sorting
-  if not settings or settings.enabled ~= true or common.nowSeconds() - lastSorting < (tonumber(settings.interval) or 30) then return end
-  lastSorting = common.nowSeconds()
-  if not peripheral or not peripheral.wrap then return end
-  local source = peripheral.wrap(settings.source or "")
-  local valuable = peripheral.wrap(settings.valuableTarget or "")
-  local bulk = peripheral.wrap(settings.bulkTarget or "")
-  local seal = peripheral.wrap(settings.sealTarget or "")
-  if not source or type(source.list) ~= "function" or type(source.pushItems) ~= "function" then
-    if not sortingWarned then sortingWarned = true; setNotice("Sorting WARN: source inventory is not configured.", false) end
-    return
-  end
-  if not valuable or not bulk or not seal then
-    if not sortingWarned then sortingWarned = true; setNotice("Sorting WARN: one or more target inventories are missing.", false) end
-    return
-  end

@@ -1,3 +1,45 @@
+local UPDATE_SENTINEL = [[-- CC Miner V4 update-incomplete sentinel for worker
+error("CC Miner runtime update is incomplete. Re-transfer the offline bundle and run update-low-space.", 0)
+]]
+local LOW_SPACE_STEPS = {
+  { kind = "runtime", index = 1 },
+  { kind = "runtime", index = 2 },
+  { kind = "runtime", index = 3 },
+  { kind = "runtime", index = 4 },
+  { kind = "runtime", index = 5 },
+  { kind = "runtime", index = 6 },
+  { kind = "runtime", index = 7 },
+  { kind = "runtime", index = 9 },
+  { kind = "runtime", index = 10 },
+  { kind = "runtime", index = 11 },
+  { kind = "runtime", index = 12 },
+  { kind = "runtime", index = 13 },
+  { kind = "obsolete", target = [[controller.lua]] },
+  { kind = "obsolete", target = [[controller_parts/01.part]] },
+  { kind = "obsolete", target = [[controller_parts/02.part]] },
+  { kind = "obsolete", target = [[controller_parts/03.part]] },
+  { kind = "obsolete", target = [[gps_host.lua]] },
+}
+
+local function fail(message)
+  error(tostring(message), 0)
+end
+local function ensureDir(path)
+  if not path or path == "" or fs.exists(path) then return end
+  local parent = fs.getDir(path)
+  if parent and parent ~= "" and parent ~= path then ensureDir(parent) end
+  fs.makeDir(path)
+end
+local function readFile(path)
+  if not fs.exists(path) or fs.isDir(path) then return nil end
+  local handle = fs.open(path, "rb")
+  if not handle then return nil end
+  local text = handle.readAll(); handle.close(); return text
+end
+local function writeFile(path, text)
+  ensureDir(fs.getDir(path))
+  local handle = fs.open(path, "wb")
+  if not handle then return false, "Cannot write " .. path end
   local ok, writeError = pcall(handle.write, text or "")
   handle.close()
   if not ok then return false, tostring(writeError) end
@@ -227,46 +269,3 @@ local function markerRead()
   if backupText then return nil, "Recovery marker backup is corrupt and cannot be trusted." end
   return nil, nil
 end
-local function markerWrite(state, nextIndex)
-  local text = table.concat({
-    "version=" .. VERSION,
-    "schema=" .. tostring(SCHEMA),
-    "role=" .. ROLE,
-    "state=" .. tostring(state),
-    "next=" .. tostring(nextIndex or 1),
-    "",
-  }, "\n")
-  return atomicWrite(LOW_SPACE_MARKER, text)
-end
-local function clearMarker()
-  for _, suffix in ipairs({ "", ".tmp", ".bak" }) do
-    local path = LOW_SPACE_MARKER .. suffix
-    if fs.exists(path) then pcall(fs.delete, path) end
-    if fs.exists(path) then return false, "Cannot clear recovery marker artifact: " .. path end
-  end
-  return true
-end
-local function lowSpaceFailure(message)
-  printError("LOW-SPACE UPDATE PAUSED")
-  fail(tostring(message) .. "\nRecovery marker: " .. LOW_SPACE_MARKER
-    .. "\nRe-transfer ccminer-offline-" .. ROLE .. ".lua and its parts, then rerun update-low-space.")
-end
-local function embeddedEntrypoint()
-  for _, file in ipairs(files) do
-    if file.target == ENTRYPOINT then return file.content end
-  end
-  lowSpaceFailure("Embedded role loader is missing: " .. ENTRYPOINT)
-end
-local function ensureUpdateSentinel()
-  local path = ROOT .. "/" .. ENTRYPOINT
-  if readFile(path) ~= UPDATE_SENTINEL then
-    local wrote, writeError = atomicWrite(path, UPDATE_SENTINEL)
-    if not wrote then lowSpaceFailure("Cannot install the update-incomplete sentinel: " .. tostring(writeError)) end
-  end
-  if readFile(path) ~= UPDATE_SENTINEL then
-    lowSpaceFailure("Update-incomplete sentinel could not be verified; runtime was not started.")
-  end
-end
-local function applyLowSpaceStep(step)
-  if step.kind == "runtime" then
-    local file = files[step.index]

@@ -1,3 +1,17 @@
+  if type(config.sealBlocks) ~= "table" then config.sealBlocks = M.copy(defaults.sealBlocks) end
+  return config
+end
+
+local function normalizeControllerConfig(raw)
+  local defaults = M.defaultControllerConfig()
+  local config = normalizeTable(defaults, raw)
+  config.role = "controller"
+  config.schema, config.version = M.SCHEMA, M.VERSION
+  config.networkKey = normalizeString(config.networkKey, defaults.networkKey, 8, 40)
+  config.controllerName = normalizeString(config.controllerName, defaults.controllerName, 1, 20)
+  config.monitorName = normalizePeripheralName(config.monitorName, defaults.monitorName)
+  config.workerTimeoutSeconds = normalizeInteger(config.workerTimeoutSeconds, 1, 3600, defaults.workerTimeoutSeconds)
+  config.discoverySeconds = normalizeInteger(config.discoverySeconds, 1, 3600, defaults.discoverySeconds)
   config.monitorTextScale = normalizeNumber(config.monitorTextScale, 0.5, 5, defaults.monitorTextScale)
   if config.monitorTextScale * 2 ~= math.floor(config.monitorTextScale * 2) then config.monitorTextScale = defaults.monitorTextScale end
   config.touchEnabled = normalizeBoolean(config.touchEnabled, defaults.touchEnabled)
@@ -203,7 +217,7 @@ end
 
 return M
 ]] },
-  { source = [[src/ccminer/setup.lua]], target = [[setup.lua]], digest = [[f0f3868cff311cc0a02a730750d0a98d3146132789f3a76f6acaf0ed707273ae]], content = [=[-- CC Miner V4 - interactive configuration
+  { source = [[src/ccminer/setup.lua]], target = [[setup.lua]], digest = [[04982ea9bdb3e13d88a31696c333ff061f19fb67e16f62078666708d8f1bfb10]], content = [=[-- CC Miner V4 - interactive configuration
 
 local args = { ... }
 local common = dofile("/ccminer/lib/common.lua")
@@ -211,21 +225,3 @@ local current = common.loadConfig()
 local requestedRole = string.lower(tostring(args[1] or (current and current.role) or ""))
 
 -- Setup is intentionally forgiving when it reads a hand-edited/old config:
--- malformed values are replaced by a safe default before they are passed to
--- the interactive validators.  This prevents an invalid stored default from
--- trapping a user in a prompt loop while preserving every valid old value.
-local function validInteger(value, fallback, minimum, maximum)
-  local number = tonumber(value)
-  if not number or number ~= math.floor(number) then return fallback end
-  if minimum and number < minimum then return fallback end
-  if maximum and number > maximum then return fallback end
-  return number
-end
-
-local function validNumber(value, fallback, minimum, maximum)
-  local number = tonumber(value)
-  if not number then return fallback end
-  if minimum and number < minimum then return fallback end
-  if maximum and number > maximum then return fallback end
-  return number
-end

@@ -1,3 +1,16 @@
+        if match then check("bay pose:#" .. tostring(id), "ok", "world pose verified", false) else check("bay pose:#" .. tostring(id), "bad", "worker is not at bay world pose", true) end
+        local facing = data.facing or data.pose and data.pose.dir
+        if facing == nil then check("bay facing:#" .. tostring(id), "bad", "worker facing unavailable", true)
+        elseif workerBay.facing ~= nil and tostring(facing) ~= tostring(workerBay.facing) then check("bay facing:#" .. tostring(id), "bad", "facing mismatch", true)
+        else check("bay facing:#" .. tostring(id), "ok", tostring(facing), false) end
+      end
+    end
+    if worldMode and not workerDock then check("dock:#" .. tostring(id), "bad", "registered dock metadata unavailable", true) end
+    if workerDock and workerDock.maxDepth and tonumber(spec.maxDepth) and tonumber(workerDock.maxDepth) < tonumber(spec.maxDepth) then spec.maxDepth = tonumber(workerDock.maxDepth) end
+    local homeY = tonumber(spec.homeY)
+    local bottom = commonBottom
+    if worldMode and (not homeY or not bottom) then check("Y:#" .. tostring(id), "bad", "HOME Y/BOTTOM Y unavailable", true) end
+    if worldMode and homeY and bottom then
       local layers = math.floor(homeY - bottom + 1)
       local maxDepth = tonumber(spec.maxDepth or config.maxDepth)
       if layers < 1 then check("maxDepth:#" .. tostring(id), "bad", "BOTTOM Y is above HOME Y", true) elseif layers > maxDepth then check("maxDepth:#" .. tostring(id), "bad", tostring(layers) .. " > " .. tostring(maxDepth), true) else check("maxDepth:#" .. tostring(id), "ok", tostring(layers), false) end
@@ -144,13 +157,3 @@ local function dispatchGroupJob(job, force)
         assignmentId = assignment.assignmentId, assignmentTotal = #sortedJobAssignments(job), assignmentChunks = common.copy(assignment.chunkKeys or {}), chunkKeys = common.copy(assignment.chunkKeys or {}), transitKeys = common.copy(assignment.transitKeys or {}), seedKey = assignment.seedKey, bayChunkKey = assignment.bayChunkKey,
         homeY = assignment.homeY, bottomY = assignment.bottomY, targetY = assignment.bottomY, layers = assignment.layers, width = job.width, length = job.length, depth = assignment.layers or job.depth,
         chunkMode = job.chunkMode, name = job.name, profile = job.profile, waterMode = job.waterMode, lighting = common.copy(job.lighting or {}), workerId = assignment.workerId, targetWorkerId = assignment.workerId,
-        bay = assignment.bay, bayId = assignment.bayId, dock = common.copy(assignment.dock or {}), dockId = assignment.dockId, homeWorld = common.copy(assignment.homeWorld), maxDepth = assignment.maxDepth, facing = assignment.facing,
-        lease = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) },
-        leases = { transit = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "transit", chunks = common.copy(assignment.transitKeys or {}) }, mine = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) } },
-      }
-      payload.command = "start"
-      payload.assignment = common.copy(assignment)
-      local ok = sendCommand(assignment.workerId, "start", payload)
-      job.pending[key] = nil
-      if ok then
-        job.awaitingAck[key] = { sentAt = now, attempts = tonumber(job.attempts and job.attempts[key] or 0) + 1, assignmentId = assignment.assignmentId }

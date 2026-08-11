@@ -1,3 +1,39 @@
+
+local function beginAutomaticService(reason)
+  beginService(true, "working", "automatic_" .. tostring(reason), false)
+  continueService()
+end
+
+local function handleMoveFailure(prefix, err, allowBedrock)
+  if err == "control_request" then return true end
+  if err == "seal_material" then beginAutomaticService("seal"); return true end
+  if err == "torch_material" then beginAutomaticService("torch"); return true end
+  if err == "torch_surface_unavailable" then
+    markBlocked(prefix .. ": no safe torch wall/floor surface was available.")
+    return true
+  end
+  if err == "inventory_full" then beginAutomaticService("inventory"); return true end
+  if err == "water_seal_limit" then
+    state.status, state.phase, state.lastError = "blocked", "water_seal_limit", prefix .. ": continuous water sealing limit reached."
+    state.stats.waterBlocked = (state.stats.waterBlocked or 0) + 1
+    saveState("water_seal_limit")
+    return true
+  end
+  if err == "lava_seal_limit" then
+    markBlocked(prefix .. ": continuous lava sealing limit reached.")
+    return true
+  end
+  if common.startsWith(err or "", "water:") then
+    state.status, state.phase, state.lastError = "blocked", "water_detected", prefix .. ": water detected (mode=" .. waterMode() .. ")."
+    saveState("water_stop")
+    return true
+  end
+  if err == "out_of_fuel" then
+    markBlocked(prefix .. ": fuel was exhausted before the safety return threshold.")
+    return true
+  end
+  if allowBedrock and common.startsWith(err or "", "protected:minecraft:bedrock") then
+    state.completionReason = "bedrock_reached"
     beginService(false, "complete", "bedrock", false)
     continueService()
     return true
@@ -256,30 +292,3 @@ local function runMiningStep()
 end
 
 local function displayLocalStatus()
-  common.clear(colors and colors.black or nil, colors and colors.white or nil)
-  print("CC Miner V4 Worker " .. common.VERSION)
-  print("ID: " .. os.getComputerID() .. "  " .. tostring(config.workerName))
-  print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
-  print(("Pose: x=%d y=%d z=%d d=%d"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir))
-  if state.gps and state.gps.lastFix then
-    print(("GPS: %d,%d,%d%s"):format(
-      state.gps.lastFix.x, state.gps.lastFix.y, state.gps.lastFix.z,
-      gpsCalibration() and " calibrated" or " uncalibrated"
-]] },
-  { source = [[src/ccminer/worker_parts/05.part]], target = [[worker_parts/05.part]], digest = [[7807e70cc70294234d8716894ee8580dd4b068ac3c3a829759a736bc524d06ed]], content = [[    ))
-  else
-    print("GPS: " .. (gpsCalibration() and "no fix" or "not calibrated"))
-  end
-  print("Fuel: " .. tostring(fuelLevel()) .. " / " .. tostring(fuelLimit()))
-  local used, empty, items = inventoryStats()
-  print(("Inventory: %d used, %d empty, %d items"):format(used, empty, items))
-  print(("Lava seal: %d/%d (%s)"):format(sealMaterialCount(), tonumber(config.sealTarget) or 64, config.lavaMode or "seal"))
-  local lightMode, lightInterval = effectiveLighting()
-  print(("Lighting: %s every %d, torches=%d, placed=%d"):format(
-    lightMode, lightInterval, torchMaterialCount(), state.stats.torchesPlaced or 0
-  ))
-  print(("Water: %s, detected=%d sealed=%d"):format(
-    waterMode(), state.stats.waterDetected or 0, state.stats.waterSealed or 0
-  ))
-  local throughput = throughputSnapshot()
-  local returnInfo = returnSnapshot()

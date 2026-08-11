@@ -1,3 +1,30 @@
+  for _, key in ipairs(keys) do
+    local chunk = chunks[key]
+    appendIndex(byMinX, chunk.minX, key)
+    appendIndex(byMaxX, chunk.maxX, key)
+    appendIndex(byMinZ, chunk.minZ, key)
+    appendIndex(byMaxZ, chunk.maxZ, key)
+    chunk.neighbors = {}
+  end
+  local order = {}
+  for index, key in ipairs(keys) do order[key] = index end
+  local function addPair(leftKey, rightKey)
+    if leftKey == rightKey or order[leftKey] > order[rightKey] then return end
+    local left, right = chunks[leftKey], chunks[rightKey]
+    if not adjacent(left, right) then return end
+    left.neighbors[#left.neighbors + 1] = rightKey
+    right.neighbors[#right.neighbors + 1] = leftKey
+  end
+  for _, key in ipairs(keys) do
+    local chunk = chunks[key]
+    local candidates, seen = {}, {}
+    local function collect(list)
+      for _, candidate in ipairs(list or {}) do
+        if not seen[candidate] then seen[candidate] = true; candidates[#candidates + 1] = candidate end
+      end
+    end
+    collect(byMinX[chunk.maxX + 1])
+    collect(byMaxX[chunk.minX - 1])
     collect(byMinZ[chunk.maxZ + 1])
     collect(byMaxZ[chunk.minZ - 1])
     table.sort(candidates, function(a, b) return order[a] < order[b] end)
@@ -269,32 +296,3 @@ function M.buildChunkPlan(job, calibration)
   if contains(chunks[rootKey], 0, 1) then chunks[rootKey].anchor = { x = 0, z = 1 } end
   local optimized, optimizedOrder = optimizedWalk(chunks, keys, rootKey)
   return {
-    mode = mode,
-    width = validWidth,
-    length = validLength,
-    depth = validDepth,
-    rootKey = rootKey,
-    chunks = chunks,
-    walk = walk,
-    -- optimizedWalk is deliberately separate: worker recovery still uses the
-    -- DFS parent/walk representation above.
-    optimizedWalk = optimized,
-    optimizedRoute = optimizedOrder,
-    -- `route` is a legacy alias.  It must be a separate array because the
-    -- runtime state is saved with textutils.serialize, which rejects shared
-    -- table references even when the values are otherwise valid.
-    route = (function()
-      local copy = {}
-      for index, key in ipairs(optimizedOrder) do copy[index] = key end
-      return copy
-    end)(),
-    columns = columns,
-    selectedChunks = #keys,
-    excludedCount = excludedCount,
-    catalogCount = #catalog,
-  }
-end
-
-function M.chunkCellCount(chunk)
-  if type(chunk) ~= "table" then return nil, "invalid_chunk" end
-  local minX, maxX = integerValue(chunk.minX), integerValue(chunk.maxX)

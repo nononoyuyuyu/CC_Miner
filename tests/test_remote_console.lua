@@ -41,7 +41,7 @@ local changelog = read("CHANGELOG.md")
 for _, expected in ipairs({
   "function M.defaultRemoteConsoleConfig()",
   "remoteConsole = M.defaultRemoteConsoleConfig()",
-  "enabled = false",
+  "enabled = true",
   "allowShell = false",
   "sessionSeconds = 120",
   "maxOutputBytes = 8192",
@@ -61,18 +61,21 @@ for _, expected in ipairs({
 end
 marker(common, "function M.normalizeRemoteConsoleConfig(value)", "remote-console normalizer")
 marker(common, "loaded.remoteConsoleAllowlist", "remote-console migration alias")
+marker(common, "if not remoteWasSpecified then remoteSource.enabled = false end", "legacy update remains opt-in")
 marker(common, "toSave.remoteConsole = M.normalizeRemoteConsoleConfig(config.remoteConsole)", "remote-console serializer detachment")
 marker(common, "config.controllerId = normalizeInteger(config.controllerId, 0, 65535, defaults.controllerId)", "controller pin normalization")
 
--- Setup must make this a Japanese, explicit opt-in and must not combine shell
--- permission with the first enable question.
+-- Fresh setup enables only the bounded safe console for same-key controllers.
+-- Arbitrary shell access remains a separate opt-in and requires a pin.
 for _, expected in ipairs({
   'local remoteConsole = ensureTable(config, "remoteConsole", workerDefaults.remoteConsole)',
   "【強い警告】遠隔コンソールは",
-  "遠隔コンソールを有効にしますか（既定OFF）",
+  "安全な遠隔コンソールを有効にしますか（新規設定はON）",
   "remoteConsole.allowShell = common.promptYesNo",
   "allowShell（シェル実行）を許可しますか",
-  "controllerId=0 のままでは遠隔コンソールを有効にできません。",
+  "controllerId=0 は、同じ合言葉を持つ管理用コンピューターを許可します。",
+  "allowShellではcontrollerId=0を使えません。",
+  "Allowed controller ID (0=same network key)",
   "Controller computer ID (1-65535)",
   "config.remoteConsole = common.normalizeRemoteConsoleConfig(remoteConsole)",
 }) do
@@ -121,11 +124,11 @@ marker(command, "ccm remote <workerId>", "ccm remote help")
 -- Beginner documentation must describe the safe sequence and the fact that
 -- rednet is not encryption, without hiding the command itself.
 for _, expected in ipairs({
-  "既定はOFFです",
+  "安全な確認機能だけが既定でONです",
+  "同じ合言葉",
   "ccm remote 12",
   "採掘を止め",
   "ドックへ戻った",
-  "controller pin",
   "controllerId",
   "exit",
   "更新",
@@ -139,7 +142,7 @@ for _, expected in ipairs({
 end
 for _, expected in ipairs({
   "ccm remote 12",
-  "controller pin",
+  "controllerId=0",
   "採掘を停止",
   "ドック",
   "exit",
@@ -148,8 +151,8 @@ for _, expected in ipairs({
 }) do
   marker(safety, expected, "remote-console safety documentation")
 end
-marker(quickstart, "遠隔コンソールは使いません", "remote-console quickstart default warning")
+marker(quickstart, "この最短手順では遠隔コンソールを使いません", "remote-console quickstart scope warning")
 marker(readme, "ccm remote 12", "remote-console README procedure")
-marker(changelog, "遠隔コンソールを既定OFF", "remote-console changelog entry")
+marker(changelog, "同じnetworkKeyのコントローラーへ読み取りallowlistだけを既定許可", "remote-console changelog entry")
 
 print("remote-console V4 config, setup, runtime boundary, and beginner documentation contracts passed")

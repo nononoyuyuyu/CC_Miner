@@ -1,3 +1,19 @@
+  local action = remoteAckField(payload, result, "action")
+    or remoteAckField(payload, result, "remoteAction")
+  if action ~= nil and tostring(action):lower() ~= tostring(pending.action):lower() then return false end
+  local sessionId = remoteAckField(payload, result, "sessionId")
+  local nonce = remoteAckField(payload, result, "nonce")
+  -- The worker creates fresh session credentials on OPEN and returns them in
+  -- the result table.  Subsequent actions must echo those credentials exactly;
+  -- the controller's provisional values are only an anti-collision hint.
+  if pending.action ~= "open" then
+    if sessionId ~= nil and tostring(sessionId) ~= tostring(session.sessionId) then return false end
+    if nonce ~= nil and tostring(nonce) ~= tostring(session.nonce) then return false end
+  end
+  local sequence = remoteAckField(payload, result, "seq")
+    or remoteAckField(payload, result, "sequence")
+  if sequence ~= nil and tonumber(sequence) ~= tonumber(pending.seq) then return false end
+  if pending.action == "open" then
     if payload.ok == true and (sessionId == nil or tostring(sessionId) == ""
       or nonce == nil or tostring(nonce) == "") then return false end
     if sessionId ~= nil and tostring(sessionId) ~= "" then session.sessionId = tostring(sessionId) end
@@ -197,27 +213,3 @@ end
 local function remoteSensitiveKey(key)
   local name = tostring(key or ""):lower():gsub("[^%a%d]", "")
   return name == "networkkey" or name == "password" or name == "passwd"
-    or name == "secret" or name == "token" or name == "nonce"
-    or name == "sessionid" or name == "apikey" or name == "auth"
-end
-
-local function remoteValueText(value, depth, field)
-  if remoteSensitiveKey(field) then return "[REDACTED]" end
-  depth = tonumber(depth) or 0
-  if value == nil then return "-" end
-  if type(value) == "string" then return remoteRedactText(value) end
-  if type(value) == "number" or type(value) == "boolean" then return tostring(value) end
-  if type(value) ~= "table" then return remoteRedactText(value) end
-  if depth >= 3 then return "{...}" end
-  local keys = {}
-  for key in pairs(value) do keys[#keys + 1] = key end
-  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-  local parts = {}
-  for _, key in ipairs(keys) do
-    parts[#parts + 1] = tostring(key) .. "=" .. remoteValueText(value[key], depth + 1, key)
-    if #parts >= 32 then parts[#parts + 1] = "..."; break end
-  end
-  return "{" .. table.concat(parts, ",") .. "}"
-end
-
-local function remoteResultTable(payload)

@@ -1,3 +1,50 @@
+  if character == "d" then discover()
+  elseif character == "n" then dashboardAction("new")()
+  elseif character == "p" then sendCommand(id, "pause")
+  elseif character == "r" then sendCommand(id, "resume")
+  elseif character == "h" then sendCommand(id, "recall")
+  elseif character == "s" then dashboardAction("stop")()
+  elseif character == "x" then dashboardAction("abort")()
+  elseif character == "c" then dashboardAction("clear")()
+  elseif character == "i" then dashboardAction("info")()
+  elseif character == "g" then dashboardAction("progress")()
+  elseif character == "o" then dashboardAction("remote")()
+  elseif character == "e" then dashboardAction("recovery")()
+  elseif character == "t" then dashboardAction("report")()
+  elseif character == "l" then dashboardAction("gps")()
+  elseif character == "v" then dashboardAction("groups")()
+  elseif character == "q" then running = false end
+end
+
+local function processKey(keyCode)
+  if keys and keyCode == keys.escape then
+    if mode == "dashboard" then
+      running = false
+    else
+      mode, draft, confirmState = "dashboard", nil, nil
+      invalidate()
+    end
+    return
+  end
+  if mode == "dashboard" then
+    local ids = orderedIds()
+    if keys and keyCode == keys.up then
+      selected = math.max(1, selected - 1)
+      invalidate()
+    elseif keys and keyCode == keys.down then
+      selected = math.min(math.max(1, #ids), selected + 1)
+      invalidate()
+    elseif keys and keyCode == keys.enter then
+      mode = "info"
+      invalidate()
+    end
+  elseif mode == "error_detail" then
+    if keys and (keyCode == keys.enter or keyCode == keys.backspace or keyCode == keys.escape) then noticeState.dismiss() end
+  elseif mode == "groups" then
+    local ids = orderedGroupIds()
+    if keys and keyCode == keys.up then selectedGroup = math.max(1, selectedGroup - 1); invalidate()
+    elseif keys and keyCode == keys.down then selectedGroup = math.min(math.max(1, #ids), selectedGroup + 1); invalidate()
+    elseif keys and keyCode == keys.enter then mode = "group_info"; invalidate()
     elseif keys and keyCode == keys.backspace then mode = "dashboard"; invalidate() end
   elseif mode == "group_info" then
     if keys and (keyCode == keys.enter or keyCode == keys.backspace) then mode = "groups"; invalidate() end
@@ -190,39 +237,3 @@ local function commandLineMode()
     local sub, id = string.lower(args[2] or "list"), args[3]
     local registry = command == "dock" and db.docks or db.bays
     if sub == "list" then
-      for key, value in pairs(registry or {}) do print(("%s world=%s,%s,%s facing=%s maxDepth=%s"):format(tostring(key), tostring(value.world and value.world.x or "-"), tostring(value.world and value.world.y or "-"), tostring(value.world and value.world.z or "-"), tostring(value.facing or "-"), tostring(value.maxDepth or "-"))) end
-    elseif sub == "register" and id then
-      local value = { world = { x = tonumber(args[4]), y = tonumber(args[5]), z = tonumber(args[6]) }, facing = args[7], maxDepth = tonumber(args[8]) }
-      local ok, err = command == "dock" and registerDock(id, value) or registerBay(id, value)
-      print(ok and ((command == "dock" and "Dock" or "Bay") .. " saved.") or ("Register error: " .. tostring(err)))
-    else print("Usage: " .. command .. " list|register <id> <x> <y> <z> [facing=south|east|north|west|0..3] [maxDepth]") end
-    return true
-  end
-  if command == "remote" then
-    local id = tonumber(args[2])
-    if not id then
-      print("Usage: ccm remote <workerId> [-- <command...>]")
-      return true
-    end
-    if args[3] == nil then
-      return noticeState.remoteApi.consoleCommand(id)
-    end
-    if args[3] ~= "--" or args[4] == nil then
-      print("Usage: ccm remote <workerId> [-- <command...>]")
-      return true
-    end
-    local commandText = {}
-    for index = 4, #args do commandText[#commandText + 1] = tostring(args[index]) end
-    return noticeState.remoteApi.consoleCommand(id, table.concat(commandText, " "))
-  end
-  if command == "discover" or command == "status" then
-    discover(); pumpFor(3)
-    local ids = orderedIds()
-    if #ids == 0 then print("No workers found."); return true end
-    for _, id in ipairs(ids) do
-      local data = workers[id].data or {}
-      print(("#%s %-16s %-14s %s GPS=%s seal=%s"):format(id, workerLabel(workers[id], id), statusOf(workers[id]), progressText(data), data.gps and data.gps.calibrated and "ready" or "no", data.seal and data.seal.count or "-"))
-    end
-    return true
-  elseif command == "start" then
-    local id, width, length, depth = tonumber(args[2]), tonumber(args[3]), tonumber(args[4]), tonumber(args[5])

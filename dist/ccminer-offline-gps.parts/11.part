@@ -1,3 +1,35 @@
+    matches = ok and value == wanted
+  end
+  if not matches and peripheral.hasType then
+    local ok, value = pcall(peripheral.hasType, name, wanted)
+    matches = ok and value == true
+  end
+  return matches
+end
+
+local function wirelessModems()
+  local names = {}
+  if not peripheral or type(peripheral.getNames) ~= "function" then return names end
+  local ok, all = pcall(peripheral.getNames)
+  if not ok or type(all) ~= "table" then return names end
+  for _, name in ipairs(all) do
+    if peripheralIsType(name, "modem") then
+      local wireless = false
+      local wrapped = peripheral.wrap and peripheral.wrap(name) or nil
+      if wrapped and type(wrapped.isWireless) == "function" then
+        local wirelessOk, result = pcall(wrapped.isWireless)
+        wireless = wirelessOk and result == true
+      end
+      if wireless then names[#names + 1] = tostring(name) end
+    end
+  end
+  return names
+end
+
+local function inventoryAvailable(side)
+  if not side or side == "" then return false end
+  if peripheralIsType(side, "inventory") then return true end
+  if peripheral and peripheral.wrap then
     local ok, wrapped = pcall(peripheral.wrap, side)
     if ok and wrapped and (type(wrapped.list) == "function" or type(wrapped.size) == "function") then return true end
   end
@@ -222,24 +254,3 @@ local function runDoctor()
     finding("PASS", "config.role", role)
   end
   if config.version == nil then finding("WARN", "config.version", "missing") else finding("PASS", "config.version", tostring(config.version)) end
-
-  local networkKey = config.networkKey
-  if role ~= "gps" then
-    if type(networkKey) ~= "string" or networkKey == "" or networkKey == "CHANGE_ME" then
-      finding("FAIL", "config.networkKey", "missing or still CHANGE_ME")
-    else
-      finding("PASS", "config.networkKey", "configured (masked)")
-    end
-  end
-  if role == "worker" then
-    local numericChecks = {
-      { "config.maxWidth", config.maxWidth, 1 }, { "config.maxLength", config.maxLength, 1 },
-      { "config.maxDepth", config.maxDepth, 1 }, { "config.maxVolume", config.maxVolume, 1 },
-      { "config.reserveEmptySlots", config.reserveEmptySlots, 0 },
-    }
-    for _, check in ipairs(numericChecks) do
-      if tonumber(check[2]) and tonumber(check[2]) >= check[3] then finding("PASS", check[1], tostring(check[2]))
-      else finding("FAIL", check[1], "must be a number >= " .. tostring(check[3])) end
-    end
-    finding("PASS", "config.profile", tostring(config.profile or "balanced"))
-    finding("PASS", "config.water", valueString(config.water or config.waterMode or "seal"))

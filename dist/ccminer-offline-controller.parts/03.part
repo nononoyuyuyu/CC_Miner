@@ -1,3 +1,9 @@
+    resumeToken = nil,
+    resume = {
+      token = nil,
+      issuedAt = nil,
+      consumedAt = nil,
+    },
     -- Disposal is audited independently of the general recycle counters.
     -- Items that are not selected by the active policy are counted as held or
     -- skipped rather than silently dropped.
@@ -390,7 +396,3 @@ local function normalizeIdentifier(value, fallback, maximum)
   if type(value) == "number" then value = tostring(value) end
   value = normalizeString(value, fallback, 1, maximum or 64)
   if type(value) ~= "string" or value:find("[%c%s]") then return fallback end
-  return value
-end
-
--- Remote console commands are deliberately represented as an array of exact

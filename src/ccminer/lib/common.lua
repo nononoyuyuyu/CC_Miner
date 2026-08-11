@@ -428,7 +428,10 @@ end
 -- exact command-head authorization contract.
 function M.defaultRemoteConsoleConfig()
   return {
-    enabled = false,
+    -- Fresh worker setups expose only the exact read-only allowlist to
+    -- controllers which know the same network key. Arbitrary shell access is
+    -- still a separate, pinned-controller privilege.
+    enabled = true,
     allowShell = false,
     sessionSeconds = 120,
     maxOutputBytes = 8192,
@@ -456,10 +459,9 @@ function M.defaultWorkerConfig()
     networkKey = "CHANGE_ME",
     workerName = M.safeComputerLabel("Miner"),
     controllerId = 0,
-    -- Remote console is deliberately disabled until a setup user opts in.
-    -- The allowlist is an ordered string array (rather than a map) so the
-    -- controller/worker wire contract and ComputerCraft serializer remain
-    -- straightforward and deterministic.
+    -- Fresh setups permit only the bounded read-only console for controllers
+    -- which know the same network key. `allowShell` remains separately OFF.
+    -- The ordered array keeps the wire/serializer contract deterministic.
     remoteConsole = M.defaultRemoteConsoleConfig(),
     reserveEmptySlots = 3,
     fuelBuffer = 256,
@@ -1204,7 +1206,9 @@ function M.normalizeRemoteConsoleConfig(value)
   local defaults = M.defaultRemoteConsoleConfig()
   local source = type(value) == "table" and value or {}
   local out = {
-    enabled = normalizeBoolean(source.enabled, defaults.enabled),
+    -- Fresh setup writes an explicit true. Missing or malformed persisted
+    -- values must not silently enable a network-facing feature.
+    enabled = type(source.enabled) == "boolean" and source.enabled or false,
     allowShell = normalizeBoolean(source.allowShell, defaults.allowShell),
     sessionSeconds = normalizeInteger(source.sessionSeconds, 1, 3600, defaults.sessionSeconds),
     maxOutputBytes = normalizeInteger(source.maxOutputBytes, 256, 65536, defaults.maxOutputBytes),
@@ -1257,6 +1261,10 @@ local function normalizeWorkerConfig(raw)
     or (type(loaded.remote_console) == "table" and loaded.remote_console)
     or (type(loaded.remote) == "table" and loaded.remote) or {}
   local remoteScalar = type(loaded.remoteConsole) == "boolean" and loaded.remoteConsole or nil
+  local remoteWasSpecified = type(loaded.remoteConsole) == "table" or remoteScalar ~= nil
+    or type(loaded.remote_console) == "table" or type(loaded.remote) == "table"
+    or loaded.remoteConsoleEnabled ~= nil or loaded.remote_console_enabled ~= nil
+    or loaded.remoteEnabled ~= nil
   local remoteSource = {
     enabled = firstNonNil(loadedRemote.enabled, remoteScalar, loaded.remoteConsoleEnabled,
       loaded.remote_console_enabled, loaded.remoteEnabled),
@@ -1272,6 +1280,11 @@ local function normalizeWorkerConfig(raw)
       loadedRemote.allowedCommands, loaded.remoteAllowlist, loaded.remote_allowlist,
       loaded.remoteConsoleAllowlist),
   }
+  -- Updating a pre-console installation must not silently create a new
+  -- network surface. Fresh setup writes the explicit default=true record;
+  -- legacy configs with no remote field migrate to disabled until setup is
+  -- run and the operator sees the warning.
+  if not remoteWasSpecified then remoteSource.enabled = false end
   config.remoteConsole = M.normalizeRemoteConsoleConfig(remoteSource)
   config.profile = normalizeEnum(config.profile, { safe = true, balanced = true, turbo = true }, defaults.profile)
   config.waterMode = normalizeEnum(config.waterMode, { ignore = true, stop = true, seal = true }, defaults.waterMode)

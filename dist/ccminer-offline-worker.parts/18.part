@@ -1,3 +1,27 @@
+      if type(source) == "table" and (source.key == nil or tostring(source.key) == "") then
+        local copy = {}
+        for field, value in pairs(source) do copy[field] = value end
+        copy.key = tostring(mapKey)
+        sources[#sources + 1] = copy
+      else
+        sources[#sources + 1] = source
+      end
+    end
+  end
+  if #sources > MAX_CHUNKS then return nil, "too_many_chunks" end
+  for _, source in ipairs(sources) do
+    if type(source) ~= "table" then return nil, "invalid_chunk_catalog" end
+    local key = source.key and tostring(source.key) or nil
+    if not key or key == "" then return nil, "invalid_chunk_key" end
+    if source.mode ~= "world" or key:sub(1, 2) ~= "W:" then return nil, "gps_required_world_catalog" end
+    local cx, cz = integerValue(source.cx), integerValue(source.cz)
+    local minX, maxX = integerValue(source.minX), integerValue(source.maxX)
+    local minZ, maxZ = integerValue(source.minZ), integerValue(source.maxZ)
+    local cells = integerValue(source.cells, 1, MAX_COLUMNS)
+    if not cx or not cz or not minX or not maxX or not minZ or not maxZ or maxX < minX or maxZ < minZ or not cells or cells < 1 then
+      return nil, "invalid_chunk_catalog"
+    end
+    local keyCx, keyCz = key:match("^W:(%-?%d+):(%-?%d+)$")
     if not keyCx or tonumber(keyCx) ~= cx or tonumber(keyCz) ~= cz then return nil, "invalid_chunk_key" end
     if chunks[key] then return nil, "duplicate_chunk_key" end
     chunks[key] = {
@@ -245,27 +269,3 @@ function M.buildWorldCatalog(width, length, worldSeed, options)
     options = type(length) == "table" and length or options
     width, length = descriptor.width, descriptor.length
     worldSeed = descriptor.worldSeed or descriptor.seed or descriptor.calibration or options.worldSeed or worldSeed
-    if descriptor.options and type(descriptor.options) == "table" then
-      local merged = {}
-      for key, value in pairs(descriptor.options) do merged[key] = value end
-      for key, value in pairs(options) do merged[key] = value end
-      options = merged
-      if worldSeed == nil then worldSeed = options.worldSeed end
-    end
-  end
-  local calibration = options.calibration
-  if not calibration then calibration = worldSeedCalibration(worldSeed, options) end
-  if not calibration then return nil, "gps_not_calibrated" end
-  local catalog, catalogError = M.buildCatalog(width, length, "world", calibration)
-  if not catalog then return nil, catalogError end
-  -- Arrays may carry metadata fields in Lua.  Keep the reference GPS seed and
-  -- bounds available to assigned-plan builders without sharing calibration
-  -- tables with the caller or with persisted worker state.
-  catalog.referenceCalibration = {
-    home = { x = calibration.home.x, y = calibration.home.y, z = calibration.home.z },
-    forward = { x = calibration.forward.x, z = calibration.forward.z },
-  }
-  catalog.calibrationSeed = {
-    home = { x = calibration.home.x, y = calibration.home.y, z = calibration.home.z },
-    forward = { x = calibration.forward.x, z = calibration.forward.z },
-  }

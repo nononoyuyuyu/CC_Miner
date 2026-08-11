@@ -1,3 +1,20 @@
+    if layers == nil and worker.homeY ~= nil and bottomY ~= nil then layers = worker.homeY - bottomY + 1 end
+    if layers == nil then layers = 1 end
+    if layers < 1 or layers > MAX_DIMENSION then return nil, "invalid_worker_layers" end
+    local volume = loads[index] * layers
+    if volume > MAX_BLOCKS then return nil, "group_too_large" end
+    local distance = #transitKeys + math.max(0, #chunkKeys - 1)
+    if worker.bay then
+      local seedChunk = chunks[seedKey]
+      distance = distance + math.abs(worker.bay.x - (seedChunk.cx * 16 + 8))
+        + math.abs(worker.bay.z - (seedChunk.cz * 16 + 8))
+    end
+    local estimatedCost = volume + distance
+    -- Lease overlap checks operate on global chunk keys.  Do not prefix these
+    -- arrays with a worker name: that would make two assignments appear
+    -- disjoint to the controller.  The assignment-scoped identity lives in
+    -- leaseId separately, while each array gets its own copy for CC's
+    -- serializer.
     local leaseKeys = cloneStringArray(chunkKeys)
     local transitLeaseKeys = cloneStringArray(transitKeys)
     local assignment = {
@@ -258,18 +275,3 @@ function M.buildAssignedChunkPlan(catalog, assignedKeys, options)
     end
   end
   local function rebaseBounds(chunk)
-    if not workerCalibration then return true end
-    local minX, maxX, minZ, maxZ = chunk.minX, chunk.maxX, chunk.minZ, chunk.maxZ
-    local corners = {
-      { x = minX, z = minZ }, { x = minX, z = maxZ },
-      { x = maxX, z = minZ }, { x = maxX, z = maxZ },
-    }
-    local rebasedMinX, rebasedMaxX, rebasedMinZ, rebasedMaxZ
-    for _, corner in ipairs(corners) do
-      local worldX, worldZ = localToWorld(referenceCalibration, corner.x, corner.z)
-      local localX, localZ, rebaseError = worldToLocalXZ(workerCalibration, worldX, worldZ)
-      if not localX or not localZ then return nil, rebaseError or "invalid_rebase" end
-      if localX % 1 ~= 0 or localZ % 1 ~= 0 then return nil, "non_integral_rebase" end
-      rebasedMinX = rebasedMinX and math.min(rebasedMinX, localX) or localX
-      rebasedMaxX = rebasedMaxX and math.max(rebasedMaxX, localX) or localX
-      rebasedMinZ = rebasedMinZ and math.min(rebasedMinZ, localZ) or localZ

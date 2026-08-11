@@ -1,3 +1,41 @@
+      return false, "Fuel loading safety limit reached."
+    end
+    local slot = firstFuelSlot()
+    if not slot then
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "No empty slot available while refueling."
+    end
+    turtle.select(slot)
+    local sucked = runInventoryPhysicalAction("refuel_suck", {
+      slot = slot, count = 1, direction = fuelSide,
+    }, function() return suckFunction(1) end)
+    if not sucked then
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Fuel inventory is empty."
+    end
+    local validFuel = runInventoryPhysicalAction("refuel_probe", {
+      slot = slot, count = turtle.getItemCount(slot), direction = fuelSide,
+    }, function() return turtle.refuel(0) end)
+    if not validFuel then
+      runInventoryPhysicalAction("refuel_reject", {
+        slot = slot, item = itemName(slot), direction = fuelSide,
+      }, dropFunction)
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Fuel inventory contains a non-fuel item."
+    end
+    local before = fuelLevel()
+    local consumed = runInventoryPhysicalAction("refuel_consume", {
+      slot = slot, item = itemName(slot), direction = fuelSide,
+    }, function() return turtle.refuel(1) end)
+    local after = fuelLevel()
+    if not consumed then
+      runInventoryPhysicalAction("refuel_reject", {
+        slot = slot, item = itemName(slot), direction = fuelSide,
+      }, dropFunction)
+      restoreSideDirection(fuelSide, restoreDir)
       turtle.select(originalSlot)
       return false, "Turtle refused the selected fuel item."
     end
@@ -237,31 +275,3 @@ local function finishService()
     state.assignmentResumeToken = nil
     state.status, state.phase = "complete", "home"
     state.estimate = state.estimate or {}
-    state.estimate.actual = state.job and state.job.cursor or 0
-    state.estimate.variance = (state.estimate.actual or 0) - (tonumber(state.estimate.estimated) or (state.estimate.actual or 0))
-    state.report = {
-      jobId = state.job and state.job.id or nil,
-      assignmentId = state.job and state.job.assignmentId or nil,
-      groupJobId = state.job and state.job.groupJobId or nil,
-      group = state.group and common.copy(state.group) or nil,
-      reason = state.completionReason,
-      returnReason = state.lastReturnReason or state.returnReason,
-      ["return"] = state.serviceReturn and common.copy(state.serviceReturn) or nil,
-      completedAt = common.nowSeconds(),
-      elapsed = state.job and math.max(0, common.nowSeconds() - (state.job.startedAt or common.nowSeconds())) or 0,
-      progress = state.job and { cursor = state.job.cursor or 0, total = state.job.total or 0 } or nil,
-      stats = common.copy(state.stats),
-      estimated = state.estimate and state.estimate.estimated or nil,
-      actual = state.job and state.job.cursor or nil,
-      materials = {
-        torchCount = torchMaterialCount(), sealCount = sealMaterialCount(),
-      },
-      discard = common.copy(state.discardStats or state.discard or {}),
-      throughput = throughputSnapshot(),
-      assignmentResumeToken = nil,
-    }
-    state.stats.jobReports = (state.stats.jobReports or 0) + 1
-    state.job.report = common.copy(state.report)
-    state.lastReport = common.copy(state.report)
-    state.jobReport = common.copy(state.report)
-  elseif finalStatus == "aborted" then

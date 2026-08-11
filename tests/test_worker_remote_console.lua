@@ -40,7 +40,9 @@ for _, action in ipairs({
 
 for _, field in ipairs({
   "config.controllerId or 0",
-  "Remote console requires a pinned controllerId.",
+  "Arbitrary remote shell requires a pinned controllerId.",
+  "pinnedController > 0",
+  "Remote console sender is not the pinned controller.",
   "Remote console requires an idle, complete, aborted, or paused worker.",
   "Remote console requires the worker to be at home.",
   "state.pendingAction",

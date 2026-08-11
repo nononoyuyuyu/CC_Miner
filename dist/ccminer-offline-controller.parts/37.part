@@ -1,3 +1,39 @@
+  -- unchanged so old monitors and keyboard shortcuts continue to work.
+  buttonRow(key, math.max(1, bottom - 1), width, {
+    { "GROUPS", dashboardAction("groups") }, { "G START", dashboardAction("group_start") },
+    { "G PAUSE", dashboardAction("group_pause") }, { "G RETURN", dashboardAction("group_return") },
+  })
+  local groupIds = orderedGroupIds()
+  if #groupIds > 0 then
+    local gy = math.max(2, bottom - 2)
+    local gid, g = selectedGroupRecord()
+    local gj = gid and activeGroupJob(gid) or nil
+    local aggregate = gj and (gj.aggregate or updateGroupAggregate(gj)) or nil
+    local line = ("Group %s %s %d workers %s%% minFuel=%s ACK=%s/%s"):format(tostring(gid), groupName(g, gid), #(groupWorkerIds(g)), tostring(aggregate and aggregate.percent or 0), tostring(aggregate and aggregate.minFuel or "-"), tostring(aggregate and aggregate.acks or 0), tostring(aggregate and aggregate.ackTotal or #groupWorkerIds(g)))
+    common.writeAt(1, gy, common.fit(line, width), colors and colors.cyan or nil)
+  end
+  noticeLine(target, height)
+end
+
+local function groupAction(groupCommandName)
+  return function()
+    local gid = selectedGroupRecord()
+    if not gid then setNotice("No group selected.", true); return end
+    if groupCommandName == "start" then
+      groupDraft = groupDraftDefaults(groupRecord(gid))
+      groupDraft.selectedField = "width"
+      groupDraft.buffer = tostring(groupDraft.width or 1)
+      groupDraft.preflight = nil
+      mode = "group_dimensions"
+    else
+      groupCommand(gid, groupCommandName)
+    end
+    invalidate()
+  end
+end
+
+local function groupAssignmentCount(result)
+  local count = 0
   for _, assignment in pairs(result and result.assignments or {}) do if type(assignment) == "table" then count = count + 1 end end
   return count
 end
@@ -128,19 +164,3 @@ local function renderGroupInfo(target, key)
     common.writeAt(1, 3, common.fit("No group selected.", width), colors and colors.yellow or nil)
   else
     local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, minFuel = nil, warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
-    common.writeAt(1, 2, common.fit(("%s (%s) mode=%s partition=%s"):format(groupName(group, gid), tostring(gid), tostring(group.mode or "world"), tostring(group.partition or "stripe")), width), colors and colors.lightGray or nil)
-    common.writeAt(1, 3, common.fit(("GROUP %s%% | BOTTOM Y=%s | minFuel=%s | ACK %d/%d | warnings=%d"):format(tostring(aggregate.percent or 0), tostring(job and job.bottomY or "-"), tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0, #(aggregate.warnings or {})), width), colors and colors.cyan or nil)
-    local row = 5
-    for _, workerId in ipairs(groupWorkerIds(group)) do
-      if row >= height - 5 then break end
-      local worker = workers[workerId]
-      local data = worker and worker.data or {}
-      local assignment = job and job.assignments and (job.assignments[tostring(workerId)] or job.assignments[workerId]) or nil
-      local status = assignment and assignment.status or statusOf(worker)
-      local homeY = assignment and assignment.homeY or data.homeY or data.gps and data.gps.calibration and data.gps.calibration.home and data.gps.calibration.home.y or "-"
-      local layers = assignment and assignment.layers or data.job and data.job.depth or "-"
-      local progress = worker and progressText(data) or "-"
-      local line = ("#%-4s %-12s %-12s %s HOME Y=%s LAYERS=%s"):format(tostring(workerId), common.fit(workerLabel(worker, workerId), 12), common.fit(status, 12), common.fit(progress, 14), tostring(homeY), tostring(layers))
-      common.writeAt(1, row, common.fit(line, width), status == "blocked" and colors and colors.red or colors and colors.white or nil)
-      row = row + 1
-      if assignment and (status == "blocked" or status == "offline" or status == "failed") then

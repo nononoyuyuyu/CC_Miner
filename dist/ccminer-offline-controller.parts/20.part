@@ -1,3 +1,21 @@
+        for index in pairs(candidateOwners) do
+          local projected = math.abs((loads[index] + chunks[key].cells) - target)
+          local score = projected
+          if distanceWeight and workers[index].bay then
+            local chunk = chunks[key]
+            score = score + distanceWeight * (math.abs(workers[index].bay.x - (chunk.cx * 16 + 8))
+              + math.abs(workers[index].bay.z - (chunk.cz * 16 + 8)))
+          end
+          if not bestKey or score < bestScore or (score == bestScore and (chunkComparator(chunks[key], chunks[bestKey]) or (key == bestKey and index < bestOwner))) then
+            bestKey, bestOwner, bestScore, bestProjected = key, index, score, projected
+          end
+        end
+      end
+    end
+    if not bestKey then return nil, "chunk_catalog_disconnected" end
+    owner[bestKey] = bestOwner
+    owned[bestOwner][#owned[bestOwner] + 1] = bestKey
+    loads[bestOwner] = loads[bestOwner] + chunks[bestKey].cells
     assigned = assigned + 1
   end
   return owner, owned, loads, strategyLabel or "graph", seeds
@@ -240,20 +258,3 @@ function M.partitionGroup(catalog, workersInput, options)
     for transitKey in pairs(transitSet) do transitKeys[#transitKeys + 1] = transitKey end
     table.sort(transitKeys, function(a, b) return chunkComparator(chunks[a], chunks[b]) end)
     local layers = defaultLayers
-    if layers == nil and worker.homeY ~= nil and bottomY ~= nil then layers = worker.homeY - bottomY + 1 end
-    if layers == nil then layers = 1 end
-    if layers < 1 or layers > MAX_DIMENSION then return nil, "invalid_worker_layers" end
-    local volume = loads[index] * layers
-    if volume > MAX_BLOCKS then return nil, "group_too_large" end
-    local distance = #transitKeys + math.max(0, #chunkKeys - 1)
-    if worker.bay then
-      local seedChunk = chunks[seedKey]
-      distance = distance + math.abs(worker.bay.x - (seedChunk.cx * 16 + 8))
-        + math.abs(worker.bay.z - (seedChunk.cz * 16 + 8))
-    end
-    local estimatedCost = volume + distance
-    -- Lease overlap checks operate on global chunk keys.  Do not prefix these
-    -- arrays with a worker name: that would make two assignments appear
-    -- disjoint to the controller.  The assignment-scoped identity lives in
-    -- leaseId separately, while each array gets its own copy for CC's
-    -- serializer.

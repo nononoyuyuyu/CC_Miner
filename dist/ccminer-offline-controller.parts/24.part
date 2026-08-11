@@ -1,3 +1,32 @@
+  persistedDb.groupJobs, persistedDb.groupLeases = persistedJobs, persistedGroupLeases
+  persistedDb.groupScheduler = persistentDraft(db.groupScheduler or {})
+  persistedDb.activeLeases = common.copy(db.leases or {})
+  local ok, err = common.saveTable(DB_PATH, persistedDb)
+  if not ok then dbError = err end
+  return ok, err
+end
+
+loadControllerDb()
+
+local workers = {}
+local selected = 1
+local selectedGroup = 1
+local groupMode = false
+local groupDraft = nil
+local groupCommandAcks = {}
+local groupSchedulerLast = 0
+local normalizedProfile, normalizedWaterMode, normalizedLighting
+local releaseGroupLeases
+local finalizePendingReassignment
+local acceptGroupStart, rejectGroupStart
+local sortedJobAssignments, groupSafeStop
+local notice = dbError and ("Controller DB recovered: " .. tostring(dbError)) or "Controller ready. Touch DISCOVER or press D."
+local noticeIsError = false
+local noticeState = { detail = nil, returnMode = nil }
+local lastDiscovery = 0
+local running = true
+local mode = "dashboard"
+local draft = nil
 local confirmState = nil
 local hitboxes = {}
 local renderCache = {}
@@ -262,26 +291,3 @@ local function registerGroup(groupId, workerIds, options)
     workerIds = common.copy(ids),
     dockId = options.dockId or previous.dockId,
     bayId = options.bayId or previous.bayId,
-    -- Per-worker overrides are maps keyed by worker ID.  A shared dock/bay
-    -- remains a convenient default for legacy group registrations.
-    workerBays = common.copy(options.workerBays or previous.workerBays or {}),
-    workerDocks = common.copy(options.workerDocks or previous.workerDocks or {}),
-    mode = mode,
-    partition = partition,
-    staggerSeconds = math.max(0, tonumber(options.staggerSeconds or previous.staggerSeconds) or tonumber(db.groupScheduler.staggerSeconds) or 0),
-    replenishConcurrency = math.max(1, math.floor(tonumber(options.replenishConcurrency or previous.replenishConcurrency) or tonumber(db.groupScheduler.replenishConcurrency) or 1)),
-    updatedAt = common.nowSeconds(),
-  }
-  db.groups[groupId] = persistentGroupValue(group)
-  saveControllerDb()
-  return true, db.groups[groupId]
-end
-
-local function selectedGroupRecord()
-  local ids = orderedGroupIds()
-  local id = ids[selectedGroup]
-  return id, id and groupRecord(id) or nil
-end
-
-local function activeGroupJob(groupId)
-  local latest

@@ -1,3 +1,25 @@
+        elseif depth and expectedDepth ~= depth then
+          finding("FAIL", "gps.absoluteY", ("BOTTOM Y/depth mismatch (derived %d, depth %s)"):format(expectedDepth, tostring(depth)))
+        else finding("PASS", "gps.absoluteY", ("homeY=%s bottomY=%s"):format(tostring(homeY), tostring(bottomY))) end
+      else
+        finding("PASS", "gps.absoluteY", "homeY=" .. tostring(homeY))
+      end
+      doctorJournal(config, state, finding)
+    end
+  elseif stateError and stateError ~= "missing" then
+    finding("WARN", "state.file", "not applicable; read error " .. tostring(stateError))
+  end
+
+  if role == "controller" then
+    local found = false
+    for _, path in ipairs(controllerDbCandidates(config)) do
+      local db, dbError = readTableNoWrite(path)
+      if db then
+        found = true
+        local history = historyFromDb(db)
+        if history then
+          local historyCount = 0
+          for _ in pairs(history) do historyCount = historyCount + 1 end
           finding("PASS", "controller.db", tostring(path) .. " entries=" .. tostring(historyCount))
         else finding("WARN", "controller.db", tostring(path) .. " has no history table") end
 
@@ -200,17 +222,3 @@ elseif command == "status" then
   print("Role: " .. tostring(config.role))
   print("Computer ID: " .. tostring(os.getComputerID()))
   print("Label: " .. tostring(os.getComputerLabel and os.getComputerLabel() or "-"))
-  if type(config.networkKey) == "string" and config.networkKey ~= "" then print("Network key: configured (masked)") else print("Network key: not configured") end
-  printStatusFeature("Profile", config.profile)
-  printStatusFeature("Lighting", config.lighting, config.lightMode)
-  printStatusFeature("Water", config.water, config.waterMode)
-  printStatusFeature("Materials", config.materials)
-  printStatusFeature("Staged stop", config.stagedStop)
-  if config.role == "worker" then
-    local state, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
-    if stateError then reportError(stateError) end
-    print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
-    if state.pose then print(("Pose: x=%s y=%s z=%s dir=%s"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir)) end
-    print("GPS calibrated: " .. tostring(config.gps and config.gps.calibration ~= nil))
-    print("Lava mode: " .. tostring(config.lavaMode))
-    printStatusFeature("Lighting", state.lighting, config.lighting or config.lightMode)

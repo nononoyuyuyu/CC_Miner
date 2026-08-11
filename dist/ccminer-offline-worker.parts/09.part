@@ -1,3 +1,27 @@
+
+common.clear(colors and colors.black or nil, colors and colors.white or nil)
+print("SETUP COMPLETE")
+print("")
+print("Role: " .. requestedRole)
+if requestedRole == "worker" then
+  print("Output chest: BEHIND the turtle")
+  print("Fuel chest: ABOVE the turtle")
+  if config.lavaMode == "seal" then print("Seal-block chest: " .. string.upper(config.sealSide) .. " of the turtle") end
+  if config.lighting and config.lighting.mode ~= "off" then
+    print("Torch chest: " .. string.upper(config.lighting.side or config.torchSide or "left") .. " of the turtle")
+  end
+  print("Turtle front: quarry entrance")
+  if config.gps.enabled then print("After GPS hosts are online: controller -> GPS CAL") end
+elseif requestedRole == "controller" then
+  print("Attach a wireless modem and optional Advanced Monitor.")
+  print("Monitor touches and terminal mouse clicks are enabled.")
+else
+  print(("GPS host coordinates: %d, %d, %d"):format(config.x, config.y, config.z))
+  print("Keep this computer and its wireless modem chunk-loaded.")
+end
+print("")
+print("Reboot with: reboot")
+]=] },
   { source = [[src/ccminer/boot.lua]], target = [[boot.lua]], digest = [[e78dedb9650ffc10004eed5856f0d30a4c3a1941aa79058a5f49ae58d1369e94]], content = [[-- CC Miner V4 boot dispatcher
 
 local common = dofile("/ccminer/lib/common.lua")
@@ -278,31 +302,3 @@ local function printOperationalFields(root, config)
     { "stats", "discard" }, { "stats", "discarded" },
     { "stats", "discardedBlocks" }, { "stats", "discardCount" },
   })
-  if discard ~= nil then printField("Discard", discard) end
-
-  local performance = firstNestedValue(roots, {
-    { "performance" }, { "stats", "performance" },
-  })
-  if performance ~= nil then printField("Performance", performance) end
-  local throughput = firstNestedValue(roots, {
-    { "throughput" }, { "performance", "throughput" },
-    { "report", "throughput" }, { "stats", "throughput" },
-    { "blocksPerSecond" }, { "perSecond" },
-  })
-  if throughput ~= nil then printField("Throughput", throughput) end
-
-  local partial = firstNestedValue(roots, {
-    { "partialStart" }, { "partial" }, { "partialAssignment" },
-    { "group", "partialStart" }, { "group", "partial" },
-  })
-  if partial ~= nil then printField("Partial start", partial) end
-  local acks = firstNestedValue(roots, {
-    { "ackSummary" }, { "acks" }, { "ack" }, { "groupAcks" },
-    { "group", "acks" }, { "group", "ackSummary" },
-  })
-  if acks ~= nil then printField("ACK summary", acks) end
-end
-
-local function controllerDbCandidates(config)
-  local paths, seen = {}, {}
-  local function add(path)

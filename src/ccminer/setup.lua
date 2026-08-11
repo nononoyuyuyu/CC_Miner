@@ -205,28 +205,31 @@ else
     local remoteConsole = ensureTable(config, "remoteConsole", workerDefaults.remoteConsole)
     config.controllerId = validInteger(config.controllerId, 0, 0, 65535)
 
-    -- Remote console is an explicit opt-in.  Keep the warning immediately
-    -- beside the prompt so a setup rerun cannot make a dangerous feature look
-    -- like an ordinary networking toggle.
+    -- Fresh setups enable only the exact read-only allowlist for controllers
+    -- with the same network key. Arbitrary shell access remains a separate,
+    -- pinned-controller opt-in.
     print("【強い警告】遠隔コンソールは、管理用コンピューターからタートルへコマンドを送ります。")
-    print("採掘を止め、タートルをドックへ戻し、管理番号を確認してから使ってください。")
-    print("既定値はOFFです。CCの無線通信（rednet）は暗号化されません。")
+    print("同じ合言葉の管理用コンピューターは、既定で安全な確認コマンドだけを使えます。")
+    print("採掘を止め、タートルをドックへ戻してから使ってください。rednetは暗号化されません。")
     remoteConsole.enabled = common.promptYesNo(
-      "遠隔コンソールを有効にしますか（既定OFF）",
+      "安全な遠隔コンソールを有効にしますか（新規設定はON）",
       remoteConsole.enabled == true
     )
     if remoteConsole.enabled then
-      if config.controllerId == 0 then
-        print("controllerId=0 のままでは遠隔コンソールを有効にできません。")
-        print("接続を許可する管理用コンピューターのID（controller pin）を入力してください。")
-        print("番号が分からない場合は、管理用コンピューターで id と入力して確認します。")
-        config.controllerId = common.promptNumber("Controller computer ID (1-65535)", 1, 1, 65535)
-      end
+      print("controllerId=0 は、同じ合言葉を持つ管理用コンピューターを許可します。")
+      print("1台だけに限定する場合は、管理用コンピューターで id と入力して番号を確認します。")
+      config.controllerId = common.promptNumber(
+        "Allowed controller ID (0=same network key)", config.controllerId, 0, 65535
+      )
       print("allowShell は任意のシェル実行を許可する別の危険設定です。通常はOFFにしてください。")
       remoteConsole.allowShell = common.promptYesNo(
         "allowShell（シェル実行）を許可しますか",
         remoteConsole.allowShell == true
       )
+      if remoteConsole.allowShell and config.controllerId == 0 then
+        print("allowShellではcontrollerId=0を使えません。許可する管理用コンピューターを固定します。")
+        config.controllerId = common.promptNumber("Controller computer ID (1-65535)", 1, 1, 65535)
+      end
     else
       -- Disabling the feature also drops the second privilege.  This avoids
       -- an old allowShell=true value becoming active after a later migration.

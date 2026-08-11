@@ -18,7 +18,7 @@
 <p>CC Minerは、チャンクが読み込まれているかを調べたり、チャンクを読み込んだままにしたりできません。読み込まれていない場所へ入っても記録を失いにくい作りですが、サーバーやModのチャンクローダーが必要な場合は、管理者の説明に従ってください。</p>
 <h2 id="remote-console">遠隔コンソールを使うとき</h2>
 <div class="callout danger"><strong>初期設定ではOFFです。</strong>使う必要がない限り、そのままにしてください。CCの <code>rednet</code> は暗号化されない無線なので、パスワードのように秘密を守る仕組みではありません。</div>
-<ol class="steps"><li><div><h3>採掘を停止する</h3><p>管理画面からRETURN HOMEまたはABORTを選び、タートルがドックで <span class="screen-word">home</span> になったことを確認します。</p></div></li><li><div><h3>controller pinを確認する</h3><p>管理用コンピューターで <code>id</code> と入力し、その番号をworkerの <code>controllerId</code> に入れます。<code>0</code> のままでは有効化できません。</p></div></li><li><div><h3>短時間だけ使う</h3><p>管理用コンピューターで <code>ccm remote 12</code> を実行し、必要な読み取りだけを行います。終わるときは必ず <code>exit</code> を入力します。</p></div></li><li><div><h3>危険な許可を増やさない</h3><p>allowShellは別確認のある上級設定です。削除や設定変更を含むシェルを許可するので、通常はOFFにします。文字入力を待つ対話型プログラムには対応しません。</p></div></li></ol>
+<ol class="steps"><li><div><h3>採掘を停止する</h3><p>管理画面からRETURN HOMEまたはABORTを選び、タートルがドックで <span class="screen-word">home</span> になったことを確認します。</p></div></li><li><div><h3>合言葉を確認する</h3><p><code>controllerId=0</code>では同じ合言葉のコントローラーを許可します。1台だけへ限定するときは、管理用コンピューターで <code>id</code> と入力し、その番号を設定します。</p></div></li><li><div><h3>短時間だけ使う</h3><p>管理用コンピューターで <code>ccm remote 12</code> を実行し、必要な読み取りだけを行います。終わるときは必ず <code>exit</code> を入力します。</p></div></li><li><div><h3>危険な許可を増やさない</h3><p>allowShellは別確認のある上級設定です。任意シェルではcontrollerId固定が必須です。通常はOFFにし、文字入力を待つ対話型プログラムには使いません。</p></div></li></ol>
 <h2 id="backup">残しておくファイル</h2>
 <ul><li><code>/ccminer/config.db</code>：設定</li><li><code>/ccminer/data/state.db</code>：今の作業と位置</li><li><code>.bak</code>：ひとつ前の控え</li><li><code>journal</code>：細かな作業記録</li><li><code>logs</code>：エラーや動作の記録</li></ul>
 <p>異常が起きたときは、これらを消す前にコピーします。</p>

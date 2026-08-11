@@ -1,3 +1,19 @@
+  if type(config.networkKey) == "string" and config.networkKey ~= "" then print("Network key: configured (masked)") else print("Network key: not configured") end
+  printStatusFeature("Profile", config.profile)
+  printStatusFeature("Lighting", config.lighting, config.lightMode)
+  printStatusFeature("Water", config.water, config.waterMode)
+  printStatusFeature("Materials", config.materials)
+  printStatusFeature("Staged stop", config.stagedStop)
+  if config.role == "worker" then
+    local state, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
+    if stateError then reportError(stateError) end
+    print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
+    if state.pose then print(("Pose: x=%s y=%s z=%s dir=%s"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir)) end
+    print("GPS calibrated: " .. tostring(config.gps and config.gps.calibration ~= nil))
+    print("Lava mode: " .. tostring(config.lavaMode))
+    printStatusFeature("Lighting", state.lighting, config.lighting or config.lightMode)
+    printStatusFeature("Water", state.water, config.water or config.waterMode)
+    printStatusFeature("Profile", state.profile, config.profile)
     printStatusFeature("Materials", state.materials, config.materials)
     printStatusFeature("Staged stop", state.stagedStop, config.stagedStop)
     if state.job then print(("Job: %s %s/%s [%s]"):format(tostring(state.job.name), tostring(state.job.cursor), tostring(state.job.total), tostring(state.job.strategy))) end
@@ -271,26 +287,3 @@ end
 
 -- Inverse of localToWorld for worker-local rebasing.  GPS calibrations are
 -- cardinal (one-block forward/right vectors), so the result remains integral
--- for integral world positions while still accepting numeric coordinates for
--- diagnostics.
-local function worldToLocalXZ(calibration, worldX, worldZ)
-  if not validCalibration(calibration) then return nil, nil, "gps_not_calibrated" end
-  worldX, worldZ = numberValue(worldX), numberValue(worldZ)
-  if not worldX or not worldZ then return nil, nil, "invalid_world_position" end
-  local forwardX, forwardZ = numberValue(calibration.forward.x), numberValue(calibration.forward.z)
-  local homeX, homeZ = numberValue(calibration.home.x), numberValue(calibration.home.z)
-  local dx, dz = worldX - homeX, worldZ - homeZ
-  local rightX, rightZ = -forwardZ, forwardX
-  return dx * rightX + dz * rightZ, dx * forwardX + dz * forwardZ
-end
-
-M.worldToLocalXZ = worldToLocalXZ
-function M.inverseWorldToLocal(calibration, worldX, worldZ)
-  if type(worldX) == "table" then worldZ, worldX = worldX.z, worldX.x end
-  local localX, localZ, inverseError = worldToLocalXZ(calibration, worldX, worldZ)
-  if not localX then return nil, inverseError end
-  return { x = localX, z = localZ }
-end
-function M.referenceLocalToWorld(calibration, x, z)
-  if not validCalibration(calibration) then return nil, "gps_not_calibrated" end
-  x, z = numberValue(x), numberValue(z)

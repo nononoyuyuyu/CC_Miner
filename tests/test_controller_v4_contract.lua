@@ -295,6 +295,18 @@ for _, item in ipairs({
   marker(controller, item[1], item[2])
 end
 
+-- A background queue dispatch temporarily uses the legacy shared draft, but
+-- must restore an operator's open NEW JOB form. Rendering also fails safe if
+-- an older/corrupt state contains a form mode without its draft table.
+for _, item in ipairs({
+  { "local operatorDraft, operatorMode = draft, mode", "queue preserves operator draft" },
+  { "draft, mode = operatorDraft, operatorMode", "queue restores operator draft" },
+  { 'singleDraftMode and type(draft) ~= "table"', "nil single draft render guard" },
+  { 'groupDraftMode and type(groupDraft) ~= "table"', "nil group draft render guard" },
+}) do
+  marker(controller, item[1], item[2])
+end
+
 -- Approximate CC:Tweaked textutils.serialize's repeated-reference check.
 -- It catches aliases as well as cycles (both are rejected by the real
 -- ComputerCraft serializer).

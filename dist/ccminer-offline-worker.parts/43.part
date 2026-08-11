@@ -1,3 +1,46 @@
+local function markerWrite(state, nextIndex)
+  local text = table.concat({
+    "version=" .. VERSION,
+    "schema=" .. tostring(SCHEMA),
+    "role=" .. ROLE,
+    "state=" .. tostring(state),
+    "next=" .. tostring(nextIndex or 1),
+    "",
+  }, "\n")
+  return atomicWrite(LOW_SPACE_MARKER, text)
+end
+local function clearMarker()
+  for _, suffix in ipairs({ "", ".tmp", ".bak" }) do
+    local path = LOW_SPACE_MARKER .. suffix
+    if fs.exists(path) then pcall(fs.delete, path) end
+    if fs.exists(path) then return false, "Cannot clear recovery marker artifact: " .. path end
+  end
+  return true
+end
+local function lowSpaceFailure(message)
+  printError("LOW-SPACE UPDATE PAUSED")
+  fail(tostring(message) .. "\nRecovery marker: " .. LOW_SPACE_MARKER
+    .. "\nRe-transfer ccminer-offline-" .. ROLE .. ".lua and its parts, then rerun update-low-space.")
+end
+local function embeddedEntrypoint()
+  for _, file in ipairs(files) do
+    if file.target == ENTRYPOINT then return file.content end
+  end
+  lowSpaceFailure("Embedded role loader is missing: " .. ENTRYPOINT)
+end
+local function ensureUpdateSentinel()
+  local path = ROOT .. "/" .. ENTRYPOINT
+  if readFile(path) ~= UPDATE_SENTINEL then
+    local wrote, writeError = atomicWrite(path, UPDATE_SENTINEL)
+    if not wrote then lowSpaceFailure("Cannot install the update-incomplete sentinel: " .. tostring(writeError)) end
+  end
+  if readFile(path) ~= UPDATE_SENTINEL then
+    lowSpaceFailure("Update-incomplete sentinel could not be verified; runtime was not started.")
+  end
+end
+local function applyLowSpaceStep(step)
+  if step.kind == "runtime" then
+    local file = files[step.index]
     if not file then return false, "Low-space runtime step has an invalid file index." end
     local wrote, writeError = atomicWrite(ROOT .. "/" .. file.target, file.content)
     if not wrote then return false, "Cannot atomically install " .. file.target .. ": " .. tostring(writeError) end

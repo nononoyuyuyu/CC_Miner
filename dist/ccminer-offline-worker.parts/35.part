@@ -1,3 +1,33 @@
+  if not from or not target then return false, err or "Missing chunk anchor." end
+  local adjacent = false
+  for _, key in ipairs(from.neighbors or {}) do if key == toKey then adjacent = true; break end end
+  if not adjacent then return false, "Chunk route is not adjacent: " .. tostring(fromKey) .. " -> " .. tostring(toKey) end
+  return navigateTo(target, "inside", context)
+end
+
+local function normalizeWaypoint(value, fallbackY)
+  if type(value) ~= "table" then return nil end
+  local pose = value.pose or value.position or value.target or value
+  if type(pose) ~= "table" then return nil end
+  local x, z = tonumber(pose.x), tonumber(pose.z)
+  if not x or not z then return nil end
+  return { x = x, y = tonumber(pose.y) or tonumber(fallbackY) or 0, z = z,
+    dir = pose.dir ~= nil and ((tonumber(pose.dir) or 0) % 4) or nil }
+end
+
+local function routeChunkKeys(plan, fromKey, toKey)
+  if type(quarry.shortestChunkPath) == "function" then
+    local ok, path = pcall(quarry.shortestChunkPath, plan, fromKey, toKey)
+    if ok and type(path) == "table" then path = path.chunkKeys or path.path or path.keys end
+    if ok and type(path) == "table" and #path > 0 then return path, "bfs" end
+  end
+  if fromKey == toKey then return { fromKey }, "same" end
+  return nil
+end
+
+-- Assigned plans intentionally do not persist mutable parent pointers, so a
+-- worker that resumes with an older quarry module may not have pathToRoot.
+-- Keep a bounded graph-only DFS fallback over the validated neighbor edges.
 local function dfsChunkPath(plan, fromKey, toKey)
   if fromKey == toKey then return { fromKey } end
   local chunks = plan and plan.chunks or {}
@@ -231,37 +261,3 @@ end
 
 local function looksLikeInventoryBlock(data)
   local name = string.lower(blockName(data))
-  if name == "minecraft:chest" or name == "minecraft:trapped_chest" or name == "minecraft:barrel" then return true end
-  return name:match("^minecraft:[%w_]+shulker_box$") ~= nil
-end
-
-local function discardPolicy()
-  local policy = config.discard or {}
-  local mode = tostring(policy.mode or policy.policy or "KEEP_ALL"):upper()
-  if mode ~= "KEEP_ALL" and mode ~= "DISCARD_EXCESS_STONE" and mode ~= "CUSTOM_ALLOWLIST" then mode = "KEEP_ALL" end
-  return policy, mode
-end
-
-local function isOreOrRawMaterial(name)
-  name = string.lower(tostring(name or ""))
-  -- Keep all ores/raw materials regardless of the selected allowlist.  The
-  -- broad suffix/prefix checks intentionally err on the side of retention
-  -- for modded names (an unknown resource is safer in the output chest).
-  return name:find("_ore", 1, true) ~= nil
-    or name:find("ore_", 1, true) ~= nil
-    or name:find("raw_", 1, true) ~= nil
-    or name:find("_raw", 1, true) ~= nil
-    or name:find("rawore", 1, true) ~= nil
-end
-
-local function isUnknownModItem(name)
-  local namespace = tostring(name or ""):match("^([^:]+):")
-  if not namespace or namespace == "" then return true end
-  if namespace == "minecraft" or namespace == "computercraft" or namespace == "cc_tweaked" then return false end
-  local policy = config.discard or {}
-  local known = policy.knownNamespaces or policy.knownMods
-  if type(known) == "table" and (known[namespace] == true or known[namespace] == 1) then return false end
-  return true
-end
-
-local function discardProtectedItem(slot, name)

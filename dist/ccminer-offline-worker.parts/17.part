@@ -1,3 +1,38 @@
+    [2] = { x = toPoint.x, y = toPoint.y, z = toPoint.z, kind = "to" },
+    fromKey = from,
+    toKey = to,
+    distance = math.abs(toPoint.x - fromPoint.x) + math.abs(toPoint.y - fromPoint.y) + math.abs(toPoint.z - fromPoint.z),
+  }
+end
+
+M.chunkTransition = M.edgeTransition
+M.neighborTransition = M.edgeTransition
+M.transitionPoint = M.edgeTransition
+
+local function routePointForChunk(chunk, y)
+  local pointY = numberValue(y) or 0
+  -- Integer midpoint keeps a route interior to the chunk for both odd and
+  -- even dimensions.  It is deliberately not the historical min corner.
+  return {
+    x = math.floor((chunk.minX + chunk.maxX) / 2),
+    y = pointY,
+    z = math.floor((chunk.minZ + chunk.maxZ) / 2),
+  }
+end
+
+local function normalizeRoutePose(plan, value, defaultKey, defaultY)
+  local key, point
+  if value == nil then
+    key = defaultKey
+  elseif type(value) == "string" or type(value) == "number" then
+    key = tostring(value)
+  elseif type(value) == "table" then
+    key = value.chunkKey or value.chunk or value.key
+    if key == nil and value.cx ~= nil and value.cz ~= nil then
+      local cx, cz = integerValue(value.cx), integerValue(value.cz)
+      if cx and cz then key = chunkKey(plan.mode, cx, cz) end
+    end
+    local nested = value.point or value.pose or value.position
     local source = type(nested) == "table" and nested or value
     local x, z = numberValue(source.x), numberValue(source.z)
     local y = numberValue(source.y)
@@ -242,27 +277,3 @@ local function catalogGraph(catalog)
     -- validation; never mutate the caller's table (the descriptor may be
     -- shared with another worker/controller).
     for mapKey, source in pairs(entries) do
-      if type(source) == "table" and (source.key == nil or tostring(source.key) == "") then
-        local copy = {}
-        for field, value in pairs(source) do copy[field] = value end
-        copy.key = tostring(mapKey)
-        sources[#sources + 1] = copy
-      else
-        sources[#sources + 1] = source
-      end
-    end
-  end
-  if #sources > MAX_CHUNKS then return nil, "too_many_chunks" end
-  for _, source in ipairs(sources) do
-    if type(source) ~= "table" then return nil, "invalid_chunk_catalog" end
-    local key = source.key and tostring(source.key) or nil
-    if not key or key == "" then return nil, "invalid_chunk_key" end
-    if source.mode ~= "world" or key:sub(1, 2) ~= "W:" then return nil, "gps_required_world_catalog" end
-    local cx, cz = integerValue(source.cx), integerValue(source.cz)
-    local minX, maxX = integerValue(source.minX), integerValue(source.maxX)
-    local minZ, maxZ = integerValue(source.minZ), integerValue(source.maxZ)
-    local cells = integerValue(source.cells, 1, MAX_COLUMNS)
-    if not cx or not cz or not minX or not maxX or not minZ or not maxZ or maxX < minX or maxZ < minZ or not cells or cells < 1 then
-      return nil, "invalid_chunk_catalog"
-    end
-    local keyCx, keyCz = key:match("^W:(%-?%d+):(%-?%d+)$")

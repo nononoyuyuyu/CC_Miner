@@ -1,3 +1,24 @@
+-- malformed values are replaced by a safe default before they are passed to
+-- the interactive validators.  This prevents an invalid stored default from
+-- trapping a user in a prompt loop while preserving every valid old value.
+local function validInteger(value, fallback, minimum, maximum)
+  local number = tonumber(value)
+  if not number or number ~= math.floor(number) then return fallback end
+  if minimum and number < minimum then return fallback end
+  if maximum and number > maximum then return fallback end
+  return number
+end
+
+local function validNumber(value, fallback, minimum, maximum)
+  local number = tonumber(value)
+  if not number then return fallback end
+  if minimum and number < minimum then return fallback end
+  if maximum and number > maximum then return fallback end
+  return number
+end
+
+local function ensureTable(config, key, defaults)
+  if type(config[key]) ~= "table" then config[key] = common.copy(defaults) end
   config[key] = common.merge(defaults, config[key])
   return config[key]
 end
@@ -176,28 +197,31 @@ else
     local remoteConsole = ensureTable(config, "remoteConsole", workerDefaults.remoteConsole)
     config.controllerId = validInteger(config.controllerId, 0, 0, 65535)
 
-    -- Remote console is an explicit opt-in.  Keep the warning immediately
-    -- beside the prompt so a setup rerun cannot make a dangerous feature look
-    -- like an ordinary networking toggle.
+    -- Fresh setups enable only the exact read-only allowlist for controllers
+    -- with the same network key. Arbitrary shell access remains a separate,
+    -- pinned-controller opt-in.
     print("【強い警告】遠隔コンソールは、管理用コンピューターからタートルへコマンドを送ります。")
-    print("採掘を止め、タートルをドックへ戻し、管理番号を確認してから使ってください。")
-    print("既定値はOFFです。CCの無線通信（rednet）は暗号化されません。")
+    print("同じ合言葉の管理用コンピューターは、既定で安全な確認コマンドだけを使えます。")
+    print("採掘を止め、タートルをドックへ戻してから使ってください。rednetは暗号化されません。")
     remoteConsole.enabled = common.promptYesNo(
-      "遠隔コンソールを有効にしますか（既定OFF）",
+      "安全な遠隔コンソールを有効にしますか（新規設定はON）",
       remoteConsole.enabled == true
     )
     if remoteConsole.enabled then
-      if config.controllerId == 0 then
-        print("controllerId=0 のままでは遠隔コンソールを有効にできません。")
-        print("接続を許可する管理用コンピューターのID（controller pin）を入力してください。")
-        print("番号が分からない場合は、管理用コンピューターで id と入力して確認します。")
-        config.controllerId = common.promptNumber("Controller computer ID (1-65535)", 1, 1, 65535)
-      end
+      print("controllerId=0 は、同じ合言葉を持つ管理用コンピューターを許可します。")
+      print("1台だけに限定する場合は、管理用コンピューターで id と入力して番号を確認します。")
+      config.controllerId = common.promptNumber(
+        "Allowed controller ID (0=same network key)", config.controllerId, 0, 65535
+      )
       print("allowShell は任意のシェル実行を許可する別の危険設定です。通常はOFFにしてください。")
       remoteConsole.allowShell = common.promptYesNo(
         "allowShell（シェル実行）を許可しますか",
         remoteConsole.allowShell == true
       )
+      if remoteConsole.allowShell and config.controllerId == 0 then
+        print("allowShellではcontrollerId=0を使えません。許可する管理用コンピューターを固定します。")
+        config.controllerId = common.promptNumber("Controller computer ID (1-65535)", 1, 1, 65535)
+      end
     else
       -- Disabling the feature also drops the second privilege.  This avoids
       -- an old allowShell=true value becoming active after a later migration.
@@ -224,23 +248,3 @@ else
 
     -- Disposal is deliberately a short, explicit safety wizard.  KEEP_ALL is
     -- the default; the stone mode keeps only its built-in stone candidates,
-    -- while CUSTOM_ALLOWLIST considers only complete IDs entered by the user.
-    discard.mode = discardModePrompt(discard.mode)
-    if discard.mode == "CUSTOM_ALLOWLIST" then
-      discard.allowlist = allowlistPrompt(discard.allowlist)
-    else
-      discard.allowlist = type(discard.allowlist) == "table" and discard.allowlist or {}
-    end
-    discard.retainSealTarget = validInteger(discard.retainSealTarget or config.retainSealTarget, 64, 1, 512)
-    discard.triggerEmptySlots = common.promptNumber(
-      "Discard when empty slots reach",
-      validInteger(discard.triggerEmptySlots, config.reserveEmptySlots or 3, 0, 16),
-      0,
-      16
-    )
-    print("設定方向に inventory が見つかった場合は、誤投入防止のため world 廃棄をスキップします。")
-    discard.direction = enumPrompt("現場廃棄方向 (front/back/left/right/top/bottom)", discard.direction or config.outputSide or "back", {
-      front = true, back = true, left = true, right = true, top = true, bottom = true,
-    }, "back")
-    discard.maxStacksPerPass = validInteger(discard.maxStacksPerPass, 8, 1, 64)
-    config.retainSealTarget = discard.retainSealTarget

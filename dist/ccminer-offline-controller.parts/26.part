@@ -1,3 +1,13 @@
+    local progress = data and data.progress or {}
+    local cursor, total = tonumber(progress and progress.cursor or data and data.job and data.job.cursor), tonumber(progress and progress.total or data and data.job and data.job.total)
+    if cursor and total and total > 0 then weightedDone, weightedTotal = weightedDone + math.max(0, math.min(cursor, total)), weightedTotal + total end
+    local warning = data and (data.lastError or data.completionReason)
+    if warning and not seenWarning[tostring(warning)] then seenWarning[tostring(warning)] = true; aggregate.warnings[#aggregate.warnings + 1] = tostring(warning) end
+    local ack = groupJob.acks and groupJob.acks[tostring(id)]
+    if ack and ack.ok ~= nil then aggregate.acks = aggregate.acks + 1 end
+  end
+  aggregate.percent = weightedTotal > 0 and math.floor(weightedDone * 100 / weightedTotal + 0.5) or (#ids > 0 and math.floor(aggregate.complete * 100 / #ids + 0.5) or 0)
+  if aggregate.blocked > 0 then aggregate.warnings[#aggregate.warnings + 1] = "blocked=" .. tostring(aggregate.blocked) end
   if aggregate.waiting > 0 then aggregate.warnings[#aggregate.warnings + 1] = "service=" .. tostring(aggregate.waiting) end
   if aggregate.minFuel == nil then aggregate.warnings[#aggregate.warnings + 1] = "minFuel=unknown" end
   for _, eventWarning in ipairs(groupJob.alerts or {}) do
@@ -236,19 +246,3 @@ noticeState.remoteApi.ackMatches = function(sender, message, payload)
   local result = type(payload.result) == "table" and payload.result or nil
   local wireCommand = payload.command
   if tostring(wireCommand or ""):lower() ~= "remote_console" then return false end
-  local action = remoteAckField(payload, result, "action")
-    or remoteAckField(payload, result, "remoteAction")
-  if action ~= nil and tostring(action):lower() ~= tostring(pending.action):lower() then return false end
-  local sessionId = remoteAckField(payload, result, "sessionId")
-  local nonce = remoteAckField(payload, result, "nonce")
-  -- The worker creates fresh session credentials on OPEN and returns them in
-  -- the result table.  Subsequent actions must echo those credentials exactly;
-  -- the controller's provisional values are only an anti-collision hint.
-  if pending.action ~= "open" then
-    if sessionId ~= nil and tostring(sessionId) ~= tostring(session.sessionId) then return false end
-    if nonce ~= nil and tostring(nonce) ~= tostring(session.nonce) then return false end
-  end
-  local sequence = remoteAckField(payload, result, "seq")
-    or remoteAckField(payload, result, "sequence")
-  if sequence ~= nil and tonumber(sequence) ~= tonumber(pending.seq) then return false end
-  if pending.action == "open" then

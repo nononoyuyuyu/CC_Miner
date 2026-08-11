@@ -1,3 +1,29 @@
+    cursor = state.job.cursor or 0,
+    total = state.job.total or 0,
+    percent = common.percent(state.job.cursor or 0, state.job.total or 0),
+    startedAt = state.job.startedAt,
+    chunkMode = state.job.chunkMode,
+    excludedChunks = state.job.excludedChunks and #state.job.excludedChunks or 0,
+    currentLayer = layer,
+    currentRow = row,
+    currentChunk = currentChunk,
+    completedChunks = state.job.completedChunks or 0,
+    assignmentChunks = state.job.assignmentChunks and #state.job.assignmentChunks or 0,
+    assignmentChunkKeys = state.job.assignmentChunks and common.copy(state.job.assignmentChunks) or nil,
+    transitChunkKeys = state.job.assignmentTransitChunks and common.copy(state.job.assignmentTransitChunks) or nil,
+    assignmentCatalog = state.job.assignmentCatalog and {
+      mode = state.job.assignmentCatalog.mode,
+      rootKey = state.job.assignmentCatalog.rootKey,
+      chunkCount = state.job.assignmentCatalog.chunks and #state.job.assignmentCatalog.chunks or nil,
+    } or nil,
+  }
+end
+
+local function throughputSnapshot()
+  local now = common.nowSeconds()
+  local started = tonumber(state.job and state.job.startedAt)
+    or tonumber(state.timeMetrics and state.timeMetrics.startedAt)
+  local elapsed = started and math.max(0, now - started) or 0
   local blocks = tonumber(state.job and state.job.cursor) or tonumber(state.stats and state.stats.blocksDug) or 0
   local perSecond = elapsed > 0 and blocks / elapsed or 0
   state.timeMetrics = state.timeMetrics or {}
@@ -236,39 +262,3 @@ local function locateGPS()
   if gpsConfig().enabled == false then
     state.gps.available = false
     state.gps.lastError = "GPS is disabled in configuration."
-    return nil, state.gps.lastError
-  end
-  if not gps or type(gps.locate) ~= "function" then
-    state.gps.available = false
-    state.gps.lastError = "GPS API is unavailable."
-    return nil, state.gps.lastError
-  end
-  local ok, x, y, z = pcall(gps.locate, tonumber(gpsConfig().timeout) or 2, false)
-  if not ok then
-    local text = tostring(x)
-    -- gps.locate waits for events. Preserve Ctrl+T as a real local stop even
-    -- when it arrives during a GPS lookup instead of a rednet receive.
-    if text == "Terminated" or text:find("Terminated", 1, true) then error(x, 0) end
-  end
-  if not ok or x == nil then
-    state.gps.available = false
-    state.gps.lastError = ok and "No GPS fix received." or tostring(x)
-    return nil, state.gps.lastError
-  end
-  local fix, fixError = geo.integerFix(x, y, z, 0.35)
-  if not fix then
-    state.gps.available = false
-    state.gps.lastError = fixError
-    return nil, fixError
-  end
-  state.gps.available = true
-  state.gps.lastFix = fix
-  state.gps.lastFixAt = common.nowSeconds()
-  state.gps.lastError = nil
-  state.stats.gpsFixes = (state.stats.gpsFixes or 0) + 1
-  return fix
-end
-
-local function verifyGPS(force)
-  local calibration = gpsCalibration()
-  if not calibration then

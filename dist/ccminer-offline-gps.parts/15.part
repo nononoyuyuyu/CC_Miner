@@ -1,3 +1,33 @@
+end
+local function usage()
+  print("CC Miner V4 offline " .. ROLE .. " installer " .. VERSION .. " (schema " .. SCHEMA .. ")")
+  print("  ccminer-offline-" .. ROLE .. ".lua " .. ROLE)
+  print("  ccminer-offline-" .. ROLE .. ".lua update")
+  print("  ccminer-offline-" .. ROLE .. ".lua update-low-space")
+end
+
+local action = validateAction()
+if action == "" then usage(); return end
+if action ~= "update-low-space" then
+  term.clear(); term.setCursorPos(1, 1)
+  print("CC MINER V4 OFFLINE " .. string.upper(action) .. " / " .. ROLE); print("")
+  if fs.exists(TEMP) then fs.delete(TEMP) end
+  ensureDir(TEMP)
+  for index, file in ipairs(files) do
+    write(("[%d/%d] %s ... "):format(index, #files, file.target))
+    local ok, writeError = writeFile(TEMP .. "/" .. file.target, file.content)
+    if not ok then fs.delete(TEMP); fail(writeError) end
+    print("OK")
+  end
+  validateAll()
+end
+
+local preserved = {
+  { ROOT .. "/config.db", TEMP .. "/config.db" },
+  { ROOT .. "/config.db.bak", TEMP .. "/config.db.bak" },
+  { ROOT .. "/data/state.db", TEMP .. "/data/state.db" },
+  { ROOT .. "/data/state.db.bak", TEMP .. "/data/state.db.bak" },
+  { ROOT .. "/data/state.pending", TEMP .. "/data/state.pending" },
   { ROOT .. "/data/state.journal", TEMP .. "/data/state.journal" },
   { ROOT .. "/data/state.checkpoint.db", TEMP .. "/data/state.checkpoint.db" },
   { ROOT .. "/data/controller.db", TEMP .. "/data/controller.db" },

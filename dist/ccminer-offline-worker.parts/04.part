@@ -1,3 +1,6 @@
+
+-- Remote console commands are deliberately represented as an array of exact
+-- command strings.  A command may contain one space-separated subcommand (for
 -- example `ccm status` or `label get`), but shell syntax and arguments are
 -- never accepted here.  The worker performs the final command-head check;
 -- this normalizer only keeps persisted configuration portable and safe.
@@ -72,7 +75,9 @@ function M.normalizeRemoteConsoleConfig(value)
   local defaults = M.defaultRemoteConsoleConfig()
   local source = type(value) == "table" and value or {}
   local out = {
-    enabled = normalizeBoolean(source.enabled, defaults.enabled),
+    -- Fresh setup writes an explicit true. Missing or malformed persisted
+    -- values must not silently enable a network-facing feature.
+    enabled = type(source.enabled) == "boolean" and source.enabled or false,
     allowShell = normalizeBoolean(source.allowShell, defaults.allowShell),
     sessionSeconds = normalizeInteger(source.sessionSeconds, 1, 3600, defaults.sessionSeconds),
     maxOutputBytes = normalizeInteger(source.maxOutputBytes, 256, 65536, defaults.maxOutputBytes),
@@ -125,6 +130,10 @@ local function normalizeWorkerConfig(raw)
     or (type(loaded.remote_console) == "table" and loaded.remote_console)
     or (type(loaded.remote) == "table" and loaded.remote) or {}
   local remoteScalar = type(loaded.remoteConsole) == "boolean" and loaded.remoteConsole or nil
+  local remoteWasSpecified = type(loaded.remoteConsole) == "table" or remoteScalar ~= nil
+    or type(loaded.remote_console) == "table" or type(loaded.remote) == "table"
+    or loaded.remoteConsoleEnabled ~= nil or loaded.remote_console_enabled ~= nil
+    or loaded.remoteEnabled ~= nil
   local remoteSource = {
     enabled = firstNonNil(loadedRemote.enabled, remoteScalar, loaded.remoteConsoleEnabled,
       loaded.remote_console_enabled, loaded.remoteEnabled),
@@ -140,6 +149,11 @@ local function normalizeWorkerConfig(raw)
       loadedRemote.allowedCommands, loaded.remoteAllowlist, loaded.remote_allowlist,
       loaded.remoteConsoleAllowlist),
   }
+  -- Updating a pre-console installation must not silently create a new
+  -- network surface. Fresh setup writes the explicit default=true record;
+  -- legacy configs with no remote field migrate to disabled until setup is
+  -- run and the operator sees the warning.
+  if not remoteWasSpecified then remoteSource.enabled = false end
   config.remoteConsole = M.normalizeRemoteConsoleConfig(remoteSource)
   config.profile = normalizeEnum(config.profile, { safe = true, balanced = true, turbo = true }, defaults.profile)
   config.waterMode = normalizeEnum(config.waterMode, { ignore = true, stop = true, seal = true }, defaults.waterMode)
@@ -200,16 +214,3 @@ local function normalizeWorkerConfig(raw)
     loadedDiscard.maxStacksPerPass or loadedDiscard.maxStacks or config.discard.maxStacksPerPass,
     1, 64, defaults.discard.maxStacksPerPass
   )
-  -- Keep the legacy material aliases synchronized.  The nested discard value
-  -- is canonical, but older workers still read materials.retainSealTarget.
-  config.materials = normalizeTable(defaults.materials, config.materials)
-  if loadedDiscard.retainSealTarget == nil and legacyRetainSeal ~= nil then
-    config.materials.retainSealTarget = config.discard.retainSealTarget
-  end
-  config.materials.retainSealTarget = config.discard.retainSealTarget
-  config.retainSealTarget = config.discard.retainSealTarget
-
-  config.lighting = normalizeTable(defaults.lighting, config.lighting)
-  config.lighting.mode = normalizeEnum(config.lighting.mode, { off = true, safe = true, custom = true }, defaults.lighting.mode)
-  config.lighting.interval = normalizeInteger(config.lighting.interval, 1, 4096, defaults.lighting.interval)
-  config.lighting.temporaryFloor = normalizeBoolean(config.lighting.temporaryFloor, defaults.lighting.temporaryFloor)

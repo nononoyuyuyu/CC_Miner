@@ -1,3 +1,52 @@
+      fail("Embedded runtime order/target is invalid at index " .. tostring(index))
+    end
+    seen[file.target] = true
+    local actual, digestError = digest(file.content)
+    if not actual then fail(digestError) end
+    if actual ~= string.lower(file.digest or "") then
+      fail("Embedded runtime digest mismatch: " .. tostring(file.target))
+    end
+    aggregate[#aggregate + 1] = file.source; aggregate[#aggregate + 1] = "\0"
+    aggregate[#aggregate + 1] = file.target; aggregate[#aggregate + 1] = "\0"
+    aggregate[#aggregate + 1] = file.digest; aggregate[#aggregate + 1] = "\0"
+    aggregate[#aggregate + 1] = file.content; aggregate[#aggregate + 1] = "\0"
+  end
+  local aggregateDigest, aggregateError = digest(table.concat(aggregate))
+  if not aggregateDigest then fail(aggregateError) end
+  if aggregateDigest ~= string.lower(SOURCE_DIGEST) then
+    fail("Embedded role source digest mismatch for " .. ROLE)
+  end
+  return true
+end
+local function validateParts(label, targets)
+  if #targets == 0 then return true end
+  local source = {}
+  for index, target in ipairs(targets) do
+    local found
+    for _, file in ipairs(files) do if file.target == target then found = file.content; break end end
+    if not found then fail("Embedded runtime part is missing: " .. target) end
+    source[index] = found
+  end
+  local ok, compileError = compileText(label .. ".assembled.lua", table.concat(source))
+  if not ok then fail("Assembled source failed syntax validation: " .. label .. ": " .. compileError) end
+end
+local function validateAll()
+  validateEmbedded()
+  for _, file in ipairs(files) do
+    if not file.target:match("%.part$") then
+      local ok, compileError = compileText(file.target, file.content)
+      if not ok then fail("Embedded file failed syntax validation: " .. file.target .. ": " .. compileError) end
+    end
+  end
+  validateParts("worker", WORKER_PARTS)
+  validateParts("controller", CONTROLLER_PARTS)
+end
+-- Kept as a named boundary for source-contract checks and recovery logs.  The
+-- role bundle validates from memory, so no /ccminer.update staging tree is
+-- needed before a low-space commit.
+local function validateLowSpaceStage()
+  validateAll()
+end
 local function copyIfPresent(source, target)
   local text = readFile(source)
   if text then return writeFile(target, text) end
@@ -216,43 +265,3 @@ local function lowSpaceUpdate()
   -- entrypoint is first replaced by a fail-closed sentinel, so a power loss
   -- cannot boot a mixed set of files.  The final entrypoint is committed only
   -- after every non-loader write and obsolete-role deletion has completed.
-  validateLowSpaceStage()
-  ensureUpdateSentinel()
-  local marker, markerReadError = markerRead()
-  if markerReadError then lowSpaceFailure(markerReadError) end
-  if marker then
-    if marker.version ~= VERSION or marker.schema ~= SCHEMA or marker.role ~= ROLE then
-      lowSpaceFailure("Recovery marker does not match this role bundle.")
-    end
-    if marker.state ~= "ready" and marker.state ~= "committing" and marker.state ~= "final-ready" then
-      lowSpaceFailure("Recovery marker has an unknown state: " .. tostring(marker.state))
-    end
-  else
-    local marked, markerError = markerWrite("ready", 1)
-    if not marked then lowSpaceFailure("Cannot create recovery marker: " .. tostring(markerError)) end
-    marker, markerReadError = markerRead()
-    if markerReadError or not marker then
-      lowSpaceFailure(markerReadError or "Recovery marker was written but could not be read back.")
-    end
-  end
-  local first
-  if marker.state == "final-ready" then
-    -- final-ready explicitly skips every non-loader step on resume.
-    first = #LOW_SPACE_STEPS + 1
-  else
-    first = math.max(1, math.min(#LOW_SPACE_STEPS + 1, marker.next or 1))
-  end
-  local marked, markerError = markerWrite("ready", first)
-  if not marked then lowSpaceFailure("Cannot mark validated runtime: " .. tostring(markerError)) end
-  for index = first, #LOW_SPACE_STEPS do
-    local step = LOW_SPACE_STEPS[index]
-    marked, markerError = markerWrite("committing", index)
-    if not marked then lowSpaceFailure("Cannot record commit progress for step " .. tostring(index) .. ": " .. tostring(markerError)) end
-    local applied, applyError = applyLowSpaceStep(step)
-    if not applied then lowSpaceFailure(applyError) end
-    marked, markerError = markerWrite("committing", index + 1)
-    if not marked then lowSpaceFailure("Applied low-space step " .. tostring(index) .. ", but cannot advance recovery marker: " .. tostring(markerError)) end
-  end
-  local finalContent = embeddedEntrypoint()
-  marked, markerError = markerWrite("final-ready", #LOW_SPACE_STEPS + 1)
-  if not marked then lowSpaceFailure("Cannot mark the validated final role loader: " .. tostring(markerError)) end

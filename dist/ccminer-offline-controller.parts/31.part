@@ -1,3 +1,26 @@
+    partition = group and group.partition or (config.group and config.group.partitionMode) or "stripe",
+    lighting = normalizedLighting and normalizedLighting(previous.lighting) or common.copy(previous.lighting or { mode = "safe", interval = 10 }),
+    waterMode = normalizedWaterMode and normalizedWaterMode(previous.waterMode) or tostring(previous.waterMode or "seal"),
+    profile = normalizedProfile and normalizedProfile(previous.profile) or tostring(previous.profile or "balanced"),
+    name = previous.name or (group and group.name and ("Group " .. tostring(group.name)) or "Group Quarry"),
+  }
+end
+
+local function groupCatalogAndShape(group, value)
+  local mode = value.mode == "world" and "world" or "local"
+  local specs = groupWorkerSpecs(group)
+  local calibration
+  for _, spec in ipairs(specs) do
+    if spec.calibration then calibration = spec.calibration; break end
+  end
+  local catalog, err
+  if type(value.catalog) == "table" and #value.catalog > 0 then
+    catalog = common.copy(value.catalog)
+  else
+    catalog, err = quarry.buildCatalog(value.width, value.length, mode, calibration)
+  end
+  if not catalog then return nil, err end
+  local rootKey
   for _, chunk in ipairs(catalog) do
     if 0 >= chunk.minX and 0 <= chunk.maxX and 1 >= chunk.minZ and 1 <= chunk.maxZ then rootKey = chunk.key; break end
   end
@@ -145,16 +168,3 @@ local function computeGroupPreflight(groupId, value)
       elseif workerBay.world then
         local pos = data.world or data.position
         local match = pos and tonumber(pos.x) == tonumber(workerBay.world.x) and tonumber(pos.y) == tonumber(workerBay.world.y) and tonumber(pos.z) == tonumber(workerBay.world.z)
-        if match then check("bay pose:#" .. tostring(id), "ok", "world pose verified", false) else check("bay pose:#" .. tostring(id), "bad", "worker is not at bay world pose", true) end
-        local facing = data.facing or data.pose and data.pose.dir
-        if facing == nil then check("bay facing:#" .. tostring(id), "bad", "worker facing unavailable", true)
-        elseif workerBay.facing ~= nil and tostring(facing) ~= tostring(workerBay.facing) then check("bay facing:#" .. tostring(id), "bad", "facing mismatch", true)
-        else check("bay facing:#" .. tostring(id), "ok", tostring(facing), false) end
-      end
-    end
-    if worldMode and not workerDock then check("dock:#" .. tostring(id), "bad", "registered dock metadata unavailable", true) end
-    if workerDock and workerDock.maxDepth and tonumber(spec.maxDepth) and tonumber(workerDock.maxDepth) < tonumber(spec.maxDepth) then spec.maxDepth = tonumber(workerDock.maxDepth) end
-    local homeY = tonumber(spec.homeY)
-    local bottom = commonBottom
-    if worldMode and (not homeY or not bottom) then check("Y:#" .. tostring(id), "bad", "HOME Y/BOTTOM Y unavailable", true) end
-    if worldMode and homeY and bottom then

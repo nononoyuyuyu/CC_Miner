@@ -1,3 +1,26 @@
+  if not minX or not maxX or not minZ or not maxZ or maxX < minX or maxZ < minZ then return nil, "invalid_bounds" end
+  if (maxX - minX + 1) * (maxZ - minZ + 1) > MAX_COLUMNS then return nil, "bounds_too_large" end
+  return {
+    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
+    width = maxX - minX + 1, length = maxZ - minZ + 1,
+    cells = (maxX - minX + 1) * (maxZ - minZ + 1),
+  }
+end
+
+function M.gridBounds(value, length, options)
+  return boundsFrom(value, length, options)
+end
+
+M.getGridBounds = M.gridBounds
+M.bounds = M.gridBounds
+
+function M.gridPage(bounds, page, pageWidth, pageHeight)
+  local normalized, boundsError = boundsFrom(bounds)
+  if not normalized then return nil, boundsError end
+  if type(pageWidth) == "table" then pageHeight, pageWidth = pageWidth.pageHeight, pageWidth.pageWidth end
+  pageWidth = integerValue(pageWidth, 1, MAX_DIMENSION) or 16
+  pageHeight = integerValue(pageHeight, 1, MAX_DIMENSION) or pageWidth
+  local pagesX = math.ceil(normalized.width / pageWidth)
   local pagesZ = math.ceil(normalized.length / pageHeight)
   local pageCount = pagesX * pagesZ
   page = integerValue(page, 1, pageCount) or 1
@@ -115,7 +138,7 @@ local program, compileError = loader(table.concat(source), "@/ccminer/controller
 if not program then error("Cannot assemble controller: " .. tostring(compileError), 0) end
 return program(...)
 ]] },
-  { source = [[src/ccminer/controller_parts/01.part]], target = [[controller_parts/01.part]], digest = [[eb8e86c5a2c31c205e531c3c2f23c4d42747ca13445abf72ce0c89af3d98aecc]], content = [[-- CC Miner V4 - controller state, persistence and job orchestration.
+  { source = [[src/ccminer/controller_parts/01.part]], target = [[controller_parts/01.part]], digest = [[9702dd6232011994e0163ddde6b9e43dc97f12fc195edade864992b88a53f6e0]], content = [[-- CC Miner V4 - controller state, persistence and job orchestration.
 -- The controller is deliberately tolerant of V2 worker payloads.  New
 -- fields are additive and every command has a legacy equivalent where one
 -- exists.
@@ -239,32 +262,3 @@ local function saveControllerDb()
   local persistedDb = {}
   for key, value in pairs(db) do persistedDb[key] = common.copy(value) end
   persistedDb.groups, persistedDb.docks, persistedDb.bays = persistedGroups, persistedDocks, persistedBays
-  persistedDb.groupJobs, persistedDb.groupLeases = persistedJobs, persistedGroupLeases
-  persistedDb.groupScheduler = persistentDraft(db.groupScheduler or {})
-  persistedDb.activeLeases = common.copy(db.leases or {})
-  local ok, err = common.saveTable(DB_PATH, persistedDb)
-  if not ok then dbError = err end
-  return ok, err
-end
-
-loadControllerDb()
-
-local workers = {}
-local selected = 1
-local selectedGroup = 1
-local groupMode = false
-local groupDraft = nil
-local groupCommandAcks = {}
-local groupSchedulerLast = 0
-local normalizedProfile, normalizedWaterMode, normalizedLighting
-local releaseGroupLeases
-local finalizePendingReassignment
-local acceptGroupStart, rejectGroupStart
-local sortedJobAssignments, groupSafeStop
-local notice = dbError and ("Controller DB recovered: " .. tostring(dbError)) or "Controller ready. Touch DISCOVER or press D."
-local noticeIsError = false
-local noticeState = { detail = nil, returnMode = nil }
-local lastDiscovery = 0
-local running = true
-local mode = "dashboard"
-local draft = nil

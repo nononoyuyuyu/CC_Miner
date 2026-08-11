@@ -1,3 +1,29 @@
+  local optimized, optimizedOrder = optimizedWalk(mineCopies, mineKeys, seedKey)
+  for _, key in ipairs(mineKeys) do
+    if mineCopies[key].optimizedAnchor then
+      chunks[key].optimizedAnchor = { x = mineCopies[key].optimizedAnchor.x, z = mineCopies[key].optimizedAnchor.z }
+    end
+  end
+  local routeCopy = {}
+  for index, key in ipairs(optimizedOrder) do routeCopy[index] = key end
+  local assignedColumns = 0
+  local assignedBounds
+  for _, key in ipairs(mineKeys) do assignedColumns = assignedColumns + chunks[key].cells end
+  for _, key in ipairs(mineKeys) do
+    local chunk = chunks[key]
+    assignedBounds = assignedBounds or { minX = chunk.minX, maxX = chunk.maxX, minZ = chunk.minZ, maxZ = chunk.maxZ }
+    assignedBounds.minX, assignedBounds.maxX = math.min(assignedBounds.minX, chunk.minX), math.max(assignedBounds.maxX, chunk.maxX)
+    assignedBounds.minZ, assignedBounds.maxZ = math.min(assignedBounds.minZ, chunk.minZ), math.max(assignedBounds.maxZ, chunk.maxZ)
+  end
+  local servicePlan = {
+    mode = "world", chunks = chunks, rootKey = dockKey,
+  }
+  local dockPose = { chunkKey = dockKey }
+  if chunks[dockKey] then
+    local dockAnchor = chunks[dockKey].anchor
+    if contains(chunks[dockKey], 0, 1) then
+      dockPose.x, dockPose.z = 0, 1
+    elseif dockAnchor then
       dockPose.x, dockPose.z = dockAnchor.x, dockAnchor.z
     end
   end
@@ -227,7 +253,7 @@ local program, compileError = loader(table.concat(source), "@/ccminer/worker.ass
 if not program then error("Cannot assemble worker: " .. tostring(compileError), 0) end
 return program(...)
 ]] },
-  { source = [[src/ccminer/worker_parts/01.part]], target = [[worker_parts/01.part]], digest = [[adfdcc73c12b346fbe31dcca56b8c0d4b9a5bde1ed05be0a98579b1c3cf24c25]], content = [[-- CC Miner V4 - autonomous quarry worker
+  { source = [[src/ccminer/worker_parts/01.part]], target = [[worker_parts/01.part]], digest = [[93a3c5d046c2fdc5273de5223a2e83d0718e842b19bc025264ad7526a42703a3]], content = [[-- CC Miner V4 - autonomous quarry worker
 -- Home=(0,0,0), forward=+Z, right=+X, down=-Y.
 
 local common = dofile("/ccminer/lib/common.lua")
@@ -241,31 +267,3 @@ local config, configError = common.loadConfig()
 if not config or config.role ~= "worker" then
   error(configError or "Worker configuration not found. Run: ccm setup worker", 0)
 end
-
--- Forward declaration: statusPayload is defined before the assignment resume
--- helpers below, but Lua lexical scope otherwise resolves that call globally.
-local assignmentResumeSnapshot
-
--- Accept both the V4 nested defaults and older flat V2 settings.  This is
--- intentionally in-memory so an old config remains readable by V2 tooling.
-config.materials = config.materials or {}
-config.lighting = config.lighting or {}
-config.water = config.water or {}
-config.journal = config.journal or {}
-config.performance = config.performance or {}
-config.gps = config.gps or {}
-config.discard = config.discard or config.materials.discard or {}
-config.dock = config.dock or {}
-config.group = config.group or {}
--- Remote console is deliberately fail-closed.  Keep its policy in one nested
--- table so older V2 configs (which have no remoteConsole key) remain disabled
--- until an operator opts in explicitly.
-config.remoteConsole = config.remoteConsole or {}
-config.remoteConsole.enabled = config.remoteConsole.enabled == true
-config.remoteConsole.allowShell = config.remoteConsole.allowShell == true
-config.remoteConsole.sessionSeconds = math.max(1, math.floor(
-  tonumber(config.remoteConsole.sessionSeconds) or 120
-))
-config.remoteConsole.maxOutputBytes = math.max(1, math.floor(
-  tonumber(config.remoteConsole.maxOutputBytes) or 8192
-))

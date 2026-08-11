@@ -1,3 +1,39 @@
+      for key, value in pairs(registry or {}) do print(("%s world=%s,%s,%s facing=%s maxDepth=%s"):format(tostring(key), tostring(value.world and value.world.x or "-"), tostring(value.world and value.world.y or "-"), tostring(value.world and value.world.z or "-"), tostring(value.facing or "-"), tostring(value.maxDepth or "-"))) end
+    elseif sub == "register" and id then
+      local value = { world = { x = tonumber(args[4]), y = tonumber(args[5]), z = tonumber(args[6]) }, facing = args[7], maxDepth = tonumber(args[8]) }
+      local ok, err = command == "dock" and registerDock(id, value) or registerBay(id, value)
+      print(ok and ((command == "dock" and "Dock" or "Bay") .. " saved.") or ("Register error: " .. tostring(err)))
+    else print("Usage: " .. command .. " list|register <id> <x> <y> <z> [facing=south|east|north|west|0..3] [maxDepth]") end
+    return true
+  end
+  if command == "remote" then
+    local id = tonumber(args[2])
+    if not id then
+      print("Usage: ccm remote <workerId> [-- <command...>]")
+      return true
+    end
+    if args[3] == nil then
+      return noticeState.remoteApi.consoleCommand(id)
+    end
+    if args[3] ~= "--" or args[4] == nil then
+      print("Usage: ccm remote <workerId> [-- <command...>]")
+      return true
+    end
+    local commandText = {}
+    for index = 4, #args do commandText[#commandText + 1] = tostring(args[index]) end
+    return noticeState.remoteApi.consoleCommand(id, table.concat(commandText, " "))
+  end
+  if command == "discover" or command == "status" then
+    discover(); pumpFor(3)
+    local ids = orderedIds()
+    if #ids == 0 then print("No workers found."); return true end
+    for _, id in ipairs(ids) do
+      local data = workers[id].data or {}
+      print(("#%s %-16s %-14s %s GPS=%s seal=%s"):format(id, workerLabel(workers[id], id), statusOf(workers[id]), progressText(data), data.gps and data.gps.calibrated and "ready" or "no", data.seal and data.seal.count or "-"))
+    end
+    return true
+  elseif command == "start" then
+    local id, width, length, depth = tonumber(args[2]), tonumber(args[3]), tonumber(args[4]), tonumber(args[5])
     if not id or not width or not length or not depth then print("Usage: controller.lua start <id> <width> <length> <depth>"); return true end
     discover(); pumpFor(1)
     draft = makeCliDraft(id, width, length, depth)
@@ -171,52 +207,3 @@ local function validateEmbedded()
   }
   for index, file in ipairs(files) do
     if type(file.target) ~= "string" or type(file.content) ~= "string" or seen[file.target] then
-      fail("Embedded runtime order/target is invalid at index " .. tostring(index))
-    end
-    seen[file.target] = true
-    local actual, digestError = digest(file.content)
-    if not actual then fail(digestError) end
-    if actual ~= string.lower(file.digest or "") then
-      fail("Embedded runtime digest mismatch: " .. tostring(file.target))
-    end
-    aggregate[#aggregate + 1] = file.source; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.target; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.digest; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.content; aggregate[#aggregate + 1] = "\0"
-  end
-  local aggregateDigest, aggregateError = digest(table.concat(aggregate))
-  if not aggregateDigest then fail(aggregateError) end
-  if aggregateDigest ~= string.lower(SOURCE_DIGEST) then
-    fail("Embedded role source digest mismatch for " .. ROLE)
-  end
-  return true
-end
-local function validateParts(label, targets)
-  if #targets == 0 then return true end
-  local source = {}
-  for index, target in ipairs(targets) do
-    local found
-    for _, file in ipairs(files) do if file.target == target then found = file.content; break end end
-    if not found then fail("Embedded runtime part is missing: " .. target) end
-    source[index] = found
-  end
-  local ok, compileError = compileText(label .. ".assembled.lua", table.concat(source))
-  if not ok then fail("Assembled source failed syntax validation: " .. label .. ": " .. compileError) end
-end
-local function validateAll()
-  validateEmbedded()
-  for _, file in ipairs(files) do
-    if not file.target:match("%.part$") then
-      local ok, compileError = compileText(file.target, file.content)
-      if not ok then fail("Embedded file failed syntax validation: " .. file.target .. ": " .. compileError) end
-    end
-  end
-  validateParts("worker", WORKER_PARTS)
-  validateParts("controller", CONTROLLER_PARTS)
-end
--- Kept as a named boundary for source-contract checks and recovery logs.  The
--- role bundle validates from memory, so no /ccminer.update staging tree is
--- needed before a low-space commit.
-local function validateLowSpaceStage()
-  validateAll()
-end

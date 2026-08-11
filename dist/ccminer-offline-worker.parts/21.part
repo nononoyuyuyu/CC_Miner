@@ -1,3 +1,27 @@
+  if options.stripeAxis ~= nil and options.stripeAxis ~= "x" and options.stripeAxis ~= "z" then
+    return nil, "invalid_stripe_axis"
+  end
+  local distanceWeight = options.distanceWeight
+  if distanceWeight == nil then distanceWeight = 0.25 end
+  distanceWeight = numberValue(distanceWeight)
+  if not distanceWeight or distanceWeight < 0 or distanceWeight > MAX_DIMENSION then return nil, "invalid_distance_weight" end
+
+  local owner, owned, loads, strategyUsed, seeds, stripeAxisUsed
+  if strategy ~= "graph" and strategy ~= "growth" and options.stripeFirst ~= false then
+    owner, owned, loads, strategyUsed, stripeAxisUsed = stripeOwner(chunks, keys, workers, options)
+  end
+  if strategy == "stripe" and not owner then return nil, owned or "stripe_partition_unavailable" end
+  if not owner then
+    owner, owned, loads, strategyUsed, seeds = graphOwner(chunks, keys, workers,
+      strategy == "growth" and "growth" or "graph", distanceWeight)
+  end
+  if not owner then return nil, owned or "partition_failed" end
+
+  -- Rectangular stripes are expected to be connected, but a hand-authored
+  -- catalog may have irregular bounding boxes.  Fail closed (or use graph
+  -- growth for the automatic strategy) instead of handing a worker a split
+  -- region.
+  local function ownedConnected(list)
     if #list < 2 then return true end
     local allowed, seen, queue = {}, {}, { list[1] }
     for _, key in ipairs(list) do allowed[key] = true end
@@ -245,41 +269,3 @@ local function assignedConnected(chunks, keys)
       if allowed[neighbor] and not seen[neighbor] then seen[neighbor] = true; queue[#queue + 1] = neighbor end
     end
   end
-  for _, key in ipairs(keys) do if not seen[key] then return false end end
-  return true
-end
-
-local function assignedWalk(chunks, keys, rootKey, assignedSet)
-  local visited, walk = {}, {}
-  visited[rootKey] = true
-  chunks[rootKey].parent = nil
-  walk[1] = {
-    key = rootKey,
-    first = true,
-    anchor = { x = chunks[rootKey].anchor.x, z = chunks[rootKey].anchor.z },
-  }
-  local stack = { { key = rootKey, next = 1 } }
-  while #stack > 0 do
-    local frame = stack[#stack]
-    local chunk = chunks[frame.key]
-    local nextKey
-    while frame.next <= #chunk.neighbors do
-      local candidate = chunk.neighbors[frame.next]
-      frame.next = frame.next + 1
-      if assignedSet[candidate] and not visited[candidate] then nextKey = candidate; break end
-    end
-    if nextKey then
-      visited[nextKey] = true
-      chunks[nextKey].parent = frame.key
-      local boundary = M.chunkAnchor(chunks[nextKey], chunks[frame.key]) or chunks[nextKey].anchor
-      chunks[nextKey].anchor = { x = boundary.x, z = boundary.z }
-      walk[#walk + 1] = {
-        key = nextKey,
-        first = true,
-        anchor = { x = boundary.x, z = boundary.z },
-      }
-      stack[#stack + 1] = { key = nextKey, next = 1 }
-    else
-      stack[#stack] = nil
-      if #stack > 0 then
-        local parentKey = stack[#stack].key

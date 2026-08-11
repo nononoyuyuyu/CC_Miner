@@ -1,3 +1,27 @@
+    or name == "secret" or name == "token" or name == "nonce"
+    or name == "sessionid" or name == "apikey" or name == "auth"
+end
+
+local function remoteValueText(value, depth, field)
+  if remoteSensitiveKey(field) then return "[REDACTED]" end
+  depth = tonumber(depth) or 0
+  if value == nil then return "-" end
+  if type(value) == "string" then return remoteRedactText(value) end
+  if type(value) == "number" or type(value) == "boolean" then return tostring(value) end
+  if type(value) ~= "table" then return remoteRedactText(value) end
+  if depth >= 3 then return "{...}" end
+  local keys = {}
+  for key in pairs(value) do keys[#keys + 1] = key end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  local parts = {}
+  for _, key in ipairs(keys) do
+    parts[#parts + 1] = tostring(key) .. "=" .. remoteValueText(value[key], depth + 1, key)
+    if #parts >= 32 then parts[#parts + 1] = "..."; break end
+  end
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+
+local function remoteResultTable(payload)
   if type(payload) ~= "table" then return nil end
   if type(payload.result) == "table" then return payload.result end
   if type(payload.response) == "table" then return payload.response end
@@ -233,29 +257,4 @@ local function addHitbox(key, x1, y1, x2, y2, action)
   hitboxes[key][#hitboxes[key] + 1] = {
     x1 = math.floor(x1), y1 = math.floor(y1), x2 = math.floor(x2), y2 = math.floor(y2), action = action,
   }
-end
-
-local function drawButton(key, x, y, width, label, action, enabled, selectedButton)
-  width = math.max(3, math.floor(width))
-  local background = colors and (selectedButton and colors.lightBlue or enabled == false and colors.gray or colors.blue) or nil
-  local foreground = colors and (enabled == false and colors.lightGray or colors.white) or nil
-  common.writeAt(x, y, common.center(label, width), foreground, background)
-  if enabled ~= false and action then addHitbox(key, x, y, x + width - 1, y, action) end
-end
-
-local function buttonRow(key, y, width, definitions)
-  if width < 1 or y < 1 then return end
-  local count = math.max(1, #definitions)
-  local base = math.max(1, math.floor(width / count))
-  local x = 1
-  for index, definition in ipairs(definitions) do
-    local buttonWidth = index == count and (width - x + 1) or base
-    drawButton(key, x, y, buttonWidth, definition[1], definition[2], definition[3] ~= false, definition[4])
-    x = x + buttonWidth
-  end
-end
-
-local function draftWorker()
-  if not draft then return nil, nil end
-  return draft.workerId, workers[draft.workerId]
 end

@@ -1,3 +1,26 @@
+    -- Per-worker overrides are maps keyed by worker ID.  A shared dock/bay
+    -- remains a convenient default for legacy group registrations.
+    workerBays = common.copy(options.workerBays or previous.workerBays or {}),
+    workerDocks = common.copy(options.workerDocks or previous.workerDocks or {}),
+    mode = mode,
+    partition = partition,
+    staggerSeconds = math.max(0, tonumber(options.staggerSeconds or previous.staggerSeconds) or tonumber(db.groupScheduler.staggerSeconds) or 0),
+    replenishConcurrency = math.max(1, math.floor(tonumber(options.replenishConcurrency or previous.replenishConcurrency) or tonumber(db.groupScheduler.replenishConcurrency) or 1)),
+    updatedAt = common.nowSeconds(),
+  }
+  db.groups[groupId] = persistentGroupValue(group)
+  saveControllerDb()
+  return true, db.groups[groupId]
+end
+
+local function selectedGroupRecord()
+  local ids = orderedGroupIds()
+  local id = ids[selectedGroup]
+  return id, id and groupRecord(id) or nil
+end
+
+local function activeGroupJob(groupId)
+  local latest
   for id, job in pairs(db.groupJobs or {}) do
     if type(job) == "table" and tostring(job.groupId or id) == tostring(groupId) then
       if not latest or tonumber(job.updatedAt or job.startedAt or 0) > tonumber(latest.updatedAt or latest.startedAt or 0) then latest = job end
@@ -181,13 +204,3 @@ local function updateGroupAggregate(groupJob)
     if status == "working" or status == "mining" or status == "starting" then aggregate.active = aggregate.active + 1 end
     local fuel = data and tonumber(data.fuel or data.materials and data.materials.fuel)
     if fuel and (aggregate.minFuel == nil or fuel < aggregate.minFuel) then aggregate.minFuel = fuel end
-    local progress = data and data.progress or {}
-    local cursor, total = tonumber(progress and progress.cursor or data and data.job and data.job.cursor), tonumber(progress and progress.total or data and data.job and data.job.total)
-    if cursor and total and total > 0 then weightedDone, weightedTotal = weightedDone + math.max(0, math.min(cursor, total)), weightedTotal + total end
-    local warning = data and (data.lastError or data.completionReason)
-    if warning and not seenWarning[tostring(warning)] then seenWarning[tostring(warning)] = true; aggregate.warnings[#aggregate.warnings + 1] = tostring(warning) end
-    local ack = groupJob.acks and groupJob.acks[tostring(id)]
-    if ack and ack.ok ~= nil then aggregate.acks = aggregate.acks + 1 end
-  end
-  aggregate.percent = weightedTotal > 0 and math.floor(weightedDone * 100 / weightedTotal + 0.5) or (#ids > 0 and math.floor(aggregate.complete * 100 / #ids + 0.5) or 0)
-  if aggregate.blocked > 0 then aggregate.warnings[#aggregate.warnings + 1] = "blocked=" .. tostring(aggregate.blocked) end

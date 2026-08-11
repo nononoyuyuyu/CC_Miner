@@ -83,9 +83,11 @@ marker(setup, "Warning: torch chest side must not match the seal-block chest sid
 marker(setup, "現場廃棄方向", "discard direction explanation")
 marker(setup, "設定方向に inventory が見つかった場合は、誤投入防止のため world 廃棄をスキップします。", "discard side safety explanation")
 marker(setup, "【強い警告】遠隔コンソールは", "remote console strong warning")
-marker(setup, "遠隔コンソールを有効にしますか（既定OFF）", "remote console opt-in prompt")
+marker(setup, "安全な遠隔コンソールを有効にしますか（新規設定はON）", "safe remote console default prompt")
 marker(setup, "allowShell（シェル実行）を許可しますか", "remote shell separate confirmation")
-marker(setup, "controllerId=0 のままでは遠隔コンソールを有効にできません。", "remote controller id guard")
+marker(setup, "controllerId=0 は、同じ合言葉を持つ管理用コンピューターを許可します。", "same-key controller explanation")
+marker(setup, "allowShellではcontrollerId=0を使えません。", "arbitrary shell controller pin guard")
+marker(setup, "Allowed controller ID (0=same network key)", "safe remote controller id prompt")
 marker(setup, "Controller computer ID (1-65535)", "remote controller id prompt")
 
 -- Controller prompts expose group capacity, service concurrency, explicit

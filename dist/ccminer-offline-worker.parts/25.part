@@ -1,3 +1,33 @@
+    if rotated then entries = 0; state.journal.entries = 0 end
+  end
+  local handle = fs.open(path, "a")
+  if not handle then return false end
+  state.journal.seq = (tonumber(state.journal.seq) or 0) + 1
+  state.journal.writes = (tonumber(state.journal.writes) or 0) + 1
+  state.journal.entries = entries + 1
+  local entry = {
+    seq = state.journal.seq,
+    at = common.nowSeconds(),
+    event = tostring(event or "state"),
+    status = state.status,
+    phase = state.phase,
+    pose = {
+      x = tonumber(state.pose and state.pose.x) or 0,
+      y = tonumber(state.pose and state.pose.y) or 0,
+      z = tonumber(state.pose and state.pose.z) or 0,
+      dir = (tonumber(state.pose and state.pose.dir) or 0) % 4,
+    },
+    cursor = state.job and state.job.cursor or nil,
+    -- Keep the ambiguous physical operation in the compact journal too.  A
+    -- full checkpoint may lag this record, but replay can still force a
+    -- safety stop instead of guessing whether a dig/move happened.
+    pendingAction = state.pendingAction and {
+      kind = state.pendingAction.kind,
+      startedAt = state.pendingAction.startedAt,
+    } or nil,
+    route = state.job and state.job.route and {
+      layer = state.job.route.layer, walkIndex = state.job.route.walkIndex,
+      localCursor = state.job.route.localCursor, phase = state.job.route.phase,
       currentKey = state.job.route.currentKey,
     } or nil,
   }
@@ -239,52 +269,3 @@ local function cancelPhysicalAction()
 end
 
 local function commitPhysicalAction()
-  state.pendingAction = nil
-  state.journal = state.journal or {}
-  state.journal.lightweight = state.journal.lightweight or {}
-  state.journal.lightweight.force = true
-  saveState()
-end
-
-local function isHome()
-  return state.pose.x == 0 and state.pose.y == 0 and state.pose.z == 0
-end
-
-local function distance(a, b)
-  a, b = a or state.pose, b or { x = 0, y = 0, z = 0 }
-  return math.abs((a.x or 0) - (b.x or 0))
-    + math.abs((a.y or 0) - (b.y or 0))
-    + math.abs((a.z or 0) - (b.z or 0))
-end
-
-local function inventoryStats()
-  local used, empty, items = 0, 0, 0
-  for slot = 1, 16 do
-    local count = turtle.getItemCount(slot)
-    if count > 0 then used, items = used + 1, items + count else empty = empty + 1 end
-  end
-  return used, empty, items
-end
-
-local function fuelLevel()
-  local ok, level = pcall(turtle.getFuelLevel)
-  if not ok then return 0 end
-  return level
-end
-
-local function fuelLimit()
-  local ok, limit = pcall(turtle.getFuelLimit)
-  if not ok then return 0 end
-  return limit
-end
-
-local function itemName(slot)
-  if turtle.getItemCount(slot) <= 0 then return nil end
-  local ok, detail = pcall(turtle.getItemDetail, slot)
-  if not ok or type(detail) ~= "table" then return nil end
-  return detail.name
-end
-
-local function isSealItemName(name)
-  return name and config.sealBlocks and config.sealBlocks[name] == true
-end

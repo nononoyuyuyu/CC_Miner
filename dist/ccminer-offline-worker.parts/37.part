@@ -1,3 +1,32 @@
+    return false, "Output inventory missing on configured side " .. outputSide .. "."
+  end
+
+  local policy, mode = discardPolicy()
+  local discardStats = discardStatsTable()
+  discardStats.lastError = nil
+  local _, emptySlots = inventoryStats()
+  local trigger = tonumber(policy.triggerEmptySlots) or 3
+  local discardEnabled = mode ~= "KEEP_ALL" and emptySlots <= trigger
+  local discardSide = policy.direction or "back"
+  if discardSide == "up" then discardSide = "top" end
+  if discardSide == "down" then discardSide = "bottom" end
+  local outputTargetDir = sideTargetDirection(outRestore, outputSide)
+  local discardTargetDir = sideTargetDirection(outRestore, discardSide)
+  local discardInspect, _, discardDrop, discardRestore
+  local discardReady, discardError = true, nil
+  if discardEnabled and discardSide ~= outputSide then
+    discardInspect, _, discardDrop, discardRestore, discardError = sideFunctions(discardSide)
+    if not discardInspect then discardReady = false end
+    local checkSide = (discardSide == "top" and "top") or (discardSide == "bottom" and "bottom") or "front"
+    if discardReady and not inventoryPresent(checkSide, discardInspect) then
+      discardReady, discardError = false, "Discard inventory missing on configured side " .. tostring(discardSide) .. "."
+    end
+  elseif discardEnabled then
+    discardInspect, discardDrop, discardRestore = outInspect, outDrop, outRestore
+  end
+  if discardEnabled and not discardReady then
+    restoreSideDirection(discardSide, discardRestore or outRestore)
+    turtle.select(originalSlot)
     discardStats.lastError = discardError or "Discard inventory verification failed."
     saveState("discard_inventory_error")
     return false, discardStats.lastError
@@ -232,41 +261,3 @@ local function refuelAtHome()
     if attempts > 1024 then
       restoreSideDirection(fuelSide, restoreDir)
       turtle.select(originalSlot)
-      return false, "Fuel loading safety limit reached."
-    end
-    local slot = firstFuelSlot()
-    if not slot then
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "No empty slot available while refueling."
-    end
-    turtle.select(slot)
-    local sucked = runInventoryPhysicalAction("refuel_suck", {
-      slot = slot, count = 1, direction = fuelSide,
-    }, function() return suckFunction(1) end)
-    if not sucked then
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Fuel inventory is empty."
-    end
-    local validFuel = runInventoryPhysicalAction("refuel_probe", {
-      slot = slot, count = turtle.getItemCount(slot), direction = fuelSide,
-    }, function() return turtle.refuel(0) end)
-    if not validFuel then
-      runInventoryPhysicalAction("refuel_reject", {
-        slot = slot, item = itemName(slot), direction = fuelSide,
-      }, dropFunction)
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Fuel inventory contains a non-fuel item."
-    end
-    local before = fuelLevel()
-    local consumed = runInventoryPhysicalAction("refuel_consume", {
-      slot = slot, item = itemName(slot), direction = fuelSide,
-    }, function() return turtle.refuel(1) end)
-    local after = fuelLevel()
-    if not consumed then
-      runInventoryPhysicalAction("refuel_reject", {
-        slot = slot, item = itemName(slot), direction = fuelSide,
-      }, dropFunction)
-      restoreSideDirection(fuelSide, restoreDir)

@@ -1,3 +1,13 @@
+        bay = assignment.bay, bayId = assignment.bayId, dock = common.copy(assignment.dock or {}), dockId = assignment.dockId, homeWorld = common.copy(assignment.homeWorld), maxDepth = assignment.maxDepth, facing = assignment.facing,
+        lease = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) },
+        leases = { transit = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "transit", chunks = common.copy(assignment.transitKeys or {}) }, mine = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) } },
+      }
+      payload.command = "start"
+      payload.assignment = common.copy(assignment)
+      local ok = sendCommand(assignment.workerId, "start", payload)
+      job.pending[key] = nil
+      if ok then
+        job.awaitingAck[key] = { sentAt = now, attempts = tonumber(job.attempts and job.attempts[key] or 0) + 1, assignmentId = assignment.assignmentId }
         job.attempts = job.attempts or {}; job.attempts[key] = job.awaitingAck[key].attempts
         job.acks[key] = { ok = nil, command = "START", sentAt = now }
         assignment.status = "sent"
@@ -146,15 +156,3 @@ local function reassignGroupAssignment(groupJobId, stoppedWorkerId, targetWorker
     if not pos or tonumber(pos.x) ~= tonumber(bay.world.x) or tonumber(pos.y) ~= tonumber(bay.world.y) or tonumber(pos.z) ~= tonumber(bay.world.z) then setNotice("Reassign target is not at its bay pose.", true); return false end
   end
   local targetKey = tostring(targetWorkerId)
-  local existingTarget = job.assignments[targetKey]
-  local target = existingTarget and common.copy(existingTarget) or { workerId = tonumber(targetWorkerId) or targetWorkerId, groupJobId = job.groupJobId, parentJobId = job.groupJobId, jobId = job.groupJobId .. "/reassign-" .. targetKey, assignmentId = job.groupJobId .. ":reassign:" .. targetKey, chunkKeys = {}, transitKeys = {}, status = "pending_reassign" }
-  target.chunkKeys = common.copy(source.chunkKeys)
-  target.transitKeys = common.copy(source.transitKeys or {})
-  target.bay, target.bayId, target.dock, target.dockId = bayId, bayId, common.copy(dock or {}), dockId
-  target.homeWorld = dock and common.copy(dock.homeWorld or dock.world) or common.copy(target.homeWorld or targetData.world)
-  target.maxDepth = tonumber(dock and dock.maxDepth or target.maxDepth or config.maxDepth)
-  target.facing = targetData.facing or target.facing
-  if job.chunkMode == "world" and targetData.gps and targetData.gps.calibration and targetData.gps.calibration.home then
-    local targetHome = targetData.gps.calibration.home
-    if tonumber(targetHome.x) and tonumber(targetHome.z) then
-      target.bayChunkKey = quarry.chunkKey("world", math.floor(tonumber(targetHome.x) / 16), math.floor(tonumber(targetHome.z) / 16))

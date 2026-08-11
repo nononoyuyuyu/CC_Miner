@@ -1,3 +1,30 @@
+      if id then confirmState = { command = "clear", message = "Clear the completed or aborted job record?" }; mode = "confirm" end
+    elseif name == "rehome" then
+      if id then confirmState = { command = "rehome", payload = { confirm = "RESET" }, twoStep = true, message = "REHOME RESET clears the active job. Press YES twice only when the turtle is physically in its dock." }; mode = "confirm" end
+    elseif name == "gps" then
+      if id then confirmState = { command = "calibrate_gps", message = "GPS calibration moves forward one block and back. Is the dock front clear?" }; mode = "confirm" end
+    elseif name == "quit" then running = false end
+    invalidate()
+  end
+end
+
+local function sortingTick()
+  local settings = config.sorting
+  if not settings or settings.enabled ~= true or common.nowSeconds() - lastSorting < (tonumber(settings.interval) or 30) then return end
+  lastSorting = common.nowSeconds()
+  if not peripheral or not peripheral.wrap then return end
+  local source = peripheral.wrap(settings.source or "")
+  local valuable = peripheral.wrap(settings.valuableTarget or "")
+  local bulk = peripheral.wrap(settings.bulkTarget or "")
+  local seal = peripheral.wrap(settings.sealTarget or "")
+  if not source or type(source.list) ~= "function" or type(source.pushItems) ~= "function" then
+    if not sortingWarned then sortingWarned = true; setNotice("Sorting WARN: source inventory is not configured.", false) end
+    return
+  end
+  if not valuable or not bulk or not seal then
+    if not sortingWarned then sortingWarned = true; setNotice("Sorting WARN: one or more target inventories are missing.", false) end
+    return
+  end
   local valuableItems, sealItems = settings.valuableItems or {}, settings.sealBlocks or {}
   for slot, item in pairs(source.list() or {}) do
     local destination = bulk
@@ -8,7 +35,7 @@
   end
 end
 ]] },
-  { source = [[src/ccminer/controller_parts/02.part]], target = [[controller_parts/02.part]], digest = [[3d6524acc7f7427e1020439b9ecac0c2d7f8867392295bbf783fbcab32b149ad]], content = [[-- CC Miner V4 - adaptive touch views.  Every view has a keyboard fallback and
+  { source = [[src/ccminer/controller_parts/02.part]], target = [[controller_parts/02.part]], digest = [[016d8225951b66c802fd7687a03a31348d89d045e497e8d8ae9cf2df6cbe382b]], content = [[-- CC Miner V4 - adaptive touch views.  Every view has a keyboard fallback and
 -- uses bounded hitboxes, so a 20x8 monitor remains operable.
 
 local fieldOrder = { "width", "length", "depth", "targetY" }
@@ -216,39 +243,3 @@ local function renderDashboard(target, key)
     { "REHOME", dashboardAction("rehome") }, { "LAST ERR", dashboardAction("last_error") },
   })
   -- Group controls are additive; the legacy single-worker rows above remain
-  -- unchanged so old monitors and keyboard shortcuts continue to work.
-  buttonRow(key, math.max(1, bottom - 1), width, {
-    { "GROUPS", dashboardAction("groups") }, { "G START", dashboardAction("group_start") },
-    { "G PAUSE", dashboardAction("group_pause") }, { "G RETURN", dashboardAction("group_return") },
-  })
-  local groupIds = orderedGroupIds()
-  if #groupIds > 0 then
-    local gy = math.max(2, bottom - 2)
-    local gid, g = selectedGroupRecord()
-    local gj = gid and activeGroupJob(gid) or nil
-    local aggregate = gj and (gj.aggregate or updateGroupAggregate(gj)) or nil
-    local line = ("Group %s %s %d workers %s%% minFuel=%s ACK=%s/%s"):format(tostring(gid), groupName(g, gid), #(groupWorkerIds(g)), tostring(aggregate and aggregate.percent or 0), tostring(aggregate and aggregate.minFuel or "-"), tostring(aggregate and aggregate.acks or 0), tostring(aggregate and aggregate.ackTotal or #groupWorkerIds(g)))
-    common.writeAt(1, gy, common.fit(line, width), colors and colors.cyan or nil)
-  end
-  noticeLine(target, height)
-end
-
-local function groupAction(groupCommandName)
-  return function()
-    local gid = selectedGroupRecord()
-    if not gid then setNotice("No group selected.", true); return end
-    if groupCommandName == "start" then
-      groupDraft = groupDraftDefaults(groupRecord(gid))
-      groupDraft.selectedField = "width"
-      groupDraft.buffer = tostring(groupDraft.width or 1)
-      groupDraft.preflight = nil
-      mode = "group_dimensions"
-    else
-      groupCommand(gid, groupCommandName)
-    end
-    invalidate()
-  end
-end
-
-local function groupAssignmentCount(result)
-  local count = 0

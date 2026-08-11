@@ -1,3 +1,26 @@
+-- for integral world positions while still accepting numeric coordinates for
+-- diagnostics.
+local function worldToLocalXZ(calibration, worldX, worldZ)
+  if not validCalibration(calibration) then return nil, nil, "gps_not_calibrated" end
+  worldX, worldZ = numberValue(worldX), numberValue(worldZ)
+  if not worldX or not worldZ then return nil, nil, "invalid_world_position" end
+  local forwardX, forwardZ = numberValue(calibration.forward.x), numberValue(calibration.forward.z)
+  local homeX, homeZ = numberValue(calibration.home.x), numberValue(calibration.home.z)
+  local dx, dz = worldX - homeX, worldZ - homeZ
+  local rightX, rightZ = -forwardZ, forwardX
+  return dx * rightX + dz * rightZ, dx * forwardX + dz * forwardZ
+end
+
+M.worldToLocalXZ = worldToLocalXZ
+function M.inverseWorldToLocal(calibration, worldX, worldZ)
+  if type(worldX) == "table" then worldZ, worldX = worldX.z, worldX.x end
+  local localX, localZ, inverseError = worldToLocalXZ(calibration, worldX, worldZ)
+  if not localX then return nil, inverseError end
+  return { x = localX, z = localZ }
+end
+function M.referenceLocalToWorld(calibration, x, z)
+  if not validCalibration(calibration) then return nil, "gps_not_calibrated" end
+  x, z = numberValue(x), numberValue(z)
   if not x or not z then return nil, "invalid_position" end
   local worldX, worldZ = localToWorld(calibration, x, z)
   return { x = worldX, z = worldZ }
@@ -281,36 +304,3 @@ end
 M.shortestPath = M.shortestChunkPath
 
 local function nearestUnvisitedPath(chunks, startKey, visited)
-  local queue, head, tail = { startKey }, 1, 1
-  local previous, seen = {}, { [startKey] = true }
-  while head <= tail do
-    local key = queue[head]; head = head + 1
-    for _, neighbor in ipairs(chunks[key].neighbors or {}) do
-      if not seen[neighbor] then
-        seen[neighbor] = true
-        previous[neighbor] = key
-        if not visited[neighbor] then
-          local path, current = { neighbor }, neighbor
-          while current ~= startKey do
-            current = previous[current]
-            path[#path + 1] = current
-          end
-          local reversed = {}
-          for index = #path, 1, -1 do reversed[#reversed + 1] = path[index] end
-          return reversed
-        end
-        tail = tail + 1; queue[tail] = neighbor
-      end
-    end
-  end
-  return nil
-end
-
-local function optimizedWalk(chunks, keys, rootKey)
-  local walk, order, visited = {}, {}, { [rootKey] = true }
-  local current = rootKey
-  -- Every plan is persisted in worker state.  CC:Tweaked's serializer rejects
-  -- shared table references, so keep compatibility fields as independent
-  -- point values instead of aliasing the chunk's anchor table.
-  local rootAnchor = chunks[rootKey].anchor
-    and { x = chunks[rootKey].anchor.x, z = chunks[rootKey].anchor.z }

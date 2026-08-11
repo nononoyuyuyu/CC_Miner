@@ -1,3 +1,43 @@
+  validateLowSpaceStage()
+  ensureUpdateSentinel()
+  local marker, markerReadError = markerRead()
+  if markerReadError then lowSpaceFailure(markerReadError) end
+  if marker then
+    if marker.version ~= VERSION or marker.schema ~= SCHEMA or marker.role ~= ROLE then
+      lowSpaceFailure("Recovery marker does not match this role bundle.")
+    end
+    if marker.state ~= "ready" and marker.state ~= "committing" and marker.state ~= "final-ready" then
+      lowSpaceFailure("Recovery marker has an unknown state: " .. tostring(marker.state))
+    end
+  else
+    local marked, markerError = markerWrite("ready", 1)
+    if not marked then lowSpaceFailure("Cannot create recovery marker: " .. tostring(markerError)) end
+    marker, markerReadError = markerRead()
+    if markerReadError or not marker then
+      lowSpaceFailure(markerReadError or "Recovery marker was written but could not be read back.")
+    end
+  end
+  local first
+  if marker.state == "final-ready" then
+    -- final-ready explicitly skips every non-loader step on resume.
+    first = #LOW_SPACE_STEPS + 1
+  else
+    first = math.max(1, math.min(#LOW_SPACE_STEPS + 1, marker.next or 1))
+  end
+  local marked, markerError = markerWrite("ready", first)
+  if not marked then lowSpaceFailure("Cannot mark validated runtime: " .. tostring(markerError)) end
+  for index = first, #LOW_SPACE_STEPS do
+    local step = LOW_SPACE_STEPS[index]
+    marked, markerError = markerWrite("committing", index)
+    if not marked then lowSpaceFailure("Cannot record commit progress for step " .. tostring(index) .. ": " .. tostring(markerError)) end
+    local applied, applyError = applyLowSpaceStep(step)
+    if not applied then lowSpaceFailure(applyError) end
+    marked, markerError = markerWrite("committing", index + 1)
+    if not marked then lowSpaceFailure("Applied low-space step " .. tostring(index) .. ", but cannot advance recovery marker: " .. tostring(markerError)) end
+  end
+  local finalContent = embeddedEntrypoint()
+  marked, markerError = markerWrite("final-ready", #LOW_SPACE_STEPS + 1)
+  if not marked then lowSpaceFailure("Cannot mark the validated final role loader: " .. tostring(markerError)) end
   local finalPath = ROOT .. "/" .. ENTRYPOINT
   local wrote, writeError = atomicWrite(finalPath, finalContent)
   if not wrote then lowSpaceFailure("Cannot atomically commit final role loader: " .. tostring(writeError)) end

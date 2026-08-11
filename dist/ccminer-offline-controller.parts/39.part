@@ -1,3 +1,22 @@
+  if not catalog then common.writeAt(1, 3, common.fit(tostring(err), width), colors and colors.red or nil); drawButton(key, 1, height - 1, width, "BACK", function() mode = "job_dimensions" end, true); return end
+  local partialMask = normalizeChunkMask(catalog, rootKey)
+  local byCoordinate, xValues, zValues, xIndex, zIndex = chunkGrid(catalog)
+  local cellWidth = width >= 48 and 2 or 1
+  local cols = common.clamp(math.floor((width - 3) / cellWidth), 1, math.max(1, #xValues))
+  local rows = common.clamp(height - 8, 1, math.max(1, #zValues))
+  draft.gridPageX = common.clamp(draft.gridPageX or 1, 1, math.max(1, #xValues - cols + 1))
+  draft.gridPageZ = common.clamp(draft.gridPageZ or 1, 1, math.max(1, #zValues - rows + 1))
+  local pageX, pageZ = draft.gridPageX, draft.gridPageZ
+  common.writeAt(1, 2, common.fit(("%s chunks cx=%s..%s cz=%s..%s | %s"):format(chunkMode, tostring(xValues[pageX] or "-"), tostring(xValues[math.min(#xValues, pageX + cols - 1)] or "-"), tostring(zValues[pageZ] or "-"), tostring(zValues[math.min(#zValues, pageZ + rows - 1)] or "-"), draft.rectMode and (draft.rectStart and "RECT: second point" or "RECT: first point") or "tap toggles mining"), width), colors and colors.lightGray or nil)
+  for row = 0, rows - 1 do
+    local cz = zValues[pageZ + row]
+    for col = 0, cols - 1 do
+      local cx = xValues[pageX + col]
+      local chunk = cx and cz and byCoordinate[tostring(cx) .. ":" .. tostring(cz)] or nil
+      if chunk then
+      local locked = chunk.key == rootKey
+      local excluded = draft.excluded and draft.excluded[chunk.key] == true
+      local glyph = locked and "E" or excluded and "X" or "."
       local fg = locked and (colors and colors.black or nil) or excluded and (colors and colors.white or nil) or (colors and colors.lime or nil)
       local bg = locked and (colors and colors.yellow or nil) or excluded and (colors and colors.red or nil) or (colors and colors.green or nil)
       local px, py = 2 + col * cellWidth, 4 + row
@@ -158,24 +177,3 @@ local function renderRecovery(target, key)
   local width, height = target.getSize()
   local id, worker = selectedWorker()
   local data = worker and worker.data or {}
-  writeHeader("RECOVERY WIZARD", target, colors and colors.red or nil)
-  local explanation = data.lastError or (data.pendingAction and ("Pending action: " .. tostring(data.pendingAction.kind)) or "Worker needs recovery.")
-  common.writeAt(1, 2, common.fit("State: " .. tostring(data.status or "unknown") .. " / " .. tostring(data.phase or "-"), width), colors and colors.yellow or nil)
-  common.writeAt(1, 3, common.fit(explanation, width), colors and colors.white or nil)
-  buttonRow(key, 5, width, { { "GPS FIX", function() recoveryAction("gps_fix") end }, { "RETRY", function() recoveryAction("retry") end }, { "RESUME", function() recoveryAction("resume") end } })
-  buttonRow(key, 6, width, { { "RETURN", function() recoveryAction("return") end }, { "REHOME RESET", function() recoveryAction("rehome") end }, { "BACK", function() mode = "dashboard" end } })
-  noticeLine(target, height)
-end
-
-local function renderInfo(target, key)
-  local width, height = target.getSize()
-  local id, worker = selectedWorker()
-  local data = worker and worker.data or {}
-  writeHeader("WORKER DETAILS", target)
-  if not id or not worker then common.writeAt(1, 3, common.fit("No worker selected.", width), colors and colors.red or nil)
-  else
-    local lines = {
-      ("ID: %s  Name: %s"):format(tostring(id), workerLabel(worker, id)),
-      ("Status: %s / %s"):format(statusOf(worker), tostring(data.phase or "-")),
-      data.pose and ("Local pose: x=%s y=%s z=%s dir=%s"):format(data.pose.x, data.pose.y, data.pose.z, data.pose.dir) or "Local pose: -",
-      data.world and ("GPS world: %s, %s, %s"):format(data.world.x, data.world.y, data.world.z) or "GPS world: no fix",

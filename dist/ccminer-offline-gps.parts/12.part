@@ -1,3 +1,24 @@
+
+  local networkKey = config.networkKey
+  if role ~= "gps" then
+    if type(networkKey) ~= "string" or networkKey == "" or networkKey == "CHANGE_ME" then
+      finding("FAIL", "config.networkKey", "missing or still CHANGE_ME")
+    else
+      finding("PASS", "config.networkKey", "configured (masked)")
+    end
+  end
+  if role == "worker" then
+    local numericChecks = {
+      { "config.maxWidth", config.maxWidth, 1 }, { "config.maxLength", config.maxLength, 1 },
+      { "config.maxDepth", config.maxDepth, 1 }, { "config.maxVolume", config.maxVolume, 1 },
+      { "config.reserveEmptySlots", config.reserveEmptySlots, 0 },
+    }
+    for _, check in ipairs(numericChecks) do
+      if tonumber(check[2]) and tonumber(check[2]) >= check[3] then finding("PASS", check[1], tostring(check[2]))
+      else finding("FAIL", check[1], "must be a number >= " .. tostring(check[3])) end
+    end
+    finding("PASS", "config.profile", tostring(config.profile or "balanced"))
+    finding("PASS", "config.water", valueString(config.water or config.waterMode or "seal"))
     finding("PASS", "config.lighting", valueString(config.lighting or config.lightMode or "off"))
     finding("PASS", "config.materials", valueString(config.materials or {}))
   elseif role == "controller" then
@@ -170,26 +191,3 @@
         local expectedDepth = numericBottom and math.floor(homeY - numericBottom + 1) or nil
         if not numericBottom or numericBottom ~= math.floor(numericBottom) or numericBottom > homeY then
           finding("FAIL", "gps.absoluteY", "BOTTOM Y is above calibrated home Y")
-        elseif depth and expectedDepth ~= depth then
-          finding("FAIL", "gps.absoluteY", ("BOTTOM Y/depth mismatch (derived %d, depth %s)"):format(expectedDepth, tostring(depth)))
-        else finding("PASS", "gps.absoluteY", ("homeY=%s bottomY=%s"):format(tostring(homeY), tostring(bottomY))) end
-      else
-        finding("PASS", "gps.absoluteY", "homeY=" .. tostring(homeY))
-      end
-      doctorJournal(config, state, finding)
-    end
-  elseif stateError and stateError ~= "missing" then
-    finding("WARN", "state.file", "not applicable; read error " .. tostring(stateError))
-  end
-
-  if role == "controller" then
-    local found = false
-    for _, path in ipairs(controllerDbCandidates(config)) do
-      local db, dbError = readTableNoWrite(path)
-      if db then
-        found = true
-        local history = historyFromDb(db)
-        if history then
-          local historyCount = 0
-          for _ in pairs(history) do historyCount = historyCount + 1 end
-          finding("PASS", "controller.db", tostring(path) .. " entries=" .. tostring(historyCount))

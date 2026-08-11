@@ -1,3 +1,30 @@
+  common.clear(colors and colors.black or nil, colors and colors.white or nil)
+  print("CC Miner V4 Worker " .. common.VERSION)
+  print("ID: " .. os.getComputerID() .. "  " .. tostring(config.workerName))
+  print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
+  print(("Pose: x=%d y=%d z=%d d=%d"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir))
+  if state.gps and state.gps.lastFix then
+    print(("GPS: %d,%d,%d%s"):format(
+      state.gps.lastFix.x, state.gps.lastFix.y, state.gps.lastFix.z,
+      gpsCalibration() and " calibrated" or " uncalibrated"
+]] },
+  { source = [[src/ccminer/worker_parts/05.part]], target = [[worker_parts/05.part]], digest = [[7807e70cc70294234d8716894ee8580dd4b068ac3c3a829759a736bc524d06ed]], content = [[    ))
+  else
+    print("GPS: " .. (gpsCalibration() and "no fix" or "not calibrated"))
+  end
+  print("Fuel: " .. tostring(fuelLevel()) .. " / " .. tostring(fuelLimit()))
+  local used, empty, items = inventoryStats()
+  print(("Inventory: %d used, %d empty, %d items"):format(used, empty, items))
+  print(("Lava seal: %d/%d (%s)"):format(sealMaterialCount(), tonumber(config.sealTarget) or 64, config.lavaMode or "seal"))
+  local lightMode, lightInterval = effectiveLighting()
+  print(("Lighting: %s every %d, torches=%d, placed=%d"):format(
+    lightMode, lightInterval, torchMaterialCount(), state.stats.torchesPlaced or 0
+  ))
+  print(("Water: %s, detected=%d sealed=%d"):format(
+    waterMode(), state.stats.waterDetected or 0, state.stats.waterSealed or 0
+  ))
+  local throughput = throughputSnapshot()
+  local returnInfo = returnSnapshot()
   print(("Throughput: %.2f/s  Return: %s d=%d t=%ds"):format(
     throughput.perSecond or 0, tostring(returnInfo.reason or "-"),
     tonumber(returnInfo.distance) or 0, tonumber(returnInfo.seconds) or 0
@@ -221,45 +248,3 @@ local FILE_COUNT = 13
 local WORKER_PARTS = {[[worker_parts/01.part]], [[worker_parts/02.part]], [[worker_parts/03.part]], [[worker_parts/04.part]], [[worker_parts/05.part]]}
 local CONTROLLER_PARTS = {}
 local ENTRYPOINT = [[worker.lua]]
-local UPDATE_SENTINEL = [[-- CC Miner V4 update-incomplete sentinel for worker
-error("CC Miner runtime update is incomplete. Re-transfer the offline bundle and run update-low-space.", 0)
-]]
-local LOW_SPACE_STEPS = {
-  { kind = "runtime", index = 1 },
-  { kind = "runtime", index = 2 },
-  { kind = "runtime", index = 3 },
-  { kind = "runtime", index = 4 },
-  { kind = "runtime", index = 5 },
-  { kind = "runtime", index = 6 },
-  { kind = "runtime", index = 7 },
-  { kind = "runtime", index = 9 },
-  { kind = "runtime", index = 10 },
-  { kind = "runtime", index = 11 },
-  { kind = "runtime", index = 12 },
-  { kind = "runtime", index = 13 },
-  { kind = "obsolete", target = [[controller.lua]] },
-  { kind = "obsolete", target = [[controller_parts/01.part]] },
-  { kind = "obsolete", target = [[controller_parts/02.part]] },
-  { kind = "obsolete", target = [[controller_parts/03.part]] },
-  { kind = "obsolete", target = [[gps_host.lua]] },
-}
-
-local function fail(message)
-  error(tostring(message), 0)
-end
-local function ensureDir(path)
-  if not path or path == "" or fs.exists(path) then return end
-  local parent = fs.getDir(path)
-  if parent and parent ~= "" and parent ~= path then ensureDir(parent) end
-  fs.makeDir(path)
-end
-local function readFile(path)
-  if not fs.exists(path) or fs.isDir(path) then return nil end
-  local handle = fs.open(path, "rb")
-  if not handle then return nil end
-  local text = handle.readAll(); handle.close(); return text
-end
-local function writeFile(path, text)
-  ensureDir(fs.getDir(path))
-  local handle = fs.open(path, "wb")
-  if not handle then return false, "Cannot write " .. path end

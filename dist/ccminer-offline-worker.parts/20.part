@@ -1,3 +1,29 @@
+    -- between adjacent bay levels.  This keeps every stripe contiguous and
+    -- guarantees the worker whose bay is on a level owns that level.
+    local prefix, total = { [0] = 0 }, 0
+    for index, weight in ipairs(weights) do total = total + weight; prefix[index] = total end
+    local previousCut = 0
+    for rank = 1, #workers - 1 do
+      local workerIndex = workerOrder[rank]
+      local nextWorkerIndex = workerOrder[rank + 1]
+      local minimum = math.max(previousCut + 1, bayPositions[workerIndex])
+      local maximum = math.min(bayPositions[nextWorkerIndex] - 1, #levels - (#workers - rank))
+      if minimum > maximum then return nil, "stripe_bay_alignment_unavailable" end
+      local target = total * rank / #workers
+      local bestCut, bestError
+      for candidate = minimum, maximum do
+        local error = math.abs(prefix[candidate] - target)
+        if not bestCut or error < bestError or (error == bestError and candidate < bestCut) then
+          bestCut, bestError = candidate, error
+        end
+      end
+      cuts[rank], previousCut = bestCut, bestCut
+    end
+    cuts[#workers] = #levels
+  else
+    local levelIndex, remainingWeight = 1, 0
+    for _, weight in ipairs(weights) do remainingWeight = remainingWeight + weight end
+    for rank = 1, #workers do
       local remainingWorkers = #workers - rank
       local target = remainingWeight / (remainingWorkers + 1)
       local selected = 0
@@ -246,27 +272,3 @@ function M.partitionGroup(catalog, workersInput, options)
   if strategy ~= nil and strategy ~= "stripe" and strategy ~= "graph" and strategy ~= "growth" then
     return nil, "invalid_partition_strategy"
   end
-  if options.stripeAxis ~= nil and options.stripeAxis ~= "x" and options.stripeAxis ~= "z" then
-    return nil, "invalid_stripe_axis"
-  end
-  local distanceWeight = options.distanceWeight
-  if distanceWeight == nil then distanceWeight = 0.25 end
-  distanceWeight = numberValue(distanceWeight)
-  if not distanceWeight or distanceWeight < 0 or distanceWeight > MAX_DIMENSION then return nil, "invalid_distance_weight" end
-
-  local owner, owned, loads, strategyUsed, seeds, stripeAxisUsed
-  if strategy ~= "graph" and strategy ~= "growth" and options.stripeFirst ~= false then
-    owner, owned, loads, strategyUsed, stripeAxisUsed = stripeOwner(chunks, keys, workers, options)
-  end
-  if strategy == "stripe" and not owner then return nil, owned or "stripe_partition_unavailable" end
-  if not owner then
-    owner, owned, loads, strategyUsed, seeds = graphOwner(chunks, keys, workers,
-      strategy == "growth" and "growth" or "graph", distanceWeight)
-  end
-  if not owner then return nil, owned or "partition_failed" end
-
-  -- Rectangular stripes are expected to be connected, but a hand-authored
-  -- catalog may have irregular bounding boxes.  Fail closed (or use graph
-  -- growth for the automatic strategy) instead of handing a worker a split
-  -- region.
-  local function ownedConnected(list)

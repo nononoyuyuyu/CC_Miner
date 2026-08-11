@@ -817,6 +817,14 @@ local function screenSignature(target, key)
 end
 
 local function renderOne(target, key)
+  local singleDraftMode = mode == "job_dimensions" or mode == "job_grid"
+    or mode == "job_chunks" or mode == "preflight"
+  local groupDraftMode = mode == "group_dimensions" or mode == "group_job"
+  if (singleDraftMode and type(draft) ~= "table")
+    or (groupDraftMode and type(groupDraft) ~= "table") then
+    mode = "dashboard"
+    setNotice("The unfinished job form was reset safely. Open NEW JOB again.", true)
+  end
   resetHitboxes(key)
   local signature = screenSignature(target, key)
   if renderCache[key] == signature and not dirty then return end

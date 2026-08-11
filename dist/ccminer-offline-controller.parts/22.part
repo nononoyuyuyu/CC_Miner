@@ -1,3 +1,18 @@
+    if not workerCalibration then return true end
+    local minX, maxX, minZ, maxZ = chunk.minX, chunk.maxX, chunk.minZ, chunk.maxZ
+    local corners = {
+      { x = minX, z = minZ }, { x = minX, z = maxZ },
+      { x = maxX, z = minZ }, { x = maxX, z = maxZ },
+    }
+    local rebasedMinX, rebasedMaxX, rebasedMinZ, rebasedMaxZ
+    for _, corner in ipairs(corners) do
+      local worldX, worldZ = localToWorld(referenceCalibration, corner.x, corner.z)
+      local localX, localZ, rebaseError = worldToLocalXZ(workerCalibration, worldX, worldZ)
+      if not localX or not localZ then return nil, rebaseError or "invalid_rebase" end
+      if localX % 1 ~= 0 or localZ % 1 ~= 0 then return nil, "non_integral_rebase" end
+      rebasedMinX = rebasedMinX and math.min(rebasedMinX, localX) or localX
+      rebasedMaxX = rebasedMaxX and math.max(rebasedMaxX, localX) or localX
+      rebasedMinZ = rebasedMinZ and math.min(rebasedMinZ, localZ) or localZ
       rebasedMaxZ = rebasedMaxZ and math.max(rebasedMaxZ, localZ) or localZ
     end
     chunk.referenceMinX, chunk.referenceMaxX = minX, maxX
@@ -216,26 +231,3 @@ local function boundsFrom(value, length, options)
       end
     end
   end
-  if not minX or not maxX or not minZ or not maxZ or maxX < minX or maxZ < minZ then return nil, "invalid_bounds" end
-  if (maxX - minX + 1) * (maxZ - minZ + 1) > MAX_COLUMNS then return nil, "bounds_too_large" end
-  return {
-    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
-    width = maxX - minX + 1, length = maxZ - minZ + 1,
-    cells = (maxX - minX + 1) * (maxZ - minZ + 1),
-  }
-end
-
-function M.gridBounds(value, length, options)
-  return boundsFrom(value, length, options)
-end
-
-M.getGridBounds = M.gridBounds
-M.bounds = M.gridBounds
-
-function M.gridPage(bounds, page, pageWidth, pageHeight)
-  local normalized, boundsError = boundsFrom(bounds)
-  if not normalized then return nil, boundsError end
-  if type(pageWidth) == "table" then pageHeight, pageWidth = pageWidth.pageHeight, pageWidth.pageWidth end
-  pageWidth = integerValue(pageWidth, 1, MAX_DIMENSION) or 16
-  pageHeight = integerValue(pageHeight, 1, MAX_DIMENSION) or pageWidth
-  local pagesX = math.ceil(normalized.width / pageWidth)

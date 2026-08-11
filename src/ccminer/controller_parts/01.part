@@ -2538,6 +2538,10 @@ local function dispatchQueue()
         candidate.lighting = normalizedLighting(candidate.lighting)
         candidate.waterMode = normalizedWaterMode(candidate.waterMode)
         candidate.profile = normalizedProfile(candidate.profile)
+        -- computePreflight/startDraft still use the legacy shared `draft`
+        -- variable. A background queue tick must never destroy an operator's
+        -- NEW JOB form or leave its mode pointing at a nil draft.
+        local operatorDraft, operatorMode = draft, mode
         draft = candidate
         local result = computePreflight()
         local sent = false
@@ -2548,7 +2552,8 @@ local function dispatchQueue()
           db.queue[index].retryAt, db.queue[index].lastError = now + 15, result and "preflight blocked" or "preflight unavailable"
           saveControllerDb()
         end
-        if draft then draft = nil end
+        draft, mode = operatorDraft, operatorMode
+        invalidate()
         if sent then return end
       end
     end

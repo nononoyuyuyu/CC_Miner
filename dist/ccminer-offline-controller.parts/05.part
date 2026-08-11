@@ -1,3 +1,15 @@
+  -- Keep the legacy material aliases synchronized.  The nested discard value
+  -- is canonical, but older workers still read materials.retainSealTarget.
+  config.materials = normalizeTable(defaults.materials, config.materials)
+  if loadedDiscard.retainSealTarget == nil and legacyRetainSeal ~= nil then
+    config.materials.retainSealTarget = config.discard.retainSealTarget
+  end
+  config.materials.retainSealTarget = config.discard.retainSealTarget
+  config.retainSealTarget = config.discard.retainSealTarget
+
+  config.lighting = normalizeTable(defaults.lighting, config.lighting)
+  config.lighting.mode = normalizeEnum(config.lighting.mode, { off = true, safe = true, custom = true }, defaults.lighting.mode)
+  config.lighting.interval = normalizeInteger(config.lighting.interval, 1, 4096, defaults.lighting.interval)
   config.lighting.temporaryFloor = normalizeBoolean(config.lighting.temporaryFloor, defaults.lighting.temporaryFloor)
   config.lighting.torchTarget = normalizeInteger(config.lighting.torchTarget, 1, 512, defaults.lighting.torchTarget)
   config.lighting.torchReserve = normalizeInteger(config.lighting.torchReserve, 0, math.max(0, config.lighting.torchTarget - 1), defaults.lighting.torchReserve)
@@ -159,17 +171,3 @@
   config.gps.autoResolvePending = normalizeBoolean(config.gps.autoResolvePending, defaults.gps.autoResolvePending)
   if config.gps.calibration ~= nil and type(config.gps.calibration) ~= "table" then config.gps.calibration = nil end
   if type(config.protectedBlocks) ~= "table" then config.protectedBlocks = M.copy(defaults.protectedBlocks) end
-  if type(config.sealBlocks) ~= "table" then config.sealBlocks = M.copy(defaults.sealBlocks) end
-  return config
-end
-
-local function normalizeControllerConfig(raw)
-  local defaults = M.defaultControllerConfig()
-  local config = normalizeTable(defaults, raw)
-  config.role = "controller"
-  config.schema, config.version = M.SCHEMA, M.VERSION
-  config.networkKey = normalizeString(config.networkKey, defaults.networkKey, 8, 40)
-  config.controllerName = normalizeString(config.controllerName, defaults.controllerName, 1, 20)
-  config.monitorName = normalizePeripheralName(config.monitorName, defaults.monitorName)
-  config.workerTimeoutSeconds = normalizeInteger(config.workerTimeoutSeconds, 1, 3600, defaults.workerTimeoutSeconds)
-  config.discoverySeconds = normalizeInteger(config.discoverySeconds, 1, 3600, defaults.discoverySeconds)
