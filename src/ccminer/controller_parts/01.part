@@ -66,21 +66,23 @@ local function workerLabel(worker, id)
 end
 
 local function handleMessage(sender, message)
-  local valid = protocol.validate(message, config.networkKey, os.getComputerID())
+  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
   if not valid then return false end
   if message.kind == "status" then
-    local payload = message.payload or {}
-    local id = tonumber(payload.id) or tonumber(sender)
+    local payload = message.payload
+    local id = tonumber(payload.id)
+    if not id or id ~= tonumber(sender) then return false end
     workers[id] = workers[id] or {}
     workers[id].data = payload
     workers[id].lastSeen = common.nowSeconds()
     workers[id].sender = sender
     return true
   elseif message.kind == "ack" then
-    local payload = message.payload or {}
+    local payload = message.payload
     setNotice((payload.ok and "OK: " or "ERROR: ") .. tostring(payload.message or ""), not payload.ok)
-    if payload.status and payload.status.id then
-      local id = tonumber(payload.status.id) or tonumber(sender)
+    if type(payload.status) == "table" and payload.status.id then
+      local id = tonumber(payload.status.id)
+      if not id or id ~= tonumber(sender) then return false end
       workers[id] = workers[id] or {}
       workers[id].data = payload.status
       workers[id].lastSeen = common.nowSeconds()

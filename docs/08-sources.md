@@ -3,7 +3,7 @@
 実装時に確認する一次資料です。
 
 - CC:Tweaked GPS API: <https://tweaked.cc/module/gps.html>
-- CC:Tweaked `gps` program: <https://tweaked.cc/program/gps.html>
+- CC:Tweaked GPS setup guide: <https://tweaked.cc/guide/gps_setup.html>
 - CC:Tweaked Turtle API: <https://tweaked.cc/module/turtle.html>
 - CC:Tweaked Monitor peripheral: <https://tweaked.cc/peripheral/monitor.html>
 - CC:Tweaked events (`monitor_touch`, `mouse_click`, `rednet_message`): <https://tweaked.cc/event/monitor_touch.html>

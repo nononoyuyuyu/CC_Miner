@@ -373,6 +373,9 @@ end
 local function startJob(payload)
   if state.pendingAction then return false, "Recovery is required after an interrupted physical action." end
   if not isHome() then return false, "Worker is not at home. Recall or physically recover it first." end
+  if tonumber(state.pose and state.pose.dir) ~= 0 then
+    return false, "Worker must face the quarry at home before starting a job. Use REHOME after physical recovery."
+  end
   if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
     return false, "Worker is busy."
   end

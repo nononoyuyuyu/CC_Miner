@@ -43,7 +43,7 @@ else
   print("")
   local previousKey = current and current.networkKey
   if previousKey == "CHANGE_ME" then previousKey = nil end
-  local key = common.prompt("Network key", previousKey or "ASTRAL-MINE-01", function(value)
+  local key = common.prompt("Network key", previousKey or common.randomToken(16), function(value)
     if #value < 8 or #value > 40 then return false, "Use 8 to 40 characters." end
     if value:find("[^%w_-]") then return false, "Use only letters, numbers, '-' and '_'." end
     return true
@@ -76,6 +76,9 @@ else
       config.gps.required = common.promptYesNo("Require GPS for mining", config.gps.required == true)
     else
       config.gps.required = false
+    end
+    if config.gps.calibration and common.promptYesNo("Clear stored GPS calibration for a relocated dock", false) then
+      config.gps.calibration = nil
     end
     config.attackEntities = common.promptYesNo("Attack blocking entities", config.attackEntities == true)
     config.outputSide, config.fuelSide = "back", "top"

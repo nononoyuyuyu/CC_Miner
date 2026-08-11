@@ -70,6 +70,14 @@ local function copyIfPresent(source, target)
   return true
 end
 
+local function moveChecked(source, target)
+  local ok, moveError = pcall(fs.move, source, target)
+  if not ok or not fs.exists(target) then
+    return false, tostring(moveError or ("Move destination is missing: " .. target))
+  end
+  return true
+end
+
 local function usage()
   print("CC Miner V2 installer " .. VERSION)
   print("  install.lua worker      Mining turtle")
@@ -150,12 +158,24 @@ compileParts("controller", {
 })
 
 if fs.exists(BACKUP) then fs.delete(BACKUP) end
-if fs.exists(ROOT) then fs.move(ROOT, BACKUP) end
-local moved, moveError = pcall(fs.move, TEMP, ROOT)
+local hadRoot = fs.exists(ROOT)
+if hadRoot then
+  local backedUp, backupError = moveChecked(ROOT, BACKUP)
+  if not backedUp then fs.delete(TEMP); error("Cannot back up existing installation: " .. backupError, 0) end
+end
+local moved, moveError = moveChecked(TEMP, ROOT)
 if not moved then
-  if fs.exists(ROOT) then fs.delete(ROOT) end
-  if fs.exists(BACKUP) then fs.move(BACKUP, ROOT) end
-  error("Install swap failed: " .. tostring(moveError), 0)
+  if fs.exists(ROOT) then pcall(fs.delete, ROOT) end
+  local restored, restoreError = true, nil
+  if hadRoot then
+    if fs.exists(BACKUP) then restored, restoreError = moveChecked(BACKUP, ROOT)
+    else restored, restoreError = false, "Backup directory is missing." end
+  end
+  if not restored then
+    error("Install swap failed and rollback failed. Previous files remain at " .. BACKUP .. ": "
+      .. tostring(moveError) .. "; rollback: " .. tostring(restoreError), 0)
+  end
+  error("Install swap failed; previous installation was restored: " .. tostring(moveError), 0)
 end
 
 print("")

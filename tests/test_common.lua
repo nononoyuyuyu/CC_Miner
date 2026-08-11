@@ -1,48 +1,69 @@
 local root = arg[1]
-local sandbox = os.tmpname() .. "-ccminer"
-os.execute("mkdir -p " .. string.format("%q", sandbox))
-
-local function full(path) return sandbox .. "/" .. tostring(path):gsub("^/+", "") end
+local files, directories = {}, { [""] = true }
+local function normalized(path)
+  return tostring(path or ""):gsub("\\", "/"):gsub("^/+", ""):gsub("/+$", "")
+end
 fs = {}
 function fs.exists(path)
-  local handle = io.open(full(path), "rb")
-  if handle then handle:close(); return true end
-  local ok = os.execute("test -d " .. string.format("%q", full(path)))
-  return ok == true or ok == 0
+  path = normalized(path)
+  return files[path] ~= nil or directories[path] == true
 end
 function fs.isDir(path)
-  local ok = os.execute("test -d " .. string.format("%q", full(path)))
-  return ok == true or ok == 0
+  return directories[normalized(path)] == true
 end
 function fs.getDir(path)
-  local cleaned = tostring(path):gsub("/+$", "")
+  local cleaned = normalized(path)
   return cleaned:match("^(.*)/[^/]+$") or ""
 end
-function fs.makeDir(path) os.execute("mkdir -p " .. string.format("%q", full(path))) end
-function fs.delete(path) os.execute("rm -rf " .. string.format("%q", full(path))) end
+function fs.makeDir(path)
+  path = normalized(path)
+  if path == "" then directories[path] = true; return end
+  local parent = fs.getDir(path)
+  if not directories[parent] then fs.makeDir(parent) end
+  directories[path] = true
+end
+function fs.delete(path)
+  path = normalized(path)
+  files[path] = nil
+  for candidate in pairs(files) do
+    if candidate:sub(1, #path + 1) == path .. "/" then files[candidate] = nil end
+  end
+  for candidate in pairs(directories) do
+    if candidate == path or candidate:sub(1, #path + 1) == path .. "/" then directories[candidate] = nil end
+  end
+end
 function fs.move(source, target)
+  source, target = normalized(source), normalized(target)
   local targetDir = fs.getDir(target)
   if targetDir ~= "" then fs.makeDir(targetDir) end
-  assert(os.rename(full(source), full(target)))
+  if files[source] ~= nil then
+    files[target], files[source] = files[source], nil
+    return
+  end
+  error("mock move source is missing: " .. source)
 end
 function fs.getSize(path)
-  local handle = assert(io.open(full(path), "rb"))
-  local size = handle:seek("end")
-  handle:close()
-  return size
+  return #(files[normalized(path)] or "")
 end
 function fs.open(path, mode)
+  path = normalized(path)
   local targetDir = fs.getDir(path)
   if targetDir ~= "" then fs.makeDir(targetDir) end
-  local ioMode = mode == "r" and "r" or mode == "a" and "a" or "w"
-  local handle = io.open(full(path), ioMode)
-  if not handle then return nil end
+  if mode == "r" and files[path] == nil then return nil end
+  local content = mode == "a" and (files[path] or "") or mode == "r" and files[path] or ""
+  local position = 1
   return {
-    readAll = function() return handle:read("*a") end,
-    readLine = function() return handle:read("*l") end,
-    write = function(text) handle:write(text) end,
-    writeLine = function(text) handle:write(text, "\n") end,
-    close = function() handle:close() end,
+    readAll = function() position = #content + 1; return content end,
+    readLine = function()
+      if position > #content then return nil end
+      local nextLine = content:find("\n", position, true)
+      local line = content:sub(position, nextLine and nextLine - 1 or #content)
+      position = nextLine and nextLine + 1 or #content + 1
+      return line
+    end,
+    write = function(text) content = content .. tostring(text or "") end,
+    writeLine = function(text) content = content .. tostring(text or "") .. "\n" end,
+    close = function() files[path] = content end,
   }
 end
 
@@ -96,5 +117,4 @@ assert(common.defaultControllerConfig().touchEnabled == true)
 assert(common.defaultGPSConfig().role == "gps")
 assert(common.defaultState().stats.lavaSealed == 0)
 
-os.execute("rm -rf " .. string.format("%q", sandbox))
 print("common persistence and defaults tests passed")

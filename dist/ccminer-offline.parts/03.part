@@ -1,3 +1,27 @@
+  return tostring(math.floor(tonumber(cx) or 0)) .. ":" .. tostring(math.floor(tonumber(cz) or 0))
+end
+
+function M.worldChunk(world)
+  return M.chunkCoord(world.x), M.chunkCoord(world.z)
+end
+
+function M.calibrationFromFixes(home, forwardFix)
+  if type(home) ~= "table" or type(forwardFix) ~= "table" then return nil, "missing_fix" end
+  local dx, dy, dz = forwardFix.x - home.x, forwardFix.y - home.y, forwardFix.z - home.z
+  if dy ~= 0 or math.abs(dx) + math.abs(dz) ~= 1 then
+    return nil, "Forward calibration move was not exactly one horizontal block."
+  end
+  return {
+    home = { x = home.x, y = home.y, z = home.z },
+    forward = { x = dx, z = dz },
+    calibratedAt = os and os.epoch and os.epoch("utc") or 0,
+  }
+end
+
+function M.resolvePending(pending, fix, calibration)
+  if type(pending) ~= "table" or type(pending.poseBefore) ~= "table" then return nil, "invalid_pending" end
+  local actual, err = M.worldToLocal(calibration, fix, pending.poseBefore.dir)
+  if not actual then return nil, err end
   local before = pending.poseBefore
   local kind = tostring(pending.kind or "")
   if M.samePosition(actual, before) then
@@ -49,14 +73,17 @@ local function validCalibration(calibration)
     return false
   end
   local fx, fz = tonumber(calibration.forward.x), tonumber(calibration.forward.z)
-  return fx and fz and math.abs(fx) + math.abs(fz) == 1
+  local hx, hy, hz = tonumber(calibration.home.x), tonumber(calibration.home.y), tonumber(calibration.home.z)
+  return fx ~= nil and fz ~= nil and hx ~= nil and hy ~= nil and hz ~= nil
+    and math.abs(fx) + math.abs(fz) == 1
 end
 
 local function localToWorld(calibration, x, z)
-  local forward = calibration.forward
+  local forward = { x = tonumber(calibration.forward.x), z = tonumber(calibration.forward.z) }
+  local homeX, homeZ = tonumber(calibration.home.x), tonumber(calibration.home.z)
   local rightX, rightZ = -forward.z, forward.x
-  return calibration.home.x + rightX * x + forward.x * z,
-    calibration.home.z + rightZ * x + forward.z * z
+  return homeX + rightX * x + forward.x * z,
+    homeZ + rightZ * x + forward.z * z
 end
 
 local function chunkKey(mode, cx, cz)
@@ -325,51 +352,3 @@ if stateError then common.log("WARN", stateError) end
 local lastHeartbeat = 0
 local networkReady = false
 local pollNetwork
-
-local function saveState()
-  state.schema = common.SCHEMA
-  state.version = common.VERSION
-  state.updatedAt = common.nowSeconds()
-  local ok, err = common.saveTable(common.STATE_PATH, state)
-  if not ok then
-    common.log("ERROR", "State save failed: " .. tostring(err))
-    error("State save failed: " .. tostring(err), 0)
-  end
-end
-
-local function poseCopy(pose)
-  pose = pose or state.pose or {}
-  return {
-    x = tonumber(pose.x) or 0,
-    y = tonumber(pose.y) or 0,
-    z = tonumber(pose.z) or 0,
-    dir = (tonumber(pose.dir) or 0) % 4,
-  }
-end
-
-local function samePosePosition(a, b)
-  return tonumber(a and a.x) == tonumber(b and b.x)
-    and tonumber(a and a.y) == tonumber(b and b.y)
-    and tonumber(a and a.z) == tonumber(b and b.z)
-end
-
-local function beginPhysicalAction(kind, details, poseAfter)
-  if state.pendingAction then
-    return false, "An unresolved physical action is already recorded. Rehome the turtle before continuing."
-  end
-  state.pendingAction = {
-    kind = tostring(kind or "unknown"),
-    poseBefore = poseCopy(),
-    poseAfter = poseAfter and poseCopy(poseAfter) or nil,
-    details = details or {},
-    startedAt = common.nowSeconds(),
-  }
-  saveState()
-  return true
-end
-
-local function cancelPhysicalAction()
-  state.pendingAction = nil
-  saveState()
-end
-

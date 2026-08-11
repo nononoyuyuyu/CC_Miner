@@ -1,3 +1,16 @@
+
+function M.findPeripheral(peripheralType, preferredName)
+  local all = M.findPeripherals(peripheralType)
+  if preferredName and preferredName ~= "" then
+    for _, entry in ipairs(all) do if entry.name == preferredName then return entry.device, entry.name end end
+  end
+  if all[1] then return all[1].device, all[1].name end
+  return nil, nil
+end
+
+function M.isInventorySide(side)
+  if not peripheral or not side then return false end
+  local wrapped = peripheral.wrap(side)
   if not wrapped then return false end
   return type(wrapped.list) == "function" or type(wrapped.size) == "function"
 end
@@ -214,11 +227,17 @@ function M.message(kind, key, payload, target)
   }
 end
 
-function M.validate(message, expectedKey, expectedTarget)
+function M.validate(message, expectedKey, expectedTarget, actualSender)
   if type(message) ~= "table" then return false, "not_table" end
   if message.magic ~= common.MAGIC then return false, "bad_magic" end
   if tonumber(message.schema) ~= common.SCHEMA then return false, "bad_schema" end
+  if message.version ~= common.VERSION then return false, "bad_version" end
   if type(message.kind) ~= "string" then return false, "bad_kind" end
+  if type(message.id) ~= "string" or message.id == "" then return false, "bad_id" end
+  if type(message.payload) ~= "table" then return false, "bad_payload" end
+  local claimedSender = tonumber(message.sender)
+  if not claimedSender then return false, "bad_sender" end
+  if actualSender and claimedSender ~= tonumber(actualSender) then return false, "sender_mismatch" end
   if expectedKey and expectedKey ~= "" and message.key ~= expectedKey then return false, "bad_key" end
   if expectedTarget and message.target and tonumber(message.target) ~= tonumber(expectedTarget) then
     return false, "wrong_target"
@@ -362,27 +381,3 @@ function M.chunkCoord(value)
 end
 
 function M.chunkKey(cx, cz)
-  return tostring(math.floor(tonumber(cx) or 0)) .. ":" .. tostring(math.floor(tonumber(cz) or 0))
-end
-
-function M.worldChunk(world)
-  return M.chunkCoord(world.x), M.chunkCoord(world.z)
-end
-
-function M.calibrationFromFixes(home, forwardFix)
-  if type(home) ~= "table" or type(forwardFix) ~= "table" then return nil, "missing_fix" end
-  local dx, dy, dz = forwardFix.x - home.x, forwardFix.y - home.y, forwardFix.z - home.z
-  if dy ~= 0 or math.abs(dx) + math.abs(dz) ~= 1 then
-    return nil, "Forward calibration move was not exactly one horizontal block."
-  end
-  return {
-    home = { x = home.x, y = home.y, z = home.z },
-    forward = { x = dx, z = dz },
-    calibratedAt = os and os.epoch and os.epoch("utc") or 0,
-  }
-end
-
-function M.resolvePending(pending, fix, calibration)
-  if type(pending) ~= "table" or type(pending.poseBefore) ~= "table" then return nil, "invalid_pending" end
-  local actual, err = M.worldToLocal(calibration, fix, pending.poseBefore.dir)
-  if not actual then return nil, err end

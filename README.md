@@ -2,7 +2,7 @@
 
 CC: Restitched / CC:Tweaked 向けの、復旧可能な遠隔クアリーシステムです。Advanced Mining Turtle を複数台管理し、タッチ操作、任意GPS、溶岩の自動封鎖、チャンク単位の採掘除外、自動補給・搬出、電源断復旧を一つの配布物で扱います。
 
-![システム全体図](docs/images/system-overview.svg)
+![コントローラー、GPSホスト、採掘タートル、3系統のチェスト、採掘領域の接続図](docs/images/system-overview.svg)
 
 ## V2.1 の主な機能
 
@@ -24,9 +24,9 @@ CC: Restitched / CC:Tweaked 向けの、復旧可能な遠隔クアリーシス�
 
 ## 配置
 
-![採掘ドック上面図](docs/images/base-layout-top.svg)
+![タートルの後ろに搬出、上に燃料、右に封鎖材チェストを置く採掘ドック上面図](docs/images/base-layout-top.svg)
 
-![採掘ドック側面図](docs/images/dock-side.svg)
+![タートルの後ろの搬出チェストと真上の燃料チェストを示す採掘ドック側面図](docs/images/dock-side.svg)
 
 図中の色付きブロックは、SVGのマス目と同じ整数グリッド座標へ揃えています。1マスが1ブロックです。
 
@@ -61,7 +61,7 @@ HTTPを使えない環境では、[`dist/ccminer-offline.lua`](dist/ccminer-offl
 5. **CHUNK MASK** で除外対象を切り替えます。入口チャンクは安全上ロックされています。
 6. **START** で開始します。
 
-![チャンク除外例](docs/images/chunk-mask.svg)
+![入口を保護し、中央チャンクを除外して周囲の許可チャンクを結ぶ経路例](docs/images/chunk-mask.svg)
 
 ## 主要コマンド
 
@@ -96,8 +96,12 @@ ccm rehome <id> RESET
 
 リポジトリのルートで次を実行します。
 
-```bash
-python3 tools/check.py
+Python 3.10以降と、Lua 5.2互換の `texlua`、`lua5.2`、`lua` のいずれかが必要です。別のLua実行ファイルを使う場合は `CCMINER_LUA` にパスを設定します。
+
+```text
+python tools/check.py
 ```
+
+Luaが見つからない場合も非Lua検査までは実行されますが、全検証は未完了として終了します。生成物が古い場合は `python tools/build_offline_bundle.py` で更新してから再実行してください。
 
 Lua構文、通常蛇行経路、GPS座標変換、除外チャンクの連結性とDFS経路、状態ファイル復旧、インストーラーの収録漏れ、Markdownリンク、SVGグリッド整合、オフライン配布物を検査します。

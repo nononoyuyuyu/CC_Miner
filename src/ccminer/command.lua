@@ -49,10 +49,17 @@ elseif command == "rehome" then
       local calibration = config.gps and config.gps.calibration or nil
       if calibration and gps and gps.locate then
         local x, y, z = gps.locate(2, false)
-        if x and (common.round(x) ~= calibration.home.x or common.round(y) ~= calibration.home.y or common.round(z) ~= calibration.home.z) then
+        if not x then
+          printError("A GPS fix is required to verify the calibrated dock. Rehome was cancelled.")
+          return
+        end
+        if common.round(x) ~= calibration.home.x or common.round(y) ~= calibration.home.y or common.round(z) ~= calibration.home.z then
           printError("GPS position does not match the calibrated dock. Rehome was cancelled.")
           return
         end
+      elseif calibration then
+        printError("GPS is unavailable, so the calibrated dock cannot be verified. Rehome was cancelled.")
+        return
       end
       local previous = common.loadTable(common.STATE_PATH, common.defaultState())
       local reset = common.defaultState()
@@ -77,7 +84,7 @@ elseif command == "status" then
   print("Role: " .. tostring(config.role))
   print("Computer ID: " .. tostring(os.getComputerID()))
   print("Label: " .. tostring(os.getComputerLabel and os.getComputerLabel() or "-"))
-  if config.networkKey then print("Network key: " .. tostring(config.networkKey)) end
+  if config.networkKey then print("Network key: configured (" .. tostring(#tostring(config.networkKey)) .. " characters)") end
   if config.role == "worker" then
     local state, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
     if stateError then printError(stateError) end

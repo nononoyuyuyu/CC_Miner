@@ -1,3 +1,72 @@
+  state.gps = common.merge(common.defaultState().gps, state.gps)
+  if state.job and not state.job.strategy then state.job.strategy = "serpentine" end
+  if state.job and state.job.strategy == "chunk_plan" and not state.job.chunkPlan then
+    local plan, planError = quarry.buildChunkPlan(state.job, gpsCalibration())
+    if plan then state.job.chunkPlan = plan else state.lastError = planError end
+  end
+
+  if state.pendingAction then
+    local resolved, resolveError = tryResolvePendingAction()
+    if not resolved then
+      local pending = state.pendingAction
+      state.status, state.phase, state.request, state.service = "blocked", "recovery_required", nil, nil
+      state.lastError = ("Power loss occurred during '%s' from x=%s y=%s z=%s dir=%s. GPS recovery failed: %s. Return the turtle to its dock, face the quarry, then use REHOME."):format(
+        tostring(pending.kind or "unknown"), tostring(pending.poseBefore and pending.poseBefore.x or "?"),
+        tostring(pending.poseBefore and pending.poseBefore.y or "?"), tostring(pending.poseBefore and pending.poseBefore.z or "?"),
+        tostring(pending.poseBefore and pending.poseBefore.dir or "?"), tostring(resolveError)
+      )
+      common.log("ERROR", state.lastError)
+    end
+  elseif gpsCalibration() then
+    local fix, fixError = locateGPS()
+    if fix then
+      local expected = geo.localToWorld(gpsCalibration(), state.pose)
+      if not geo.samePosition(fix, expected) then
+        if not state.job and state.status ~= "working" then
+          local corrected = geo.worldToLocal(gpsCalibration(), fix, state.pose.dir)
+          state.pose = poseCopy(corrected)
+          state.gps.corrections = (state.gps.corrections or 0) + 1
+          common.log("WARN", "GPS corrected idle local coordinates at boot.")
+        else
+          state.status, state.phase = "blocked", "gps_drift"
+          state.lastError = ("Boot GPS mismatch: expected %d,%d,%d, located %d,%d,%d."):format(
+            expected.x, expected.y, expected.z, fix.x, fix.y, fix.z
+          )
+        end
+      end
+    elseif gpsConfig().required then
+      state.status, state.phase = "blocked", "gps_error"
+      state.lastError = "Required GPS fix failed at boot: " .. tostring(fixError)
+    end
+  elseif gpsConfig().required then
+    state.status, state.phase = "blocked", "gps_error"
+    state.lastError = "GPS is required but no calibration is stored."
+  end
+
+  saveState()
+  displayLocalStatus()
+  heartbeat(true)
+end
+
+preflight()
+
+while true do
+  drainNetwork(12)
+  if state.request and state.status ~= "working" then state.status = "working" end
+  if state.status == "working" then
+    if state.request then handlePendingRequest() end
+    if state.service then continueService() else runMiningStep() end
+  elseif state.status == "waiting_output" or state.status == "waiting_fuel" or state.status == "waiting_seal" then
+    if state.service then
+      continueService()
+      if state.status == "waiting_output" or state.status == "waiting_fuel" or state.status == "waiting_seal" then sleep(3) end
+    else
+      markBlocked("Service state is missing while waiting.")
+    end
+  else
+    pollNetwork(0.5)
+  end
+  heartbeat(false)
   if state.status ~= "working" then displayLocalStatus() end
 end
 ]] },
@@ -87,21 +156,23 @@ local function workerLabel(worker, id)
 end
 
 local function handleMessage(sender, message)
-  local valid = protocol.validate(message, config.networkKey, os.getComputerID())
+  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
   if not valid then return false end
   if message.kind == "status" then
-    local payload = message.payload or {}
-    local id = tonumber(payload.id) or tonumber(sender)
+    local payload = message.payload
+    local id = tonumber(payload.id)
+    if not id or id ~= tonumber(sender) then return false end
     workers[id] = workers[id] or {}
     workers[id].data = payload
     workers[id].lastSeen = common.nowSeconds()
     workers[id].sender = sender
     return true
   elseif message.kind == "ack" then
-    local payload = message.payload or {}
+    local payload = message.payload
     setNotice((payload.ok and "OK: " or "ERROR: ") .. tostring(payload.message or ""), not payload.ok)
-    if payload.status and payload.status.id then
-      local id = tonumber(payload.status.id) or tonumber(sender)
+    if type(payload.status) == "table" and payload.status.id then
+      local id = tonumber(payload.status.id)
+      if not id or id ~= tonumber(sender) then return false end
       workers[id] = workers[id] or {}
       workers[id].data = payload.status
       workers[id].lastSeen = common.nowSeconds()
@@ -217,79 +288,3 @@ local function renderDashboard(target, key)
   end
 
   local maxRows = math.max(1, height - 9)
-  if #ids == 0 then
-    common.writeAt(2, headerY + 2, common.fit("No workers found. Touch DISCOVER.", width - 2), colors and colors.lightGray or nil)
-  else
-    local first = 1
-    if selected > maxRows then first = selected - maxRows + 1 end
-    for row = 1, maxRows do
-      local index = first + row - 1
-      local id = ids[index]
-      if not id then break end
-      local worker = workers[id]
-      local data = worker.data or {}
-      local status = statusOf(worker)
-      local marker = index == selected and ">" or " "
-      local line
-      if width >= 48 then
-        line = ("%s %-5s %-14s %-12s %-17s %-5s %-4s"):format(
-          marker, tostring(id), common.fit(workerLabel(worker, id), 14), common.fit(status, 12),
-          common.fit(progressText(data), 17), tostring(data.fuel or "-"), tostring(data.seal and data.seal.count or "-")
-        )
-      else
-        line = ("%s%-5s %-10s %-8s %s"):format(
-          marker, tostring(id), common.fit(workerLabel(worker, id), 10), common.fit(status, 8), progressText(data)
-        )
-      end
-      local foreground = index == selected and (colors and colors.black or nil) or common.statusColor(status)
-      local background = index == selected and (colors and colors.white or nil) or (colors and colors.black or nil)
-      local y = headerY + row
-      common.writeAt(1, y, common.fit(line, width), foreground, background)
-      addHitbox(key, 1, y, width, y, function() selected = index end)
-    end
-  end
-
-  buttonRow(key, height - 4, width, {
-    { "DISCOVER", dashboardAction("discover") }, { "NEW JOB", dashboardAction("new") },
-    { "GPS CAL", dashboardAction("gps") }, { "INFO", dashboardAction("info") },
-  })
-  buttonRow(key, height - 3, width, {
-    { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
-    { "RECALL", dashboardAction("recall") }, { "SERVICE", dashboardAction("service") },
-  })
-  buttonRow(key, height - 2, width, {
-    { "ABORT", dashboardAction("abort") }, { "CLEAR", dashboardAction("clear") },
-    { "REHOME", dashboardAction("rehome") }, { "QUIT", dashboardAction("quit") },
-  })
-  local noticeColor = noticeIsError and (colors and colors.red or nil) or (colors and colors.lime or nil)
-  common.writeAt(1, height, common.fit(notice, width), noticeColor)
-end
-
-local fieldOrder = { "width", "length", "depth" }
-local fieldLabels = { width = "WIDTH (right)", length = "LENGTH (forward)", depth = "DEPTH (down)" }
-local fieldLimits = { width = 128, length = 512, depth = 128 }
-
-local function commitDraftField()
-  if not draft then return end
-  local field = draft.selectedField or "width"
-  local value = tonumber(draft.buffer)
-  if not value then value = draft[field] or 1 end
-  value = common.clamp(math.floor(value), 1, fieldLimits[field])
-  draft[field], draft.buffer = value, tostring(value)
-end
-
-local function chooseDraftField(field)
-  commitDraftField()
-  draft.selectedField = field
-  draft.buffer = tostring(draft[field])
-end
-
-local function draftDigit(digit)
-  if not draft then return end
-  local buffer = tostring(draft.buffer or "")
-  if buffer == "0" then buffer = "" end
-  if #buffer < 4 then draft.buffer = buffer .. tostring(digit) end
-end
-
-local function draftBackspace()
-  if not draft then return end

@@ -1,6 +1,87 @@
+      if previous and previous.stats then reset.stats = previous.stats end
+      local ok, err = common.saveTable(common.STATE_PATH, reset)
+      if not ok then printError("Cannot reset worker state: " .. tostring(err))
+      else print("Worker coordinates and job were reset to home. Run: reboot") end
+    end
+  elseif config.role == "controller" then
+    if not tonumber(args[2]) or args[3] ~= "RESET" then printError("Usage: ccm rehome <id> RESET") else forwardController() end
+  else
+    printError("Rehome is not available for role " .. tostring(config.role))
+  end
+elseif command == "start" or command == "pause" or command == "resume" or command == "recall"
+  or command == "service" or command == "abort" or command == "clear" or command == "gps" or command == "calibrate" then
+  local config = common.loadConfig()
+  if not config or config.role ~= "controller" then printError("Run this command on the controller computer.") else forwardController() end
+elseif command == "status" then
+  local config, configError = common.loadConfig()
+  if not config then printError(configError or "Not configured."); return end
+  print("CC Miner V2 " .. common.VERSION)
+  print("Role: " .. tostring(config.role))
+  print("Computer ID: " .. tostring(os.getComputerID()))
+  print("Label: " .. tostring(os.getComputerLabel and os.getComputerLabel() or "-"))
+  if config.networkKey then print("Network key: configured (" .. tostring(#tostring(config.networkKey)) .. " characters)") end
+  if config.role == "worker" then
+    local state, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
+    if stateError then printError(stateError) end
+    print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
+    if state.pose then print(("Pose: x=%s y=%s z=%s dir=%s"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir)) end
+    print("GPS calibrated: " .. tostring(config.gps and config.gps.calibration ~= nil))
+    print("Lava mode: " .. tostring(config.lavaMode))
+    if state.job then print(("Job: %s %s/%s [%s]"):format(tostring(state.job.name), tostring(state.job.cursor), tostring(state.job.total), tostring(state.job.strategy))) end
+    if state.lastError then print("Error: " .. tostring(state.lastError)) end
+  elseif config.role == "gps" then
+    print(("Coordinates: %s, %s, %s"):format(config.x, config.y, config.z))
+  end
+elseif command == "logs" then
+  if not fs.exists(common.LOG_PATH) then print("No log file yet."); return end
+  local handle = fs.open(common.LOG_PATH, "r")
+  local lines = {}
+  while true do
+    local line = handle.readLine()
+    if not line then break end
+    lines[#lines + 1] = line
+    if #lines > 30 then table.remove(lines, 1) end
+  end
+  handle.close()
+  for _, line in ipairs(lines) do print(line) end
+elseif command == "update" then
+  if not http then printError("HTTP API is disabled."); return end
+  shell.run("wget", "run", "https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua", "update")
+else
+  printError("Unknown command: " .. command)
+  printHelp()
+end
+]] },
+}
+
+local function ensureDir(path)
+  if not path or path == "" or fs.exists(path) then return end
+  local parent = fs.getDir(path)
+  if parent and parent ~= "" then ensureDir(parent) end
+  fs.makeDir(path)
+end
+local function readFile(path)
+  if not fs.exists(path) or fs.isDir(path) then return nil end
+  local handle = fs.open(path, "r")
+  if not handle then return nil end
+  local text = handle.readAll(); handle.close(); return text
+end
+local function writeFile(path, text)
+  ensureDir(fs.getDir(path))
+  local handle = fs.open(path, "w")
+  if not handle then return false, "Cannot write " .. path end
+  handle.write(text); handle.close(); return true
+end
 local function copyIfPresent(source, target)
   local text = readFile(source)
   if text then return writeFile(target, text) end
+  return true
+end
+local function moveChecked(source, target)
+  local ok, moveError = pcall(fs.move, source, target)
+  if not ok or not fs.exists(target) then
+    return false, tostring(moveError or ("Move destination is missing: " .. target))
+  end
   return true
 end
 local function compileFile(target)
@@ -75,12 +156,24 @@ for _, pair in ipairs(preserved) do
   if not ok then fs.delete(TEMP); error("Cannot preserve existing data: " .. tostring(err), 0) end
 end
 if fs.exists(BACKUP) then fs.delete(BACKUP) end
-if fs.exists(ROOT) then fs.move(ROOT, BACKUP) end
-local moved, moveError = pcall(fs.move, TEMP, ROOT)
+local hadRoot = fs.exists(ROOT)
+if hadRoot then
+  local backedUp, backupError = moveChecked(ROOT, BACKUP)
+  if not backedUp then fs.delete(TEMP); error("Cannot back up existing installation: " .. backupError, 0) end
+end
+local moved, moveError = moveChecked(TEMP, ROOT)
 if not moved then
-  if fs.exists(ROOT) then fs.delete(ROOT) end
-  if fs.exists(BACKUP) then fs.move(BACKUP, ROOT) end
-  error("Install swap failed: " .. tostring(moveError), 0)
+  if fs.exists(ROOT) then pcall(fs.delete, ROOT) end
+  local restored, restoreError = true, nil
+  if hadRoot then
+    if fs.exists(BACKUP) then restored, restoreError = moveChecked(BACKUP, ROOT)
+    else restored, restoreError = false, "Backup directory is missing." end
+  end
+  if not restored then
+    error("Install swap failed and rollback failed. Previous files remain at " .. BACKUP .. ": "
+      .. tostring(moveError) .. "; rollback: " .. tostring(restoreError), 0)
+  end
+  error("Install swap failed; previous installation was restored: " .. tostring(moveError), 0)
 end
 print("")
 if action == "update" then

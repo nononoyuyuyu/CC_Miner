@@ -2,9 +2,13 @@
 
 ## 一括検査
 
-```bash
-python3 tools/check.py
+Python 3.10以降とLua 5.2互換の実行環境が必要です。通常は次を実行します。
+
+```text
+python tools/check.py
 ```
+
+`texlua`、`lua5.2`、`lua` 以外を使う場合は、`CCMINER_LUA` に実行ファイルのパスを設定します。Luaが見つからない場合は非Lua検査まで実行した後にエラーで終了し、全検証完了とはみなしません。生成物の差分を指摘された場合は `python tools/build_offline_bundle.py` を実行してから再検査します。
 
 検査内容:
 
@@ -19,6 +23,7 @@ python3 tools/check.py
 9. Markdown相対リンク
 10. SVGの色付きブロックが宣言グリッドへ一致すること
 11. 分割オフライン配布物の連番・各ファイルサイズ・再結合後Lua構文
+12. Rednetメッセージのバージョン、payload型、送信元一致
 
 ## 実機受け入れ試験
 

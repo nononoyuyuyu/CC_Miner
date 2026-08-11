@@ -161,7 +161,11 @@ local function shouldService()
   if empty <= (tonumber(config.reserveEmptySlots) or 3) then return true, "inventory" end
   local level = fuelLevel()
   if level ~= "unlimited" then
-    local needed = distance(state.pose, { x = 0, y = 0, z = 0 }) + (tonumber(config.fuelBuffer) or 256)
+    local returnDistance, returnError = estimatedReturnDistance(state.pose)
+    if not returnDistance then
+      return true, "fuel_route:" .. tostring(returnError)
+    end
+    local needed = returnDistance + (tonumber(config.fuelBuffer) or 256)
     if tonumber(level or 0) <= needed then return true, "fuel" end
   end
   if (config.lavaMode or "seal") == "seal" and sealMaterialCount() <= (tonumber(config.sealReserve) or 8) then

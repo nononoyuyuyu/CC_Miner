@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="680" viewBox="0 0 1200 680" role="img" aria-labelledby="title desc">
   <title id="title">CC Miner V2.1 システム全体図</title>
-  <desc id="desc">タッチコントローラー、GPSホスト、採掘タートル、3種類の補給チェスト、チャンク除外対応採掘領域</desc>
+  <desc id="desc">タッチコントローラー、GPSホスト、採掘タートル、燃料・封鎖材・搬出の3系統のチェスト、チャンク除外対応採掘領域</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#334155"/></marker>
     <style>.box{fill:#f8fafc;stroke:#334155;stroke-width:3}.title{font:700 28px sans-serif;fill:#0f172a}.label{font:600 21px sans-serif;fill:#0f172a}.small{font:17px sans-serif;fill:#334155}.arrow{stroke:#334155;stroke-width:4;fill:none;marker-end:url(#arrow)}.wireless{stroke:#7c3aed;stroke-width:4;fill:none;stroke-dasharray:12 9;marker-end:url(#arrow)}.gps{stroke:#0891b2;stroke-width:4;fill:none;stroke-dasharray:8 7;marker-end:url(#arrow)}</style>

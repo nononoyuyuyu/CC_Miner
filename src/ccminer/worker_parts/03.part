@@ -144,6 +144,33 @@ local function navigateChunkPlanWork(checkpoint, context)
   return navigateTo(checkpoint, "inside", context)
 end
 
+local function estimatedReturnDistance(pose)
+  pose = pose or state.pose
+  if tonumber(pose.x) == 0 and tonumber(pose.y) == 0 and tonumber(pose.z) == 0 then return 0 end
+  if not state.job or state.job.strategy ~= "chunk_plan" or not state.job.chunkPlan then
+    return distance(pose, { x = 0, y = 0, z = 0 })
+  end
+
+  local plan = state.job.chunkPlan
+  local currentKey = quarry.findChunk(plan, pose.x, pose.z)
+  if not currentKey then return nil, "Current position is outside every allowed chunk." end
+  local path, pathError = quarry.pathToRoot(plan, currentKey)
+  if not path then return nil, pathError end
+
+  local current = plan.chunks[currentKey]
+  local total = math.abs(pose.x - current.anchor.x) + math.abs(pose.z - current.anchor.z)
+  for index = 2, #path do
+    local from, target = plan.chunks[path[index - 1]], plan.chunks[path[index]]
+    if not from or not target then return nil, "Chunk return path references a missing chunk." end
+    total = total + math.abs(from.anchor.x - target.anchor.x) + math.abs(from.anchor.z - target.anchor.z)
+  end
+  local root = plan.chunks[plan.rootKey]
+  if not root then return nil, "Chunk return path has no entrance chunk." end
+  total = total + math.abs(tonumber(pose.y) or 0)
+  total = total + math.abs(root.anchor.x) + math.abs(root.anchor.z)
+  return total
+end
+
 local function firstEmptySlot()
   for slot = 1, 16 do if turtle.getItemCount(slot) == 0 then return slot end end
   return nil
@@ -232,7 +259,10 @@ end
 local function targetFuelForService()
   local target = tonumber(config.fuelTarget) or 12000
   if state.service and state.service.resumeAfter and state.checkpoint then
-    local checkpointDistance = distance({ x = 0, y = 0, z = 0 }, state.checkpoint)
+    local checkpointDistance = estimatedReturnDistance(state.checkpoint)
+    if not checkpointDistance then
+      checkpointDistance = distance({ x = 0, y = 0, z = 0 }, state.checkpoint)
+    end
     target = math.max(target, checkpointDistance * 2 + (tonumber(config.fuelBuffer) or 256))
   end
   local limit = fuelLimit()

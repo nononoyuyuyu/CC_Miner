@@ -1,7 +1,13 @@
 .PHONY: bundle test
 
-bundle:
-	python3 tools/build_offline_bundle.py
+ifeq ($(OS),Windows_NT)
+PYTHON ?= python
+else
+PYTHON ?= python3
+endif
 
-test: bundle
-	python3 tools/check.py
+bundle:
+	$(PYTHON) tools/build_offline_bundle.py
+
+test:
+	$(PYTHON) tools/check.py

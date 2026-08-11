@@ -122,5 +122,9 @@ for _, chunk in ipairs(worldCatalog) do
   assert(chunk.key:sub(1, 2) == "W:")
 end
 assert(quarry.buildCatalog(20, 20, "world", nil) == nil)
+assert(quarry.buildCatalog(20, 20, "world", { home = {}, forward = { x = 1, z = 0 } }) == nil)
+local negativeCalibration = { home = { x = -17, y = 64, z = -17 }, forward = { x = 0, z = -1 } }
+local negativeCx, negativeCz = quarry.chunkForCell("world", negativeCalibration, 0, 1)
+assert(negativeCx == -2 and negativeCz == -2)
 
 print("quarry path and chunk-plan tests passed (" .. tostring(#cases) .. " legacy cases)")

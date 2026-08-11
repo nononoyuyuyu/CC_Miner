@@ -31,7 +31,7 @@
 | GPS通信 | ホストごとに1 | Wireless Modem |
 | 常時ロード | 必要数 | ModpackのChunk Loader等 |
 
-![GPS配置](images/gps-layout.svg)
+![高さを変えた4基のGPSホストで採掘域を囲む立体配置例](images/gps-layout.svg)
 
 4台を同一平面へ並べず、高さを変えて立体的に配置します。各ホストへ入力する座標はコンピューター本体ではなく、距離測定に使われる無線モデムブロックの座標です。
 

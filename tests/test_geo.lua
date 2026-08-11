@@ -20,6 +20,8 @@ local generated = assert(geo.calibrationFromFixes(
 ))
 assert(generated.forward.x == 1 and generated.forward.z == 0)
 assert(geo.calibrationFromFixes({ x = 0, y = 0, z = 0 }, { x = 1, y = 1, z = 0 }) == nil)
+assert(not geo.validCalibration({ home = {}, forward = { x = 1, z = 0 } }))
+assert(not geo.validCalibration({ home = { x = 0, y = 0, z = 0 }, forward = { x = 1, z = 1 } }))
 
 local pose = { x = 0, y = 0, z = 0, dir = 1 }
 local after = geo.poseAfterMove(pose, "forward")
@@ -37,6 +39,12 @@ local resolvedAfter = assert(geo.resolvePending(pending, afterWorld, calibration
 assert(resolvedBefore.outcome == "before")
 assert(resolvedAfter.outcome == "after")
 assert(geo.resolvePending(pending, { x = 999, y = 64, z = 999 }, calibration) == nil)
+local stationary = {
+  kind = "dig_forward",
+  poseBefore = { x = 0, y = 0, z = 0, dir = 0 },
+  poseAfter = { x = 0, y = 0, z = 0, dir = 0 },
+}
+assert(geo.resolvePending(stationary, beforeWorld, calibration).outcome == "before")
 
 assert(geo.chunkCoord(-1) == -1)
 assert(geo.chunkCoord(-16) == -1)

@@ -36,7 +36,7 @@
     <path class="a" d="M470 350 L470 330"/>
     <text x="560" y="292" class="s">上から燃料を吸入</text>
     <path class="a" d="M390 430 L350 430"/>
-    <path class="a" d="M550 430 L610 430"/>
+    <path class="a" d="M550 480 L610 480"/>
   </g>
 
   <line x1="120" y1="500" x2="960" y2="500" stroke="#64748b" stroke-width="7"/>

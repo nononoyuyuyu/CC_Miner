@@ -32,6 +32,8 @@ ccminer-offline.lua controller
 ccminer-offline.lua gps
 ```
 
+コマンドは2つの配布物を置いた親ディレクトリで実行します。初回セットアップが途中で終了した場合は、表示された `/ccminer/setup.lua <role>` を実行して設定を再開し、完了後に `reboot` します。
+
 既存環境の更新:
 
 ```lua

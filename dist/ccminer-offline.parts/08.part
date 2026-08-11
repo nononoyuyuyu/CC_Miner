@@ -1,3 +1,87 @@
+      ok, err = navigateTo(checkpoint, "work", "service")
+    end
+    if not ok then
+      if err == "control_request" then return false end
+      markBlocked("Return to work point failed: " .. tostring(err))
+      return false
+    end
+    ok, err = turnTo(checkpoint.dir)
+    if not ok then markBlocked("Cannot restore work direction: " .. tostring(err)); return false end
+    if movementInterrupted("service") then return false end
+    state.checkpoint = nil
+  end
+  finishService()
+  return true
+end
+
+local function requiredDirectionTo(target)
+  local dx, dy, dz = target.x - state.pose.x, target.y - state.pose.y, target.z - state.pose.z
+  local manhattan = math.abs(dx) + math.abs(dy) + math.abs(dz)
+  if manhattan ~= 1 then return nil, "path_desync:" .. tostring(manhattan) end
+  if dy == 1 then return "up", nil, dy end
+  if dy == -1 then return "down", nil, dy end
+  if dx == 1 then return "forward", 1, 0 end
+  if dx == -1 then return "forward", 3, 0 end
+  if dz == 1 then return "forward", 0, 0 end
+  if dz == -1 then return "forward", 2, 0 end
+  return nil, "invalid_delta"
+end
+
+local function shouldService()
+  local _, empty = inventoryStats()
+  if empty <= (tonumber(config.reserveEmptySlots) or 3) then return true, "inventory" end
+  local level = fuelLevel()
+  if level ~= "unlimited" then
+    local returnDistance, returnError = estimatedReturnDistance(state.pose)
+    if not returnDistance then
+      return true, "fuel_route:" .. tostring(returnError)
+    end
+    local needed = returnDistance + (tonumber(config.fuelBuffer) or 256)
+    if tonumber(level or 0) <= needed then return true, "fuel" end
+  end
+  if (config.lavaMode or "seal") == "seal" and sealMaterialCount() <= (tonumber(config.sealReserve) or 8) then
+    return true, "seal"
+  end
+  return false
+end
+
+local function handlePendingRequest()
+  if state.request == "recall" then beginService(false, "paused", "recall", true); return true end
+  if state.request == "service" then beginService(false, "paused", "manual_service", true); return true end
+  if state.request == "abort" then beginService(false, "aborted", "abort", false); return true end
+  return false
+end
+
+local function beginAutomaticService(reason)
+  beginService(true, "working", "automatic_" .. tostring(reason), false)
+  continueService()
+end
+
+local function handleMoveFailure(prefix, err, allowBedrock)
+  if err == "control_request" then return true end
+  if err == "seal_material" then beginAutomaticService("seal"); return true end
+  if err == "inventory_full" then beginAutomaticService("inventory"); return true end
+  if err == "out_of_fuel" then
+    markBlocked(prefix .. ": fuel was exhausted before the safety return threshold.")
+    return true
+  end
+  if allowBedrock and common.startsWith(err or "", "protected:minecraft:bedrock") then
+    state.completionReason = "bedrock_reached"
+    beginService(false, "complete", "bedrock", false)
+    continueService()
+    return true
+  end
+  return false
+end
+
+local function completeJob(reason)
+  state.completionReason = reason or "completed"
+  beginService(false, "complete", "job_complete", false)
+  continueService()
+end
+
+local function runSerpentineStep(job)
+  job.cursor = tonumber(job.cursor) or 0
   job.total = tonumber(job.total) or (job.width * job.length * job.depth)
   if job.cursor >= job.total then completeJob(state.completionReason or "completed"); return end
 
@@ -219,72 +303,3 @@ local function preflight()
 
   state.pose = poseCopy(state.pose)
   state.stats = common.merge(common.defaultState().stats, state.stats)
-  state.gps = common.merge(common.defaultState().gps, state.gps)
-  if state.job and not state.job.strategy then state.job.strategy = "serpentine" end
-  if state.job and state.job.strategy == "chunk_plan" and not state.job.chunkPlan then
-    local plan, planError = quarry.buildChunkPlan(state.job, gpsCalibration())
-    if plan then state.job.chunkPlan = plan else state.lastError = planError end
-  end
-
-  if state.pendingAction then
-    local resolved, resolveError = tryResolvePendingAction()
-    if not resolved then
-      local pending = state.pendingAction
-      state.status, state.phase, state.request, state.service = "blocked", "recovery_required", nil, nil
-      state.lastError = ("Power loss occurred during '%s' from x=%s y=%s z=%s dir=%s. GPS recovery failed: %s. Return the turtle to its dock, face the quarry, then use REHOME."):format(
-        tostring(pending.kind or "unknown"), tostring(pending.poseBefore and pending.poseBefore.x or "?"),
-        tostring(pending.poseBefore and pending.poseBefore.y or "?"), tostring(pending.poseBefore and pending.poseBefore.z or "?"),
-        tostring(pending.poseBefore and pending.poseBefore.dir or "?"), tostring(resolveError)
-      )
-      common.log("ERROR", state.lastError)
-    end
-  elseif gpsCalibration() then
-    local fix, fixError = locateGPS()
-    if fix then
-      local expected = geo.localToWorld(gpsCalibration(), state.pose)
-      if not geo.samePosition(fix, expected) then
-        if not state.job and state.status ~= "working" then
-          local corrected = geo.worldToLocal(gpsCalibration(), fix, state.pose.dir)
-          state.pose = poseCopy(corrected)
-          state.gps.corrections = (state.gps.corrections or 0) + 1
-          common.log("WARN", "GPS corrected idle local coordinates at boot.")
-        else
-          state.status, state.phase = "blocked", "gps_drift"
-          state.lastError = ("Boot GPS mismatch: expected %d,%d,%d, located %d,%d,%d."):format(
-            expected.x, expected.y, expected.z, fix.x, fix.y, fix.z
-          )
-        end
-      end
-    elseif gpsConfig().required then
-      state.status, state.phase = "blocked", "gps_error"
-      state.lastError = "Required GPS fix failed at boot: " .. tostring(fixError)
-    end
-  elseif gpsConfig().required then
-    state.status, state.phase = "blocked", "gps_error"
-    state.lastError = "GPS is required but no calibration is stored."
-  end
-
-  saveState()
-  displayLocalStatus()
-  heartbeat(true)
-end
-
-preflight()
-
-while true do
-  drainNetwork(12)
-  if state.request and state.status ~= "working" then state.status = "working" end
-  if state.status == "working" then
-    if state.request then handlePendingRequest() end
-    if state.service then continueService() else runMiningStep() end
-  elseif state.status == "waiting_output" or state.status == "waiting_fuel" or state.status == "waiting_seal" then
-    if state.service then
-      continueService()
-      if state.status == "waiting_output" or state.status == "waiting_fuel" or state.status == "waiting_seal" then sleep(3) end
-    else
-      markBlocked("Service state is missing while waiting.")
-    end
-  else
-    pollNetwork(0.5)
-  end
-  heartbeat(false)

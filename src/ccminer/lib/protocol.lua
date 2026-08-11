@@ -24,11 +24,17 @@ function M.message(kind, key, payload, target)
   }
 end
 
-function M.validate(message, expectedKey, expectedTarget)
+function M.validate(message, expectedKey, expectedTarget, actualSender)
   if type(message) ~= "table" then return false, "not_table" end
   if message.magic ~= common.MAGIC then return false, "bad_magic" end
   if tonumber(message.schema) ~= common.SCHEMA then return false, "bad_schema" end
+  if message.version ~= common.VERSION then return false, "bad_version" end
   if type(message.kind) ~= "string" then return false, "bad_kind" end
+  if type(message.id) ~= "string" or message.id == "" then return false, "bad_id" end
+  if type(message.payload) ~= "table" then return false, "bad_payload" end
+  local claimedSender = tonumber(message.sender)
+  if not claimedSender then return false, "bad_sender" end
+  if actualSender and claimedSender ~= tonumber(actualSender) then return false, "sender_mismatch" end
   if expectedKey and expectedKey ~= "" and message.key ~= expectedKey then return false, "bad_key" end
   if expectedTarget and message.target and tonumber(message.target) ~= tonumber(expectedTarget) then
     return false, "wrong_target"

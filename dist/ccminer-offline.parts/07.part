@@ -1,3 +1,77 @@
+    local ok, err = turnTo(2)
+    if not ok then return nil, nil, nil, restoreDir, err end
+    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
+  elseif side == "right" then
+    local ok, err = turnTo(1)
+    if not ok then return nil, nil, nil, restoreDir, err end
+    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
+  elseif side == "left" then
+    local ok, err = turnTo(3)
+    if not ok then return nil, nil, nil, restoreDir, err end
+    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
+  elseif side == "top" then
+    return turtle.inspectUp, turtle.suckUp, turtle.dropUp, restoreDir
+  elseif side == "bottom" then
+    return turtle.inspectDown, turtle.suckDown, turtle.dropDown, restoreDir
+  end
+  return nil, nil, nil, restoreDir, "Unsupported inventory side: " .. tostring(side)
+end
+
+local function restoreSideDirection(side, restoreDir)
+  if side == "front" or side == "back" or side == "right" or side == "left" then return turnTo(restoreDir) end
+  return true
+end
+
+local function unloadAtHome()
+  state.phase, state.status = "unloading", "working"
+  saveState()
+  local originalSlot = turtle.getSelectedSlot()
+  local outputSide = config.outputSide or "back"
+  local inspectFunction, _, dropFunction, restoreDir, sideError = sideFunctions(outputSide)
+  if not inspectFunction then turtle.select(originalSlot); return false, sideError end
+  local checkSide = (outputSide == "top" and "top") or (outputSide == "bottom" and "bottom") or "front"
+  if not inventoryPresent(checkSide, inspectFunction) then
+    restoreSideDirection(outputSide, restoreDir)
+    turtle.select(originalSlot)
+    return false, "Output inventory missing on configured side " .. outputSide .. "."
+  end
+
+  local allDropped = true
+  for slot = 1, 16 do
+    if turtle.getItemCount(slot) > 0 and not isSealItemName(itemName(slot)) then
+      turtle.select(slot)
+      dropFunction()
+      if turtle.getItemCount(slot) > 0 then allDropped = false end
+    end
+  end
+  local restored, restoreError = restoreSideDirection(outputSide, restoreDir)
+  turtle.select(originalSlot)
+  if not restored then return false, restoreError end
+  if not allDropped then return false, "Output inventory is full." end
+  state.stats.unloads = (state.stats.unloads or 0) + 1
+  saveState()
+  return true
+end
+
+local function targetFuelForService()
+  local target = tonumber(config.fuelTarget) or 12000
+  if state.service and state.service.resumeAfter and state.checkpoint then
+    local checkpointDistance = estimatedReturnDistance(state.checkpoint)
+    if not checkpointDistance then
+      checkpointDistance = distance({ x = 0, y = 0, z = 0 }, state.checkpoint)
+    end
+    target = math.max(target, checkpointDistance * 2 + (tonumber(config.fuelBuffer) or 256))
+  end
+  local limit = fuelLimit()
+  if limit == "unlimited" then return "unlimited" end
+  if type(limit) == "number" and limit > 0 then target = math.min(target, limit) end
+  return math.max(1, math.floor(target))
+end
+
+local function refuelAtHome()
+  state.phase, state.status = "refueling", "working"
+  saveState()
+  local current = fuelLevel()
   if current == "unlimited" then return true end
   local target = targetFuelForService()
   local fuelSide = config.fuelSide or "top"
@@ -103,7 +177,7 @@ local function refillSealAtHome()
     if attempts > 64 then
       restoreSideDirection(side, restoreDir)
       turtle.select(originalSlot)
-]] },
+]=] },
   { target = [[worker_parts/04.part]], content = [[      return false, "Seal-block loading safety limit reached."
     end
     local slot = refillSlotForSeal()
@@ -233,83 +307,3 @@ local function continueService()
     if state.job and state.job.strategy == "chunk_plan" then
       ok, err = navigateChunkPlanWork(checkpoint, "service")
     else
-      ok, err = navigateTo(checkpoint, "work", "service")
-    end
-    if not ok then
-      if err == "control_request" then return false end
-      markBlocked("Return to work point failed: " .. tostring(err))
-      return false
-    end
-    ok, err = turnTo(checkpoint.dir)
-    if not ok then markBlocked("Cannot restore work direction: " .. tostring(err)); return false end
-    if movementInterrupted("service") then return false end
-    state.checkpoint = nil
-  end
-  finishService()
-  return true
-end
-
-local function requiredDirectionTo(target)
-  local dx, dy, dz = target.x - state.pose.x, target.y - state.pose.y, target.z - state.pose.z
-  local manhattan = math.abs(dx) + math.abs(dy) + math.abs(dz)
-  if manhattan ~= 1 then return nil, "path_desync:" .. tostring(manhattan) end
-  if dy == 1 then return "up", nil, dy end
-  if dy == -1 then return "down", nil, dy end
-  if dx == 1 then return "forward", 1, 0 end
-  if dx == -1 then return "forward", 3, 0 end
-  if dz == 1 then return "forward", 0, 0 end
-  if dz == -1 then return "forward", 2, 0 end
-  return nil, "invalid_delta"
-end
-
-local function shouldService()
-  local _, empty = inventoryStats()
-  if empty <= (tonumber(config.reserveEmptySlots) or 3) then return true, "inventory" end
-  local level = fuelLevel()
-  if level ~= "unlimited" then
-    local needed = distance(state.pose, { x = 0, y = 0, z = 0 }) + (tonumber(config.fuelBuffer) or 256)
-    if tonumber(level or 0) <= needed then return true, "fuel" end
-  end
-  if (config.lavaMode or "seal") == "seal" and sealMaterialCount() <= (tonumber(config.sealReserve) or 8) then
-    return true, "seal"
-  end
-  return false
-end
-
-local function handlePendingRequest()
-  if state.request == "recall" then beginService(false, "paused", "recall", true); return true end
-  if state.request == "service" then beginService(false, "paused", "manual_service", true); return true end
-  if state.request == "abort" then beginService(false, "aborted", "abort", false); return true end
-  return false
-end
-
-local function beginAutomaticService(reason)
-  beginService(true, "working", "automatic_" .. tostring(reason), false)
-  continueService()
-end
-
-local function handleMoveFailure(prefix, err, allowBedrock)
-  if err == "control_request" then return true end
-  if err == "seal_material" then beginAutomaticService("seal"); return true end
-  if err == "inventory_full" then beginAutomaticService("inventory"); return true end
-  if err == "out_of_fuel" then
-    markBlocked(prefix .. ": fuel was exhausted before the safety return threshold.")
-    return true
-  end
-  if allowBedrock and common.startsWith(err or "", "protected:minecraft:bedrock") then
-    state.completionReason = "bedrock_reached"
-    beginService(false, "complete", "bedrock", false)
-    continueService()
-    return true
-  end
-  return false
-end
-
-local function completeJob(reason)
-  state.completionReason = reason or "completed"
-  beginService(false, "complete", "job_complete", false)
-  continueService()
-end
-
-local function runSerpentineStep(job)
-  job.cursor = tonumber(job.cursor) or 0

@@ -25,13 +25,13 @@ GPSを必須にすると、fixを取得できない状態では採掘を開始�
 
 ## 保護ブロックとインベントリ
 
-Bedrock、End Portal、Nether Portal、Reinforced Deepslate、Computer/Turtle類を保護対象にしています。進行方向のインベントリも掘削しません。
+Bedrock、End Portal、End Portal Frame、Nether Portal、Reinforced Deepslate、Computer/Turtle類を保護対象にしています。進行方向のチェスト、樽、Shulker Boxなどのインベントリも掘削しません。
 
 Mod追加の重要ブロックは `protectedBlocks` へ追加してください。
 
 ## 燃料と在庫
 
-補給判断はドックまでのマンハッタン距離と燃料バッファを使います。チャンク除外ジョブの実帰還距離は親経路で長くなる場合があるため、十分に大きい `fuelBuffer` と `fuelTarget` を設定してください。
+補給判断は、通常ジョブではドックまでのマンハッタン距離、チャンク除外ジョブでは現在位置から入口までのDFS親経路を使って帰還距離を見積もり、`fuelBuffer` を加えます。ドックでの補給目標も作業地点との往復距離を下回らないよう補正します。掘削不能ブロックの迂回は行わないため、Mod追加環境では余裕を持った `fuelBuffer` と `fuelTarget` を設定してください。
 
 搬出時は封鎖材を保持し、それ以外を搬出します。搬出チェスト満杯、燃料切れ、封鎖材チェスト空、異物混入はそれぞれ待機状態として表示します。
 

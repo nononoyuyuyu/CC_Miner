@@ -2,3 +2,38 @@ __pycache__/
 *.pyc
 *.tmp
 .DS_Store
+
+# Local AI-agent instructions and state (never publish)
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.codex/
+.claude/
+.cursor/
+.windsurf/
+.aider*
+.h5i-ctx/
+work/
+outputs/
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+!.env.sample
+secrets/
+private/
+credentials/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Machine-local configuration and logs
+*.local
+*.local.*
+*.log
+Thumbs.db
+Desktop.ini

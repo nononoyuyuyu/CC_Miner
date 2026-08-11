@@ -28,14 +28,17 @@ local function validCalibration(calibration)
     return false
   end
   local fx, fz = tonumber(calibration.forward.x), tonumber(calibration.forward.z)
-  return fx and fz and math.abs(fx) + math.abs(fz) == 1
+  local hx, hy, hz = tonumber(calibration.home.x), tonumber(calibration.home.y), tonumber(calibration.home.z)
+  return fx ~= nil and fz ~= nil and hx ~= nil and hy ~= nil and hz ~= nil
+    and math.abs(fx) + math.abs(fz) == 1
 end
 
 local function localToWorld(calibration, x, z)
-  local forward = calibration.forward
+  local forward = { x = tonumber(calibration.forward.x), z = tonumber(calibration.forward.z) }
+  local homeX, homeZ = tonumber(calibration.home.x), tonumber(calibration.home.z)
   local rightX, rightZ = -forward.z, forward.x
-  return calibration.home.x + rightX * x + forward.x * z,
-    calibration.home.z + rightZ * x + forward.z * z
+  return homeX + rightX * x + forward.x * z,
+    homeZ + rightZ * x + forward.z * z
 end
 
 local function chunkKey(mode, cx, cz)

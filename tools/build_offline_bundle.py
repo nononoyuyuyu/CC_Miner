@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import os
 import shutil
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,15 +53,27 @@ def split_text(text: str, maximum_bytes: int) -> list[str]:
         if line_bytes > maximum_bytes:
             raise ValueError(f"A generated line exceeds the part limit: {line_bytes} bytes")
         if current and current_bytes + line_bytes > maximum_bytes:
-            parts.append("".join(current))
-            current = []
-            current_bytes = 0
+            carry: list[str] = []
+            while current and not current[-1].strip():
+                blank = current.pop()
+                current_bytes -= len(blank.encode("utf-8"))
+                carry.insert(0, blank)
+            if current:
+                parts.append("".join(current))
+            current = carry
+            current_bytes = sum(len(item.encode("utf-8")) for item in carry)
+            if current and current_bytes + line_bytes > maximum_bytes:
+                parts.append("".join(current))
+                current = []
+                current_bytes = 0
         current.append(line)
         current_bytes += line_bytes
     if current:
         parts.append("".join(current))
     if "".join(parts) != text:
         raise AssertionError("Split output does not reproduce the source")
+    if any(len(part.encode("utf-8")) > maximum_bytes for part in parts):
+        raise AssertionError("Split output exceeds the part limit")
     return parts
 
 
@@ -111,6 +126,13 @@ end
 local function copyIfPresent(source, target)
   local text = readFile(source)
   if text then return writeFile(target, text) end
+  return true
+end
+local function moveChecked(source, target)
+  local ok, moveError = pcall(fs.move, source, target)
+  if not ok or not fs.exists(target) then
+    return false, tostring(moveError or ("Move destination is missing: " .. target))
+  end
   return true
 end
 local function compileFile(target)
@@ -185,12 +207,24 @@ for _, pair in ipairs(preserved) do
   if not ok then fs.delete(TEMP); error("Cannot preserve existing data: " .. tostring(err), 0) end
 end
 if fs.exists(BACKUP) then fs.delete(BACKUP) end
-if fs.exists(ROOT) then fs.move(ROOT, BACKUP) end
-local moved, moveError = pcall(fs.move, TEMP, ROOT)
+local hadRoot = fs.exists(ROOT)
+if hadRoot then
+  local backedUp, backupError = moveChecked(ROOT, BACKUP)
+  if not backedUp then fs.delete(TEMP); error("Cannot back up existing installation: " .. backupError, 0) end
+end
+local moved, moveError = moveChecked(TEMP, ROOT)
 if not moved then
-  if fs.exists(ROOT) then fs.delete(ROOT) end
-  if fs.exists(BACKUP) then fs.move(BACKUP, ROOT) end
-  error("Install swap failed: " .. tostring(moveError), 0)
+  if fs.exists(ROOT) then pcall(fs.delete, ROOT) end
+  local restored, restoreError = true, nil
+  if hadRoot then
+    if fs.exists(BACKUP) then restored, restoreError = moveChecked(BACKUP, ROOT)
+    else restored, restoreError = false, "Backup directory is missing." end
+  end
+  if not restored then
+    error("Install swap failed and rollback failed. Previous files remain at " .. BACKUP .. ": "
+      .. tostring(moveError) .. "; rollback: " .. tostring(restoreError), 0)
+  end
+  error("Install swap failed; previous installation was restored: " .. tostring(moveError), 0)
 end
 print("")
 if action == "update" then
@@ -203,23 +237,11 @@ end
 '''
 
 
-def main() -> None:
+def render_bundle() -> tuple[list[str], list[str], str]:
     installer = build_installer()
     parts = split_text(installer, PART_LIMIT_BYTES)
-
-    dist = ROOT / "dist"
-    parts_dir = dist / "ccminer-offline.parts"
-    dist.mkdir(parents=True, exist_ok=True)
-    if parts_dir.exists():
-        shutil.rmtree(parts_dir)
-    parts_dir.mkdir(parents=True)
-
-    names = []
-    for index, part in enumerate(parts, start=1):
-        name = f"{index:02d}.part"
-        names.append(name)
-        (parts_dir / name).write_text(part, encoding="utf-8", newline="\n")
-
+    name_width = max(2, len(str(len(parts))))
+    names = [f"{index:0{name_width}d}.part" for index in range(1, len(parts) + 1)]
     lua_names = "\n".join(f'  "{name}",' for name in names)
     loader = f'''-- CC Miner V2 split offline installer loader
 -- Keep the adjacent ccminer-offline.parts directory when transferring this file.
@@ -242,13 +264,81 @@ local program, compileError = loadSource(table.concat(source), "@ccminer-offline
 if not program then error("Cannot assemble offline installer: " .. tostring(compileError), 0) end
 return program(...)
 '''
+    return parts, names, loader
+
+
+def check_outputs(parts: list[str], names: list[str], loader: str) -> None:
+    dist = ROOT / "dist"
+    parts_dir = dist / "ccminer-offline.parts"
     output = dist / "ccminer-offline.lua"
-    output.write_text(loader, encoding="utf-8", newline="\n")
-    total = sum(path.stat().st_size for path in parts_dir.glob("*.part"))
+    actual_names = sorted(path.name for path in parts_dir.glob("*.part")) if parts_dir.is_dir() else []
+    if actual_names != names:
+        raise SystemExit(
+            "Offline bundle is stale: part list differs. Run: python tools/build_offline_bundle.py"
+        )
+    for name, expected in zip(names, parts):
+        if (parts_dir / name).read_bytes() != expected.encode("utf-8"):
+            raise SystemExit(
+                f"Offline bundle is stale: {name} differs. Run: python tools/build_offline_bundle.py"
+            )
+    if not output.is_file() or output.read_bytes() != loader.encode("utf-8"):
+        raise SystemExit(
+            "Offline bundle is stale: loader differs. Run: python tools/build_offline_bundle.py"
+        )
+    total = sum(len(part.encode("utf-8")) for part in parts)
+    print(f"Offline bundle is current ({len(parts)} parts, {total} assembled bytes).")
+
+
+def write_outputs(parts: list[str], names: list[str], loader: str) -> None:
+
+    dist = ROOT / "dist"
+    parts_dir = dist / "ccminer-offline.parts"
+    output = dist / "ccminer-offline.lua"
+    dist.mkdir(parents=True, exist_ok=True)
+    backup_dir = dist / ".ccminer-offline.parts.previous"
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir)
+
+    with tempfile.TemporaryDirectory(prefix=".ccminer-offline.", dir=dist) as temporary:
+        stage = Path(temporary)
+        stage_parts = stage / "ccminer-offline.parts"
+        stage_parts.mkdir()
+        for name, part in zip(names, parts):
+            (stage_parts / name).write_text(part, encoding="utf-8", newline="\n")
+        stage_loader = stage / "ccminer-offline.lua"
+        stage_loader.write_text(loader, encoding="utf-8", newline="\n")
+
+        had_parts = parts_dir.exists()
+        if had_parts:
+            os.replace(parts_dir, backup_dir)
+        try:
+            os.replace(stage_parts, parts_dir)
+            os.replace(stage_loader, output)
+        except Exception:
+            if parts_dir.exists():
+                shutil.rmtree(parts_dir)
+            if had_parts and backup_dir.exists():
+                os.replace(backup_dir, parts_dir)
+            raise
+        if backup_dir.exists():
+            shutil.rmtree(backup_dir)
+
+    total = sum(len(part.encode("utf-8")) for part in parts)
     print(
         f"Wrote {output.relative_to(ROOT)} and {len(parts)} parts "
         f"({total} assembled bytes; each <= {PART_LIMIT_BYTES})"
     )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="Fail if tracked dist files are stale")
+    args = parser.parse_args()
+    parts, names, loader = render_bundle()
+    if args.check:
+        check_outputs(parts, names, loader)
+    else:
+        write_outputs(parts, names, loader)
 
 
 if __name__ == "__main__":

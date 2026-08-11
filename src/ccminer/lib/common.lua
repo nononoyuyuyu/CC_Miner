@@ -114,8 +114,20 @@ function M.writeAllAtomic(path, text)
   local movedNew, moveNewError = pcall(fs.move, temp, path)
   if not movedNew or not fs.exists(path) then
     if fs.exists(path) then fs.delete(path) end
-    if hadCurrent and fs.exists(backup) then pcall(fs.move, backup, path) end
+    local restored, restoreError = true, nil
+    if hadCurrent then
+      if fs.exists(backup) then
+        restored, restoreError = pcall(fs.move, backup, path)
+        restored = restored and fs.exists(path)
+      else
+        restored, restoreError = false, "Backup file is missing."
+      end
+    end
     if fs.exists(temp) then fs.delete(temp) end
+    if not restored then
+      return false, "Atomic move failed and backup restore failed: " .. tostring(moveNewError or path)
+        .. "; restore: " .. tostring(restoreError or "destination missing")
+    end
     return false, "Atomic move failed: " .. tostring(moveNewError or path)
   end
   return true

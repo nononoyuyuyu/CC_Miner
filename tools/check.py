@@ -11,6 +11,7 @@ import sys
 import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_FILES = [
@@ -69,7 +70,9 @@ def concatenate(paths: list[Path]) -> str:
 
 def offline_parts() -> list[Path]:
     parts_dir = ROOT / "dist/ccminer-offline.parts"
-    return sorted(parts_dir.glob("*.part")) if parts_dir.is_dir() else []
+    if not parts_dir.is_dir():
+        return []
+    return sorted(parts_dir.glob("*.part"), key=lambda path: int(path.stem) if path.stem.isdigit() else -1)
 
 
 def check_lua_syntax(lua: str) -> None:
@@ -112,13 +115,37 @@ def check_runtime_lists() -> None:
     manifest = (ROOT / "manifest.lua").read_text(encoding="utf-8")
     installer = (ROOT / "install.lua").read_text(encoding="utf-8")
     builder = (ROOT / "tools/build_offline_bundle.py").read_text(encoding="utf-8")
+    common = (ROOT / "src/ccminer/lib/common.lua").read_text(encoding="utf-8")
+
+    manifest_sources = re.findall(r'^\s+"(src/ccminer/[^"]+)",\s*$', manifest, re.MULTILINE)
+    installer_files = re.findall(
+        r'{\s*source\s*=\s*"([^"]+)",\s*target\s*=\s*"([^"]+)"\s*}', installer
+    )
+    builder_list = builder.split("RUNTIME_FILES = [", 1)[1].split("\n]", 1)[0]
+    builder_files = re.findall(r'\("([^"]+)",\s*"([^"]+)"\)', builder_list)
+    if manifest_sources != RUNTIME_SOURCES:
+        fail("manifest.lua runtime source list differs from the authoritative check list")
+    if installer_files != RUNTIME_FILES:
+        fail("install.lua runtime source/target list differs from the authoritative check list")
+    if builder_files != RUNTIME_FILES:
+        fail("offline builder runtime source/target list differs from the authoritative check list")
+
+    version_patterns = {
+        "manifest.lua": (manifest, r'\bversion\s*=\s*"([^"]+)"'),
+        "install.lua": (installer, r'\bVERSION\s*=\s*"([^"]+)"'),
+        "offline builder": (builder, r'^VERSION\s*=\s*"([^"]+)"'),
+        "common.lua": (common, r'\bM\.VERSION\s*=\s*"([^"]+)"'),
+    }
+    versions: dict[str, str] = {}
+    for label, (text, pattern) in version_patterns.items():
+        match = re.search(pattern, text, re.MULTILINE)
+        if not match:
+            fail(f"cannot find version in {label}")
+        versions[label] = match.group(1)
+    if len(set(versions.values())) != 1:
+        fail("version mismatch: " + ", ".join(f"{label}={version}" for label, version in versions.items()))
+
     for source in RUNTIME_SOURCES:
-        if source not in manifest:
-            fail(f"manifest.lua is missing {source}")
-        if source not in installer:
-            fail(f"install.lua is missing {source}")
-        if source not in builder:
-            fail(f"offline builder is missing {source}")
         if not (ROOT / source).is_file():
             fail(f"runtime source does not exist: {source}")
 
@@ -137,10 +164,8 @@ def check_markdown_links() -> None:
 
 
 def check_github_scope() -> None:
-    allowed = (
-        "github.com/nononoyuyuyu/CC_Miner",
-        "raw.githubusercontent.com/nononoyuyuyu/CC_Miner",
-    )
+    allowed_hosts = {"github.com", "raw.githubusercontent.com"}
+    allowed_path = "/nononoyuyuyu/CC_Miner"
     url_pattern = re.compile(r"https?://[^\s)\]>'\"]+")
     text_extensions = {".md", ".lua", ".part", ".py", ".yml", ".yaml", ".txt"}
     for path in ROOT.rglob("*"):
@@ -148,8 +173,12 @@ def check_github_scope() -> None:
             continue
         text = path.read_text(encoding="utf-8")
         for url in url_pattern.findall(text):
-            if "github.com" in url or "githubusercontent.com" in url:
-                if not any(allowed_part in url for allowed_part in allowed):
+            parsed = urlsplit(url)
+            host = (parsed.hostname or "").lower()
+            if "github.com" in host or "githubusercontent.com" in host:
+                if host not in allowed_hosts or not (
+                    parsed.path == allowed_path or parsed.path.startswith(allowed_path + "/")
+                ):
                     fail(f"out-of-scope GitHub URL in {path.relative_to(ROOT)}: {url}")
 
 
@@ -163,6 +192,7 @@ def check_feature_markers() -> None:
         "worker lava sealing": (worker, "sealLava"),
         "worker seal refill state": (worker, "waiting_seal"),
         "worker chunk strategy": (worker, '"chunk_plan"'),
+        "worker targeted commands": (worker, "tonumber(message.target) ~= tonumber(os.getComputerID())"),
         "controller monitor touch": (controller, 'event == "monitor_touch"'),
         "controller terminal click": (controller, 'event == "mouse_click"'),
         "controller keypad": (controller, '"CLR", "0", "<"'),
@@ -226,7 +256,8 @@ def check_bundle() -> None:
     if not loader.is_file() or not parts:
         fail("split offline bundle was not generated")
     names = [path.name for path in parts]
-    expected = [f"{index:02d}.part" for index in range(1, len(parts) + 1)]
+    name_width = max(2, len(str(len(parts))))
+    expected = [f"{index:0{name_width}d}.part" for index in range(1, len(parts) + 1)]
     if names != expected:
         fail(f"offline parts are not contiguous: {names}")
     loader_text = loader.read_text(encoding="utf-8")
@@ -247,18 +278,19 @@ def check_bundle() -> None:
 
 
 def main() -> None:
-    run([sys.executable, "tools/build_offline_bundle.py"])
-    lua = find_lua()
-    check_lua_syntax(lua)
-    run([lua, "tests/test_quarry.lua", str(ROOT)])
-    run([lua, "tests/test_geo.lua", str(ROOT)])
-    run([lua, "tests/test_common.lua", str(ROOT)])
+    run([sys.executable, "tools/build_offline_bundle.py", "--check"])
     check_runtime_lists()
     check_markdown_links()
     check_github_scope()
     check_feature_markers()
     check_svg_grids()
     check_bundle()
+    lua = find_lua()
+    check_lua_syntax(lua)
+    run([lua, "tests/test_quarry.lua", str(ROOT)])
+    run([lua, "tests/test_geo.lua", str(ROOT)])
+    run([lua, "tests/test_common.lua", str(ROOT)])
+    run([lua, "tests/test_protocol.lua", str(ROOT)])
     print("All CC Miner V2.1 checks passed.")
 
 
