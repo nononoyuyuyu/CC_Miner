@@ -202,7 +202,7 @@ local function releaseLeasesForWorker(id, jobId)
     if not (sameWorker and sameJob) then kept[#kept + 1] = lease end
   end
   db.leases = kept
-  db.activeLeases = kept
+  db.activeLeases = common.copy(kept)
   saveControllerDb()
 end
 
@@ -639,7 +639,7 @@ local function reserveLease(jobId, workerId, mode, chunks, assignmentId)
     mode = mode, chunks = common.copy(chunks or {}), createdAt = common.nowSeconds(),
   }
   db.leases[#db.leases + 1] = lease
-  db.activeLeases = db.leases
+  db.activeLeases = common.copy(db.leases)
   local ok, err = saveControllerDb()
   if not ok then table.remove(db.leases); return nil, err or "Could not persist active lease" end
   return lease

@@ -22,6 +22,8 @@ end
 local controller = parts("src/ccminer/controller_parts", 3)
 assert(controller:find("local function persistentDraft(source)", 1, true), "controller draft sanitizer is missing")
 assert(controller:find("db.activeLeases = common.copy(db.leases or {})", 1, true), "controller lease detachment is missing")
+assert(not controller:find("db.activeLeases = db.leases", 1, true), "controller still aliases active leases")
+assert(not controller:find("db.activeLeases = kept", 1, true), "controller still aliases released leases")
 assert(controller:find("db.lastDraft = persistentDraft(draft)", 1, true), "last draft is not sanitized before save")
 assert(controller:find("local item = persistentDraft(draft)", 1, true), "queue draft is not sanitized before save")
 assert(controller:find("local draftValue = persistentDraft(source or draft or db.lastDraft or {})", 1, true), "preset draft is not sanitized before save")
