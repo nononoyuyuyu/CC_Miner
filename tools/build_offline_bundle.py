@@ -266,13 +266,13 @@ local function ensureDir(path)
 end
 local function readFile(path)
   if not fs.exists(path) or fs.isDir(path) then return nil end
-  local handle = fs.open(path, "r")
+  local handle = fs.open(path, "rb")
   if not handle then return nil end
   local text = handle.readAll(); handle.close(); return text
 end
 local function writeFile(path, text)
   ensureDir(fs.getDir(path))
-  local handle = fs.open(path, "w")
+  local handle = fs.open(path, "wb")
   if not handle then return false, "Cannot write " .. path end
   local ok, writeError = pcall(handle.write, text or "")
   handle.close()
@@ -726,7 +726,7 @@ for index, item in ipairs(partManifest) do
   if not found[item.name] then error("Missing offline installer part: " .. fs.combine(partDir, item.name), 0) end
   found[item.name] = nil
   local path = fs.combine(partDir, item.name)
-  local handle = fs.open(path, "r")
+  local handle = fs.open(path, "rb")
   if not handle then error("Cannot read offline installer part: " .. path, 0) end
   local text = handle.readAll(); handle.close()
   if #text ~= item.bytes then error("Offline installer part size mismatch: " .. item.name, 0) end

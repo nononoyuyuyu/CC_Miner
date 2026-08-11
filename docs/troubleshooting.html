@@ -25,7 +25,7 @@ shell.run("/ccminer/boot.lua")</code></pre></div></li><li><div><h3>再起動す�
 <pre><code>wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua update-low-space</code></pre>
 <p>途中で止まった場合は、少し空きを作り、同じコマンドをもう一度実行します。</p>
 <h2 id="staging">[1/13] lib/common.lua ... FAILED / Staging verification failed</h2>
-<p>多くの場合、通常更新が作る一時コピーの空き容量が足りず、最初の <code>common.lua</code> を途中までしか書けなかった状態です。最新版では、必要量と実際に書けた量を表示し、省容量更新へ自動で切り替わります。</p>
+<p>通常更新が作る一時コピーの空き容量不足、または古いCC環境で保存時に文字データが変換された状態です。空きが十分あるのに「expected」と「wrote」がほぼ同じ大きさなら、文字変換が原因です。最新版は取得・保存・再読込をバイナリ方式に統一し、正確なバイト数を表示します。空き容量が本当に不足している場合だけ、省容量更新へ自動で切り替わります。</p>
 <ol><li>最新版の <code>install.lua update</code> をもう一度実行します。</li><li><code>Switching automatically to update-low-space mode</code> と表示されたら、そのまま待ちます。</li><li>古い <code>/ccminer</code>、設定、作業記録は手で削除しません。</li><li>古いインストーラーのままなら、上の <code>update-low-space</code> コマンドを直接実行します。</li></ol>
 <h2 id="focus">タートルをクリックしても文字を入力できない</h2>
 <p>採掘タートルの画面がプログラムに使われている間は、通常の入力行が出ません。管理用コンピューターから操作するのが正常です。</p>

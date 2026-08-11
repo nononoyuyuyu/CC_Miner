@@ -143,8 +143,12 @@ local regularStage = block(installer, "local function stageRegular", "local func
 requireText(regularStage, "local required = #body + 4096", "online regular staging reserve")
 requireText(regularStage, "if freeBefore and freeBefore < required then", "online regular free-space precheck")
 requireText(regularStage, "local stagedBody = readFile(stagedPath)", "online staged readback")
-requireText(regularStage, "stagedBody ~= nil and wrote < #body", "online truncated-file detection")
-requireText(regularStage, "expected %s, wrote %s", "online actionable staging error")
+requireText(regularStage, "freeBefore == nil and stagedBody ~= nil and wrote < #body",
+  "online unknown-capacity truncated-file detection")
+requireText(regularStage, "expected %s [%d bytes], wrote %s [%d bytes]",
+  "online exact-byte staging error")
+requireText(installer, 'fs.open(path, "rb")', "online binary-safe read")
+requireText(installer, 'fs.open(path, "wb")', "online binary-safe write")
 requireText(installer, "if not base and action == \"update\" and lowSpaceRecommended then",
   "online update-only automatic low-space fallback")
 requireOrdered(installer, {

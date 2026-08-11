@@ -58,7 +58,9 @@ end
 
 local function readFile(path)
   if not fs.exists(path) or fs.isDir(path) then return nil end
-  local handle = fs.open(path, "r")
+  -- Keep downloaded source byte-for-byte identical on older CC versions.
+  -- Text handles may decode/re-encode data, while HTTP is read in binary mode.
+  local handle = fs.open(path, "rb")
   if not handle then return nil end
   local ok, text = pcall(handle.readAll)
   pcall(handle.close)
@@ -70,7 +72,7 @@ local function writeFile(path, text)
   local parent = fs.getDir(path)
   local made, makeError = ensureDir(parent)
   if not made then return false, "Cannot create " .. tostring(parent) .. ": " .. tostring(makeError) end
-  local handle = fs.open(path, "w")
+  local handle = fs.open(path, "wb")
   if not handle then return false, "Cannot write " .. path end
   local ok, err = pcall(handle.write, text or "")
   pcall(handle.close)
@@ -290,14 +292,21 @@ local function stageRegular(role)
     if not ok or stagedBody ~= body then
       printError("FAILED"); deleteKnown(base)
       local wrote = stagedBody and #stagedBody or 0
+      -- A shorter readback is not proof of an out-of-space condition when
+      -- the filesystem reports ample free space. Older CC text handles can
+      -- also transform a byte, which is why readFile/writeFile use rb/wb.
       local likelyOutOfSpace = (freeBefore and freeBefore < required)
-        or (stagedBody ~= nil and wrote < #body)
-      local detail = ("Staging verification failed for %s (expected %s, wrote %s%s)."):format(
-        file.target, formatBytes(#body), formatBytes(wrote),
+        or (freeBefore == nil and stagedBody ~= nil and wrote < #body)
+      local detail = ("Staging verification failed for %s (expected %s [%d bytes], wrote %s [%d bytes]%s)."):format(
+        file.target, formatBytes(#body), #body, formatBytes(wrote), wrote,
         freeBefore and (", free before write " .. formatBytes(freeBefore)) or ""
       )
       if likelyOutOfSpace then
         detail = detail .. " The file was truncated, which normally means the computer is out of space."
+      elseif stagedBody ~= nil and wrote ~= #body then
+        detail = detail .. " The filesystem changed the byte count despite having enough free space."
+      elseif stagedBody ~= nil then
+        detail = detail .. " The byte count matches, but the saved contents differ."
       elseif writeError then
         detail = detail .. " " .. tostring(writeError)
       end
