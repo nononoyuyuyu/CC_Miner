@@ -1,3 +1,8 @@
+    elseif name == "recovery" then
+      if id then mode = "recovery" else setNotice("No worker selected.", true) end
+    elseif name == "report" then mode = "report"
+    elseif name == "last_error" then noticeState.showLast()
+    elseif name == "stop" then if id then mode = "stop_menu" else setNotice("No worker selected.", true) end
     elseif name == "pause" or name == "resume" or name == "recall" or name == "service" then sendCommand(id, name)
     elseif name == "abort" then
       if id then confirmState = { command = "stop", payload = { mode = "abort" }, message = "Abort the active job and return home?" }; mode = "confirm" end
@@ -234,11 +239,3 @@ local function renderDashboard(target, key)
     { "DISCOVER", dashboardAction("discover") }, { "NEW JOB", dashboardAction("new") },
     { "PROGRESS", dashboardAction("progress") }, { "MORE", dashboardAction("more") },
   })
-  buttonRow(key, bottom + verticalStep, width, {
-    { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
-    { "RETURN", dashboardAction("recall") }, { "STOP", dashboardAction("stop") },
-  })
-  local groupIds = orderedGroupIds()
-  if #groupIds > 0 then
-    local gy = 3
-    local gid, g = selectedGroupRecord()

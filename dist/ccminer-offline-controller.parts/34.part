@@ -1,3 +1,6 @@
+  if job.chunkMode == "world" and (not bay or not dock) then setNotice("Reassign target bay/dock metadata unavailable.", true); return false end
+  if bay and bay.world then
+    local pos = targetData.world or targetData.position
     if not pos or tonumber(pos.x) ~= tonumber(bay.world.x) or tonumber(pos.y) ~= tonumber(bay.world.y) or tonumber(pos.z) ~= tonumber(bay.world.z) then setNotice("Reassign target is not at its bay pose.", true); return false end
   end
   local targetKey = tostring(targetWorkerId)
@@ -179,6 +182,3 @@ local function startDraft()
   end
   if not sent then
     for _, assignment in ipairs(assignments) do db.pendingStarts[tostring(assignment.workerId)] = nil end
-    for _, assignment in ipairs(sentAssignments) do sendCommand(assignment.workerId, "stop", { mode = "abort", assignmentId = assignment.assignmentId }) end
-    for _, assignment in ipairs(assignments) do releaseLeasesForWorker(assignment.workerId, assignment.jobId) end
-    setNotice("One or more workers rejected the job; all assignments were stopped.", true)

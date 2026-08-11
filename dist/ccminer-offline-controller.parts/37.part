@@ -1,3 +1,11 @@
+  buttonRow(key, bottom + verticalStep, width, {
+    { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
+    { "RETURN", dashboardAction("recall") }, { "STOP", dashboardAction("stop") },
+  })
+  local groupIds = orderedGroupIds()
+  if #groupIds > 0 then
+    local gy = 3
+    local gid, g = selectedGroupRecord()
     local gj = gid and activeGroupJob(gid) or nil
     local aggregate = gj and (gj.aggregate or updateGroupAggregate(gj)) or nil
     local line = ("Group %s %s %d workers %s%% minFuel=%s ACK=%s/%s"):format(tostring(gid), groupName(g, gid), #(groupWorkerIds(g)), tostring(aggregate and aggregate.percent or 0), tostring(aggregate and aggregate.minFuel or "-"), tostring(aggregate and aggregate.acks or 0), tostring(aggregate and aggregate.ackTotal or #groupWorkerIds(g)))

@@ -1,3 +1,7 @@
+      elseif not workerBay.world then
+        check("bay pose:#" .. tostring(id), "bad", "bay world pose unavailable", true)
+      elseif workerBay.world then
+        local pos = data.world or data.position
         local match = pos and tonumber(pos.x) == tonumber(workerBay.world.x) and tonumber(pos.y) == tonumber(workerBay.world.y) and tonumber(pos.z) == tonumber(workerBay.world.z)
         if match then check("bay pose:#" .. tostring(id), "ok", "world pose verified", false) else check("bay pose:#" .. tostring(id), "bad", "worker is not at bay world pose", true) end
         local facing = data.facing or data.pose and data.pose.dir
@@ -156,4 +160,3 @@ local function dispatchGroupJob(job, force)
       local payload = {
         scope = "group", group = true, groupId = tostring(job.groupId), groupJobId = tostring(job.groupJobId), parentGroupJobId = tostring(job.groupJobId), groupCommand = "START", requestedCommand = "start", assignmentCatalog = common.copy(job.catalog),
         assignmentId = assignment.assignmentId, assignmentTotal = #sortedJobAssignments(job), assignmentChunks = common.copy(assignment.chunkKeys or {}), chunkKeys = common.copy(assignment.chunkKeys or {}), transitKeys = common.copy(assignment.transitKeys or {}), seedKey = assignment.seedKey, bayChunkKey = assignment.bayChunkKey,
-        homeY = assignment.homeY, bottomY = assignment.bottomY, targetY = assignment.bottomY, layers = assignment.layers, width = job.width, length = job.length, depth = assignment.layers or job.depth,

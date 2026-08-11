@@ -1,3 +1,4 @@
+        homeY = assignment.homeY, bottomY = assignment.bottomY, targetY = assignment.bottomY, layers = assignment.layers, width = job.width, length = job.length, depth = assignment.layers or job.depth,
         chunkMode = job.chunkMode, name = job.name, profile = job.profile, waterMode = job.waterMode, lighting = common.copy(job.lighting or {}), workerId = assignment.workerId, targetWorkerId = assignment.workerId,
         bay = assignment.bay, bayId = assignment.bayId, dock = common.copy(assignment.dock or {}), dockId = assignment.dockId, homeWorld = common.copy(assignment.homeWorld), maxDepth = assignment.maxDepth, facing = assignment.facing,
         lease = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) },
@@ -151,6 +152,3 @@ local function reassignGroupAssignment(groupJobId, stoppedWorkerId, targetWorker
   local group = groupRecord(job.groupId)
   local bayId, bay = groupWorkerResource(group, targetWorkerId, "bay")
   local dockId, dock = groupWorkerResource(group, targetWorkerId, "dock")
-  if job.chunkMode == "world" and (not bay or not dock) then setNotice("Reassign target bay/dock metadata unavailable.", true); return false end
-  if bay and bay.world then
-    local pos = targetData.world or targetData.position

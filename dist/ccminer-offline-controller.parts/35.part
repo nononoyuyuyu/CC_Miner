@@ -1,3 +1,6 @@
+    for _, assignment in ipairs(sentAssignments) do sendCommand(assignment.workerId, "stop", { mode = "abort", assignmentId = assignment.assignmentId }) end
+    for _, assignment in ipairs(assignments) do releaseLeasesForWorker(assignment.workerId, assignment.jobId) end
+    setNotice("One or more workers rejected the job; all assignments were stopped.", true)
     return false
   end
   db.lastDraft = persistentDraft(draft)
@@ -236,8 +239,3 @@ local function dashboardAction(name)
       end
     elseif name == "progress" then
       if id then mode = "progress" else setNotice("No worker selected.", true) end
-    elseif name == "recovery" then
-      if id then mode = "recovery" else setNotice("No worker selected.", true) end
-    elseif name == "report" then mode = "report"
-    elseif name == "last_error" then noticeState.showLast()
-    elseif name == "stop" then if id then mode = "stop_menu" else setNotice("No worker selected.", true) end

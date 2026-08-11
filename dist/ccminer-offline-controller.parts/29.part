@@ -1,9 +1,14 @@
 
 local function drawButton(key, x, y, width, label, action, enabled, selectedButton)
   width = math.max(3, math.floor(width))
-  local background = colors and (selectedButton and colors.yellow or enabled == false and colors.gray or colors.lightBlue) or nil
-  local foreground = colors and (enabled == false and colors.lightGray or colors.black) or nil
-  common.writeAt(x, y, common.center(label, width), foreground, background)
+  local background = colors and (selectedButton and colors.yellow or enabled == false and colors.gray or colors.blue) or nil
+  local foreground = colors and (selectedButton and colors.black or colors.white) or nil
+  -- Always leave one full background-colour cell on both sides.  Besides
+  -- making the button frame easier to touch, this prevents dark glyph edges
+  -- from visually merging into the black screen around a narrow button.
+  local rendered = width >= 5 and (" " .. common.center(label, width - 2) .. " ")
+    or common.center(label, width)
+  common.writeAt(x, y, rendered, foreground, background)
   if enabled ~= false and action then addHitbox(key, x, y, x + width - 1, y, action) end
 end
 
@@ -222,7 +227,3 @@ local function computePreflight()
   local recoveryRequired = data.recoveryRequired == true or data.pendingAction ~= nil
   check("recovery", recoveryRequired and "bad" or "ok", recoveryRequired and "pending physical recovery" or "ready", recoveryRequired)
   local unfinished = data.job ~= nil and workerStatus ~= "complete" and workerStatus ~= "completed" and workerStatus ~= "aborted"
-  check("existing job", unfinished and "bad" or "ok", unfinished and "abort or clear the unfinished job first" or "clear", unfinished)
-  if fuel and fuel >= requiredFuel then
-    check("worker fuel", "ok", ("available %s / need %d"):format(tostring(fuel), requiredFuel), false)
-  elseif fuel then

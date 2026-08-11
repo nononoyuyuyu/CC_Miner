@@ -1,3 +1,7 @@
+  check("existing job", unfinished and "bad" or "ok", unfinished and "abort or clear the unfinished job first" or "clear", unfinished)
+  if fuel and fuel >= requiredFuel then
+    check("worker fuel", "ok", ("available %s / need %d"):format(tostring(fuel), requiredFuel), false)
+  elseif fuel then
     check("worker fuel", "warn", ("available %s / need %d (dock refill expected)"):format(tostring(fuel), requiredFuel), false)
   else
     check("worker fuel", "warn", ("unknown / need %d"):format(requiredFuel), false)
@@ -205,11 +209,3 @@ local function groupDraftDefaults(group)
   local firstData = workerIds[1] and workerData(workerIds[1]) or nil
   local calibration = firstData and firstData.gps and firstData.gps.calibration
   local homeY = calibration and calibration.home and tonumber(calibration.home.y) or tonumber(firstData and firstData.homeY)
-  local depth = tonumber(previous.depth) or 16
-  local bottomY = tonumber(previous.bottomY or previous.targetY)
-  if not bottomY and homeY then bottomY = homeY - depth + 1 end
-  return {
-    groupId = group and group.id,
-    width = tonumber(previous.width) or 8,
-    length = tonumber(previous.length) or 32,
-    depth = depth,

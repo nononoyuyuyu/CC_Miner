@@ -1,3 +1,11 @@
+  local depth = tonumber(previous.depth) or 16
+  local bottomY = tonumber(previous.bottomY or previous.targetY)
+  if not bottomY and homeY then bottomY = homeY - depth + 1 end
+  return {
+    groupId = group and group.id,
+    width = tonumber(previous.width) or 8,
+    length = tonumber(previous.length) or 32,
+    depth = depth,
     bottomY = bottomY,
     targetY = bottomY,
     mode = group and group.mode or "world",
@@ -166,7 +174,3 @@ local function computeGroupPreflight(groupId, value)
       end
       if not workerBay then
         check("bay:#" .. tostring(id), "bad", "registered bay metadata unavailable", true)
-      elseif not workerBay.world then
-        check("bay pose:#" .. tostring(id), "bad", "bay world pose unavailable", true)
-      elseif workerBay.world then
-        local pos = data.world or data.position
