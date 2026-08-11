@@ -1,3 +1,11 @@
+      return false, "No clearable job record exists in the current state."
+    end
+    if state.service or state.request then
+      return false, "Cannot clear while service or a control request is pending."
+    end
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+      return false, "Worker is busy."
+    end
     state.job, state.checkpoint, state.resumeToken, state.assignmentResumeToken, state.service, state.request = nil, nil, nil, nil, nil, nil
     state.group, state.dock = nil, nil
     state.stagedStop = false
@@ -284,16 +292,3 @@ local function noteMinedMaterial(name)
   state.recycle.held = (state.recycle.held or 0) + 1
   state.recycle.cap = math.max(0, math.floor(tonumber(materials.retainSealTarget or recycle.maxHeld or config.retainSealTarget or config.sealTarget or state.recycle.cap or 64) or 64))
   if state.recycle.held > state.recycle.cap then
-    state.recycle.overflow = state.recycle.held - state.recycle.cap
-  end
-  state.stats.recycledBlocks = (state.stats.recycledBlocks or 0) + 1
-  state.stats.recycled = (state.stats.recycled or 0) + 1
-end
-
-local function isGravityBlock(data)
-  local name = string.lower(blockName(data))
-  for _, marker in ipairs({ "sand", "gravel", "concrete_powder", "anvil", "dragon_egg", "scaffolding" }) do
-    if name:find(marker, 1, true) then return true end
-  end
-  return false
-end

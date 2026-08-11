@@ -1,3 +1,12 @@
+  if config.remoteConsole.enabled ~= true then
+    return false, "Remote console is disabled.", nil, nil
+  end
+  local action = string.lower(common.trim(payload.action or payload.remoteAction or ""))
+  remoteSessionExpired()
+  if action == "open" then
+    local pinnedController = tonumber(config.controllerId or 0) or 0
+    if config.remoteConsole.allowShell == true and pinnedController <= 0 then
+      return false, "Arbitrary remote shell requires a pinned controllerId.", nil, nil
     end
     if pinnedController > 0 and tonumber(sender) ~= pinnedController then
       return false, "Remote console sender is not the pinned controller.", nil, nil
@@ -242,11 +251,3 @@ local function applyControlCommand(command, payload, sender)
       return false, "Cannot clear an unfinished job; ABORT it first."
     end
     if not state.job and state.status ~= "idle" then
-      return false, "No clearable job record exists in the current state."
-    end
-    if state.service or state.request then
-      return false, "Cannot clear while service or a control request is pending."
-    end
-    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
-      return false, "Worker is busy."
-    end

@@ -39,7 +39,7 @@ local function sortingTick()
   end
 end
 ]] },
-  { source = [[src/ccminer/controller_parts/02.part]], target = [[controller_parts/02.part]], digest = [[f87dffacffe3d6dd969681595eec255a5ffbe4aafcd455951a824695eab6a3eb]], content = [[-- CC Miner V4 - adaptive touch views.  Every view has a keyboard fallback and
+  { source = [[src/ccminer/controller_parts/02.part]], target = [[controller_parts/02.part]], digest = [[745544ecf4416446715b65b43c68d2bbfa94c26f5c87894a79f497d04d82bda5]], content = [[-- CC Miner V4 - adaptive touch views.  Every view has a keyboard fallback and
 -- uses bounded hitboxes, so a 20x8 monitor remains operable.
 
 local fieldOrder = { "width", "length", "depth", "targetY" }
@@ -206,7 +206,8 @@ local function renderDashboard(target, key)
   common.writeAt(1, 2, common.fit(("Controller #%d | Workers %d/%d | Q%d H%d"):format(os.getComputerID(), online, #ids, #db.queue, #db.history), width), colors and colors.lightGray or nil)
   local headerY = 4
   common.writeAt(1, headerY, common.fit(width >= 48 and " ID    NAME           STATUS       PROGRESS       FUEL" or " ID NAME      STATUS   PROGRESS", width), colors and colors.yellow or nil)
-  local maxRows = math.max(1, height - 7)
+  local verticalStep = height >= 10 and 2 or 1
+  local maxRows = math.max(1, height - (verticalStep == 2 and 8 or 7))
   if #ids == 0 then
     common.writeAt(2, headerY + 2, common.fit("No workers. DISCOVER (D).", math.max(1, width - 2)), colors and colors.lightGray or nil)
   else
@@ -228,12 +229,12 @@ local function renderDashboard(target, key)
       addHitbox(key, 1, y, width, y, function() selected = index; invalidate() end)
     end
   end
-  local bottom = math.max(1, height - 2)
+  local bottom = math.max(1, height - verticalStep - 1)
   buttonRow(key, bottom, width, {
     { "DISCOVER", dashboardAction("discover") }, { "NEW JOB", dashboardAction("new") },
     { "PROGRESS", dashboardAction("progress") }, { "MORE", dashboardAction("more") },
   })
-  buttonRow(key, bottom + 1, width, {
+  buttonRow(key, bottom + verticalStep, width, {
     { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
     { "RETURN", dashboardAction("recall") }, { "STOP", dashboardAction("stop") },
   })
@@ -241,4 +242,3 @@ local function renderDashboard(target, key)
   if #groupIds > 0 then
     local gy = 3
     local gid, g = selectedGroupRecord()
-    local gj = gid and activeGroupJob(gid) or nil

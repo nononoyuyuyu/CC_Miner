@@ -57,7 +57,11 @@ local function statusPayload()
         count = count,
         seal = isSealItemName(name) == true,
         torch = isTorchItemName(name) == true,
-        fuel = isFuelItem(slot) == true,
+        -- Do not call isFuelItem here.  turtle.refuel(0) requires selecting
+        -- the slot, which made the visible inventory cursor sweep every slot
+        -- on every heartbeat.  Fuel reserve slots are still marked and the
+        -- actual discard path performs the authoritative fuel safety check.
+        fuel = slotRoleContains(slot, "fuel") == true,
         reserved = isReservedSlot(slot) == true,
       }
     end
@@ -263,12 +267,3 @@ end
 local function commandSeen(id)
   if not id then return false end
   state.recentCommands = state.recentCommands or {}
-  for _, existing in ipairs(state.recentCommands) do if existing == id then return true end end
-  state.recentCommands[#state.recentCommands + 1] = id
-  while #state.recentCommands > 32 do table.remove(state.recentCommands, 1) end
-  return false
-end
-
-local function locateGPS()
-  state.gps = state.gps or common.defaultState().gps
-  if gpsConfig().enabled == false then

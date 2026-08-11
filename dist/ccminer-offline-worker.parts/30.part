@@ -1,3 +1,10 @@
+      -- silently reinterpret the catalog as a job and mine the full region.
+      local assignment = job.assignment or {}
+      local assignmentOptions = {
+        transitKeys = job.assignmentTransitChunks or {},
+        seedKey = payload.seedKey or assignment.seedKey or job.seedKey,
+        rootKey = assignmentCatalog.rootKey,
+        dockKey = payload.dockKey or assignment.dockKey or assignmentCatalog.dockKey,
         workerId = payload.workerId or assignment.workerId,
         groupJobId = job.groupJobId,
         bottomY = job.bottomY or targetY,
@@ -232,17 +239,3 @@ local function calibrateGPS()
   local returned, returnError = turtle.back()
   if not returned then
     state.status, state.phase = "blocked", "recovery_required"
-    state.lastError = "GPS calibration moved forward but could not return: " .. tostring(returnError)
-    saveState()
-    return false, state.lastError
-  end
-  if not forwardFix then
-    cancelPhysicalAction()
-    state.status, state.phase, state.lastError = "blocked", "gps_error", forwardError
-    saveState()
-    return false, forwardError
-  end
-
-  local calibration, calibrationError = geo.calibrationFromFixes(homeFix, forwardFix)
-  if not calibration then
-    cancelPhysicalAction()

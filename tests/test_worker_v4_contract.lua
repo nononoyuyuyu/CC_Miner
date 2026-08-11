@@ -314,6 +314,8 @@ marker(worker, "Discard settings can only be changed while the worker is at its 
 marker(worker, "common.saveConfig(config)", "discard settings persistence")
 marker(status, "slots = inventorySlots", "inventory slot status for item picker")
 marker(status, "discardConfig = true", "discard configuration capability")
+assert(not status:find('fuel = isFuelItem(slot)', 1, true), "status heartbeat still moves the visible inventory cursor")
+marker(status, 'fuel = slotRoleContains(slot, "fuel") == true', "non-mutating fuel reserve status")
 
 -- A power loss during any inventory transfer is ambiguous.  Recovery keeps
 -- the pending action and stops for explicit/manual revalidation, including

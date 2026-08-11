@@ -1,3 +1,7 @@
+  common.writeAt(1, summaryY, common.fit(("%dx%dx%d=%s blocks | %s | %s profile=%s %s"):format(draft.width, draft.length, shownDepth, common.humanNumber(volume), worldMode and ("BOTTOM Y=" .. tostring(draft.targetY)) or "LOCAL DEPTH=" .. tostring(shownDepth), homeText, tostring(draft.profile), intervalText), width), colors and colors.lightGray or nil)
+  local optionY = math.max(4, summaryY + 1)
+  buttonRow(key, optionY, width, {
+    { "LIGHT " .. tostring(draft.lighting and draft.lighting.mode or "safe"), function() local modes = { "off", "safe", "custom" }; local now = draft.lighting and draft.lighting.mode or "safe"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; draft.lighting.mode = modes[n % #modes + 1]; invalidate() end },
     { "WATER " .. tostring(draft.waterMode or "seal"), function() local modes = { "ignore", "stop", "seal" }; local now = draft.waterMode or "seal"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; draft.waterMode = modes[n % #modes + 1]; invalidate() end },
     { "PROFILE " .. tostring(draft.profile or "balanced"), function() local modes = { "safe", "balanced", "turbo" }; local now = draft.profile or "balanced"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; draft.profile = modes[n % #modes + 1]; invalidate() end },
     { "AUTO: QUEUE", function() draft.autoAssign = false; setNotice("Single footprint is sent to the selected worker; queue dispatch handles parallel jobs.", false) end },
@@ -82,6 +86,7 @@ end
 
 local function renderGrid(target, key)
   local width, height = target.getSize()
+  local verticalStep = height >= 12 and 2 or 1
   local catalog, err, chunkMode, _, rootKey = gridCatalog()
   writeHeader("NEW JOB - TOUCH GRID", target)
   if not catalog then common.writeAt(1, 3, common.fit(tostring(err), width), colors and colors.red or nil); drawButton(key, 1, height - 1, width, "BACK", function() mode = "job_dimensions" end, true); return end
@@ -89,7 +94,7 @@ local function renderGrid(target, key)
   local byCoordinate, xValues, zValues, xIndex, zIndex = chunkGrid(catalog)
   local cellWidth = width >= 48 and 2 or 1
   local cols = common.clamp(math.floor((width - 3) / cellWidth), 1, math.max(1, #xValues))
-  local rows = common.clamp(height - 8, 1, math.max(1, #zValues))
+  local rows = common.clamp(height - (verticalStep == 2 and 10 or 8), 1, math.max(1, #zValues))
   draft.gridPageX = common.clamp(draft.gridPageX or 1, 1, math.max(1, #xValues - cols + 1))
   draft.gridPageZ = common.clamp(draft.gridPageZ or 1, 1, math.max(1, #zValues - rows + 1))
   local pageX, pageZ = draft.gridPageX, draft.gridPageZ
@@ -112,15 +117,17 @@ local function renderGrid(target, key)
     end
   end
   local _, excluded = draftCells(catalog, rootKey)
-  common.writeAt(1, math.max(3, height - 5), common.fit(("Mining chunks: %d/%d | E locked | page %d,%d%s"):format(#catalog - excluded, #catalog, pageX, pageZ, partialMask and " | legacy partial mask" or ""), width), partialMask and (colors and colors.red or nil) or (colors and colors.lightGray or nil))
-  buttonRow(key, math.max(1, height - 4), width, {
+  local buttonTop = math.max(1, height - verticalStep * 2 - 1)
+  local gridSummaryY = math.max(3, buttonTop - (verticalStep == 1 and 2 or 1))
+  common.writeAt(1, gridSummaryY, common.fit(("Mining chunks: %d/%d | E locked | page %d,%d%s"):format(#catalog - excluded, #catalog, pageX, pageZ, partialMask and " | legacy partial mask" or ""), width), partialMask and (colors and colors.red or nil) or (colors and colors.lightGray or nil))
+  buttonRow(key, buttonTop, width, {
     { "ALL", function() allGrid(true) end }, { "CLEAR", function() allGrid(false) end }, { "INVERT", invertGrid }, { "RECT", function() draft.rectMode = not draft.rectMode; draft.rectStart = nil; invalidate() end },
   })
-  buttonRow(key, math.max(1, height - 3), width, {
+  buttonRow(key, buttonTop + verticalStep, width, {
     { "<X", function() draft.gridPageX = math.max(1, draft.gridPageX - cols) end, pageX > 1 }, { "X>", function() draft.gridPageX = math.min(math.max(1, #xValues - cols + 1), draft.gridPageX + cols) end, pageX + cols <= #xValues },
     { "<Z", function() draft.gridPageZ = math.max(1, draft.gridPageZ - rows) end, pageZ > 1 }, { "Z>", function() draft.gridPageZ = math.min(math.max(1, #zValues - rows + 1), draft.gridPageZ + rows) end, pageZ + rows <= #zValues },
   })
-  buttonRow(key, math.max(1, height - 2), width, {
+  buttonRow(key, buttonTop + verticalStep * 2, width, {
     { "BACK", function() mode = "job_dimensions" end },
     { "PREFLIGHT", function() local result = computePreflight(); if result then mode = "preflight" end end },
     { "START", function() local result = computePreflight(); if result then mode = "preflight" end end },
@@ -172,16 +179,3 @@ local function progressChunkState(data, chunk, index, excludedSet)
     if state == "completed" then state = "complete" elseif state == "waiting" or state == "service_requested" then state = "service" end
     return state
   end
-  if excludedSet[chunk.key] then return "excluded" end
-  if data.status == "blocked" then return "blocked" end
-  if data.status == "waiting_fuel" or data.status == "waiting_output" or data.status == "waiting_seal" or data.phase == "service_requested" then return "service" end
-  local current = progress.currentChunk or job.currentChunk
-  if current and tostring(current) == tostring(chunk.key) then return data.status == "blocked" and "blocked" or "working" end
-  local completed = tonumber(progress.completedChunks or job.completedChunks)
-  if completed and index <= completed then return "complete" end
-  if not completed then
-    local cursor = tonumber(progress.cursor or job.cursor)
-    local depth = math.max(1, tonumber(job.depth) or 1)
-    if cursor then
-      local startBlock = (index - 1) * math.max(1, tonumber(chunk.cells) or 1) * depth
-      local endBlock = startBlock + math.max(1, tonumber(chunk.cells) or 1) * depth

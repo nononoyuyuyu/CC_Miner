@@ -1,3 +1,5 @@
+    { "LIGHT " .. tostring(groupDraft.lighting and groupDraft.lighting.mode or "safe"), function() local modes = { "off", "safe", "custom" }; local now = groupDraft.lighting and groupDraft.lighting.mode or "safe"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; groupDraft.lighting.mode = modes[n % #modes + 1]; groupDraft.preflight = nil; invalidate() end },
+    { "WATER " .. tostring(groupDraft.waterMode or "seal"), function() local modes = { "ignore", "stop", "seal" }; local now = groupDraft.waterMode or "seal"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; groupDraft.waterMode = modes[n % #modes + 1]; groupDraft.preflight = nil; invalidate() end },
     { "PROFILE " .. tostring(groupDraft.profile or "balanced"), function() local modes = { "safe", "balanced", "turbo" }; local now = groupDraft.profile or "balanced"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; groupDraft.profile = modes[n % #modes + 1]; groupDraft.preflight = nil; invalidate() end },
     { "PART " .. tostring(groupDraft.partition or group.partition or "stripe"), function() groupDraft.partition = (tostring(groupDraft.partition or group.partition or "stripe") == "stripe") and "round_robin" or "stripe"; groupDraft.preflight = nil; invalidate() end },
   })
@@ -12,10 +14,11 @@ end
 
 local function renderGroups(target, key)
   local width, height = target.getSize()
+  local verticalStep = height >= 12 and 2 or 1
   writeHeader("WORKER GROUPS", target)
   local ids = orderedGroupIds()
   common.writeAt(1, 2, common.fit(("Groups %d | selected=%d"):format(#ids, selectedGroup), width), colors and colors.lightGray or nil)
-  local maxRows = math.max(1, height - 9)
+  local maxRows = math.max(1, height - (verticalStep == 2 and 11 or 9))
   if #ids == 0 then
     common.writeAt(2, 4, common.fit("No groups. Register: group register <id> <workers> [name dock bay mode partition]", width), colors and colors.yellow or nil)
     common.writeAt(2, 5, common.fit("Per-bay maps: worker=bay,worker=bay (dock map follows).", width), colors and colors.lightGray or nil)
@@ -35,10 +38,10 @@ local function renderGroups(target, key)
       addHitbox(key, 1, y, width, y, function() selectedGroup = index; invalidate() end)
     end
   end
-  local bottom = math.max(1, height - 5)
+  local bottom = math.max(1, height - verticalStep * 2 - 1)
   buttonRow(key, bottom, width, { { "START", groupAction("start") }, { "PAUSE", groupAction("pause") }, { "RESUME", groupAction("resume") }, { "RETURN", groupAction("return") } })
-  buttonRow(key, bottom + 1, width, { { "SERVICE", groupAction("service") }, { "ABORT", groupAction("abort") }, { "CLEAR", groupAction("clear") }, { "DRILLDOWN", function() mode = "group_info"; invalidate() end } })
-  buttonRow(key, bottom + 2, width, { { "BACK", function() mode = "dashboard" end }, { "REFRESH", function() local gid = selectedGroupRecord(); local job = gid and activeGroupJob(gid); if job then updateGroupAggregate(job) end; invalidate() end } })
+  buttonRow(key, bottom + verticalStep, width, { { "SERVICE", groupAction("service") }, { "ABORT", groupAction("abort") }, { "CLEAR", groupAction("clear") }, { "DRILLDOWN", function() mode = "group_info"; invalidate() end } })
+  buttonRow(key, bottom + verticalStep * 2, width, { { "BACK", function() mode = "dashboard" end }, { "REFRESH", function() local gid = selectedGroupRecord(); local job = gid and activeGroupJob(gid); if job then updateGroupAggregate(job) end; invalidate() end } })
   noticeLine(target, height)
 end
 
@@ -134,7 +137,3 @@ local function renderDimensions(target, key)
     local calibration = draftCalibration()
     homeText = "HOME Y=" .. tostring(calibration and calibration.home and calibration.home.y or "-") .. " LAYERS=" .. tostring(shownDepth)
   end
-  common.writeAt(1, summaryY, common.fit(("%dx%dx%d=%s blocks | %s | %s profile=%s %s"):format(draft.width, draft.length, shownDepth, common.humanNumber(volume), worldMode and ("BOTTOM Y=" .. tostring(draft.targetY)) or "LOCAL DEPTH=" .. tostring(shownDepth), homeText, tostring(draft.profile), intervalText), width), colors and colors.lightGray or nil)
-  local optionY = math.max(4, summaryY + 1)
-  buttonRow(key, optionY, width, {
-    { "LIGHT " .. tostring(draft.lighting and draft.lighting.mode or "safe"), function() local modes = { "off", "safe", "custom" }; local now = draft.lighting and draft.lighting.mode or "safe"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; draft.lighting.mode = modes[n % #modes + 1]; invalidate() end },

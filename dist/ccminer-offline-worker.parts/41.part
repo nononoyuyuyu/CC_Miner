@@ -1,3 +1,19 @@
+      route.walkIndex = route.walkIndex + 1
+    end
+    saveState()
+    return
+  end
+
+  if route.phase == "mine" then
+    if job.transitSet and job.transitSet[chunk.key] and not (job.assignmentSet and job.assignmentSet[chunk.key]) then
+      -- Transit-only chunks exist to keep the assigned region connected.  We
+      -- walk through them for service safety but never count or mine cells.
+      route.phase, route.localCursor = "return", 0
+      saveState("transit_chunk")
+      return
+    end
+    local count = quarry.chunkCellCount(chunk)
+    if route.localCursor >= count then
       route.phase = "return"
       saveState()
       return
@@ -245,17 +261,3 @@ local function preflight()
   if not os.getComputerLabel or not os.getComputerLabel() then
     if os.setComputerLabel then os.setComputerLabel(config.workerName) end
   end
-  local opened, names = protocol.open()
-  networkReady = opened
-  if not opened then
-    common.log("ERROR", "No wireless modem found.")
-    printError("No wireless modem found. Equip one on the turtle.")
-  else
-    common.log("INFO", "Wireless modem opened: " .. table.concat(names, ","))
-  end
-
-  state.pose = poseCopy(state.pose)
-  ensureV3State()
-  state.stats = common.merge(common.defaultState().stats, state.stats)
-  state.gps = common.merge(common.defaultState().gps, state.gps)
-  if state.job and not state.job.strategy then state.job.strategy = "serpentine" end

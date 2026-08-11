@@ -1,3 +1,12 @@
+  for _, existing in ipairs(state.recentCommands) do if existing == id then return true end end
+  state.recentCommands[#state.recentCommands + 1] = id
+  while #state.recentCommands > 32 do table.remove(state.recentCommands, 1) end
+  return false
+end
+
+local function locateGPS()
+  state.gps = state.gps or common.defaultState().gps
+  if gpsConfig().enabled == false then
     state.gps.available = false
     state.gps.lastError = "GPS is disabled in configuration."
     return nil, state.gps.lastError
@@ -233,11 +242,3 @@ local function validateAssignmentResumeToken(value, job)
   return {
     pose = localPose,
     x = localPose.x, y = localPose.y, z = localPose.z, dir = localPose.dir,
-    layer = layer, walkIndex = walkIndex, localCursor = localCursor,
-    phase = phase, currentKey = currentKey, cursor = cursor,
-    route = {
-      layer = layer, walkIndex = walkIndex, localCursor = localCursor,
-      phase = phase, currentKey = currentKey,
-    },
-    jobId = tostring(value.jobId or ""), groupJobId = tostring(value.groupJobId), assignmentId = tostring(value.assignmentId),
-    worldPose = {

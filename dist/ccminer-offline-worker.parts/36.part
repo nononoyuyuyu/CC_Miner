@@ -1,3 +1,10 @@
+  if type(quarry.shortestServiceRoute) == "function" then
+    local dockKey = plan.dockKey or plan.entranceKey or plan.rootKey
+    local dock = plan.chunks and plan.chunks[dockKey]
+    if dock then
+      local dockPose = { x = dock.anchor.x, y = pose.y, z = dock.anchor.z }
+      local ok, route = pcall(quarry.shortestServiceRoute, plan, pose, dockPose, { allowFallback = true })
+      if ok and type(route) == "table" and tonumber(route.distance) then
         return tonumber(route.distance) + math.abs(dock.anchor.x) + math.abs(dock.anchor.z) + math.abs(tonumber(pose.y) or 0)
       end
     end
@@ -265,14 +272,3 @@ end
 
 local function compressInventoryAtField()
   -- compactEvery is a local inventory operation.  It must never create a
-  -- service/return merely to consolidate stacks, and it must not touch
-  -- protected reserve slots or split a stack while moving items.
-  local originalSlot = turtle.getSelectedSlot()
-  local moved = compressSealStacks()
-  for destination = 1, 16 do
-    if not isReservedSlot(destination) and turtle.getItemCount(destination) > 0 then
-      local name = itemName(destination)
-      if name then
-        local space = turtle.getItemSpace(destination)
-        if space > 0 then
-          for source = 1, 16 do

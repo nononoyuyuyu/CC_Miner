@@ -1,3 +1,20 @@
+    if not ok then return false, err end
+    ok, err = moveOne("forward", context)
+    if not ok then return false, err end
+  end
+  return true
+end
+
+local function moveZ(targetZ, context)
+  while state.pose.z ~= targetZ do
+    local targetDir = state.pose.z < targetZ and 0 or 2
+    local ok, err = turnTo(targetDir)
+    if not ok then return false, err end
+    ok, err = moveOne("forward", context)
+    if not ok then return false, err end
+  end
+  return true
+end
 
 local function moveY(targetY, context)
   while state.pose.y < targetY do
@@ -259,10 +276,3 @@ local function estimatedReturnDistance(pose)
   local plan = state.job.chunkPlan
   local currentKey = quarry.findChunk(plan, pose.x, pose.z)
   if not currentKey then return nil, "Current position is outside every allowed chunk." end
-  if type(quarry.shortestServiceRoute) == "function" then
-    local dockKey = plan.dockKey or plan.entranceKey or plan.rootKey
-    local dock = plan.chunks and plan.chunks[dockKey]
-    if dock then
-      local dockPose = { x = dock.anchor.x, y = pose.y, z = dock.anchor.z }
-      local ok, route = pcall(quarry.shortestServiceRoute, plan, pose, dockPose, { allowFallback = true })
-      if ok and type(route) == "table" and tonumber(route.distance) then

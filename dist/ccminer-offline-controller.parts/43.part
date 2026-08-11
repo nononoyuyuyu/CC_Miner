@@ -1,3 +1,14 @@
+    if sub == "list" then for _, preset in ipairs(db.presets) do print(tostring(preset.name)) end
+    elseif sub == "save" then local ok, err = savePreset(args[3], db.lastDraft or draft); print(ok and "Preset saved." or ("Preset error: " .. tostring(err)))
+    elseif sub == "use" or sub == "load" then print(applyPreset(args[3]) and "Preset selected." or "Preset not found.")
+    elseif sub == "delete" or sub == "remove" then local keep = {}; for _, preset in ipairs(db.presets) do if tostring(preset.name) ~= tostring(args[3]) then keep[#keep + 1] = preset end end; db.presets = keep; saveControllerDb(); print("Preset removed.")
+    else print("Usage: preset list|save|use|delete <name>") end
+    return true
+  elseif command == "report" or command == "history" then printHistory(); return true
+  elseif command == "doctor" then
+    print("CC Miner controller doctor")
+    print("network=" .. tostring(networkReady) .. " modems=" .. tostring(#(modemNames or {})))
+    print("db=" .. tostring(dbError and ("WARN " .. dbError) or "ok") .. " path=" .. DB_PATH)
     print("workers=" .. tostring(#orderedIds()) .. " leases=" .. tostring(#(db.leases or {})) .. " queue=" .. tostring(#db.queue))
     print("sorting=" .. tostring(config.sorting and config.sorting.enabled == true and "enabled" or "off"))
     return true
@@ -252,26 +263,3 @@ end
 
 local action = validateAction()
 if action == "" then usage(); return end
-if action == "update" then
-  term.clear(); term.setCursorPos(1, 1)
-  print("CC MINER V4 OFFLINE " .. string.upper(action) .. " / " .. ROLE); print("")
-  if fs.exists(TEMP) then fs.delete(TEMP) end
-  ensureDir(TEMP)
-  for index, file in ipairs(files) do
-    write(("[%d/%d] %s ... "):format(index, #files, file.target))
-    local ok, writeError = writeFile(TEMP .. "/" .. file.target, file.content)
-    if not ok then fs.delete(TEMP); fail(writeError) end
-    print("OK")
-  end
-  validateAll()
-end
-
-local preserved = {
-  { ROOT .. "/config.db", TEMP .. "/config.db" },
-  { ROOT .. "/config.db.bak", TEMP .. "/config.db.bak" },
-  { ROOT .. "/data/state.db", TEMP .. "/data/state.db" },
-  { ROOT .. "/data/state.db.bak", TEMP .. "/data/state.db.bak" },
-  { ROOT .. "/data/state.pending", TEMP .. "/data/state.pending" },
-  { ROOT .. "/data/state.journal", TEMP .. "/data/state.journal" },
-  { ROOT .. "/data/state.checkpoint.db", TEMP .. "/data/state.checkpoint.db" },
-  { ROOT .. "/data/controller.db", TEMP .. "/data/controller.db" },

@@ -1,3 +1,17 @@
+    discardStats.lastError = "Field discard skipped because the configured direction contains an inventory."
+    state.stats.discardSkipped = (state.stats.discardSkipped or 0) + 1
+    restoreSideDirection(side, restoreDir)
+    turtle.select(originalSlot)
+    saveState("field_discard_inventory")
+    return true
+  end
+
+  local _, _, totalItems = inventoryStats()
+  local totalSeal = updateRecycleInventoryState()
+  local maxStacks = math.max(1, math.floor(tonumber(policy.maxStacksPerPass) or 8))
+  local discardedStacks = 0
+  for slot = 1, 16 do
+    if discardedStacks >= maxStacks then break end
     local count, name = turtle.getItemCount(slot), itemName(slot)
     if count > 0 and discardCandidate(slot, name, totalSeal, policy, mode)
       and not (isSealItemName(name) and totalSeal - count < (tonumber(policy.retainSealTarget) or 64)) then
@@ -266,20 +280,3 @@ local function refillTorchAtHome()
     local preferred = preferredTorchSlots()
     if type(preferred) == "table" then
       for _, candidate in ipairs(preferred) do
-        local candidateSlot = tonumber(candidate)
-        if candidateSlot and not isReservedSlot(candidateSlot, "torch") and turtle.getItemCount(candidateSlot) == 0 then
-          slot = candidateSlot
-          break
-        end
-      end
-    end
-    if not slot then
-      for candidate = 1, 16 do
-        if not isReservedSlot(candidate, "torch") and turtle.getItemCount(candidate) == 0 then slot = candidate; break end
-      end
-    end
-    if not slot then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "No inventory space for torches."
-    end

@@ -1,3 +1,26 @@
+if action == "update" then
+  term.clear(); term.setCursorPos(1, 1)
+  print("CC MINER V4 OFFLINE " .. string.upper(action) .. " / " .. ROLE); print("")
+  if fs.exists(TEMP) then fs.delete(TEMP) end
+  ensureDir(TEMP)
+  for index, file in ipairs(files) do
+    write(("[%d/%d] %s ... "):format(index, #files, file.target))
+    local ok, writeError = writeFile(TEMP .. "/" .. file.target, file.content)
+    if not ok then fs.delete(TEMP); fail(writeError) end
+    print("OK")
+  end
+  validateAll()
+end
+
+local preserved = {
+  { ROOT .. "/config.db", TEMP .. "/config.db" },
+  { ROOT .. "/config.db.bak", TEMP .. "/config.db.bak" },
+  { ROOT .. "/data/state.db", TEMP .. "/data/state.db" },
+  { ROOT .. "/data/state.db.bak", TEMP .. "/data/state.db.bak" },
+  { ROOT .. "/data/state.pending", TEMP .. "/data/state.pending" },
+  { ROOT .. "/data/state.journal", TEMP .. "/data/state.journal" },
+  { ROOT .. "/data/state.checkpoint.db", TEMP .. "/data/state.checkpoint.db" },
+  { ROOT .. "/data/controller.db", TEMP .. "/data/controller.db" },
   { ROOT .. "/controller.db", TEMP .. "/controller.db" },
   { ROOT .. "/data/ccminer.log", TEMP .. "/data/ccminer.log" },
   { ROOT .. "/data/ccminer.log.1", TEMP .. "/data/ccminer.log.1" },

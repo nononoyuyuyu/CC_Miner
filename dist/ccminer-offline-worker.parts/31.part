@@ -1,3 +1,17 @@
+    state.lastError = "GPS calibration moved forward but could not return: " .. tostring(returnError)
+    saveState()
+    return false, state.lastError
+  end
+  if not forwardFix then
+    cancelPhysicalAction()
+    state.status, state.phase, state.lastError = "blocked", "gps_error", forwardError
+    saveState()
+    return false, forwardError
+  end
+
+  local calibration, calibrationError = geo.calibrationFromFixes(homeFix, forwardFix)
+  if not calibration then
+    cancelPhysicalAction()
     state.status, state.phase, state.lastError = "blocked", "gps_error", calibrationError
     saveState()
     return false, calibrationError
@@ -260,12 +274,3 @@ end
 
 local function remoteConsoleAction(sender, payload)
   payload = payload or {}
-  if config.remoteConsole.enabled ~= true then
-    return false, "Remote console is disabled.", nil, nil
-  end
-  local action = string.lower(common.trim(payload.action or payload.remoteAction or ""))
-  remoteSessionExpired()
-  if action == "open" then
-    local pinnedController = tonumber(config.controllerId or 0) or 0
-    if config.remoteConsole.allowShell == true and pinnedController <= 0 then
-      return false, "Arbitrary remote shell requires a pinned controllerId.", nil, nil

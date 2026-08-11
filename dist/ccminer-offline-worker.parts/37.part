@@ -1,3 +1,14 @@
+  -- service/return merely to consolidate stacks, and it must not touch
+  -- protected reserve slots or split a stack while moving items.
+  local originalSlot = turtle.getSelectedSlot()
+  local moved = compressSealStacks()
+  for destination = 1, 16 do
+    if not isReservedSlot(destination) and turtle.getItemCount(destination) > 0 then
+      local name = itemName(destination)
+      if name then
+        local space = turtle.getItemSpace(destination)
+        if space > 0 then
+          for source = 1, 16 do
             if source ~= destination and not isReservedSlot(source)
               and turtle.getItemCount(source) > 0 and itemName(source) == name then
               turtle.select(source)
@@ -258,17 +269,3 @@ local function discardAtField()
   -- boundary: never accidentally inject a discard stack into it.
   if inventoryPresent(checkSide, inspectFunction) then
     discardStats.skipped = (discardStats.skipped or 0) + 1
-    discardStats.lastError = "Field discard skipped because the configured direction contains an inventory."
-    state.stats.discardSkipped = (state.stats.discardSkipped or 0) + 1
-    restoreSideDirection(side, restoreDir)
-    turtle.select(originalSlot)
-    saveState("field_discard_inventory")
-    return true
-  end
-
-  local _, _, totalItems = inventoryStats()
-  local totalSeal = updateRecycleInventoryState()
-  local maxStacks = math.max(1, math.floor(tonumber(policy.maxStacksPerPass) or 8))
-  local discardedStacks = 0
-  for slot = 1, 16 do
-    if discardedStacks >= maxStacks then break end

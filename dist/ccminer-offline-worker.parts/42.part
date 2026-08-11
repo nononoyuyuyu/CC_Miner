@@ -1,3 +1,17 @@
+  local opened, names = protocol.open()
+  networkReady = opened
+  if not opened then
+    common.log("ERROR", "No wireless modem found.")
+    printError("No wireless modem found. Equip one on the turtle.")
+  else
+    common.log("INFO", "Wireless modem opened: " .. table.concat(names, ","))
+  end
+
+  state.pose = poseCopy(state.pose)
+  ensureV3State()
+  state.stats = common.merge(common.defaultState().stats, state.stats)
+  state.gps = common.merge(common.defaultState().gps, state.gps)
+  if state.job and not state.job.strategy then state.job.strategy = "serpentine" end
   if state.job and state.job.strategy == "chunk_plan" and not state.job.chunkPlan then
     local plan, planError = quarry.buildChunkPlan(state.job, gpsCalibration())
     if plan then state.job.chunkPlan = plan else state.lastError = planError end
@@ -260,18 +274,3 @@ local function validateAction()
   end
   if action == "update" and fs.exists(LOW_SPACE_MARKER) then
     fail("A low-space update is incomplete. Re-transfer the original "
-      .. "ccminer-offline-" .. ROLE .. ".lua and parts, then run update-low-space.")
-  end
-  return action
-end
-local function usage()
-  print("CC Miner V4 offline " .. ROLE .. " installer " .. VERSION .. " (schema " .. SCHEMA .. ")")
-  print("  ccminer-offline-" .. ROLE .. ".lua " .. ROLE)
-  print("  ccminer-offline-" .. ROLE .. ".lua update")
-  print("  ccminer-offline-" .. ROLE .. ".lua update-low-space")
-end
-
-local action = validateAction()
-if action == "" then usage(); return end
-if action == "update" then
-  term.clear(); term.setCursorPos(1, 1)

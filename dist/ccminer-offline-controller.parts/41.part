@@ -1,3 +1,19 @@
+  return table.concat({ tostring(mode), tostring(key), tostring(width), tostring(height), tostring(id or ""), tostring(data.updatedAt or data.status or ""), tostring(gid or ""), tostring(group and group.updatedAt or ""), tostring(groupJob and groupJob.updatedAt or ""), tostring(groupDraft and groupDraft.updatedAt or ""), tostring(groupDraft and groupDraft.preflight and groupDraft.preflight.computedAt or ""), tostring(draft and draft.gridPageX or ""), tostring(draft and draft.gridPageZ or ""), tostring(dirty) }, "|")
+end
+
+local function renderOne(target, key)
+  local singleDraftMode = mode == "job_dimensions" or mode == "job_grid"
+    or mode == "job_chunks" or mode == "preflight"
+  local groupDraftMode = mode == "group_dimensions" or mode == "group_job"
+  if (singleDraftMode and type(draft) ~= "table")
+    or (groupDraftMode and type(groupDraft) ~= "table") then
+    mode = "dashboard"
+    setNotice("The unfinished job form was reset safely. Open NEW JOB again.", true)
+  end
+  resetHitboxes(key)
+  local signature = screenSignature(target, key)
+  if renderCache[key] == signature and not dirty then return end
+  common.withTerm(target, function()
     common.clear(colors and colors.black or nil, colors and colors.white or nil)
     if mode == "dashboard" then renderDashboard(target, key)
     elseif mode == "more" then noticeState.renderMore(target, key)
@@ -222,27 +238,3 @@ end
 
 local function pumpFor(seconds)
   local deadline = common.nowSeconds() + (seconds or 1)
-  while common.nowSeconds() <= deadline do
-    local sender, message = protocol.receive(0.25)
-    if sender then handleMessage(sender, message) end
-    groupSchedulerTick()
-  end
-end
-
-local function makeCliDraft(id, width, length, depth)
-  local previous = db.lastDraft or {}
-  local calibration = draftCalibration(id)
-  local targetY = calibration and calibration.home and tonumber(calibration.home.y) and (tonumber(calibration.home.y) - depth + 1) or nil
-  return {
-    workerId = id, width = width, length = length, depth = depth,
-    targetY = targetY,
-    lighting = normalizedLighting(previous.lighting),
-    waterMode = normalizedWaterMode(previous.waterMode), profile = normalizedProfile(previous.profile),
-    selectedField = "width", buffer = tostring(width), excluded = {},
-    gridPageX = 1, gridPageZ = 1, rectMode = false, autoAssign = false,
-    name = "CLI Quarry",
-  }
-end
-
-local function printQueue()
-  if #db.queue == 0 then print("Queue empty."); return end

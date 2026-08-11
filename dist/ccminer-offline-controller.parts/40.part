@@ -1,3 +1,16 @@
+  if excludedSet[chunk.key] then return "excluded" end
+  if data.status == "blocked" then return "blocked" end
+  if data.status == "waiting_fuel" or data.status == "waiting_output" or data.status == "waiting_seal" or data.phase == "service_requested" then return "service" end
+  local current = progress.currentChunk or job.currentChunk
+  if current and tostring(current) == tostring(chunk.key) then return data.status == "blocked" and "blocked" or "working" end
+  local completed = tonumber(progress.completedChunks or job.completedChunks)
+  if completed and index <= completed then return "complete" end
+  if not completed then
+    local cursor = tonumber(progress.cursor or job.cursor)
+    local depth = math.max(1, tonumber(job.depth) or 1)
+    if cursor then
+      local startBlock = (index - 1) * math.max(1, tonumber(chunk.cells) or 1) * depth
+      local endBlock = startBlock + math.max(1, tonumber(chunk.cells) or 1) * depth
       if cursor >= endBlock then return "complete" elseif cursor > startBlock then return "working" end
     end
   end
@@ -60,6 +73,7 @@ end
 
 local function renderStopMenu(target, key)
   local width, height = target.getSize()
+  local verticalStep = height >= 10 and 2 or 1
   writeHeader("STAGED STOP", target, colors and colors.orange or nil)
   common.writeAt(1, 2, common.fit("Select a boundary; payload is command=stop, mode=...", width), colors and colors.lightGray or nil)
   local id = selectedWorker()
@@ -67,13 +81,14 @@ local function renderStopMenu(target, key)
     return function() setNotice(message, false); stageStop(id, stopMode); mode = "dashboard" end
   end
   buttonRow(key, 4, width, { { "PAUSE NOW", action("pause_now", "Pause requested now.") }, { "FINISH ROW", action("finish_row", "Finish current row then stop.") } })
-  buttonRow(key, 5, width, { { "FINISH LAYER", action("finish_layer", "Finish current layer then stop.") }, { "RETURN HOME", action("return_home", "Return-home stop requested.") } })
-  buttonRow(key, math.max(6, height - 3), width, { { "ABORT", action("abort", "Abort requested.") }, { "BACK", function() mode = "dashboard" end } })
+  buttonRow(key, 4 + verticalStep, width, { { "FINISH LAYER", action("finish_layer", "Finish current layer then stop.") }, { "RETURN HOME", action("return_home", "Return-home stop requested.") } })
+  buttonRow(key, math.max(4 + verticalStep * 2, height - 2), width, { { "ABORT", action("abort", "Abort requested.") }, { "BACK", function() mode = "dashboard" end } })
   noticeLine(target, height)
 end
 
 local function renderRecovery(target, key)
   local width, height = target.getSize()
+  local verticalStep = height >= 9 and 2 or 1
   local id, worker = selectedWorker()
   local data = worker and worker.data or {}
   writeHeader("RECOVERY WIZARD", target, colors and colors.red or nil)
@@ -81,7 +96,7 @@ local function renderRecovery(target, key)
   common.writeAt(1, 2, common.fit("State: " .. tostring(data.status or "unknown") .. " / " .. tostring(data.phase or "-"), width), colors and colors.yellow or nil)
   common.writeAt(1, 3, common.fit(explanation, width), colors and colors.white or nil)
   buttonRow(key, 5, width, { { "GPS FIX", function() recoveryAction("gps_fix") end }, { "RETRY", function() recoveryAction("retry") end }, { "RESUME", function() recoveryAction("resume") end } })
-  buttonRow(key, 6, width, { { "RETURN", function() recoveryAction("return") end }, { "REHOME RESET", function() recoveryAction("rehome") end }, { "BACK", function() mode = "dashboard" end } })
+  buttonRow(key, 5 + verticalStep, width, { { "RETURN", function() recoveryAction("return") end }, { "REHOME RESET", function() recoveryAction("rehome") end }, { "BACK", function() mode = "dashboard" end } })
   noticeLine(target, height)
 end
 
@@ -165,19 +180,3 @@ local function screenSignature(target, key)
   local data = worker and worker.data or {}
   local gid, group = selectedGroupRecord()
   local groupJob = gid and activeGroupJob(gid) or nil
-  return table.concat({ tostring(mode), tostring(key), tostring(width), tostring(height), tostring(id or ""), tostring(data.updatedAt or data.status or ""), tostring(gid or ""), tostring(group and group.updatedAt or ""), tostring(groupJob and groupJob.updatedAt or ""), tostring(groupDraft and groupDraft.updatedAt or ""), tostring(groupDraft and groupDraft.preflight and groupDraft.preflight.computedAt or ""), tostring(draft and draft.gridPageX or ""), tostring(draft and draft.gridPageZ or ""), tostring(dirty) }, "|")
-end
-
-local function renderOne(target, key)
-  local singleDraftMode = mode == "job_dimensions" or mode == "job_grid"
-    or mode == "job_chunks" or mode == "preflight"
-  local groupDraftMode = mode == "group_dimensions" or mode == "group_job"
-  if (singleDraftMode and type(draft) ~= "table")
-    or (groupDraftMode and type(groupDraft) ~= "table") then
-    mode = "dashboard"
-    setNotice("The unfinished job form was reset safely. Open NEW JOB again.", true)
-  end
-  resetHitboxes(key)
-  local signature = screenSignature(target, key)
-  if renderCache[key] == signature and not dirty then return end
-  common.withTerm(target, function()

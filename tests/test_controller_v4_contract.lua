@@ -60,6 +60,8 @@ for _, item in ipairs({
   { 'selectedButton and colors.yellow', "high contrast selected button" },
   { 'enabled == false and colors.gray or colors.lightBlue', "high contrast enabled button" },
   { 'noticeState.configureMonitor = function(device)', "monitor palette setup" },
+  { 'local verticalStep = height >= 10 and 2 or 1', "responsive vertical button spacing" },
+  { 'local listStart, itemStep = roomy and 5 or 4, roomy and 2 or 1', "spaced item rows" },
 }) do
   marker(controller, item[1], item[2])
 end

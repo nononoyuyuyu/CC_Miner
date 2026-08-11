@@ -1,3 +1,14 @@
+    if not arrivedGPS then markBlocked("GPS verification after resume failed: " .. tostring(arrivedGPSError)); return false end
+    if state.job and state.job.route then
+      for _, key in ipairs({ "layer", "walkIndex", "localCursor", "phase", "currentKey" }) do
+        if token[key] ~= nil then state.job.route[key] = token[key] end
+      end
+    end
+    state.checkpoint = nil
+    state.resumeToken = nil
+  end
+  state.service.returnEndedAt = common.nowSeconds()
+  state.service.returnSeconds = math.max(0, state.service.returnEndedAt - (state.service.returnStartedAt or state.service.returnEndedAt))
   state.serviceReturn.endedAt = state.service.returnEndedAt
   state.serviceReturn.seconds = state.service.returnSeconds
   state.serviceReturn.distance = state.service.returnDistance or 0
@@ -262,19 +273,3 @@ local function runChunkPlanStep(job)
     if walkStep.first then
       route.phase, route.localCursor = "mine", 0
     else
-      route.walkIndex = route.walkIndex + 1
-    end
-    saveState()
-    return
-  end
-
-  if route.phase == "mine" then
-    if job.transitSet and job.transitSet[chunk.key] and not (job.assignmentSet and job.assignmentSet[chunk.key]) then
-      -- Transit-only chunks exist to keep the assigned region connected.  We
-      -- walk through them for service safety but never count or mine cells.
-      route.phase, route.localCursor = "return", 0
-      saveState("transit_chunk")
-      return
-    end
-    local count = quarry.chunkCellCount(chunk)
-    if route.localCursor >= count then

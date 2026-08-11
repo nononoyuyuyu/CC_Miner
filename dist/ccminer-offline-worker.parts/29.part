@@ -1,3 +1,11 @@
+    layer = layer, walkIndex = walkIndex, localCursor = localCursor,
+    phase = phase, currentKey = currentKey, cursor = cursor,
+    route = {
+      layer = layer, walkIndex = walkIndex, localCursor = localCursor,
+      phase = phase, currentKey = currentKey,
+    },
+    jobId = tostring(value.jobId or ""), groupJobId = tostring(value.groupJobId), assignmentId = tostring(value.assignmentId),
+    worldPose = {
       x = math.floor(tonumber(world.x)), y = math.floor(tonumber(world.y)), z = math.floor(tonumber(world.z)), dir = worldDir,
     },
   }
@@ -210,10 +218,3 @@ local function validateJob(payload)
       -- The assigned planner owns world-catalog validation, connectivity,
       -- transit leases, and the dock-to-seed service route.  Keep this call
       -- to its single canonical signature; broad compatibility attempts can
-      -- silently reinterpret the catalog as a job and mine the full region.
-      local assignment = job.assignment or {}
-      local assignmentOptions = {
-        transitKeys = job.assignmentTransitChunks or {},
-        seedKey = payload.seedKey or assignment.seedKey or job.seedKey,
-        rootKey = assignmentCatalog.rootKey,
-        dockKey = payload.dockKey or assignment.dockKey or assignmentCatalog.dockKey,

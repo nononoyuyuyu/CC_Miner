@@ -1,3 +1,20 @@
+        local candidateSlot = tonumber(candidate)
+        if candidateSlot and not isReservedSlot(candidateSlot, "torch") and turtle.getItemCount(candidateSlot) == 0 then
+          slot = candidateSlot
+          break
+        end
+      end
+    end
+    if not slot then
+      for candidate = 1, 16 do
+        if not isReservedSlot(candidate, "torch") and turtle.getItemCount(candidate) == 0 then slot = candidate; break end
+      end
+    end
+    if not slot then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "No inventory space for torches."
+    end
     turtle.select(slot)
     local need = math.min(target - torchMaterialCount(), turtle.getItemSpace(slot))
     if need <= 0 then need = 1 end
@@ -233,14 +250,3 @@ local function continueService()
     if not ok then markBlocked("Cannot restore work direction: " .. tostring(err)); return false end
     if movementInterrupted("service") then return false end
     local arrivedGPS, arrivedGPSError = verifyGPS(true)
-    if not arrivedGPS then markBlocked("GPS verification after resume failed: " .. tostring(arrivedGPSError)); return false end
-    if state.job and state.job.route then
-      for _, key in ipairs({ "layer", "walkIndex", "localCursor", "phase", "currentKey" }) do
-        if token[key] ~= nil then state.job.route[key] = token[key] end
-      end
-    end
-    state.checkpoint = nil
-    state.resumeToken = nil
-  end
-  state.service.returnEndedAt = common.nowSeconds()
-  state.service.returnSeconds = math.max(0, state.service.returnEndedAt - (state.service.returnStartedAt or state.service.returnEndedAt))

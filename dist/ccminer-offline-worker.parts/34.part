@@ -1,3 +1,16 @@
+    state.recycle.overflow = state.recycle.held - state.recycle.cap
+  end
+  state.stats.recycledBlocks = (state.stats.recycledBlocks or 0) + 1
+  state.stats.recycled = (state.stats.recycled or 0) + 1
+end
+
+local function isGravityBlock(data)
+  local name = string.lower(blockName(data))
+  for _, marker in ipairs({ "sand", "gravel", "concrete_powder", "anvil", "dragon_egg", "scaffolding" }) do
+    if name:find(marker, 1, true) then return true end
+  end
+  return false
+end
 
 local function tryPlaceTorchWall(relativeDir)
   local originalDir = state.pose.dir
@@ -268,20 +281,3 @@ local function moveX(targetX, context)
   while state.pose.x ~= targetX do
     local targetDir = state.pose.x < targetX and 1 or 3
     local ok, err = turnTo(targetDir)
-    if not ok then return false, err end
-    ok, err = moveOne("forward", context)
-    if not ok then return false, err end
-  end
-  return true
-end
-
-local function moveZ(targetZ, context)
-  while state.pose.z ~= targetZ do
-    local targetDir = state.pose.z < targetZ and 0 or 2
-    local ok, err = turnTo(targetDir)
-    if not ok then return false, err end
-    ok, err = moveOne("forward", context)
-    if not ok then return false, err end
-  end
-  return true
-end
