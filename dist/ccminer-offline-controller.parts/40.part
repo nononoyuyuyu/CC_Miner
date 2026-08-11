@@ -1,3 +1,49 @@
+      for key, value in pairs(registry or {}) do print(("%s world=%s,%s,%s facing=%s maxDepth=%s"):format(tostring(key), tostring(value.world and value.world.x or "-"), tostring(value.world and value.world.y or "-"), tostring(value.world and value.world.z or "-"), tostring(value.facing or "-"), tostring(value.maxDepth or "-"))) end
+    elseif sub == "register" and id then
+      local value = { world = { x = tonumber(args[4]), y = tonumber(args[5]), z = tonumber(args[6]) }, facing = args[7], maxDepth = tonumber(args[8]) }
+      local ok, err = command == "dock" and registerDock(id, value) or registerBay(id, value)
+      print(ok and ((command == "dock" and "Dock" or "Bay") .. " saved.") or ("Register error: " .. tostring(err)))
+    else print("Usage: " .. command .. " list|register <id> <x> <y> <z> [facing=south|east|north|west|0..3] [maxDepth]") end
+    return true
+  end
+  if command == "discover" or command == "status" then
+    discover(); pumpFor(3)
+    local ids = orderedIds()
+    if #ids == 0 then print("No workers found."); return true end
+    for _, id in ipairs(ids) do
+      local data = workers[id].data or {}
+      print(("#%s %-16s %-14s %s GPS=%s seal=%s"):format(id, workerLabel(workers[id], id), statusOf(workers[id]), progressText(data), data.gps and data.gps.calibrated and "ready" or "no", data.seal and data.seal.count or "-"))
+    end
+    return true
+  elseif command == "start" then
+    local id, width, length, depth = tonumber(args[2]), tonumber(args[3]), tonumber(args[4]), tonumber(args[5])
+    if not id or not width or not length or not depth then print("Usage: controller.lua start <id> <width> <length> <depth>"); return true end
+    discover(); pumpFor(1)
+    draft = makeCliDraft(id, width, length, depth)
+    local result = computePreflight()
+    if result and not result.fatal then startDraft() else print("Preflight blocked: " .. tostring(result and result.planError or "unavailable")) end
+    pumpFor(2); print(notice); draft = nil; mode = "dashboard"; return true
+  elseif command == "stop" then
+    local id, stopMode = tonumber(args[2]), string.lower(args[3] or "pause_now")
+    local validModes = { pause_now = true, finish_row = true, finish_layer = true, return_home = true, abort = true }
+    if not id or not validModes[stopMode] then print("Usage: controller.lua stop <id> pause_now|finish_row|finish_layer|return_home|abort"); return true end
+    stageStop(id, stopMode); pumpFor(2); print(notice); return true
+  elseif command == "pause" or command == "resume" or command == "recall" or command == "service" or command == "abort" or command == "clear" then
+    local id = tonumber(args[2]); if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
+    sendCommand(id, command); pumpFor(2); print(notice); return true
+  elseif command == "gps" or command == "calibrate" then
+    local id = tonumber(args[2]); if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
+    sendCommand(id, command == "gps" and "gps_fix" or "calibrate_gps"); pumpFor(3); print(notice); return true
+  elseif command == "rehome" then
+    local id = tonumber(args[2]); if not id or args[3] ~= "RESET" then print("Usage: controller.lua rehome <id> RESET"); return true end
+    sendCommand(id, "rehome", { confirm = "RESET" }); pumpFor(2); print(notice); return true
+  elseif command == "queue" then
+    local sub = string.lower(args[2] or "list")
+    if sub == "list" then printQueue()
+    elseif config.queueEnabled == false then print("Queue is disabled by controller configuration.")
+    elseif sub == "clear" then db.queue = {}; saveControllerDb(); print("Queue cleared.")
+    elseif sub == "remove" or sub == "delete" then local index = tonumber(args[3]); if index and db.queue[index] then table.remove(db.queue, index); saveControllerDb(); print("Queue item removed.") else print("Usage: queue remove <index>") end
+    elseif sub == "add" then
       local id, width, length, depth = tonumber(args[3]), tonumber(args[4]), tonumber(args[5]), tonumber(args[6])
       if not id or not width or not length or not depth then print("Usage: queue add <id> <width> <length> <depth>") else discover(); pumpFor(1); local item = makeCliDraft(id, width, length, depth); item.queuedAt = common.nowSeconds(); draft = item; local ok = queueDraft(); draft = nil; print(ok and "Queued." or notice) end
     elseif sub == "run" then
@@ -155,96 +201,3 @@ local function validateEmbedded()
     aggregate[#aggregate + 1] = file.source; aggregate[#aggregate + 1] = "\0"
     aggregate[#aggregate + 1] = file.target; aggregate[#aggregate + 1] = "\0"
     aggregate[#aggregate + 1] = file.digest; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.content; aggregate[#aggregate + 1] = "\0"
-  end
-  local aggregateDigest, aggregateError = digest(table.concat(aggregate))
-  if not aggregateDigest then fail(aggregateError) end
-  if aggregateDigest ~= string.lower(SOURCE_DIGEST) then
-    fail("Embedded role source digest mismatch for " .. ROLE)
-  end
-  return true
-end
-local function validateParts(label, targets)
-  if #targets == 0 then return true end
-  local source = {}
-  for index, target in ipairs(targets) do
-    local found
-    for _, file in ipairs(files) do if file.target == target then found = file.content; break end end
-    if not found then fail("Embedded runtime part is missing: " .. target) end
-    source[index] = found
-  end
-  local ok, compileError = compileText(label .. ".assembled.lua", table.concat(source))
-  if not ok then fail("Assembled source failed syntax validation: " .. label .. ": " .. compileError) end
-end
-local function validateAll()
-  validateEmbedded()
-  for _, file in ipairs(files) do
-    if not file.target:match("%.part$") then
-      local ok, compileError = compileText(file.target, file.content)
-      if not ok then fail("Embedded file failed syntax validation: " .. file.target .. ": " .. compileError) end
-    end
-  end
-  validateParts("worker", WORKER_PARTS)
-  validateParts("controller", CONTROLLER_PARTS)
-end
--- Kept as a named boundary for source-contract checks and recovery logs.  The
--- role bundle validates from memory, so no /ccminer.update staging tree is
--- needed before a low-space commit.
-local function validateLowSpaceStage()
-  validateAll()
-end
-local function copyIfPresent(source, target)
-  local text = readFile(source)
-  if text then return writeFile(target, text) end
-  return true
-end
-local function moveChecked(source, target)
-  local ok, moveError = pcall(fs.move, source, target)
-  if not ok or not fs.exists(target) then
-    return false, tostring(moveError or ("Move destination is missing: " .. target))
-  end
-  return true
-end
-local function atomicWrite(path, text)
-  local temp, backup = path .. ".tmp", path .. ".bak"
-  ensureDir(fs.getDir(path))
-  if fs.exists(temp) then fs.delete(temp) end
-  local wrote, writeError = writeFile(temp, text)
-  if not wrote then return false, writeError end
-  local hadCurrent = fs.exists(path)
-  if hadCurrent then
-    if fs.exists(backup) then fs.delete(backup) end
-    local moved, moveError = moveChecked(path, backup)
-    if not moved then fs.delete(temp); return false, "Cannot rotate previous file: " .. moveError end
-  end
-  local moved, moveError = moveChecked(temp, path)
-  if not moved then
-    if fs.exists(path) then fs.delete(path) end
-    local restored = true
-    local restoreError
-    if hadCurrent and fs.exists(backup) then
-      restored, restoreError = moveChecked(backup, path)
-    elseif hadCurrent then
-      restored, restoreError = false, "backup is missing"
-    end
-    if fs.exists(temp) then fs.delete(temp) end
-    return false, "Atomic replace failed: " .. tostring(moveError) .. "; rollback: " .. tostring(restoreError or restored)
-  end
-  if fs.exists(backup) then fs.delete(backup) end
-  if fs.exists(temp) then fs.delete(temp) end
-  return true
-end
-local function readConfigRole()
-  local text = readFile(ROOT .. "/config.db")
-  if not text then return nil, "No existing installation found." end
-  if not textutils or type(textutils.unserialize) ~= "function" then return nil, "Cannot decode config.db." end
-  local ok, value = pcall(textutils.unserialize, text)
-  if not ok or type(value) ~= "table" then return nil, "Existing config.db is invalid." end
-  return tostring(value.role or ""), nil
-end
-local function validateAction()
-  local action = requested
-  if action == "" then action = ROLE end
-  if action ~= ROLE and action ~= "update" and action ~= "update-low-space" then
-    fail("This offline bundle is fixed to role " .. ROLE .. "; refusing action " .. tostring(action))
-  end

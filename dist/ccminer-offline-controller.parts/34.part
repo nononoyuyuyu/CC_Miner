@@ -1,3 +1,30 @@
+    elseif name == "stop" then if id then mode = "stop_menu" else setNotice("No worker selected.", true) end
+    elseif name == "pause" or name == "resume" or name == "recall" or name == "service" then sendCommand(id, name)
+    elseif name == "abort" then
+      if id then confirmState = { command = "stop", payload = { mode = "abort" }, message = "Abort the active job and return home?" }; mode = "confirm" end
+    elseif name == "clear" then
+      if id then confirmState = { command = "clear", message = "Clear the completed or aborted job record?" }; mode = "confirm" end
+    elseif name == "rehome" then
+      if id then confirmState = { command = "rehome", payload = { confirm = "RESET" }, twoStep = true, message = "REHOME RESET clears the active job. Press YES twice only when the turtle is physically in its dock." }; mode = "confirm" end
+    elseif name == "gps" then
+      if id then confirmState = { command = "calibrate_gps", message = "GPS calibration moves forward one block and back. Is the dock front clear?" }; mode = "confirm" end
+    elseif name == "quit" then running = false end
+    invalidate()
+  end
+end
+
+local function sortingTick()
+  local settings = config.sorting
+  if not settings or settings.enabled ~= true or common.nowSeconds() - lastSorting < (tonumber(settings.interval) or 30) then return end
+  lastSorting = common.nowSeconds()
+  if not peripheral or not peripheral.wrap then return end
+  local source = peripheral.wrap(settings.source or "")
+  local valuable = peripheral.wrap(settings.valuableTarget or "")
+  local bulk = peripheral.wrap(settings.bulkTarget or "")
+  local seal = peripheral.wrap(settings.sealTarget or "")
+  if not source or type(source.list) ~= "function" or type(source.pushItems) ~= "function" then
+    if not sortingWarned then sortingWarned = true; setNotice("Sorting WARN: source inventory is not configured.", false) end
+    return
   end
   if not valuable or not bulk or not seal then
     if not sortingWarned then sortingWarned = true; setNotice("Sorting WARN: one or more target inventories are missing.", false) end
@@ -13,7 +40,7 @@
   end
 end
 ]] },
-  { source = [[src/ccminer/controller_parts/02.part]], target = [[controller_parts/02.part]], digest = [[275aa46fafae37455f4fad273121b8daf54bc38af0218c4843400a9d0a6f41a1]], content = [[-- CC Miner V4 - adaptive touch views.  Every view has a keyboard fallback and
+  { source = [[src/ccminer/controller_parts/02.part]], target = [[controller_parts/02.part]], digest = [[9f523a5b9993393fd52fb1e53944ba5bd5628b58bd05ef0adfe93ffa02b8162c]], content = [[-- CC Miner V4 - adaptive touch views.  Every view has a keyboard fallback and
 -- uses bounded hitboxes, so a 20x8 monitor remains operable.
 
 local fieldOrder = { "width", "length", "depth", "targetY" }
@@ -136,7 +163,35 @@ local function noticeLine(target, y)
   y = y or height
   if y < 1 then return end
   local noticeColor = noticeIsError and (colors and colors.red or nil) or (colors and colors.lime or nil)
-  common.writeAt(1, y, common.fit(notice, width), noticeColor)
+  local prefix = noticeIsError and "ERROR - open LAST ERR: " or ""
+  common.writeAt(1, y, common.fit(prefix .. notice, width), noticeColor)
+end
+
+local function wrapNotice(text, width)
+  local lines, remaining = {}, tostring(text or "")
+  width = math.max(8, width)
+  while #remaining > width do
+    local cut = width
+    while cut > 1 and remaining:sub(cut, cut) ~= " " do cut = cut - 1 end
+    if cut <= 1 then cut = width end
+    lines[#lines + 1] = remaining:sub(1, cut):gsub("%s+$", "")
+    remaining = remaining:sub(cut + 1):gsub("^%s+", "")
+  end
+  if remaining ~= "" then lines[#lines + 1] = remaining end
+  return lines
+end
+
+local function renderErrorDetail(target, key)
+  local width, height = target.getSize()
+  writeHeader("COMMAND REJECTED - DETAILS", target, colors and colors.red or nil)
+  common.writeAt(1, 2, common.fit("The worker refused the command. Read the reason below.", width), colors and colors.yellow or nil)
+  local lines = wrapNotice(noticeState.detail or notice or "Unknown error", math.max(8, width - 2))
+  local maxLines = math.max(1, height - 5)
+  for index = 1, math.min(#lines, maxLines) do
+    common.writeAt(2, 2 + index, common.fit(lines[index], math.max(1, width - 2)), colors and colors.white or nil)
+  end
+  if #lines > maxLines then common.writeAt(2, height - 2, common.fit("The message continues; use ccm report if needed.", math.max(1, width - 2)), colors and colors.yellow or nil) end
+  buttonRow(key, height, width, { { "OK - RETURN", noticeState.dismiss, true } })
 end
 
 local function statusGlyph(state)
@@ -184,67 +239,3 @@ local function renderDashboard(target, key)
     { "REPORT", dashboardAction("report") }, { "GPS", dashboardAction("gps") },
   })
   buttonRow(key, bottom + 2, width, {
-    { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
-    { "RECALL", dashboardAction("recall") }, { "SERVICE", dashboardAction("service") },
-  })
-  buttonRow(key, bottom + 3, width, {
-    { "ABORT", dashboardAction("abort") }, { "CLEAR", dashboardAction("clear") },
-    { "REHOME", dashboardAction("rehome") }, { "QUIT", dashboardAction("quit") },
-  })
-  -- Group controls are additive; the legacy single-worker rows above remain
-  -- unchanged so old monitors and keyboard shortcuts continue to work.
-  buttonRow(key, math.max(1, bottom - 1), width, {
-    { "GROUPS", dashboardAction("groups") }, { "G START", dashboardAction("group_start") },
-    { "G PAUSE", dashboardAction("group_pause") }, { "G RETURN", dashboardAction("group_return") },
-  })
-  local groupIds = orderedGroupIds()
-  if #groupIds > 0 then
-    local gy = math.max(2, bottom - 2)
-    local gid, g = selectedGroupRecord()
-    local gj = gid and activeGroupJob(gid) or nil
-    local aggregate = gj and (gj.aggregate or updateGroupAggregate(gj)) or nil
-    local line = ("Group %s %s %d workers %s%% minFuel=%s ACK=%s/%s"):format(tostring(gid), groupName(g, gid), #(groupWorkerIds(g)), tostring(aggregate and aggregate.percent or 0), tostring(aggregate and aggregate.minFuel or "-"), tostring(aggregate and aggregate.acks or 0), tostring(aggregate and aggregate.ackTotal or #groupWorkerIds(g)))
-    common.writeAt(1, gy, common.fit(line, width), colors and colors.cyan or nil)
-  end
-  noticeLine(target, height)
-end
-
-local function groupAction(groupCommandName)
-  return function()
-    local gid = selectedGroupRecord()
-    if not gid then setNotice("No group selected.", true); return end
-    if groupCommandName == "start" then
-      groupDraft = groupDraftDefaults(groupRecord(gid))
-      groupDraft.selectedField = "width"
-      groupDraft.buffer = tostring(groupDraft.width or 1)
-      groupDraft.preflight = nil
-      mode = "group_dimensions"
-    else
-      groupCommand(gid, groupCommandName)
-    end
-    invalidate()
-  end
-end
-
-local function groupAssignmentCount(result)
-  local count = 0
-  for _, assignment in pairs(result and result.assignments or {}) do if type(assignment) == "table" then count = count + 1 end end
-  return count
-end
-
-local function renderGroupDimensions(target, key)
-  local width, height = target.getSize()
-  local gid, group = selectedGroupRecord()
-  writeHeader("GROUP JOB / DIMENSIONS", target, colors and colors.cyan or nil)
-  if not gid or not group then
-    common.writeAt(1, 3, common.fit("No group selected.", width), colors and colors.yellow or nil)
-    buttonRow(key, math.max(1, height - 2), width, { { "BACK", function() mode = "groups" end } })
-    noticeLine(target, height)
-    return
-  end
-  groupDraft = groupDraft or groupDraftDefaults(group)
-  local ids = groupWorkerIds(group)
-  local worldMode = groupDraftWorldMode()
-  common.writeAt(1, 2, common.fit(("Group %s (%s) | workers=%d | %s | partition=%s"):format(groupName(group, gid), tostring(gid), #ids, worldMode and "WORLD" or "LOCAL", tostring(groupDraft.partition or group.partition or "stripe")), width), colors and colors.lightGray or nil)
-  common.writeAt(1, 3, common.fit(worldMode and "BOTTOM Y is absolute; each worker reports HOME Y/LAYERS." or "LOCAL uses DEPTH; multi-worker automatic splitting is disabled.", width), colors and colors.lightGray or nil)
-  local visibleFields = groupFieldOrder()

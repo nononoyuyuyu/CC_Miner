@@ -167,7 +167,7 @@ local program, compileError = loader(table.concat(source), "@/ccminer/controller
 if not program then error("Cannot assemble controller: " .. tostring(compileError), 0) end
 return program(...)
 ]] },
-  { source = [[src/ccminer/controller_parts/01.part]], target = [[controller_parts/01.part]], digest = [[0c6f24368798740d52491508d36280c0ae21a7143b558f113eed2fa45c497346]], content = [[-- CC Miner V4 - controller state, persistence and job orchestration.
+  { source = [[src/ccminer/controller_parts/01.part]], target = [[controller_parts/01.part]], digest = [[abf3c092f1fcd9ce5f20a6502b2db65b822439ff768ab50683b6ea07a00f045b]], content = [[-- CC Miner V4 - controller state, persistence and job orchestration.
 -- The controller is deliberately tolerant of V2 worker payloads.  New
 -- fields are additive and every command has a legacy equivalent where one
 -- exists.
@@ -210,6 +210,7 @@ local function dbDefaults()
     groupScheduler = { replenishConcurrency = 1, staggerSeconds = 0 },
     lastPreset = nil,
     lastDraft = nil,
+    lastCommandError = nil,
     updatedAt = common.nowSeconds(),
   }
 end

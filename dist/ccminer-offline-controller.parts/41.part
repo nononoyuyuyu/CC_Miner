@@ -1,3 +1,96 @@
+    aggregate[#aggregate + 1] = file.content; aggregate[#aggregate + 1] = "\0"
+  end
+  local aggregateDigest, aggregateError = digest(table.concat(aggregate))
+  if not aggregateDigest then fail(aggregateError) end
+  if aggregateDigest ~= string.lower(SOURCE_DIGEST) then
+    fail("Embedded role source digest mismatch for " .. ROLE)
+  end
+  return true
+end
+local function validateParts(label, targets)
+  if #targets == 0 then return true end
+  local source = {}
+  for index, target in ipairs(targets) do
+    local found
+    for _, file in ipairs(files) do if file.target == target then found = file.content; break end end
+    if not found then fail("Embedded runtime part is missing: " .. target) end
+    source[index] = found
+  end
+  local ok, compileError = compileText(label .. ".assembled.lua", table.concat(source))
+  if not ok then fail("Assembled source failed syntax validation: " .. label .. ": " .. compileError) end
+end
+local function validateAll()
+  validateEmbedded()
+  for _, file in ipairs(files) do
+    if not file.target:match("%.part$") then
+      local ok, compileError = compileText(file.target, file.content)
+      if not ok then fail("Embedded file failed syntax validation: " .. file.target .. ": " .. compileError) end
+    end
+  end
+  validateParts("worker", WORKER_PARTS)
+  validateParts("controller", CONTROLLER_PARTS)
+end
+-- Kept as a named boundary for source-contract checks and recovery logs.  The
+-- role bundle validates from memory, so no /ccminer.update staging tree is
+-- needed before a low-space commit.
+local function validateLowSpaceStage()
+  validateAll()
+end
+local function copyIfPresent(source, target)
+  local text = readFile(source)
+  if text then return writeFile(target, text) end
+  return true
+end
+local function moveChecked(source, target)
+  local ok, moveError = pcall(fs.move, source, target)
+  if not ok or not fs.exists(target) then
+    return false, tostring(moveError or ("Move destination is missing: " .. target))
+  end
+  return true
+end
+local function atomicWrite(path, text)
+  local temp, backup = path .. ".tmp", path .. ".bak"
+  ensureDir(fs.getDir(path))
+  if fs.exists(temp) then fs.delete(temp) end
+  local wrote, writeError = writeFile(temp, text)
+  if not wrote then return false, writeError end
+  local hadCurrent = fs.exists(path)
+  if hadCurrent then
+    if fs.exists(backup) then fs.delete(backup) end
+    local moved, moveError = moveChecked(path, backup)
+    if not moved then fs.delete(temp); return false, "Cannot rotate previous file: " .. moveError end
+  end
+  local moved, moveError = moveChecked(temp, path)
+  if not moved then
+    if fs.exists(path) then fs.delete(path) end
+    local restored = true
+    local restoreError
+    if hadCurrent and fs.exists(backup) then
+      restored, restoreError = moveChecked(backup, path)
+    elseif hadCurrent then
+      restored, restoreError = false, "backup is missing"
+    end
+    if fs.exists(temp) then fs.delete(temp) end
+    return false, "Atomic replace failed: " .. tostring(moveError) .. "; rollback: " .. tostring(restoreError or restored)
+  end
+  if fs.exists(backup) then fs.delete(backup) end
+  if fs.exists(temp) then fs.delete(temp) end
+  return true
+end
+local function readConfigRole()
+  local text = readFile(ROOT .. "/config.db")
+  if not text then return nil, "No existing installation found." end
+  if not textutils or type(textutils.unserialize) ~= "function" then return nil, "Cannot decode config.db." end
+  local ok, value = pcall(textutils.unserialize, text)
+  if not ok or type(value) ~= "table" then return nil, "Existing config.db is invalid." end
+  return tostring(value.role or ""), nil
+end
+local function validateAction()
+  local action = requested
+  if action == "" then action = ROLE end
+  if action ~= ROLE and action ~= "update" and action ~= "update-low-space" then
+    fail("This offline bundle is fixed to role " .. ROLE .. "; refusing action " .. tostring(action))
+  end
   if action == "worker" and not turtle then fail("Worker installation requires a turtle.") end
   if (action == "update" or action == "update-low-space") then
     local configRole, configError = readConfigRole()
@@ -173,79 +266,3 @@ local function lowSpaceUpdate()
       lowSpaceFailure("Recovery marker has an unknown state: " .. tostring(marker.state))
     end
   else
-    local marked, markerError = markerWrite("ready", 1)
-    if not marked then lowSpaceFailure("Cannot create recovery marker: " .. tostring(markerError)) end
-    marker, markerReadError = markerRead()
-    if markerReadError or not marker then
-      lowSpaceFailure(markerReadError or "Recovery marker was written but could not be read back.")
-    end
-  end
-  local first
-  if marker.state == "final-ready" then
-    -- final-ready explicitly skips every non-loader step on resume.
-    first = #LOW_SPACE_STEPS + 1
-  else
-    first = math.max(1, math.min(#LOW_SPACE_STEPS + 1, marker.next or 1))
-  end
-  local marked, markerError = markerWrite("ready", first)
-  if not marked then lowSpaceFailure("Cannot mark validated runtime: " .. tostring(markerError)) end
-  for index = first, #LOW_SPACE_STEPS do
-    local step = LOW_SPACE_STEPS[index]
-    marked, markerError = markerWrite("committing", index)
-    if not marked then lowSpaceFailure("Cannot record commit progress for step " .. tostring(index) .. ": " .. tostring(markerError)) end
-    local applied, applyError = applyLowSpaceStep(step)
-    if not applied then lowSpaceFailure(applyError) end
-    marked, markerError = markerWrite("committing", index + 1)
-    if not marked then lowSpaceFailure("Applied low-space step " .. tostring(index) .. ", but cannot advance recovery marker: " .. tostring(markerError)) end
-  end
-  local finalContent = embeddedEntrypoint()
-  marked, markerError = markerWrite("final-ready", #LOW_SPACE_STEPS + 1)
-  if not marked then lowSpaceFailure("Cannot mark the validated final role loader: " .. tostring(markerError)) end
-  local finalPath = ROOT .. "/" .. ENTRYPOINT
-  local wrote, writeError = atomicWrite(finalPath, finalContent)
-  if not wrote then lowSpaceFailure("Cannot atomically commit final role loader: " .. tostring(writeError)) end
-  if readFile(finalPath) ~= finalContent then
-    lowSpaceFailure("Final role loader could not be verified after atomic commit.")
-  end
-  local cleared, clearError = clearMarker()
-  if not cleared then lowSpaceFailure(clearError) end
-  print("Low-space update installed: " .. VERSION .. " (schema " .. SCHEMA .. ")")
-  print("User data under /ccminer was left in place. Run: reboot")
-end
-
-if action == "update-low-space" then
-  term.clear(); term.setCursorPos(1, 1)
-  print("CC MINER V4 OFFLINE UPDATE-LOW-SPACE / " .. ROLE); print("")
-  lowSpaceUpdate()
-  return
-end
-
-if fs.exists(BACKUP) then fs.delete(BACKUP) end
-local hadRoot = fs.exists(ROOT)
-if hadRoot then
-  local backedUp, backupError = moveChecked(ROOT, BACKUP)
-  if not backedUp then fs.delete(TEMP); fail("Cannot back up existing installation: " .. backupError) end
-end
-local moved, moveError = moveChecked(TEMP, ROOT)
-if not moved then
-  if fs.exists(ROOT) then fs.delete(ROOT) end
-  local restored, restoreError = true, nil
-  if hadRoot then
-    if fs.exists(BACKUP) then restored, restoreError = moveChecked(BACKUP, ROOT)
-    else restored, restoreError = false, "Backup directory is missing." end
-  end
-  if not restored then
-    fail("Install swap failed and rollback failed. Previous files remain at " .. BACKUP .. ": "
-      .. tostring(moveError) .. "; rollback: " .. tostring(restoreError))
-  end
-  fail("Install swap failed; previous installation was restored: " .. tostring(moveError))
-end
-print("")
-if action == "update" then
-  print("Offline update installed: " .. VERSION .. " (schema " .. SCHEMA .. ")")
-  print("Previous files: /ccminer.backup"); print("Run: reboot")
-else
-  local setupOk = shell.run(ROOT .. "/setup.lua", ROLE)
-  if not setupOk then printError("Setup did not complete. Run: " .. ROOT .. "/setup.lua " .. ROLE)
-  else print(""); print("Installation complete. Run: reboot") end
-end

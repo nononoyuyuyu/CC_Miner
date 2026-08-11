@@ -1,3 +1,45 @@
+  setNotice("INVERT: chunk mining selection inverted; entrance remains selected.", false)
+  invalidate()
+end
+
+local function renderGrid(target, key)
+  local width, height = target.getSize()
+  local catalog, err, chunkMode, _, rootKey = gridCatalog()
+  writeHeader("NEW JOB - TOUCH GRID", target)
+  if not catalog then common.writeAt(1, 3, common.fit(tostring(err), width), colors and colors.red or nil); drawButton(key, 1, height - 1, width, "BACK", function() mode = "job_dimensions" end, true); return end
+  local partialMask = normalizeChunkMask(catalog, rootKey)
+  local byCoordinate, xValues, zValues, xIndex, zIndex = chunkGrid(catalog)
+  local cellWidth = width >= 48 and 2 or 1
+  local cols = common.clamp(math.floor((width - 3) / cellWidth), 1, math.max(1, #xValues))
+  local rows = common.clamp(height - 8, 1, math.max(1, #zValues))
+  draft.gridPageX = common.clamp(draft.gridPageX or 1, 1, math.max(1, #xValues - cols + 1))
+  draft.gridPageZ = common.clamp(draft.gridPageZ or 1, 1, math.max(1, #zValues - rows + 1))
+  local pageX, pageZ = draft.gridPageX, draft.gridPageZ
+  common.writeAt(1, 2, common.fit(("%s chunks cx=%s..%s cz=%s..%s | %s"):format(chunkMode, tostring(xValues[pageX] or "-"), tostring(xValues[math.min(#xValues, pageX + cols - 1)] or "-"), tostring(zValues[pageZ] or "-"), tostring(zValues[math.min(#zValues, pageZ + rows - 1)] or "-"), draft.rectMode and (draft.rectStart and "RECT: second point" or "RECT: first point") or "tap toggles mining"), width), colors and colors.lightGray or nil)
+  for row = 0, rows - 1 do
+    local cz = zValues[pageZ + row]
+    for col = 0, cols - 1 do
+      local cx = xValues[pageX + col]
+      local chunk = cx and cz and byCoordinate[tostring(cx) .. ":" .. tostring(cz)] or nil
+      if chunk then
+      local locked = chunk.key == rootKey
+      local excluded = draft.excluded and draft.excluded[chunk.key] == true
+      local glyph = locked and "E" or excluded and "X" or "."
+      local fg = locked and (colors and colors.black or nil) or excluded and (colors and colors.white or nil) or (colors and colors.lime or nil)
+      local bg = locked and (colors and colors.yellow or nil) or excluded and (colors and colors.red or nil) or (colors and colors.green or nil)
+      local px, py = 2 + col * cellWidth, 4 + row
+      common.writeAt(px, py, common.center(glyph, cellWidth), fg, bg)
+      addHitbox(key, px, py, px + cellWidth - 1, py, function() toggleChunk(chunk, catalog, rootKey) end)
+      end
+    end
+  end
+  local _, excluded = draftCells(catalog, rootKey)
+  common.writeAt(1, math.max(3, height - 5), common.fit(("Mining chunks: %d/%d | E locked | page %d,%d%s"):format(#catalog - excluded, #catalog, pageX, pageZ, partialMask and " | legacy partial mask" or ""), width), partialMask and (colors and colors.red or nil) or (colors and colors.lightGray or nil))
+  buttonRow(key, math.max(1, height - 4), width, {
+    { "ALL", function() allGrid(true) end }, { "CLEAR", function() allGrid(false) end }, { "INVERT", invertGrid }, { "RECT", function() draft.rectMode = not draft.rectMode; draft.rectStart = nil; invalidate() end },
+  })
+  buttonRow(key, math.max(1, height - 3), width, {
+    { "<X", function() draft.gridPageX = math.max(1, draft.gridPageX - cols) end, pageX > 1 }, { "X>", function() draft.gridPageX = math.min(math.max(1, #xValues - cols + 1), draft.gridPageX + cols) end, pageX + cols <= #xValues },
     { "<Z", function() draft.gridPageZ = math.max(1, draft.gridPageZ - rows) end, pageZ > 1 }, { "Z>", function() draft.gridPageZ = math.min(math.max(1, #zValues - rows + 1), draft.gridPageZ + rows) end, pageZ + rows <= #zValues },
   })
   buttonRow(key, math.max(1, height - 2), width, {
@@ -135,44 +177,3 @@ local function renderStopMenu(target, key)
   end
   buttonRow(key, 4, width, { { "PAUSE NOW", action("pause_now", "Pause requested now.") }, { "FINISH ROW", action("finish_row", "Finish current row then stop.") } })
   buttonRow(key, 5, width, { { "FINISH LAYER", action("finish_layer", "Finish current layer then stop.") }, { "RETURN HOME", action("return_home", "Return-home stop requested.") } })
-  buttonRow(key, math.max(6, height - 3), width, { { "ABORT", action("abort", "Abort requested.") }, { "BACK", function() mode = "dashboard" end } })
-  noticeLine(target, height)
-end
-
-local function renderRecovery(target, key)
-  local width, height = target.getSize()
-  local id, worker = selectedWorker()
-  local data = worker and worker.data or {}
-  writeHeader("RECOVERY WIZARD", target, colors and colors.red or nil)
-  local explanation = data.lastError or (data.pendingAction and ("Pending action: " .. tostring(data.pendingAction.kind)) or "Worker needs recovery.")
-  common.writeAt(1, 2, common.fit("State: " .. tostring(data.status or "unknown") .. " / " .. tostring(data.phase or "-"), width), colors and colors.yellow or nil)
-  common.writeAt(1, 3, common.fit(explanation, width), colors and colors.white or nil)
-  buttonRow(key, 5, width, { { "GPS FIX", function() recoveryAction("gps_fix") end }, { "RETRY", function() recoveryAction("retry") end }, { "RESUME", function() recoveryAction("resume") end } })
-  buttonRow(key, 6, width, { { "RETURN", function() recoveryAction("return") end }, { "REHOME RESET", function() recoveryAction("rehome") end }, { "BACK", function() mode = "dashboard" end } })
-  noticeLine(target, height)
-end
-
-local function renderInfo(target, key)
-  local width, height = target.getSize()
-  local id, worker = selectedWorker()
-  local data = worker and worker.data or {}
-  writeHeader("WORKER DETAILS", target)
-  if not id or not worker then common.writeAt(1, 3, common.fit("No worker selected.", width), colors and colors.red or nil)
-  else
-    local lines = {
-      ("ID: %s  Name: %s"):format(tostring(id), workerLabel(worker, id)),
-      ("Status: %s / %s"):format(statusOf(worker), tostring(data.phase or "-")),
-      data.pose and ("Local pose: x=%s y=%s z=%s dir=%s"):format(data.pose.x, data.pose.y, data.pose.z, data.pose.dir) or "Local pose: -",
-      data.world and ("GPS world: %s, %s, %s"):format(data.world.x, data.world.y, data.world.z) or "GPS world: no fix",
-      ("GPS: %s / %s"):format(data.gps and data.gps.calibrated and "calibrated" or "uncalibrated", data.gps and data.gps.available and "available" or "unavailable"),
-      ("Fuel: %s / %s"):format(tostring(data.fuel or "-"), tostring(data.fuelLimit or "-")),
-      ("Inventory: %s used, %s empty, %s items"):format(tostring(data.inventoryUsed or "-"), tostring(data.inventoryEmpty or "-"), tostring(data.inventoryItems or "-")),
-      ("Materials: seal=%s water=%s"):format(tostring(data.materials and data.materials.seal or data.seal and data.seal.count or "-"), tostring(data.materials and data.materials.water or "-")),
-    }
-      if data.job then lines[#lines + 1] = ("Job: %s (%dx%dx%d) [%s]"):format(tostring(data.job.name), data.job.width, data.job.length, data.job.depth, tostring(data.job.strategy or "-")); lines[#lines + 1] = "Progress: " .. progressText(data) end
-      if data.lastError then lines[#lines + 1] = "Error: " .. tostring(data.lastError) end
-      if data.completionReason then lines[#lines + 1] = "Completion: " .. tostring(data.completionReason) end
-      if data.report or data.stats then
-        local report = data.report or data.stats
-        local discard = report.discard or report.discardCount or "-"
-        if type(discard) == "table" then discard = tostring(discard.count or discard.total or common.tableCount(discard)) end

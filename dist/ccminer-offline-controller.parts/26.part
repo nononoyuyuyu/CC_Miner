@@ -1,3 +1,19 @@
+    local payload = normalizeStatus(message.payload)
+    local id = tonumber(payload.id)
+    if not id or id ~= tonumber(sender) then return false end
+    workers[id] = workers[id] or {}
+    local previous = workers[id].data
+    workers[id].data = payload
+    workers[id].lastSeen = common.nowSeconds()
+    workers[id].sender = sender
+    reconcileSingleWorkerLeases(id, payload)
+    local groupJob = findGroupJobForWorker(id, payload)
+    if groupJob then
+      if groupJob.status == "starting" and payload.job and payload.job.assignmentId then acceptGroupStart(groupJob, id, payload.job.assignmentId) end
+      finalizePendingReassignment(groupJob, id, payload)
+      local assignment = groupJob.assignments and (groupJob.assignments[tostring(id)] or groupJob.assignments[id])
+      if assignment then
+        assignment.status = payload.status or payload.phase or assignment.status
         if payload.status == "complete" or payload.status == "completed" or payload.status == "aborted" or payload.status == "idle" then
           if groupJob.awaitingAck then groupJob.awaitingAck[tostring(id)] = nil end
           if groupJob.pending then groupJob.pending[tostring(id)] = nil end
@@ -51,6 +67,15 @@
     return true
   elseif message.kind == "ack" then
     local payload = message.payload or {}
+    if payload.ok ~= true then
+      db.lastCommandError = {
+        workerId = tonumber(sender) or sender,
+        command = tostring(payload.command or "unknown"),
+        message = tostring(payload.message or "Unknown rejection"),
+        at = common.nowSeconds(),
+      }
+      saveControllerDb()
+    end
     setNotice((payload.ok and "OK: " or "ERROR: ") .. tostring(payload.message or ""), not payload.ok)
     handleSingleStartAck(sender, message, payload)
     local ackGroupJobId = payload.groupJobId or payload.parentGroupJobId or payload.group and payload.group.groupJobId
@@ -182,36 +207,3 @@ local function groupCommand(groupId, command, payload)
     maybeFinalizeGroup(groupJob)
     saveControllerDb()
   end
-  if sent < attempted then setNotice(("Group %s: %d/%d commands sent."):format(payload.groupCommand, sent, attempted), true) else setNotice(("Group %s sent to %d workers."):format(payload.groupCommand, sent), false) end
-  return sent == attempted and attempted > 0, sent
-end
-
-local function groupCommandBySelected(command)
-  local id = selectedGroupRecord()
-  if not id then setNotice("No group selected.", true); return false end
-  return groupCommand(id, command)
-end
-
-local function progressText(data)
-  if not data or not data.job then return "-" end
-  local p = data.progress or {}
-  return ("%3d%% %s/%s"):format(
-    tonumber(p.percent or data.job.percent) or 0,
-    common.humanNumber(p.cursor or data.job.cursor or 0),
-    common.humanNumber(p.total or data.job.total or 0)
-  )
-end
-
-local function resetHitboxes(key)
-  hitboxes[key] = {}
-end
-
-local function addHitbox(key, x1, y1, x2, y2, action)
-  hitboxes[key] = hitboxes[key] or {}
-  hitboxes[key][#hitboxes[key] + 1] = {
-    x1 = math.floor(x1), y1 = math.floor(y1), x2 = math.floor(x2), y2 = math.floor(y2), action = action,
-  }
-end
-
-local function drawButton(key, x, y, width, label, action, enabled, selectedButton)
-  width = math.max(3, math.floor(width))

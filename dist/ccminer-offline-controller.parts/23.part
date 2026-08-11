@@ -43,6 +43,7 @@ local acceptGroupStart, rejectGroupStart
 local sortedJobAssignments, groupSafeStop
 local notice = dbError and ("Controller DB recovered: " .. tostring(dbError)) or "Controller ready. Touch DISCOVER or press D."
 local noticeIsError = false
+local noticeState = { detail = nil, returnMode = nil }
 local lastDiscovery = 0
 local running = true
 local mode = "dashboard"
@@ -68,7 +69,32 @@ local function invalidate()
 end
 
 local function setNotice(text, isError)
-  notice, noticeIsError = tostring(text or ""), isError == true
+  local errorNotice = isError == true
+  if not errorNotice and mode == "error_detail" and noticeIsError then return end
+  notice, noticeIsError = tostring(text or ""), errorNotice
+  if errorNotice then
+    noticeState.detail = notice
+    if mode ~= "error_detail" then noticeState.returnMode = mode end
+    mode = "error_detail"
+  end
+  invalidate()
+end
+
+noticeState.dismiss = function()
+  notice, noticeIsError, noticeState.detail = "Error acknowledged.", false, nil
+  mode = noticeState.returnMode or "dashboard"
+  noticeState.returnMode = nil
+  invalidate()
+end
+
+noticeState.showLast = function()
+  local record = db.lastCommandError
+  if type(record) ~= "table" then setNotice("No saved command error.", false); return end
+  noticeState.detail = tostring(record.message or "Unknown command error")
+  notice = noticeState.detail
+  noticeIsError = true
+  noticeState.returnMode = mode
+  mode = "error_detail"
   invalidate()
 end
 
@@ -257,19 +283,3 @@ local function registerGroup(groupId, workerIds, options)
   local partition = tostring(options.partition or previous.partition or (config.group and config.group.partitionMode) or "stripe"):lower()
   if partition ~= "stripe" and partition ~= "round_robin" then return false, "partition_mode_unsupported:" .. partition end
   local allowedWorkers = {}
-  for _, id in ipairs(ids) do allowedWorkers[tostring(id)] = true end
-  local function validateResourceMap(source, name)
-    if source == nil then return true end
-    if type(source) ~= "table" then return false, name .. "_map_invalid" end
-    for key, raw in pairs(source) do
-      local id = tostring(key)
-      if not allowedWorkers[id] then return false, name .. "_worker_unknown:" .. id end
-      local value = raw
-      if type(value) == "table" then value = value.id or value.bayId or value.dockId end
-      if value == nil or common.trim(value) == "" then return false, name .. "_value_empty:" .. id end
-    end
-    return true
-  end
-  local mapOK, mapError = validateResourceMap(options.workerBays or previous.workerBays, "worker_bay")
-  if not mapOK then return false, mapError end
-  mapOK, mapError = validateResourceMap(options.workerDocks or previous.workerDocks, "worker_dock")

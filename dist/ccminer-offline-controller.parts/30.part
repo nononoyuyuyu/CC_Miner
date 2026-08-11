@@ -1,3 +1,27 @@
+              if tonumber(localForward.x) >= tonumber(chunk.minX) and tonumber(localForward.x) <= tonumber(chunk.maxX)
+                and tonumber(localForward.z) >= tonumber(chunk.minZ) and tonumber(localForward.z) <= tonumber(chunk.maxZ) then
+                forwardCell = tostring(chunk.key) == tostring(homeKey) or forwardCell
+              end
+            end
+            if not forwardCell then check("bay cell:#" .. tostring(id), "bad", "worker forward entrance is outside its bay chunk cells", true)
+            else check("bay cell:#" .. tostring(id), "ok", "forward entrance is inside its bay chunk", false) end
+          end
+        end
+      end
+      if not workerBay then
+        check("bay:#" .. tostring(id), "bad", "registered bay metadata unavailable", true)
+      elseif not workerBay.world then
+        check("bay pose:#" .. tostring(id), "bad", "bay world pose unavailable", true)
+      elseif workerBay.world then
+        local pos = data.world or data.position
+        local match = pos and tonumber(pos.x) == tonumber(workerBay.world.x) and tonumber(pos.y) == tonumber(workerBay.world.y) and tonumber(pos.z) == tonumber(workerBay.world.z)
+        if match then check("bay pose:#" .. tostring(id), "ok", "world pose verified", false) else check("bay pose:#" .. tostring(id), "bad", "worker is not at bay world pose", true) end
+        local facing = data.facing or data.pose and data.pose.dir
+        if facing == nil then check("bay facing:#" .. tostring(id), "bad", "worker facing unavailable", true)
+        elseif workerBay.facing ~= nil and tostring(facing) ~= tostring(workerBay.facing) then check("bay facing:#" .. tostring(id), "bad", "facing mismatch", true)
+        else check("bay facing:#" .. tostring(id), "ok", tostring(facing), false) end
+      end
+    end
     if worldMode and not workerDock then check("dock:#" .. tostring(id), "bad", "registered dock metadata unavailable", true) end
     if workerDock and workerDock.maxDepth and tonumber(spec.maxDepth) and tonumber(workerDock.maxDepth) < tonumber(spec.maxDepth) then spec.maxDepth = tonumber(workerDock.maxDepth) end
     local homeY = tonumber(spec.homeY)
@@ -144,11 +168,3 @@ local function dispatchGroupJob(job, force)
   local stagger = math.max(0, tonumber(job.staggerSeconds) or 0)
   for _, assignment in ipairs(sortedJobAssignments(job)) do
     local key = tostring(assignment.workerId)
-    if not job.started[key] and not job.failed[key] and (force or not job.pending[key] or now >= (job.nextDispatchAt or 0)) then
-      local payload = {
-        scope = "group", group = true, groupId = tostring(job.groupId), groupJobId = tostring(job.groupJobId), parentGroupJobId = tostring(job.groupJobId), groupCommand = "START", requestedCommand = "start", assignmentCatalog = common.copy(job.catalog),
-        assignmentId = assignment.assignmentId, assignmentTotal = #sortedJobAssignments(job), assignmentChunks = common.copy(assignment.chunkKeys or {}), chunkKeys = common.copy(assignment.chunkKeys or {}), transitKeys = common.copy(assignment.transitKeys or {}), seedKey = assignment.seedKey, bayChunkKey = assignment.bayChunkKey,
-        homeY = assignment.homeY, bottomY = assignment.bottomY, targetY = assignment.bottomY, layers = assignment.layers, width = job.width, length = job.length, depth = assignment.layers or job.depth,
-        chunkMode = job.chunkMode, name = job.name, profile = job.profile, waterMode = job.waterMode, lighting = common.copy(job.lighting or {}), workerId = assignment.workerId, targetWorkerId = assignment.workerId,
-        bay = assignment.bay, bayId = assignment.bayId, dock = common.copy(assignment.dock or {}), dockId = assignment.dockId, homeWorld = common.copy(assignment.homeWorld), maxDepth = assignment.maxDepth, facing = assignment.facing,
-        lease = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) },

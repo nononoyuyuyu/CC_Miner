@@ -1,3 +1,14 @@
+  local aggregate = { total = #ids, online = 0, active = 0, complete = 0, blocked = 0, waiting = 0, percent = 0, minFuel = nil, warnings = {}, acks = 0, ackTotal = #ids }
+  local weightedDone, weightedTotal = 0, 0
+  local seenWarning = {}
+  for _, id in ipairs(ids) do
+    local worker = workers[id]
+    local data = worker and worker.data or nil
+    local status = statusOf(worker)
+    if status ~= "offline" then aggregate.online = aggregate.online + 1 else aggregate.warnings[#aggregate.warnings + 1] = "offline:#" .. tostring(id) end
+    if status == "complete" or status == "completed" then aggregate.complete = aggregate.complete + 1 end
+    if status == "blocked" then aggregate.blocked = aggregate.blocked + 1 end
+    if status == "waiting_fuel" or status == "waiting_output" or status == "waiting_seal" or status == "waiting_torch" or status == "waiting_water" or status == "service" then aggregate.waiting = aggregate.waiting + 1 end
     if status == "working" or status == "mining" or status == "starting" then aggregate.active = aggregate.active + 1 end
     local fuel = data and tonumber(data.fuel or data.materials and data.materials.fuel)
     if fuel and (aggregate.minFuel == nil or fuel < aggregate.minFuel) then aggregate.minFuel = fuel end
@@ -227,19 +238,3 @@ local function handleMessage(sender, message)
   local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
   if not valid then return false end
   if message.kind == "status" then
-    local payload = normalizeStatus(message.payload)
-    local id = tonumber(payload.id)
-    if not id or id ~= tonumber(sender) then return false end
-    workers[id] = workers[id] or {}
-    local previous = workers[id].data
-    workers[id].data = payload
-    workers[id].lastSeen = common.nowSeconds()
-    workers[id].sender = sender
-    reconcileSingleWorkerLeases(id, payload)
-    local groupJob = findGroupJobForWorker(id, payload)
-    if groupJob then
-      if groupJob.status == "starting" and payload.job and payload.job.assignmentId then acceptGroupStart(groupJob, id, payload.job.assignmentId) end
-      finalizePendingReassignment(groupJob, id, payload)
-      local assignment = groupJob.assignments and (groupJob.assignments[tostring(id)] or groupJob.assignments[id])
-      if assignment then
-        assignment.status = payload.status or payload.phase or assignment.status

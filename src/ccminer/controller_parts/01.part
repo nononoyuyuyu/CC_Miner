@@ -41,6 +41,7 @@ local function dbDefaults()
     groupScheduler = { replenishConcurrency = 1, staggerSeconds = 0 },
     lastPreset = nil,
     lastDraft = nil,
+    lastCommandError = nil,
     updatedAt = common.nowSeconds(),
   }
 end
@@ -145,6 +146,7 @@ local acceptGroupStart, rejectGroupStart
 local sortedJobAssignments, groupSafeStop
 local notice = dbError and ("Controller DB recovered: " .. tostring(dbError)) or "Controller ready. Touch DISCOVER or press D."
 local noticeIsError = false
+local noticeState = { detail = nil, returnMode = nil }
 local lastDiscovery = 0
 local running = true
 local mode = "dashboard"
@@ -170,7 +172,32 @@ local function invalidate()
 end
 
 local function setNotice(text, isError)
-  notice, noticeIsError = tostring(text or ""), isError == true
+  local errorNotice = isError == true
+  if not errorNotice and mode == "error_detail" and noticeIsError then return end
+  notice, noticeIsError = tostring(text or ""), errorNotice
+  if errorNotice then
+    noticeState.detail = notice
+    if mode ~= "error_detail" then noticeState.returnMode = mode end
+    mode = "error_detail"
+  end
+  invalidate()
+end
+
+noticeState.dismiss = function()
+  notice, noticeIsError, noticeState.detail = "Error acknowledged.", false, nil
+  mode = noticeState.returnMode or "dashboard"
+  noticeState.returnMode = nil
+  invalidate()
+end
+
+noticeState.showLast = function()
+  local record = db.lastCommandError
+  if type(record) ~= "table" then setNotice("No saved command error.", false); return end
+  noticeState.detail = tostring(record.message or "Unknown command error")
+  notice = noticeState.detail
+  noticeIsError = true
+  noticeState.returnMode = mode
+  mode = "error_detail"
   invalidate()
 end
 
@@ -883,6 +910,15 @@ local function handleMessage(sender, message)
     return true
   elseif message.kind == "ack" then
     local payload = message.payload or {}
+    if payload.ok ~= true then
+      db.lastCommandError = {
+        workerId = tonumber(sender) or sender,
+        command = tostring(payload.command or "unknown"),
+        message = tostring(payload.message or "Unknown rejection"),
+        at = common.nowSeconds(),
+      }
+      saveControllerDb()
+    end
     setNotice((payload.ok and "OK: " or "ERROR: ") .. tostring(payload.message or ""), not payload.ok)
     handleSingleStartAck(sender, message, payload)
     local ackGroupJobId = payload.groupJobId or payload.parentGroupJobId or payload.group and payload.group.groupJobId
@@ -1248,7 +1284,11 @@ local function computePreflight()
   if plan then check("connectivity", "ok", "connected", false) else check("connectivity", "bad", tostring(planError), true) end
   if partialMask then check("selection", "bad", "partial cell mask cannot be sent; select whole chunks", true) end
   if chunkMode == "world" then
-    check("GPS", calibration and "ok" or "bad", calibration and "calibrated" or "calibration required", not calibration)
+    local gpsData = type(data.gps) == "table" and data.gps or {}
+    local calibrated = gpsData.calibrated == true and calibration ~= nil
+    local available = gpsData.available == true and type(gpsData.lastFix) == "table"
+    check("GPS calibration", calibrated and "ok" or "bad", calibrated and "calibrated" or "run GPS CAL at the dock", not calibrated)
+    check("GPS fix", available and "ok" or "bad", available and "current position available" or tostring(gpsData.lastError or "GPS hosts are not reachable"), not available)
   else
     check("GPS", "ok", "local mode (world features unavailable)", false)
   end
@@ -2104,7 +2144,10 @@ end
 
 local function startDraft()
   if not draft then return false end
-  local result = draft.preflight or computePreflight()
+  -- Worker position, GPS visibility and active-job state may change while the
+  -- preflight page is open. START must use a fresh result, not yesterday's
+  -- green snapshot.
+  local result = computePreflight()
   if not result then setNotice("Preflight failed.", true); return false end
   if result.fatal then setNotice("Start blocked by a fatal preflight item.", true); return false end
   local assignments, assignmentError = buildAssignments(result)
@@ -2376,6 +2419,7 @@ local function dashboardAction(name)
     elseif name == "recovery" then
       if id then mode = "recovery" else setNotice("No worker selected.", true) end
     elseif name == "report" then mode = "report"
+    elseif name == "last_error" then noticeState.showLast()
     elseif name == "stop" then if id then mode = "stop_menu" else setNotice("No worker selected.", true) end
     elseif name == "pause" or name == "resume" or name == "recall" or name == "service" then sendCommand(id, name)
     elseif name == "abort" then

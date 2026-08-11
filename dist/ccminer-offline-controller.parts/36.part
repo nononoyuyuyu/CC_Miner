@@ -1,3 +1,38 @@
+  if not gid or not group then
+    common.writeAt(1, 3, common.fit("No group selected.", width), colors and colors.yellow or nil)
+  else
+    local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, minFuel = nil, warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
+    common.writeAt(1, 2, common.fit(("%s (%s) mode=%s partition=%s"):format(groupName(group, gid), tostring(gid), tostring(group.mode or "world"), tostring(group.partition or "stripe")), width), colors and colors.lightGray or nil)
+    common.writeAt(1, 3, common.fit(("GROUP %s%% | BOTTOM Y=%s | minFuel=%s | ACK %d/%d | warnings=%d"):format(tostring(aggregate.percent or 0), tostring(job and job.bottomY or "-"), tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0, #(aggregate.warnings or {})), width), colors and colors.cyan or nil)
+    local row = 5
+    for _, workerId in ipairs(groupWorkerIds(group)) do
+      if row >= height - 5 then break end
+      local worker = workers[workerId]
+      local data = worker and worker.data or {}
+      local assignment = job and job.assignments and (job.assignments[tostring(workerId)] or job.assignments[workerId]) or nil
+      local status = assignment and assignment.status or statusOf(worker)
+      local homeY = assignment and assignment.homeY or data.homeY or data.gps and data.gps.calibration and data.gps.calibration.home and data.gps.calibration.home.y or "-"
+      local layers = assignment and assignment.layers or data.job and data.job.depth or "-"
+      local progress = worker and progressText(data) or "-"
+      local line = ("#%-4s %-12s %-12s %s HOME Y=%s LAYERS=%s"):format(tostring(workerId), common.fit(workerLabel(worker, workerId), 12), common.fit(status, 12), common.fit(progress, 14), tostring(homeY), tostring(layers))
+      common.writeAt(1, row, common.fit(line, width), status == "blocked" and colors and colors.red or colors and colors.white or nil)
+      row = row + 1
+      if assignment and (status == "blocked" or status == "offline" or status == "failed") then
+        common.writeAt(3, row, common.fit("REMAIN " .. tostring(#(assignment.chunkKeys or {})) .. " chunks; use REASSIGN", math.max(1, width - 3)), colors and colors.yellow or nil)
+        addHitbox(key, 1, row, width, row, function() if job then reassignGroupAssignment(job.groupJobId, workerId) end end)
+        row = row + 1
+      end
+    end
+    local reason = job and (job.returnReason or job.completionReason) or nil
+    local report = job and (job.report or job.metrics) or nil
+    if reason then common.writeAt(1, math.max(4, height - 5), common.fit("RETURN: " .. tostring(reason), width), colors and colors.yellow or nil) end
+    if report then
+      local discard = report.discard or report.discardCount or "-"
+      if type(discard) == "table" then discard = tostring(discard.count or discard.total or common.tableCount(discard)) end
+      common.writeAt(1, math.max(4, height - 4), common.fit(("METRICS blocks=%s fuel=%s discard=%s"):format(tostring(report.blocks or report.totalBlocks or "-"), tostring(report.fuel or "-"), tostring(discard)), width), colors and colors.lightGray or nil)
+    end
+    if aggregate.warnings and #aggregate.warnings > 0 then common.writeAt(1, math.max(4, height - 3), common.fit("WARN: " .. table.concat(aggregate.warnings, "; "), width), colors and colors.orange or nil) end
+  end
   buttonRow(key, math.max(1, height - 1), width, { { "BACK", function() mode = "groups" end }, { "REFRESH", function() local id = selectedGroupRecord(); local job = id and activeGroupJob(id); if job then updateGroupAggregate(job) end; invalidate() end } })
   noticeLine(target, height)
 end
@@ -132,45 +167,3 @@ local function invertGrid()
   normalizeChunkMask(catalog, rootKey)
   draft.excluded = draft.excluded or {}
   for _, chunk in ipairs(catalog) do if chunk.key ~= rootKey then draft.excluded[chunk.key] = not draft.excluded[chunk.key] end end
-  setNotice("INVERT: chunk mining selection inverted; entrance remains selected.", false)
-  invalidate()
-end
-
-local function renderGrid(target, key)
-  local width, height = target.getSize()
-  local catalog, err, chunkMode, _, rootKey = gridCatalog()
-  writeHeader("NEW JOB - TOUCH GRID", target)
-  if not catalog then common.writeAt(1, 3, common.fit(tostring(err), width), colors and colors.red or nil); drawButton(key, 1, height - 1, width, "BACK", function() mode = "job_dimensions" end, true); return end
-  local partialMask = normalizeChunkMask(catalog, rootKey)
-  local byCoordinate, xValues, zValues, xIndex, zIndex = chunkGrid(catalog)
-  local cellWidth = width >= 48 and 2 or 1
-  local cols = common.clamp(math.floor((width - 3) / cellWidth), 1, math.max(1, #xValues))
-  local rows = common.clamp(height - 8, 1, math.max(1, #zValues))
-  draft.gridPageX = common.clamp(draft.gridPageX or 1, 1, math.max(1, #xValues - cols + 1))
-  draft.gridPageZ = common.clamp(draft.gridPageZ or 1, 1, math.max(1, #zValues - rows + 1))
-  local pageX, pageZ = draft.gridPageX, draft.gridPageZ
-  common.writeAt(1, 2, common.fit(("%s chunks cx=%s..%s cz=%s..%s | %s"):format(chunkMode, tostring(xValues[pageX] or "-"), tostring(xValues[math.min(#xValues, pageX + cols - 1)] or "-"), tostring(zValues[pageZ] or "-"), tostring(zValues[math.min(#zValues, pageZ + rows - 1)] or "-"), draft.rectMode and (draft.rectStart and "RECT: second point" or "RECT: first point") or "tap toggles mining"), width), colors and colors.lightGray or nil)
-  for row = 0, rows - 1 do
-    local cz = zValues[pageZ + row]
-    for col = 0, cols - 1 do
-      local cx = xValues[pageX + col]
-      local chunk = cx and cz and byCoordinate[tostring(cx) .. ":" .. tostring(cz)] or nil
-      if chunk then
-      local locked = chunk.key == rootKey
-      local excluded = draft.excluded and draft.excluded[chunk.key] == true
-      local glyph = locked and "E" or excluded and "X" or "."
-      local fg = locked and (colors and colors.black or nil) or excluded and (colors and colors.white or nil) or (colors and colors.lime or nil)
-      local bg = locked and (colors and colors.yellow or nil) or excluded and (colors and colors.red or nil) or (colors and colors.green or nil)
-      local px, py = 2 + col * cellWidth, 4 + row
-      common.writeAt(px, py, common.center(glyph, cellWidth), fg, bg)
-      addHitbox(key, px, py, px + cellWidth - 1, py, function() toggleChunk(chunk, catalog, rootKey) end)
-      end
-    end
-  end
-  local _, excluded = draftCells(catalog, rootKey)
-  common.writeAt(1, math.max(3, height - 5), common.fit(("Mining chunks: %d/%d | E locked | page %d,%d%s"):format(#catalog - excluded, #catalog, pageX, pageZ, partialMask and " | legacy partial mask" or ""), width), partialMask and (colors and colors.red or nil) or (colors and colors.lightGray or nil))
-  buttonRow(key, math.max(1, height - 4), width, {
-    { "ALL", function() allGrid(true) end }, { "CLEAR", function() allGrid(false) end }, { "INVERT", invertGrid }, { "RECT", function() draft.rectMode = not draft.rectMode; draft.rectStart = nil; invalidate() end },
-  })
-  buttonRow(key, math.max(1, height - 3), width, {
-    { "<X", function() draft.gridPageX = math.max(1, draft.gridPageX - cols) end, pageX > 1 }, { "X>", function() draft.gridPageX = math.min(math.max(1, #xValues - cols + 1), draft.gridPageX + cols) end, pageX + cols <= #xValues },

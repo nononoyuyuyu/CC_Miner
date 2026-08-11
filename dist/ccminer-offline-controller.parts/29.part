@@ -1,3 +1,37 @@
+      chunkKeys = common.copy(value.chunkKeys or value.chunks or {}),
+      transitKeys = common.copy(value.transitKeys or {}),
+      seedKey = value.seedKey,
+      estimatedCost = tonumber(value.estimatedCost or value.cost or value.cells) or 0,
+      homeY = spec.homeY,
+    }
+  end
+  return normalized, nil, legacy
+end
+
+local function groupDraftDefaults(group)
+  local previous = db.lastDraft or {}
+  local workerIds = groupWorkerIds(group)
+  local firstData = workerIds[1] and workerData(workerIds[1]) or nil
+  local calibration = firstData and firstData.gps and firstData.gps.calibration
+  local homeY = calibration and calibration.home and tonumber(calibration.home.y) or tonumber(firstData and firstData.homeY)
+  local depth = tonumber(previous.depth) or 16
+  local bottomY = tonumber(previous.bottomY or previous.targetY)
+  if not bottomY and homeY then bottomY = homeY - depth + 1 end
+  return {
+    groupId = group and group.id,
+    width = tonumber(previous.width) or 8,
+    length = tonumber(previous.length) or 32,
+    depth = depth,
+    bottomY = bottomY,
+    targetY = bottomY,
+    mode = group and group.mode or "world",
+    partition = group and group.partition or (config.group and config.group.partitionMode) or "stripe",
+    lighting = normalizedLighting and normalizedLighting(previous.lighting) or common.copy(previous.lighting or { mode = "safe", interval = 10 }),
+    waterMode = normalizedWaterMode and normalizedWaterMode(previous.waterMode) or tostring(previous.waterMode or "seal"),
+    profile = normalizedProfile and normalizedProfile(previous.profile) or tostring(previous.profile or "balanced"),
+    name = previous.name or (group and group.name and ("Group " .. tostring(group.name)) or "Group Quarry"),
+  }
+end
 
 local function groupCatalogAndShape(group, value)
   local mode = value.mode == "world" and "world" or "local"
@@ -144,27 +178,3 @@ local function computeGroupPreflight(groupId, value)
           else
             local forwardCell = false
             for _, chunk in ipairs(catalog or {}) do
-              if tonumber(localForward.x) >= tonumber(chunk.minX) and tonumber(localForward.x) <= tonumber(chunk.maxX)
-                and tonumber(localForward.z) >= tonumber(chunk.minZ) and tonumber(localForward.z) <= tonumber(chunk.maxZ) then
-                forwardCell = tostring(chunk.key) == tostring(homeKey) or forwardCell
-              end
-            end
-            if not forwardCell then check("bay cell:#" .. tostring(id), "bad", "worker forward entrance is outside its bay chunk cells", true)
-            else check("bay cell:#" .. tostring(id), "ok", "forward entrance is inside its bay chunk", false) end
-          end
-        end
-      end
-      if not workerBay then
-        check("bay:#" .. tostring(id), "bad", "registered bay metadata unavailable", true)
-      elseif not workerBay.world then
-        check("bay pose:#" .. tostring(id), "bad", "bay world pose unavailable", true)
-      elseif workerBay.world then
-        local pos = data.world or data.position
-        local match = pos and tonumber(pos.x) == tonumber(workerBay.world.x) and tonumber(pos.y) == tonumber(workerBay.world.y) and tonumber(pos.z) == tonumber(workerBay.world.z)
-        if match then check("bay pose:#" .. tostring(id), "ok", "world pose verified", false) else check("bay pose:#" .. tostring(id), "bad", "worker is not at bay world pose", true) end
-        local facing = data.facing or data.pose and data.pose.dir
-        if facing == nil then check("bay facing:#" .. tostring(id), "bad", "worker facing unavailable", true)
-        elseif workerBay.facing ~= nil and tostring(facing) ~= tostring(workerBay.facing) then check("bay facing:#" .. tostring(id), "bad", "facing mismatch", true)
-        else check("bay facing:#" .. tostring(id), "ok", tostring(facing), false) end
-      end
-    end

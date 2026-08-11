@@ -39,12 +39,25 @@ for _, item in ipairs({
   { "groupJobs = {},", "DB group jobs registry" },
   { "groupLeases = {},", "DB group leases registry" },
   { "pendingStarts = {},", "single START ACK registry" },
+  { "lastCommandError = nil,", "durable command rejection" },
   { "local function persistentGroupValue(source)", "group persistence copier" },
   { "local persistedGroups, persistedDocks, persistedBays, persistedJobs, persistedGroupLeases = {}, {}, {}, {}, {}", "detached group DB roots" },
   { "persistedDb.groups, persistedDb.docks, persistedDb.bays = persistedGroups, persistedDocks, persistedBays", "detached group/dock/bay save" },
   { "persistedDb.groupJobs, persistedDb.groupLeases = persistedJobs, persistedGroupLeases", "detached group job/lease save" },
   { "db.activeLeases = common.copy(db.leases or {})", "detached active lease snapshot" },
   { "persistedDb.activeLeases = common.copy(db.leases or {})", "detached persisted lease snapshot" },
+}) do
+  marker(controller, item[1], item[2])
+end
+
+for _, item in ipairs({
+  { "local function renderErrorDetail(target, key)", "persistent rejection detail screen" },
+  { 'mode = "error_detail"', "rejection detail mode" },
+  { 'db.lastCommandError = {', "saved rejection details" },
+  { 'elseif name == "last_error" then noticeState.showLast()', "last error dashboard action" },
+  { 'local result = computePreflight()', "fresh START preflight" },
+  { 'check("GPS calibration",', "GPS calibration preflight" },
+  { 'check("GPS fix",', "GPS availability preflight" },
 }) do
   marker(controller, item[1], item[2])
 end

@@ -27,6 +27,9 @@ local function processChar(character)
       confirmState, mode = nil, "dashboard"
     elseif character == "n" then confirmState, mode = nil, "dashboard"; setNotice("Cancelled.", false) end
     return
+  elseif mode == "error_detail" then
+    if character == "o" or character == "b" or character == "q" then noticeState.dismiss() end
+    return
   elseif mode == "job_grid" then
     if character == "a" then allGrid(true) elseif character == "c" then allGrid(false) elseif character == "i" then invertGrid() elseif character == "r" then draft.rectMode = not draft.rectMode; draft.rectStart = nil; invalidate() end
     return
@@ -84,6 +87,8 @@ local function processKey(keyCode)
       mode = "info"
       invalidate()
     end
+  elseif mode == "error_detail" then
+    if keys and (keyCode == keys.enter or keyCode == keys.backspace or keyCode == keys.escape) then noticeState.dismiss() end
   elseif mode == "groups" then
     local ids = orderedGroupIds()
     if keys and keyCode == keys.up then selectedGroup = math.max(1, selectedGroup - 1); invalidate()

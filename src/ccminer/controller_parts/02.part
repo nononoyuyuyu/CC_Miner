@@ -121,7 +121,35 @@ local function noticeLine(target, y)
   y = y or height
   if y < 1 then return end
   local noticeColor = noticeIsError and (colors and colors.red or nil) or (colors and colors.lime or nil)
-  common.writeAt(1, y, common.fit(notice, width), noticeColor)
+  local prefix = noticeIsError and "ERROR - open LAST ERR: " or ""
+  common.writeAt(1, y, common.fit(prefix .. notice, width), noticeColor)
+end
+
+local function wrapNotice(text, width)
+  local lines, remaining = {}, tostring(text or "")
+  width = math.max(8, width)
+  while #remaining > width do
+    local cut = width
+    while cut > 1 and remaining:sub(cut, cut) ~= " " do cut = cut - 1 end
+    if cut <= 1 then cut = width end
+    lines[#lines + 1] = remaining:sub(1, cut):gsub("%s+$", "")
+    remaining = remaining:sub(cut + 1):gsub("^%s+", "")
+  end
+  if remaining ~= "" then lines[#lines + 1] = remaining end
+  return lines
+end
+
+local function renderErrorDetail(target, key)
+  local width, height = target.getSize()
+  writeHeader("COMMAND REJECTED - DETAILS", target, colors and colors.red or nil)
+  common.writeAt(1, 2, common.fit("The worker refused the command. Read the reason below.", width), colors and colors.yellow or nil)
+  local lines = wrapNotice(noticeState.detail or notice or "Unknown error", math.max(8, width - 2))
+  local maxLines = math.max(1, height - 5)
+  for index = 1, math.min(#lines, maxLines) do
+    common.writeAt(2, 2 + index, common.fit(lines[index], math.max(1, width - 2)), colors and colors.white or nil)
+  end
+  if #lines > maxLines then common.writeAt(2, height - 2, common.fit("The message continues; use ccm report if needed.", math.max(1, width - 2)), colors and colors.yellow or nil) end
+  buttonRow(key, height, width, { { "OK - RETURN", noticeState.dismiss, true } })
 end
 
 local function statusGlyph(state)
@@ -174,7 +202,7 @@ local function renderDashboard(target, key)
   })
   buttonRow(key, bottom + 3, width, {
     { "ABORT", dashboardAction("abort") }, { "CLEAR", dashboardAction("clear") },
-    { "REHOME", dashboardAction("rehome") }, { "QUIT", dashboardAction("quit") },
+    { "REHOME", dashboardAction("rehome") }, { "LAST ERR", dashboardAction("last_error") },
   })
   -- Group controls are additive; the legacy single-worker rows above remain
   -- unchanged so old monitors and keyboard shortcuts continue to work.
@@ -806,6 +834,7 @@ local function renderOne(target, key)
     elseif mode == "info" then renderInfo(target, key)
     elseif mode == "report" then renderReport(target, key)
     elseif mode == "confirm" then renderConfirm(target, key)
+    elseif mode == "error_detail" then renderErrorDetail(target, key)
     else mode = "dashboard"; renderDashboard(target, key) end
   end)
   renderCache[key] = signature

@@ -1,3 +1,19 @@
+  for _, id in ipairs(ids) do allowedWorkers[tostring(id)] = true end
+  local function validateResourceMap(source, name)
+    if source == nil then return true end
+    if type(source) ~= "table" then return false, name .. "_map_invalid" end
+    for key, raw in pairs(source) do
+      local id = tostring(key)
+      if not allowedWorkers[id] then return false, name .. "_worker_unknown:" .. id end
+      local value = raw
+      if type(value) == "table" then value = value.id or value.bayId or value.dockId end
+      if value == nil or common.trim(value) == "" then return false, name .. "_value_empty:" .. id end
+    end
+    return true
+  end
+  local mapOK, mapError = validateResourceMap(options.workerBays or previous.workerBays, "worker_bay")
+  if not mapOK then return false, mapError end
+  mapOK, mapError = validateResourceMap(options.workerDocks or previous.workerDocks, "worker_dock")
   if not mapOK then return false, mapError end
   local group = {
     id = groupId,
@@ -197,14 +213,3 @@ local function updateGroupAggregate(groupJob)
   if type(groupJob) ~= "table" then return nil end
   local group = groupRecord(groupJob.groupId)
   local ids = groupWorkerIds(group)
-  local aggregate = { total = #ids, online = 0, active = 0, complete = 0, blocked = 0, waiting = 0, percent = 0, minFuel = nil, warnings = {}, acks = 0, ackTotal = #ids }
-  local weightedDone, weightedTotal = 0, 0
-  local seenWarning = {}
-  for _, id in ipairs(ids) do
-    local worker = workers[id]
-    local data = worker and worker.data or nil
-    local status = statusOf(worker)
-    if status ~= "offline" then aggregate.online = aggregate.online + 1 else aggregate.warnings[#aggregate.warnings + 1] = "offline:#" .. tostring(id) end
-    if status == "complete" or status == "completed" then aggregate.complete = aggregate.complete + 1 end
-    if status == "blocked" then aggregate.blocked = aggregate.blocked + 1 end
-    if status == "waiting_fuel" or status == "waiting_output" or status == "waiting_seal" or status == "waiting_torch" or status == "waiting_water" or status == "service" then aggregate.waiting = aggregate.waiting + 1 end

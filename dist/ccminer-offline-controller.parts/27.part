@@ -1,3 +1,36 @@
+  if sent < attempted then setNotice(("Group %s: %d/%d commands sent."):format(payload.groupCommand, sent, attempted), true) else setNotice(("Group %s sent to %d workers."):format(payload.groupCommand, sent), false) end
+  return sent == attempted and attempted > 0, sent
+end
+
+local function groupCommandBySelected(command)
+  local id = selectedGroupRecord()
+  if not id then setNotice("No group selected.", true); return false end
+  return groupCommand(id, command)
+end
+
+local function progressText(data)
+  if not data or not data.job then return "-" end
+  local p = data.progress or {}
+  return ("%3d%% %s/%s"):format(
+    tonumber(p.percent or data.job.percent) or 0,
+    common.humanNumber(p.cursor or data.job.cursor or 0),
+    common.humanNumber(p.total or data.job.total or 0)
+  )
+end
+
+local function resetHitboxes(key)
+  hitboxes[key] = {}
+end
+
+local function addHitbox(key, x1, y1, x2, y2, action)
+  hitboxes[key] = hitboxes[key] or {}
+  hitboxes[key][#hitboxes[key] + 1] = {
+    x1 = math.floor(x1), y1 = math.floor(y1), x2 = math.floor(x2), y2 = math.floor(y2), action = action,
+  }
+end
+
+local function drawButton(key, x, y, width, label, action, enabled, selectedButton)
+  width = math.max(3, math.floor(width))
   local background = colors and (selectedButton and colors.lightBlue or enabled == false and colors.gray or colors.blue) or nil
   local foreground = colors and (enabled == false and colors.lightGray or colors.white) or nil
   common.writeAt(x, y, common.center(label, width), foreground, background)
@@ -199,7 +232,11 @@ local function computePreflight()
   if plan then check("connectivity", "ok", "connected", false) else check("connectivity", "bad", tostring(planError), true) end
   if partialMask then check("selection", "bad", "partial cell mask cannot be sent; select whole chunks", true) end
   if chunkMode == "world" then
-    check("GPS", calibration and "ok" or "bad", calibration and "calibrated" or "calibration required", not calibration)
+    local gpsData = type(data.gps) == "table" and data.gps or {}
+    local calibrated = gpsData.calibrated == true and calibration ~= nil
+    local available = gpsData.available == true and type(gpsData.lastFix) == "table"
+    check("GPS calibration", calibrated and "ok" or "bad", calibrated and "calibrated" or "run GPS CAL at the dock", not calibrated)
+    check("GPS fix", available and "ok" or "bad", available and "current position available" or tostring(gpsData.lastError or "GPS hosts are not reachable"), not available)
   else
     check("GPS", "ok", "local mode (world features unavailable)", false)
   end
@@ -208,22 +245,3 @@ local function computePreflight()
   else check("worker", "bad", "offline or not selected", true) end
   local startableStatus = workerStatus == "idle" or workerStatus == "complete" or workerStatus == "completed" or workerStatus == "aborted"
   check("start state", startableStatus and "ok" or "bad", workerStatus, not startableStatus)
-  check("home", data.atHome == true and "ok" or "bad", data.atHome == true and "at home" or "worker is not at home", data.atHome ~= true)
-  local poseDir = tonumber(data.pose and data.pose.dir)
-  check("facing", poseDir == 0 and "ok" or "bad", poseDir == 0 and "facing quarry" or (poseDir and ("direction=" .. tostring(poseDir)) or "direction unknown"), poseDir ~= 0)
-  local recoveryRequired = data.recoveryRequired == true or data.pendingAction ~= nil
-  check("recovery", recoveryRequired and "bad" or "ok", recoveryRequired and "pending physical recovery" or "ready", recoveryRequired)
-  local unfinished = data.job ~= nil and workerStatus ~= "complete" and workerStatus ~= "completed" and workerStatus ~= "aborted"
-  check("existing job", unfinished and "bad" or "ok", unfinished and "abort or clear the unfinished job first" or "clear", unfinished)
-  if fuel and fuel >= requiredFuel then
-    check("worker fuel", "ok", ("available %s / need %d"):format(tostring(fuel), requiredFuel), false)
-  elseif fuel then
-    check("worker fuel", "warn", ("available %s / need %d (dock refill expected)"):format(tostring(fuel), requiredFuel), false)
-  else
-    check("worker fuel", "warn", ("unknown / need %d"):format(requiredFuel), false)
-  end
-  if data.inventoryEmpty ~= nil then
-    check("inventory", tonumber(data.inventoryEmpty) > 0 and "ok" or "warn", tostring(data.inventoryEmpty or 0) .. " empty", false)
-  else check("inventory", "warn", "unknown", false) end
-  local seal = tonumber(data.materials and (data.materials.sealCount or data.materials.seal) or data.seal and data.seal.count)
-  local torchStock = tonumber(data.lighting and data.lighting.torchCount or data.materials and data.materials.torchCount)
