@@ -1,3 +1,168 @@
+        walk[#walk + 1] = {
+          key = parentKey,
+          first = false,
+          anchor = { x = chunks[parentKey].anchor.x, z = chunks[parentKey].anchor.z },
+        }
+      end
+    end
+  end
+  return walk, visited
+end
+
+function M.buildAssignedChunkPlan(catalog, assignedKeys, options)
+  options = type(options) == "table" and options or {}
+  local sourceEntries, sourceByKey, sourceError = assignedCatalogEntries(catalog)
+  if not sourceEntries then return nil, sourceError end
+  local graphInput = {}
+  for _, source in ipairs(sourceEntries) do graphInput[#graphInput + 1] = source end
+  local sourceChunks, sourceKeys = catalogGraph(graphInput)
+  if not sourceChunks then return nil, sourceKeys end
+  for _, key in ipairs(sourceKeys) do
+    if sourceChunks[key].mode ~= "world" then return nil, "gps_required_world_catalog" end
+  end
+  if not graphConnected(sourceChunks, sourceKeys) then return nil, "chunk_catalog_disconnected" end
+
+  local assignment = type(assignedKeys) == "table" and assignedKeys or nil
+  if assignedKeys == nil and type(catalog) == "table" then
+    assignedKeys = catalog.assignedKeys or catalog.mineChunkKeys or catalog.chunkKeys
+    if not assignedKeys and type(catalog.catalog) == "table" then
+      assignedKeys = catalog.catalog.assignedKeys or catalog.catalog.mineChunkKeys or catalog.catalog.chunkKeys
+    end
+    assignment = type(assignedKeys) == "table" and catalog or nil
+  end
+  local mineKeys, mineError = assignedKeyList(assignment and (assignment.chunkKeys or assignment.assignedKeys or assignment.chunks) or assignedKeys)
+  if not mineKeys then return nil, mineError end
+  local transitInput = options.transitKeys or (assignment and (assignment.transitKeys or assignment.transit))
+  local transitKeys = {}
+  if transitInput ~= nil then
+    local transitError
+    local transitEmpty = type(transitInput) == "table" and next(transitInput) == nil
+    if transitEmpty then transitKeys = {} else
+      transitKeys, transitError = assignedKeyList(transitInput)
+      if not transitKeys then return nil, transitError end
+    end
+  end
+  local mineSet, transitSet = {}, {}
+  for _, key in ipairs(mineKeys) do
+    if not sourceChunks[key] then return nil, "unknown_assigned_chunk:" .. key end
+    mineSet[key] = true
+  end
+  for _, key in ipairs(transitKeys) do
+    if not sourceChunks[key] then return nil, "unknown_transit_chunk:" .. key end
+    if mineSet[key] then return nil, "transit_overlaps_assigned:" .. key end
+    transitSet[key] = true
+  end
+
+  -- Shared catalogs are expressed in the reference worker's local frame.
+  -- Rebase every catalog rectangle through world coordinates before building
+  -- the worker-local graph; this handles both offsets and cardinal rotations.
+  local referenceCalibration = options.referenceCalibration
+  if not referenceCalibration and type(catalog) == "table" then
+    referenceCalibration = catalog.referenceCalibration or catalog.calibrationSeed or catalog.calibration
+    if not referenceCalibration and type(catalog.catalog) == "table" then
+      referenceCalibration = catalog.catalog.referenceCalibration or catalog.catalog.calibrationSeed or catalog.catalog.calibration
+    end
+  end
+  local workerCalibration = options.workerCalibration or options.calibration
+  if workerCalibration and not referenceCalibration then return nil, "reference_calibration_required" end
+  if referenceCalibration and not validCalibration(referenceCalibration) then return nil, "invalid_reference_calibration" end
+  if workerCalibration and not validCalibration(workerCalibration) then return nil, "invalid_worker_calibration" end
+  local referenceRootKey = options.referenceRootKey or (type(catalog) == "table" and catalog.rootKey)
+  if not referenceRootKey and type(catalog) == "table" and type(catalog.catalog) == "table" then
+    referenceRootKey = catalog.catalog.rootKey
+  end
+  if referenceRootKey ~= nil then referenceRootKey = tostring(referenceRootKey) end
+  if not referenceRootKey then
+    for _, key in ipairs(sourceKeys) do
+      if contains(sourceChunks[key], 0, 1) then referenceRootKey = key; break end
+    end
+  end
+  local function rebaseBounds(chunk)
+    if not workerCalibration then return true end
+    local minX, maxX, minZ, maxZ = chunk.minX, chunk.maxX, chunk.minZ, chunk.maxZ
+    local corners = {
+      { x = minX, z = minZ }, { x = minX, z = maxZ },
+      { x = maxX, z = minZ }, { x = maxX, z = maxZ },
+    }
+    local rebasedMinX, rebasedMaxX, rebasedMinZ, rebasedMaxZ
+    for _, corner in ipairs(corners) do
+      local worldX, worldZ = localToWorld(referenceCalibration, corner.x, corner.z)
+      local localX, localZ, rebaseError = worldToLocalXZ(workerCalibration, worldX, worldZ)
+      if not localX or not localZ then return nil, rebaseError or "invalid_rebase" end
+      if localX % 1 ~= 0 or localZ % 1 ~= 0 then return nil, "non_integral_rebase" end
+      rebasedMinX = rebasedMinX and math.min(rebasedMinX, localX) or localX
+      rebasedMaxX = rebasedMaxX and math.max(rebasedMaxX, localX) or localX
+      rebasedMinZ = rebasedMinZ and math.min(rebasedMinZ, localZ) or localZ
+      rebasedMaxZ = rebasedMaxZ and math.max(rebasedMaxZ, localZ) or localZ
+    end
+    chunk.referenceMinX, chunk.referenceMaxX = minX, maxX
+    chunk.referenceMinZ, chunk.referenceMaxZ = minZ, maxZ
+    chunk.minX, chunk.maxX = rebasedMinX, rebasedMaxX
+    chunk.minZ, chunk.maxZ = rebasedMinZ, rebasedMaxZ
+    return true
+  end
+  for _, key in ipairs(sourceKeys) do
+    local ok, rebaseError = rebaseBounds(sourceChunks[key])
+    if not ok then return nil, rebaseError end
+  end
+  if not assignedConnected(sourceChunks, mineKeys) then return nil, "assigned_chunks_disconnected" end
+
+  local seedKey = options.seedKey or (assignment and assignment.seedKey) or mineKeys[1]
+  if seedKey ~= nil then seedKey = tostring(seedKey) end
+  if not seedKey or not mineSet[seedKey] then return nil, "assigned_seed_not_mineable" end
+  local rootKey = options.rootKey or referenceRootKey or sourceKeys[1]
+  rootKey = rootKey and tostring(rootKey) or nil
+  local dockKey = options.dockKey or options.entranceKey or rootKey
+  dockKey = dockKey and tostring(dockKey) or nil
+  if workerCalibration then
+    local dockWorldX, dockWorldZ = localToWorld(workerCalibration, 0, 1)
+    local expectedDockKey = chunkKey("world", math.floor(dockWorldX / 16), math.floor(dockWorldZ / 16))
+    if not sourceChunks[expectedDockKey] then return nil, "worker_entrance_chunk_missing" end
+    if options.dockKey and tostring(options.dockKey) ~= expectedDockKey then return nil, "worker_dock_chunk_mismatch" end
+    dockKey = expectedDockKey
+    -- A group may share one controller dock while workers enter from
+    -- distinct bay chunks.  The worker-local entrance therefore need only be
+    -- present in the catalog and explicitly mineable/transit-allowed below;
+    -- it is not required to equal the reference worker's root chunk.
+  end
+  if not dockKey or not sourceChunks[dockKey] then return nil, "unknown_dock_chunk" end
+  if not mineSet[dockKey] and not transitSet[dockKey] then
+    return nil, "dock_requires_explicit_transit:" .. dockKey
+  end
+
+  local allSet, allKeys = {}, {}
+  for _, key in ipairs(mineKeys) do allSet[key] = true; allKeys[#allKeys + 1] = key end
+  for _, key in ipairs(transitKeys) do
+    if not allSet[key] then allSet[key] = true; allKeys[#allKeys + 1] = key end
+  end
+  table.sort(allKeys, function(left, right) return chunkComparator(sourceChunks[left], sourceChunks[right]) end)
+  local chunks = {}
+  for _, key in ipairs(allKeys) do
+    local source = sourceByKey[key] or sourceChunks[key]
+    local copy = cloneValue(source)
+    if type(copy) ~= "table" then return nil, "invalid_chunk_catalog" end
+    copy.key, copy.mode = key, "world"
+    copy.cx, copy.cz = sourceChunks[key].cx, sourceChunks[key].cz
+    copy.minX, copy.maxX = sourceChunks[key].minX, sourceChunks[key].maxX
+    copy.minZ, copy.maxZ = sourceChunks[key].minZ, sourceChunks[key].maxZ
+    copy.referenceMinX, copy.referenceMaxX = sourceChunks[key].referenceMinX, sourceChunks[key].referenceMaxX
+    copy.referenceMinZ, copy.referenceMaxZ = sourceChunks[key].referenceMinZ, sourceChunks[key].referenceMaxZ
+    copy.cells = sourceChunks[key].cells
+    copy.mine = mineSet[key] == true
+    copy.transit = transitSet[key] == true and not copy.mine
+    copy.parent, copy.anchor, copy.optimizedAnchor = nil, nil, nil
+    chunks[key] = copy
+  end
+  buildNeighborGraph(chunks, allKeys)
+
+  -- Every non-assigned edge on dock -> seed must be explicitly leased as
+  -- transit.  This also permits an entrance outside the worker's mine region
+  -- without silently granting access to arbitrary shared chunks.
+  local servicePath, serviceError = shortestPathInternal(chunks, dockKey, seedKey)
+  if not servicePath then return nil, serviceError or "service_route_disconnected" end
+  for _, key in ipairs(servicePath) do
+    if not mineSet[key] and not transitSet[key] then return nil, "service_route_requires_transit:" .. key end
+  end
 
   -- Runtime movement still consumes `chunk.anchor`, including on older
   -- workers that do not understand serviceRoute waypoints.  Populate every
@@ -59,208 +224,3 @@
     if contains(chunks[dockKey], 0, 1) then
       dockPose.x, dockPose.z = 0, 1
     elseif dockAnchor then
-      dockPose.x, dockPose.z = dockAnchor.x, dockAnchor.z
-    end
-  end
-  local serviceRoute = M.shortestServiceRoute(servicePlan,
-    dockPose, { chunkKey = seedKey }, { y = options.y or options.bottomY or 0 })
-  if not serviceRoute then return nil, "service_route_disconnected" end
-  return {
-    mode = "world",
-    rootKey = seedKey,
-    dockKey = dockKey,
-    entranceKey = dockKey,
-    seedKey = seedKey,
-    chunks = chunks,
-    assignedKeys = cloneStringArray(mineKeys),
-    mineChunkKeys = cloneStringArray(mineKeys),
-    transitKeys = cloneStringArray(transitKeys),
-    serviceRoute = {
-      chunkKeys = cloneStringArray(serviceRoute.chunkKeys),
-      keys = cloneStringArray(serviceRoute.keys or serviceRoute.chunkKeys),
-      path = cloneStringArray(serviceRoute.path or serviceRoute.chunkKeys),
-      transitKeys = cloneStringArray(serviceRoute.transitKeys or serviceRoute.chunkKeys),
-      waypoints = cloneValue(serviceRoute.waypoints),
-      distance = serviceRoute.distance,
-      fallback = serviceRoute.fallback,
-    },
-    transitRouteKeys = cloneStringArray(servicePath),
-    walk = walk,
-    optimizedWalk = optimized,
-    optimizedRoute = optimizedOrder,
-    route = routeCopy,
-    columns = assignedColumns,
-    selectedChunks = #mineKeys,
-    catalogCount = #sourceKeys,
-    bounds = assignedBounds,
-    referenceCalibration = cloneValue(referenceCalibration),
-    workerCalibration = cloneValue(workerCalibration),
-    workerId = assignment and assignment.workerId or options.workerId,
-    groupJobId = assignment and assignment.groupJobId or options.groupJobId,
-    homeY = assignment and assignment.homeY or options.homeY,
-    bottomY = assignment and assignment.bottomY or options.bottomY,
-    depth = assignment and assignment.layers or options.layers,
-  }
-end
-
-M.assignedChunkPlan = M.buildAssignedChunkPlan
-M.buildWorkerChunkPlan = M.buildAssignedChunkPlan
-M.planAssignedChunks = M.buildAssignedChunkPlan
-M.planAssignment = M.buildAssignedChunkPlan
-M.buildAssignmentPlan = M.buildAssignedChunkPlan
-
-local function boundsFrom(value, length, options)
-  options = type(options) == "table" and options or {}
-  local minX, maxX, minZ, maxZ
-  if type(value) == "table" then
-    if value.minX ~= nil and value.maxX ~= nil and value.minZ ~= nil and value.maxZ ~= nil then
-      minX, maxX = integerValue(value.minX), integerValue(value.maxX)
-      minZ, maxZ = integerValue(value.minZ), integerValue(value.maxZ)
-    elseif value.width ~= nil and value.length ~= nil then
-      local width, validLength = integerValue(value.width, 1, MAX_DIMENSION), integerValue(value.length, 1, MAX_DIMENSION)
-      if not width or not validLength or width * validLength > MAX_COLUMNS then return nil, "invalid_bounds" end
-      local originX = integerValue(value.originX ~= nil and value.originX or options.originX or 0)
-      local originZ = integerValue(value.originZ ~= nil and value.originZ or options.originZ or 1)
-      if not originX or not originZ then return nil, "invalid_bounds" end
-      minX, maxX = originX, originX + width - 1
-      minZ, maxZ = originZ, originZ + validLength - 1
-    elseif value.plan then
-      return boundsFrom(value.plan, nil, options)
-    elseif value.chunks then
-      for _, chunk in pairs(value.chunks) do
-        if not minX or chunk.minX < minX then minX = chunk.minX end
-        if not maxX or chunk.maxX > maxX then maxX = chunk.maxX end
-        if not minZ or chunk.minZ < minZ then minZ = chunk.minZ end
-        if not maxZ or chunk.maxZ > maxZ then maxZ = chunk.maxZ end
-      end
-    end
-  else
-    local width = integerValue(value, 1, MAX_DIMENSION)
-    local validLength = integerValue(length, 1, MAX_DIMENSION)
-    if width and validLength and width * validLength <= MAX_COLUMNS then
-      local originX = integerValue(options.originX ~= nil and options.originX or 0)
-      local originZ = integerValue(options.originZ ~= nil and options.originZ or 1)
-      if originX and originZ then
-        minX, maxX = originX, originX + width - 1
-        minZ, maxZ = originZ, originZ + validLength - 1
-      end
-    end
-  end
-  if not minX or not maxX or not minZ or not maxZ or maxX < minX or maxZ < minZ then return nil, "invalid_bounds" end
-  if (maxX - minX + 1) * (maxZ - minZ + 1) > MAX_COLUMNS then return nil, "bounds_too_large" end
-  return {
-    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
-    width = maxX - minX + 1, length = maxZ - minZ + 1,
-    cells = (maxX - minX + 1) * (maxZ - minZ + 1),
-  }
-end
-
-function M.gridBounds(value, length, options)
-  return boundsFrom(value, length, options)
-end
-
-M.getGridBounds = M.gridBounds
-M.bounds = M.gridBounds
-
-function M.gridPage(bounds, page, pageWidth, pageHeight)
-  local normalized, boundsError = boundsFrom(bounds)
-  if not normalized then return nil, boundsError end
-  if type(pageWidth) == "table" then pageHeight, pageWidth = pageWidth.pageHeight, pageWidth.pageWidth end
-  pageWidth = integerValue(pageWidth, 1, MAX_DIMENSION) or 16
-  pageHeight = integerValue(pageHeight, 1, MAX_DIMENSION) or pageWidth
-  local pagesX = math.ceil(normalized.width / pageWidth)
-  local pagesZ = math.ceil(normalized.length / pageHeight)
-  local pageCount = pagesX * pagesZ
-  page = integerValue(page, 1, pageCount) or 1
-  local pageIndex = page - 1
-  local pageX, pageZ = pageIndex % pagesX, math.floor(pageIndex / pagesX)
-  local minX = normalized.minX + pageX * pageWidth
-  local minZ = normalized.minZ + pageZ * pageHeight
-  local maxX = math.min(normalized.maxX, minX + pageWidth - 1)
-  local maxZ = math.min(normalized.maxZ, minZ + pageHeight - 1)
-  return {
-    page = page, pageIndex = pageIndex, pageCount = pageCount,
-    pagesX = pagesX, pagesZ = pagesZ, pageX = pageX, pageZ = pageZ,
-    pageWidth = pageWidth, pageHeight = pageHeight,
-    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
-    width = maxX - minX + 1, length = maxZ - minZ + 1,
-    cells = (maxX - minX + 1) * (maxZ - minZ + 1),
-  }
-end
-
-M.getGridPage = M.gridPage
-M.page = M.gridPage
-M.gridPageInfo = M.gridPage
-M.pageInfo = M.gridPage
-
-function M.gridCell(bounds, index)
-  local normalized, boundsError = boundsFrom(bounds)
-  if not normalized then return nil, boundsError end
-  index = integerValue(index, 0)
-  if not index or index >= normalized.cells then return nil, "index_out_of_range" end
-  local row = math.floor(index / normalized.length)
-  local column = index % normalized.length
-  local z = row % 2 == 0 and (normalized.minZ + column) or (normalized.maxZ - column)
-  return { x = normalized.minX + row, z = z, index = index, row = row, column = column }
-end
-
-M.getGridCell = M.gridCell
-
-function M.gridCellInfo(bounds, x, z)
-  local normalized, boundsError = boundsFrom(bounds)
-  if not normalized then return nil, boundsError end
-  x, z = integerValue(x), integerValue(z)
-  if not x or not z then return nil, "invalid_position" end
-  local inside = contains(normalized, x, z)
-  local info = { x = x, z = z, inside = inside }
-  if inside then
-    local row, column = x - normalized.minX, z - normalized.minZ
-    info.row, info.column = row, column
-    info.index = row * normalized.length + (row % 2 == 0 and column or normalized.length - 1 - column)
-  end
-  return info
-end
-
-M.getCellInfo = M.gridCellInfo
-M.cellInfo = M.gridCellInfo
-
-function M.selectRectangle(bounds, x1, z1, x2, z2, options)
-  local normalized, boundsError = boundsFrom(bounds)
-  if not normalized then return nil, boundsError end
-  if type(x1) == "table" then
-    options = z1
-    local selection = x1
-    x1, z1, x2, z2 = selection.x1 or selection.minX, selection.z1 or selection.minZ, selection.x2 or selection.maxX, selection.z2 or selection.maxZ
-  end
-  x1, z1, x2, z2 = integerValue(x1), integerValue(z1), integerValue(x2), integerValue(z2)
-  if not x1 or not z1 or not x2 or not z2 then return nil, "invalid_rectangle" end
-  if x1 > x2 then x1, x2 = x2, x1 end
-  if z1 > z2 then z1, z2 = z2, z1 end
-  local minX, maxX = math.max(x1, normalized.minX), math.min(x2, normalized.maxX)
-  local minZ, maxZ = math.max(z1, normalized.minZ), math.min(z2, normalized.maxZ)
-  if minX > maxX or minZ > maxZ then return nil, "rectangle_out_of_bounds" end
-  local count = (maxX - minX + 1) * (maxZ - minZ + 1)
-  local result = {
-    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
-    width = maxX - minX + 1, length = maxZ - minZ + 1,
-    count = count, cellsCount = count,
-    clipped = minX ~= x1 or maxX ~= x2 or minZ ~= z1 or maxZ ~= z2,
-  }
-  local includeCells = true
-  if type(options) == "table" and options.includeCells == false then includeCells = false end
-  if type(options) == "boolean" then includeCells = options end
-  if includeCells and count <= MAX_SELECTION_CELLS then
-    result.cells = {}
-    for x = minX, maxX do
-      for z = minZ, maxZ do result.cells[#result.cells + 1] = { x = x, z = z } end
-    end
-    result.selectedCells = result.cells
-  elseif includeCells then
-    result.cellsTruncated = true
-  end
-  return result
-end
-
-M.rectangleSelection = M.selectRectangle
-M.selectRect = M.selectRectangle
-M.rectangle = M.selectRectangle

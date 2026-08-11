@@ -58,6 +58,7 @@ local function processChar(character)
   elseif character == "c" then dashboardAction("clear")()
   elseif character == "i" then dashboardAction("info")()
   elseif character == "g" then dashboardAction("progress")()
+  elseif character == "o" then dashboardAction("remote")()
   elseif character == "e" then dashboardAction("recovery")()
   elseif character == "t" then dashboardAction("report")()
   elseif character == "l" then dashboardAction("gps")()
@@ -293,6 +294,23 @@ local function commandLineMode()
       print(ok and ((command == "dock" and "Dock" or "Bay") .. " saved.") or ("Register error: " .. tostring(err)))
     else print("Usage: " .. command .. " list|register <id> <x> <y> <z> [facing=south|east|north|west|0..3] [maxDepth]") end
     return true
+  end
+  if command == "remote" then
+    local id = tonumber(args[2])
+    if not id then
+      print("Usage: ccm remote <workerId> [-- <command...>]")
+      return true
+    end
+    if args[3] == nil then
+      return noticeState.remoteApi.consoleCommand(id)
+    end
+    if args[3] ~= "--" or args[4] == nil then
+      print("Usage: ccm remote <workerId> [-- <command...>]")
+      return true
+    end
+    local commandText = {}
+    for index = 4, #args do commandText[#commandText + 1] = tostring(args[index]) end
+    return noticeState.remoteApi.consoleCommand(id, table.concat(commandText, " "))
   end
   if command == "discover" or command == "status" then
     discover(); pumpFor(3)

@@ -202,6 +202,37 @@ else
     ensureTable(config, "service", workerDefaults.service)
     local journal = ensureTable(config, "journal", workerDefaults.journal)
     ensureTable(config, "alerts", workerDefaults.alerts)
+    local remoteConsole = ensureTable(config, "remoteConsole", workerDefaults.remoteConsole)
+    config.controllerId = validInteger(config.controllerId, 0, 0, 65535)
+
+    -- Remote console is an explicit opt-in.  Keep the warning immediately
+    -- beside the prompt so a setup rerun cannot make a dangerous feature look
+    -- like an ordinary networking toggle.
+    print("【強い警告】遠隔コンソールは、管理用コンピューターからタートルへコマンドを送ります。")
+    print("採掘を止め、タートルをドックへ戻し、管理番号を確認してから使ってください。")
+    print("既定値はOFFです。CCの無線通信（rednet）は暗号化されません。")
+    remoteConsole.enabled = common.promptYesNo(
+      "遠隔コンソールを有効にしますか（既定OFF）",
+      remoteConsole.enabled == true
+    )
+    if remoteConsole.enabled then
+      if config.controllerId == 0 then
+        print("controllerId=0 のままでは遠隔コンソールを有効にできません。")
+        print("接続を許可する管理用コンピューターのID（controller pin）を入力してください。")
+        print("番号が分からない場合は、管理用コンピューターで id と入力して確認します。")
+        config.controllerId = common.promptNumber("Controller computer ID (1-65535)", 1, 1, 65535)
+      end
+      print("allowShell は任意のシェル実行を許可する別の危険設定です。通常はOFFにしてください。")
+      remoteConsole.allowShell = common.promptYesNo(
+        "allowShell（シェル実行）を許可しますか",
+        remoteConsole.allowShell == true
+      )
+    else
+      -- Disabling the feature also drops the second privilege.  This avoids
+      -- an old allowShell=true value becoming active after a later migration.
+      remoteConsole.allowShell = false
+    end
+    config.remoteConsole = common.normalizeRemoteConsoleConfig(remoteConsole)
     config.profile = enumPrompt("Operating profile (safe/balanced/turbo)", config.profile or "balanced", {
       safe = true, balanced = true, turbo = true,
     }, "balanced")

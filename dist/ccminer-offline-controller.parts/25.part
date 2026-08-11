@@ -1,3 +1,163 @@
+  for id, job in pairs(db.groupJobs or {}) do
+    if type(job) == "table" and tostring(job.groupId or id) == tostring(groupId) then
+      if not latest or tonumber(job.updatedAt or job.startedAt or 0) > tonumber(latest.updatedAt or latest.startedAt or 0) then latest = job end
+    end
+  end
+  return latest
+end
+
+local function groupWorkersTerminalAtHome(groupJob, requireAll)
+  if type(groupJob) ~= "table" then return true end
+  local group = groupRecord(groupJob.groupId)
+  local partialStart = groupJob.status == "PARTIAL_START" and requireAll ~= true
+  for _, id in ipairs(groupWorkerIds(group)) do
+    local key = tostring(id)
+    -- A PARTIAL_START must wait only for workers that actually accepted the
+    -- assignment.  Unstarted/offline targets have no physical lease or
+    -- return route and must not hold finalization forever.
+    if not (partialStart and not (groupJob.started and groupJob.started[key])) then
+      local worker = workers[id]
+      local data = worker and worker.data or {}
+      if statusOf(worker) == "offline" then return false end
+      if groupJob.awaitingAck and groupJob.awaitingAck[key] then return false end
+      local status = tostring(data.status or data.phase or "unknown")
+      if status ~= "complete" and status ~= "completed" and status ~= "aborted" and status ~= "idle" then return false end
+      if data.atHome ~= true then return false end
+    end
+  end
+  return true
+end
+
+local function maybeFinalizeGroup(groupJob)
+  if type(groupJob) ~= "table" then return false end
+  if (groupJob.status == "aborting" or groupJob.status == "clear_requested" or groupJob.status == "PARTIAL_START") and groupWorkersTerminalAtHome(groupJob) then
+    local clear = groupJob.status == "clear_requested"
+    groupJob.status = clear and "cleared" or "aborted"
+    groupJob.finishedAt = common.nowSeconds()
+    releaseGroupLeases(groupJob)
+    if not groupJob.historyRecorded then
+      db.history[#db.history + 1] = { id = tostring(groupJob.groupJobId), kind = "group", groupJobId = groupJob.groupJobId, groupId = groupJob.groupId, worker = groupName(groupRecord(groupJob.groupId), groupJob.groupId), name = groupJob.name, status = groupJob.status, reason = groupJob.returnReason or groupJob.status, startedAt = groupJob.startedAt, finishedAt = groupJob.finishedAt, metrics = common.copy(groupJob.metrics or groupJob.report or {}) }
+      groupJob.historyRecorded = true
+    end
+    return true
+  end
+  return false
+end
+
+finalizePendingReassignment = function(groupJob, workerId, data)
+  local pending = groupJob and groupJob.pendingReassignment
+  if type(pending) ~= "table" or tonumber(pending.targetWorkerId) ~= tonumber(workerId) then return false end
+  local job = data and data.job or {}
+  -- A status response can arrive late (or be the target's pre-dispatch idle
+  -- snapshot).  Never treat that as acceptance of a pending reassignment:
+  -- the echoed assignment and parent group identity are mandatory, and the
+  -- worker must report an actually accepted/running job state.
+  local assignmentId = data and (data.assignmentId or job.assignmentId) or nil
+  if assignmentId == nil or tostring(assignmentId) ~= tostring(pending.assignmentId) then return false end
+  local reportedGroupJobId = data and (data.groupJobId or (data.group and data.group.groupJobId)) or nil
+  reportedGroupJobId = reportedGroupJobId or (job and (job.groupJobId or job.parentGroupJobId))
+  if reportedGroupJobId == nil or tostring(reportedGroupJobId) ~= tostring(groupJob.groupJobId) then return false end
+  local status = tostring((data and (data.status or data.phase)) or ""):lower()
+  local acceptedStates = {
+    accepted = true, starting = true, working = true, mining = true, transit = true,
+    servicing = true, service = true, service_requested = true, waiting_fuel = true,
+    waiting_output = true, waiting_seal = true, waiting_torch = true, waiting_water = true,
+  }
+  if not acceptedStates[status] then return false end
+  local source = groupJob.assignments and (groupJob.assignments[tostring(pending.sourceWorkerId)] or groupJob.assignments[pending.sourceWorkerId])
+  if not source then return false end
+  local targetKey = tostring(pending.targetWorkerId)
+  local target = groupJob.assignments[targetKey] or {
+    workerId = pending.targetWorkerId, groupJobId = groupJob.groupJobId, parentJobId = groupJob.groupJobId,
+    jobId = groupJob.groupJobId .. "/reassign-" .. targetKey, assignmentId = pending.assignmentId, chunkKeys = {}, transitKeys = {},
+  }
+  target.chunkKeys = common.copy(pending.chunkKeys or {})
+  target.transitKeys = common.copy(pending.transitKeys or {})
+  target.assignmentResumeToken = pending.assignmentResumeToken and common.copy(pending.assignmentResumeToken) or nil
+  target.status, target.reassignedFrom, target.reassignedAt = "reassigned", pending.sourceWorkerId, common.nowSeconds()
+  target.bay, target.bayId, target.dock, target.dockId = pending.bay, pending.bayId, common.copy(pending.dock or {}), pending.dockId
+  target.homeWorld, target.maxDepth, target.facing = common.copy(pending.homeWorld), pending.maxDepth, pending.facing
+  groupJob.assignments[targetKey] = target
+  source.chunkKeys, source.status = {}, "reassigned"
+  groupJob.pendingReassignment = nil
+  groupJob.alerts = groupJob.alerts or {}
+  groupJob.alerts[#groupJob.alerts + 1] = "REASSIGNED:#" .. tostring(pending.sourceWorkerId) .. "->#" .. targetKey
+  for _, collection in ipairs({ db.leases or {}, db.groupLeases or {} }) do
+    for _, lease in ipairs(collection) do
+      if tostring(lease.groupJobId or "") == tostring(groupJob.groupJobId) and tostring(lease.assignmentId or "") == tostring(source.assignmentId) then
+        lease.workerId = pending.targetWorkerId
+        lease.assignmentId = pending.assignmentId
+        lease.jobId = target.jobId
+        lease.chunks = common.copy(lease.kind == "transit" and pending.transitKeys or pending.chunkKeys or {})
+      end
+    end
+  end
+  updateGroupAggregate(groupJob)
+  saveControllerDb()
+  return true
+end
+
+acceptGroupStart = function(groupJob, workerId, assignmentId)
+  if type(groupJob) ~= "table" then return false end
+  local key = tostring(workerId)
+  local assignment = groupJob.assignments and (groupJob.assignments[key] or groupJob.assignments[workerId])
+  if not assignment then return false end
+  if assignmentId and tostring(assignment.assignmentId or "") ~= tostring(assignmentId) then return false end
+  assignment.status, assignment.acceptedAt = "started", common.nowSeconds()
+  groupJob.started = groupJob.started or {}; groupJob.started[key] = true
+  groupJob.awaitingAck = groupJob.awaitingAck or {}; groupJob.awaitingAck[key] = nil
+  groupJob.pending = groupJob.pending or {}; groupJob.pending[key] = nil
+  groupJob.acks = groupJob.acks or {}; groupJob.acks[key] = { ok = true, command = "START", at = common.nowSeconds() }
+  local remaining = false
+  for _, candidate in ipairs(sortedJobAssignments(groupJob)) do
+    local candidateKey = tostring(candidate.workerId)
+    if not groupJob.started[candidateKey] and not groupJob.failed[candidateKey] then remaining = true; break end
+  end
+  if not remaining and not groupJob.pendingReassignment then groupJob.status = "working"; groupJob.startedAt = groupJob.startedAt or common.nowSeconds() end
+  groupJob.updatedAt = common.nowSeconds()
+  updateGroupAggregate(groupJob)
+  saveControllerDb()
+  return true
+end
+
+rejectGroupStart = function(groupJob, workerId, reason)
+  if type(groupJob) ~= "table" then return false end
+  local key = tostring(workerId)
+  local assignment = groupJob.assignments and (groupJob.assignments[key] or groupJob.assignments[workerId])
+  if assignment then assignment.status, assignment.error = "failed", reason or "start_rejected" end
+  groupJob.failed = groupJob.failed or {}; groupJob.failed[key] = true
+  groupJob.awaitingAck = groupJob.awaitingAck or {}; groupJob.awaitingAck[key] = nil
+  groupJob.pending = groupJob.pending or {}; groupJob.pending[key] = nil
+  groupJob.status = "PARTIAL_START"
+  for startedKey in pairs(groupJob.started or {}) do groupSafeStop(groupJob, startedKey, "start_rejected") end
+  releaseGroupLeases(groupJob, true)
+  groupJob.alerts = groupJob.alerts or {}
+  groupJob.alerts[#groupJob.alerts + 1] = "PARTIAL_START"
+  groupJob.alerts[#groupJob.alerts + 1] = "worker #" .. key .. ": " .. tostring(reason or "start rejected")
+  updateGroupAggregate(groupJob)
+  saveControllerDb()
+  return false
+end
+
+local function groupJobIdForWorker(id, data)
+  local job = data and data.job or {}
+  local candidate = data and (data.groupJobId or data.group and data.group.groupJobId) or nil
+  candidate = candidate or job.groupJobId or job.parentGroupJobId or job.groupId
+  if candidate then return tostring(candidate) end
+  for key, groupJob in pairs(db.groupJobs or {}) do
+    if type(groupJob) == "table" then
+      for _, assignment in pairs(groupJob.assignments or {}) do
+        if type(assignment) == "table" and tonumber(assignment.workerId) == tonumber(id) and (not job.id or tostring(assignment.jobId or "") == tostring(job.id or "") or tostring(assignment.assignmentId or "") == tostring(job.assignmentId or "")) then
+          return tostring(groupJob.groupJobId or groupJob.id or key)
+        end
+      end
+    end
+  end
+  return nil
+end
+
+local function groupStatusLabel(status)
+  status = tostring(status or "unknown")
   if status == "completed" then return "complete" end
   if status == "waiting" or status == "service_requested" then return "service" end
   return status
@@ -31,208 +191,3 @@ local function updateGroupAggregate(groupJob)
   end
   aggregate.percent = weightedTotal > 0 and math.floor(weightedDone * 100 / weightedTotal + 0.5) or (#ids > 0 and math.floor(aggregate.complete * 100 / #ids + 0.5) or 0)
   if aggregate.blocked > 0 then aggregate.warnings[#aggregate.warnings + 1] = "blocked=" .. tostring(aggregate.blocked) end
-  if aggregate.waiting > 0 then aggregate.warnings[#aggregate.warnings + 1] = "service=" .. tostring(aggregate.waiting) end
-  if aggregate.minFuel == nil then aggregate.warnings[#aggregate.warnings + 1] = "minFuel=unknown" end
-  for _, eventWarning in ipairs(groupJob.alerts or {}) do
-    local text = tostring(eventWarning)
-    if not seenWarning[text] then seenWarning[text] = true; aggregate.warnings[#aggregate.warnings + 1] = text end
-  end
-  groupJob.aggregate = persistentDraft(aggregate)
-  groupJob.minFuel = aggregate.minFuel
-  groupJob.warnings = common.copy(aggregate.warnings)
-  groupJob.updatedAt = common.nowSeconds()
-  return aggregate
-end
-
-local function findGroupJobForWorker(id, data)
-  local explicit = groupJobIdForWorker(id, data)
-  if explicit and db.groupJobs[explicit] then return db.groupJobs[explicit], explicit end
-  return nil, explicit
-end
-
-local function normalizeStatus(data)
-  data = data or {}
-  -- V2 workers expose cursor/total under job and have no progress/materials
-  -- objects.  Keep a normalized view without requiring a worker upgrade.
-  data.progress = type(data.progress) == "table" and data.progress or {}
-  if data.job then
-    if data.progress.cursor == nil then data.progress.cursor = data.job.cursor end
-    if data.progress.total == nil then data.progress.total = data.job.total end
-    if data.progress.percent == nil then data.progress.percent = data.job.percent end
-    if data.progress.layer == nil then data.progress.layer = data.job.currentLayer end
-  end
-  data.materials = type(data.materials) == "table" and data.materials or {}
-  if data.materials.fuel == nil then data.materials.fuel = data.fuel end
-  if data.materials.inventoryEmpty == nil then data.materials.inventoryEmpty = data.inventoryEmpty end
-  if data.materials.seal == nil and data.seal then data.materials.seal = data.seal.count end
-  data.capabilities = type(data.capabilities) == "table" and data.capabilities or {}
-  return data
-end
-
-local function activeJobId(data)
-  return data and data.job and tostring(data.job.id or "") or nil
-end
-
-local function addHistory(id, data, reason)
-  if not data then return end
-  local job = data.job or {}
-  local report = data.report or {}
-  db.history[#db.history + 1] = {
-    id = tostring(job.id or ("worker-" .. tostring(id) .. "-" .. common.nowMillis())),
-    jobId = job.id,
-    workerId = tonumber(id) or id,
-    worker = workerLabel(workers[id], id),
-    name = job.name,
-    status = data.status,
-    reason = reason or data.completionReason,
-    startedAt = job.startedAt,
-    finishedAt = common.nowSeconds(),
-    progress = common.copy(data.progress or job),
-    stats = common.copy(data.stats or {}),
-    report = common.copy(report),
-  }
-  local historyLimit = math.max(1, tonumber(config.historyLimit) or 50)
-  while #db.history > historyLimit do table.remove(db.history, 1) end
-  saveControllerDb()
-end
-
-local function releaseLeasesForWorker(id, jobId)
-  local kept = {}
-  local currentAtHome = workers[id] and workers[id].data and workers[id].data.atHome == true
-  for _, lease in ipairs(db.leases or {}) do
-    local sameWorker = tonumber(lease.workerId) == tonumber(id)
-    local sameJob = not jobId or tostring(lease.jobId) == tostring(jobId)
-    if not (sameWorker and sameJob and (not lease.groupJobId or currentAtHome)) then kept[#kept + 1] = lease end
-  end
-  db.leases = kept
-  local keptGroup = {}
-  for _, lease in ipairs(db.groupLeases or {}) do
-    local sameWorker = tonumber(lease.workerId) == tonumber(id)
-    local sameJob = not jobId or tostring(lease.jobId) == tostring(jobId) or tostring(lease.groupJobId) == tostring(jobId)
-    if not (sameWorker and sameJob and (not lease.groupJobId or currentAtHome)) then keptGroup[#keptGroup + 1] = lease end
-  end
-  db.groupLeases = keptGroup
-  db.activeLeases = common.copy(kept)
-  saveControllerDb()
-end
-
--- A direct single-worker START is a two-phase operation: rednet.send only
--- confirms that the packet was queued, not that the worker accepted it. Keep
--- the lease until an ACK/status confirms acceptance, and release it
--- immediately on an explicit rejection. This also repairs leases left by
--- older controllers which treated a rejected packet as a started job.
-local function reconcileSingleWorkerLeases(id, data)
-  if not id or type(data) ~= "table" then return false end
-  local key = tostring(id)
-  local pending = db.pendingStarts and db.pendingStarts[key]
-  local activeId = activeJobId(data)
-  if pending and activeId and tostring(activeId) == tostring(pending.jobId) then
-    db.pendingStarts[key] = nil
-    saveControllerDb()
-    setNotice("Worker #" .. key .. " accepted the job.", false)
-    pending = nil
-  end
-  local status = tostring(data.status or "")
-  local safelyIdle = data.atHome == true and (status == "idle" or status == "complete" or status == "completed" or status == "aborted")
-  if not safelyIdle then return false end
-  local kept, removed = {}, 0
-  for _, lease in ipairs(db.leases or {}) do
-    local sameWorker = tonumber(lease.workerId) == tonumber(id)
-    local directLease = not lease.groupJobId
-    local matchesActive = activeId and tostring(lease.jobId or "") == tostring(activeId)
-    local matchesPending = pending and tostring(lease.jobId or "") == tostring(pending.jobId or "")
-    if sameWorker and directLease and not matchesActive and not matchesPending then
-      removed = removed + 1
-    else
-      kept[#kept + 1] = lease
-    end
-  end
-  if removed > 0 then
-    db.leases = kept
-    db.activeLeases = common.copy(kept)
-    saveControllerDb()
-    setNotice(("Cleared %d rejected/stale START reservation%s for worker #%s."):format(removed, removed == 1 and "" or "s", key), false)
-    return true
-  end
-  return false
-end
-
-local function handleSingleStartAck(sender, message, payload)
-  local key = tostring(sender)
-  local pending = db.pendingStarts and db.pendingStarts[key]
-  if not pending or tostring(payload.command or "") ~= "start" then return false end
-  if pending.messageId and message.replyTo and tostring(pending.messageId) ~= tostring(message.replyTo) then return false end
-  db.pendingStarts[key] = nil
-  if payload.ok == true then
-    saveControllerDb()
-    setNotice("START accepted by worker #" .. key .. ".", false)
-  else
-    for _, item in ipairs(db.queue or {}) do
-      local awaiting = item.awaiting
-      if awaiting and tonumber(awaiting.workerId) == tonumber(sender) and tostring(awaiting.jobId) == tostring(pending.jobId) then
-        item.awaiting = nil
-        item.retryAt = common.nowSeconds() + 15
-        item.lastError = tostring(payload.message or "worker rejected START")
-      end
-    end
-    releaseLeasesForWorker(sender, pending.jobId)
-    setNotice("START rejected by worker #" .. key .. ": " .. tostring(payload.message or "unknown reason"), true)
-  end
-  return true
-end
-
-local function acknowledgeQueuedStart(id, data)
-  local job = data and data.job
-  if not job then return end
-  for index, item in ipairs(db.queue or {}) do
-    local awaiting = item.awaiting
-    if awaiting and tonumber(awaiting.workerId) == tonumber(id) and tostring(awaiting.jobId) == tostring(job.id) then
-      table.remove(db.queue, index)
-      saveControllerDb()
-      setNotice("Queued job accepted by worker #" .. tostring(id) .. ".", false)
-      return
-    end
-  end
-end
-
-local function alert(kind, id, text)
-  -- Offline/unknown are intentionally not alerts.  Respect the optional
-  -- per-channel settings and allow the same condition after cooldown.
-  local settings = config.alerts or {}
-  if settings.enabled == false then return end
-  if kind == "complete" and settings.onComplete == false then return end
-  if kind == "material" and settings.onWaiting == false then return end
-  if kind == "blocked" and settings.onError == false then return end
-  local key = tostring(id) .. ":" .. tostring(kind)
-  local now = common.nowSeconds()
-  local previous = alertLedger[key]
-  local cooldown = math.max(0, tonumber(settings.cooldownSeconds) or 30)
-  if previous and now - (previous.at or 0) < cooldown then return end
-  alertLedger[key] = { at = now }
-  if settings.speaker ~= false then
-    local instrument = kind == "complete" and "pling" or kind == "material" and "bell" or "bass"
-    local pitch = kind == "complete" and 12 or kind == "material" and 6 or 4
-    for _, entry in ipairs(speakers) do
-      local speaker = entry.device
-      if speaker and speaker.playNote then pcall(speaker.playNote, instrument, 1, pitch)
-      elseif speaker and speaker.playSound then pcall(speaker.playSound, "minecraft:block.note_block." .. instrument, 1, 1) end
-    end
-  end
-  if settings.redstone ~= false then
-    local side = tostring(settings.redstoneSide or "back")
-    local timer = os.startTimer and os.startTimer(0.25)
-    if redstone and redstone.setOutput then
-      pcall(redstone.setOutput, side, true)
-      if timer then alertTimers[timer] = { global = true, side = side } end
-    else
-      local relays = {}
-      for _, entry in ipairs(redstoneDevices) do
-        local relay = entry.device
-        if relay and relay.setOutput then
-          pcall(relay.setOutput, side, true)
-          relays[#relays + 1] = relay
-        end
-      end
-      if timer and #relays > 0 then alertTimers[timer] = { relays = relays, side = side } end
-    end
-  end

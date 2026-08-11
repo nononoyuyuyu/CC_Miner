@@ -1,177 +1,156 @@
-  if not targetWorkerId then setNotice("No online target for residual range.", true); return false end
-  local targetData, targetStatus = workerData(targetWorkerId) or {}, statusOf(workers[targetWorkerId])
-  if not ((targetStatus == "idle" or targetStatus == "complete" or targetStatus == "aborted") and targetData.atHome == true) then setNotice("Reassign target must be idle/terminal and at home.", true); return false end
-  if job.chunkMode == "world" and not (targetData.gps and targetData.gps.calibration) then setNotice("Reassign target requires GPS calibration.", true); return false end
-  local group = groupRecord(job.groupId)
-  local bayId, bay = groupWorkerResource(group, targetWorkerId, "bay")
-  local dockId, dock = groupWorkerResource(group, targetWorkerId, "dock")
-  if job.chunkMode == "world" and (not bay or not dock) then setNotice("Reassign target bay/dock metadata unavailable.", true); return false end
-  if bay and bay.world then
-    local pos = targetData.world or targetData.position
-    if not pos or tonumber(pos.x) ~= tonumber(bay.world.x) or tonumber(pos.y) ~= tonumber(bay.world.y) or tonumber(pos.z) ~= tonumber(bay.world.z) then setNotice("Reassign target is not at its bay pose.", true); return false end
-  end
-  local targetKey = tostring(targetWorkerId)
-  local existingTarget = job.assignments[targetKey]
-  local target = existingTarget and common.copy(existingTarget) or { workerId = tonumber(targetWorkerId) or targetWorkerId, groupJobId = job.groupJobId, parentJobId = job.groupJobId, jobId = job.groupJobId .. "/reassign-" .. targetKey, assignmentId = job.groupJobId .. ":reassign:" .. targetKey, chunkKeys = {}, transitKeys = {}, status = "pending_reassign" }
-  target.chunkKeys = common.copy(source.chunkKeys)
-  target.transitKeys = common.copy(source.transitKeys or {})
-  target.bay, target.bayId, target.dock, target.dockId = bayId, bayId, common.copy(dock or {}), dockId
-  target.homeWorld = dock and common.copy(dock.homeWorld or dock.world) or common.copy(target.homeWorld or targetData.world)
-  target.maxDepth = tonumber(dock and dock.maxDepth or target.maxDepth or config.maxDepth)
-  target.facing = targetData.facing or target.facing
-  if job.chunkMode == "world" and targetData.gps and targetData.gps.calibration and targetData.gps.calibration.home then
-    local targetHome = targetData.gps.calibration.home
-    if tonumber(targetHome.x) and tonumber(targetHome.z) then
-      target.bayChunkKey = quarry.chunkKey("world", math.floor(tonumber(targetHome.x) / 16), math.floor(tonumber(targetHome.z) / 16))
+      local layers = math.floor(homeY - bottom + 1)
+      local maxDepth = tonumber(spec.maxDepth or config.maxDepth)
+      if layers < 1 then check("maxDepth:#" .. tostring(id), "bad", "BOTTOM Y is above HOME Y", true) elseif layers > maxDepth then check("maxDepth:#" .. tostring(id), "bad", tostring(layers) .. " > " .. tostring(maxDepth), true) else check("maxDepth:#" .. tostring(id), "ok", tostring(layers), false) end
+      minDepth = minDepth and math.min(minDepth, layers) or layers
     end
+    local availableFuel = tonumber(data.fuel or data.materials and data.materials.fuel)
+    if availableFuel and (minFuel == nil or availableFuel < minFuel) then minFuel = availableFuel end
+    local workerDepth = (worldMode and homeY and commonBottom and math.max(1, math.floor(homeY - commonBottom + 1))) or tonumber(value.depth) or 1
+    maxRequiredFuel = math.max(maxRequiredFuel, estimateFuel(#catalog * workerDepth, value.width, value.length, workerDepth))
+    if chunkMode == "local" and #ids > 1 then check("local group partition", "bad", "local jobs cannot be auto-split", true) end
   end
-  target.homeY = target.homeY or source.homeY
-  target.bottomY = target.bottomY or source.bottomY
-  target.layers = target.layers or source.layers
-  local outboundToken = sourceToken and common.copy(sourceToken) or nil
-  if outboundToken then
-    outboundToken.sourceAssignmentId = source.assignmentId
-    outboundToken.reassignedFromAssignmentId = source.assignmentId
-    outboundToken.assignmentId = target.assignmentId
-    outboundToken.groupJobId = job.groupJobId
-    outboundToken.jobId = target.jobId
-    outboundToken.sourceWorkerId = tonumber(stoppedWorkerId) or stoppedWorkerId
-    outboundToken.workerId = target.workerId
-    target.assignmentResumeToken = common.copy(outboundToken)
-  else
-    target.assignmentResumeToken = nil
-  end
-  local pending = {
-    sourceWorkerId = tonumber(stoppedWorkerId) or stoppedWorkerId, targetWorkerId = tonumber(targetWorkerId) or targetWorkerId, assignmentId = target.assignmentId, sourceAssignmentId = source.assignmentId,
-    jobId = target.jobId, chunkKeys = common.copy(source.chunkKeys), transitKeys = common.copy(source.transitKeys or {}), bay = bayId, bayId = bayId, dock = common.copy(dock or {}), dockId = dockId,
-    homeWorld = common.copy(target.homeWorld), maxDepth = target.maxDepth, facing = target.facing, homeY = target.homeY, bottomY = target.bottomY, layers = target.layers, assignmentResumeToken = common.copy(outboundToken), sentAt = common.nowSeconds(), status = "awaiting_ack",
-  }
-  local payload = {
-    scope = "group", group = true, groupId = job.groupId, groupJobId = job.groupJobId, parentGroupJobId = job.groupJobId, groupCommand = "START", requestedCommand = "start", command = "start", assignmentCatalog = common.copy(job.catalog),
-    assignmentId = target.assignmentId, sourceAssignmentId = source.assignmentId, reassignedFromAssignmentId = source.assignmentId, assignmentResumeToken = common.copy(outboundToken), assignmentChunks = common.copy(pending.chunkKeys), chunkKeys = common.copy(pending.chunkKeys), transitKeys = common.copy(pending.transitKeys), seedKey = target.seedKey,
-    homeY = target.homeY, bottomY = target.bottomY, targetY = target.bottomY, layers = target.layers, width = job.width, length = job.length, depth = target.layers or job.depth, chunkMode = job.chunkMode,
-    name = job.name, profile = job.profile, waterMode = job.waterMode, lighting = common.copy(job.lighting or {}), workerId = target.workerId, targetWorkerId = target.workerId,
-    bay = target.bay, bayId = target.bayId, dock = common.copy(target.dock or {}), dockId = target.dockId, homeWorld = common.copy(target.homeWorld), maxDepth = target.maxDepth, facing = target.facing,
-    lease = { groupJobId = job.groupJobId, assignmentId = target.assignmentId, workerId = target.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(pending.chunkKeys) }, assignment = common.copy(target),
-    leases = { transit = { groupJobId = job.groupJobId, assignmentId = target.assignmentId, workerId = target.workerId, mode = job.chunkMode, kind = "transit", chunks = common.copy(pending.transitKeys) }, mine = { groupJobId = job.groupJobId, assignmentId = target.assignmentId, workerId = target.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(pending.chunkKeys) } },
-  }
-  job.pendingReassignment = pending
-  saveControllerDb()
-  local ok = sendCommand(target.workerId, "start", payload)
-  if ok then
-    pending.sentAt = common.nowSeconds()
-    pending.status = "awaiting_ack"
-    saveControllerDb()
-    setNotice("Residual reassignment sent; awaiting worker ACK.", false)
-  else
-    job.pendingReassignment = nil
-    saveControllerDb()
-    setNotice("Residual reassignment send failed; original lease retained.", true)
-  end
-  return ok
-end
-
-local function groupSchedulerTick()
-  local now = common.nowSeconds()
-  if now == groupSchedulerLast then return end
-  groupSchedulerLast = now
-  -- Emergency fuel/service requests take precedence over ordinary staggered
-  -- starts.  The cap is persisted per group so restarts cannot overfill a bay.
-  for _, job in pairs(db.groupJobs or {}) do
-    if type(job) == "table" and (job.status == "starting" or job.status == "queued" or job.status == "working" or job.status == "PARTIAL_START") then
-      local group = groupRecord(job.groupId)
-      job.awaitingAck = job.awaitingAck or {}
-      job.pending = job.pending or {}
-      job.attempts = job.attempts or {}
-      if job.pendingReassignment and now - tonumber(job.pendingReassignment.sentAt or now) >= 10 then
-        local pending = job.pendingReassignment
-        job.pendingReassignment = nil
-        job.alerts = job.alerts or {}
-        job.alerts[#job.alerts + 1] = "REASSIGN_TIMEOUT:#" .. tostring(pending.targetWorkerId)
-        updateGroupAggregate(job)
-        saveControllerDb()
+  -- Bay metadata is controller-owned and may differ from GPS calibration
+  -- coordinates.  Validate all registered positions as a set before asking
+  -- quarry to partition; otherwise two workers can share one entrance or be
+  -- placed on different floors/orientations while each individual check
+  -- still appears valid.
+  if worldMode and #specs > 1 then
+    local bayPoints = {}
+    for _, spec in ipairs(specs) do
+      local bayId, workerBay = groupWorkerResource(group, spec.workerId, "bay")
+      local point = workerBay and (workerBay.world or workerBay.position or workerBay)
+      if point and tonumber(point.x) and tonumber(point.y) and tonumber(point.z) then
+        bayPoints[#bayPoints + 1] = {
+          workerId = spec.workerId, bayId = bayId, x = tonumber(point.x), y = tonumber(point.y), z = tonumber(point.z),
+          facing = workerBay.facing or workerBay.direction or spec.facing,
+        }
       end
-      for waitingKey, waiting in pairs(job.awaitingAck) do
-        if now - tonumber(waiting.sentAt or now) >= 10 then
-          local attempts = tonumber(job.attempts[waitingKey] or waiting.attempts or 1)
-          job.awaitingAck[waitingKey] = nil
-          if attempts >= 2 then
-            rejectGroupStart(job, waitingKey, "start ACK timeout")
-          else
-            job.pending[waitingKey] = true
-            local assignment = job.assignments and (job.assignments[waitingKey] or job.assignments[tonumber(waitingKey)])
-            if assignment then assignment.status = "queued" end
-            job.nextDispatchAt = now
-          end
+    end
+    local requireSameFloor = not (config.dock and config.dock.requireSameFloor == false)
+    local spacing = math.max(0, tonumber(config.dock and config.dock.baySpacing) or 0)
+    for i = 1, #bayPoints do
+      for j = i + 1, #bayPoints do
+        local a, b = bayPoints[i], bayPoints[j]
+        if requireSameFloor and a.y ~= b.y then check("bay floor:#" .. tostring(a.workerId) .. "/#" .. tostring(b.workerId), "bad", "registered bay HOME Y differs", true) end
+        if a.facing ~= nil and b.facing ~= nil and tostring(a.facing) ~= tostring(b.facing) then
+          check("bay facing:#" .. tostring(a.workerId) .. "/#" .. tostring(b.workerId), "bad", "registered bay orientation differs", true)
+        end
+        local dx, dz = a.x - b.x, a.z - b.z
+        local distance = math.sqrt(dx * dx + dz * dz)
+        if distance <= 0 or (spacing > 0 and distance < spacing) then
+          check("bay spacing:#" .. tostring(a.workerId) .. "/#" .. tostring(b.workerId), "bad", "registered bay positions overlap or are closer than " .. tostring(spacing), true)
         end
       end
-      local limit = math.max(1, tonumber(group and group.replenishConcurrency or db.groupScheduler.replenishConcurrency) or 1)
-      local activeService = 0
-      job.serviceSentAt = job.serviceSentAt or {}
-      for _, id in ipairs(groupWorkerIds(group)) do
-        local data = workerData(id) or {}
-        if data.status == "waiting_fuel" or tonumber(data.fuel) and tonumber(data.fuel) <= tonumber(data.fuelLowWatermark or 0) then
-          activeService = activeService + 1
-          if activeService <= limit and now - tonumber(job.serviceSentAt[tostring(id)] or 0) >= 5 then
-            sendCommand(id, "service", { scope = "group", group = true, groupCommand = "SERVICE", groupId = job.groupId, groupJobId = job.groupJobId, priority = "EMERGENCY_FUEL", targetWorkerId = id, workerId = id })
-            job.serviceSentAt[tostring(id)] = now
-          end
-        end
-      end
-      if job.status == "starting" and now >= tonumber(job.nextDispatchAt or 0) then dispatchGroupJob(job, false) end
     end
   end
-end
-
-local function buildAssignments(result)
-  local id, worker = draftWorker()
-  if not id or not worker then return nil, "No worker selected." end
-  -- A worker's calibrated home is the authoritative entrance for its plan.
-  -- Until a future protocol can describe independent entrances, never split a
-  -- single footprint at runtime; queue dispatch below handles parallel jobs.
-  local assignments = {}
-  local base = "q-" .. tostring(os.getComputerID()) .. "-" .. tostring(common.nowMillis())
+  local partition, partitionError = partitionGroupCatalog(catalog, group, { chunkMode = chunkMode, strategy = partitionStrategy, bottomY = commonBottom, layers = chunkMode == "local" and tonumber(value.depth) or nil }, specs)
+  if not partition then check("connected partition", "bad", tostring(partitionError), true) else check("connected partition", "ok", value.partition or group.partition or "stripe", false) end
+  local assignments = partition
   local selectedKeys = {}
-  for _, chunk in ipairs(result.catalog or {}) do
-    local excluded = false
-    for _, item in ipairs(result.excludedChunks or {}) do if item.key == chunk.key then excluded = true; break end end
-    if not excluded then selectedKeys[#selectedKeys + 1] = chunk.key end
+  if assignments then
+    for _, spec in ipairs(specs) do
+      local assignment = assignments[tostring(spec.workerId)] or assignments[spec.workerId]
+      local ownsBay = false
+      local mineSet = {}
+      if not assignment then check("assignment:#" .. tostring(spec.workerId), "bad", "partition missing worker assignment", true) end
+      for _, key in ipairs(assignment and assignment.chunkKeys or {}) do mineSet[tostring(key)] = true; selectedKeys[#selectedKeys + 1] = key end
+      if worldMode and spec.bayChunkKey and mineSet[tostring(spec.bayChunkKey)] then ownsBay = true end
+      if worldMode and not ownsBay then check("assignment bay chunk:#" .. tostring(spec.workerId), "bad", "assignment does not own worker bay chunk", true) end
+      for _, key in ipairs(assignment and assignment.transitKeys or {}) do
+        if not mineSet[tostring(key)] then check("transit ownership:#" .. tostring(spec.workerId), "bad", "transit chunk leaves worker assignment", true) end
+      end
+      if worldMode and spec.bayChunkKey and assignment and tostring(assignment.seedKey or "") ~= tostring(spec.bayChunkKey) then
+        check("assignment bay seed:#" .. tostring(spec.workerId), "bad", "assignment seed is not worker bay chunk", true)
+      end
+    end
   end
-  assignments[1] = { workerId = id, assignmentId = base .. ":1", jobId = base, chunks = selectedKeys }
-  return assignments
+  local mineConflict = groupLeaseConflict(chunkMode, nil, selectedKeys, "mine", groupId)
+  if mineConflict then check("mine lease", "bad", "overlaps " .. tostring(mineConflict.groupJobId or mineConflict.jobId or "active"), true) else check("mine lease", "ok", "available", false) end
+  local transitKeys = {}
+  if assignments then for _, assignment in pairs(assignments) do for _, key in ipairs(assignment.transitKeys or {}) do transitKeys[#transitKeys + 1] = key end end end
+  local transitConflict = groupLeaseConflict(chunkMode, nil, transitKeys, "transit", groupId)
+  if transitConflict then check("transit lease", "bad", "overlaps " .. tostring(transitConflict.groupJobId or transitConflict.jobId or "active"), true) else check("transit lease", "ok", "available", false) end
+  if not minFuel then check("minimum fuel", "warn", "unknown / estimate " .. tostring(maxRequiredFuel) .. " (refill scheduler)", false) elseif minFuel < maxRequiredFuel then check("minimum fuel", "warn", tostring(minFuel) .. " < estimate " .. tostring(maxRequiredFuel) .. " (refill scheduler)", false) else check("minimum fuel", "ok", tostring(minFuel) .. " / estimate " .. tostring(maxRequiredFuel), false) end
+  local result = {
+    groupId = tostring(groupId), group = common.copy(group), value = common.copy(value), checks = checks, fatal = fatal,
+    catalog = catalog, catalogDescriptor = groupCatalogDescriptor(catalog, chunkMode, rootKey, specs), chunkMode = chunkMode, rootKey = rootKey, assignments = assignments,
+    workers = specs, bottomY = commonBottom, minLayers = minDepth, minFuel = minFuel, requiredFuel = maxRequiredFuel, partition = partitionStrategy,
+    totalChunks = #catalog, selectedChunks = #selectedKeys, warnings = {}, minimumFuel = minFuel, requiredFuel = maxRequiredFuel, computedAt = common.nowSeconds(),
+  }
+  for _, item in ipairs(checks) do if item.state == "warn" then result.warnings[#result.warnings + 1] = item.name .. ": " .. tostring(item.detail) end end
+  return result
 end
 
-local function startDraft()
-  if not draft then return false end
-  -- Worker position, GPS visibility and active-job state may change while the
-  -- preflight page is open. START must use a fresh result, not yesterday's
-  -- green snapshot.
-  local result = computePreflight()
-  if not result then setNotice("Preflight failed.", true); return false end
-  if result.fatal then setNotice("Start blocked by a fatal preflight item.", true); return false end
-  local assignments, assignmentError = buildAssignments(result)
-  if not assignments then setNotice(assignmentError, true); return false end
-  local leases = {}
-  for _, assignment in ipairs(assignments) do
-    local lease, err = reserveLease(assignment.jobId, assignment.workerId, result.chunkMode, assignment.chunks, assignment.assignmentId)
-    if not lease then
-      for _, prior in ipairs(leases) do releaseLeasesForWorker(prior.workerId, prior.jobId) end
-      setNotice(err, true)
-      return false
-    end
-    leases[#leases + 1] = lease
+local function groupLeaseEntries(job, assignment)
+  local entries = {}
+  for _, kind in ipairs({ "transit", "mine" }) do
+    local keys = kind == "transit" and (assignment.transitKeys or {}) or (assignment.chunkKeys or {})
+    entries[#entries + 1] = {
+      jobId = tostring(assignment.jobId), groupJobId = tostring(job.groupJobId), assignmentId = tostring(assignment.assignmentId), workerId = assignment.workerId,
+      kind = kind, mode = job.chunkMode, chunks = common.copy(keys), createdAt = common.nowSeconds(),
+    }
   end
-  local sent, sentAssignments = true, {}
-  for _, assignment in ipairs(assignments) do
-    local payloadDepth = result.jobDepth or draft.depth
-    local payloadLighting = common.copy(draft.lighting)
-    if type(payloadLighting) ~= "table" then payloadLighting = { mode = "safe" } end
-    if result.effectiveInterval == 0 then payloadLighting.interval = nil else payloadLighting.interval = result.effectiveInterval end
-    local payload = {
-      width = draft.width, length = draft.length, depth = payloadDepth,
-      chunkMode = result.chunkMode, excludedChunks = result.excludedChunks,
-      lighting = payloadLighting, waterMode = draft.waterMode, profile = draft.profile,
-      name = draft.name or ("Quarry %dx%dx%d"):format(draft.width, draft.length, payloadDepth),
-      -- assignmentId is group-only wire metadata. Sending it for an ordinary
-      -- one-worker quarry makes the worker correctly demand assignmentChunks
-      -- and reject the otherwise valid full-footprint job.
+  return entries
+end
+
+releaseGroupLeases = function(job, onlyPending)
+  if type(job) ~= "table" then return end
+  local removed = {}
+  local function keep(lease)
+    if tostring(lease.groupJobId or "") ~= tostring(job.groupJobId or "") then return true end
+    if onlyPending and job.started and job.started[tostring(lease.workerId)] then return true end
+    removed[#removed + 1] = lease
+    return false
+  end
+  local kept, keptGroup = {}, {}
+  for _, lease in ipairs(db.leases or {}) do if keep(lease) then kept[#kept + 1] = lease end end
+  for _, lease in ipairs(db.groupLeases or {}) do
+    if tostring(lease.groupJobId or "") ~= tostring(job.groupJobId or "") or (onlyPending and job.started and job.started[tostring(lease.workerId)]) then keptGroup[#keptGroup + 1] = lease end
+  end
+  db.leases, db.groupLeases = kept, keptGroup
+  db.activeLeases = common.copy(kept)
+  saveControllerDb()
+  return #removed
+end
+
+groupSafeStop = function(job, workerId, reason)
+  local payload = { scope = "group", group = true, groupId = job.groupId, groupJobId = job.groupJobId, groupCommand = "RETURN", mode = "return_home", safeStop = true, reason = reason or "partial_start" }
+  payload.targetWorkerId, payload.workerId = tonumber(workerId) or workerId, tonumber(workerId) or workerId
+  sendCommand(workerId, "stop", payload)
+end
+
+sortedJobAssignments = function(job)
+  local out = {}
+  for key, value in pairs(job and job.assignments or {}) do if type(value) == "table" then out[#out + 1] = value end end
+  table.sort(out, function(a, b) return tostring(a.workerId) < tostring(b.workerId) end)
+  return out
+end
+
+local function dispatchGroupJob(job, force)
+  if type(job) ~= "table" or (job.status ~= "starting" and job.status ~= "queued") then return false end
+  job.pending = job.pending or {}
+  job.started = job.started or {}
+  job.failed = job.failed or {}
+  job.awaitingAck = job.awaitingAck or {}
+  job.acks = job.acks or {}
+  for _ in pairs(job.awaitingAck) do return true end
+  local now = common.nowSeconds()
+  local stagger = math.max(0, tonumber(job.staggerSeconds) or 0)
+  for _, assignment in ipairs(sortedJobAssignments(job)) do
+    local key = tostring(assignment.workerId)
+    if not job.started[key] and not job.failed[key] and (force or not job.pending[key] or now >= (job.nextDispatchAt or 0)) then
+      local payload = {
+        scope = "group", group = true, groupId = tostring(job.groupId), groupJobId = tostring(job.groupJobId), parentGroupJobId = tostring(job.groupJobId), groupCommand = "START", requestedCommand = "start", assignmentCatalog = common.copy(job.catalog),
+        assignmentId = assignment.assignmentId, assignmentTotal = #sortedJobAssignments(job), assignmentChunks = common.copy(assignment.chunkKeys or {}), chunkKeys = common.copy(assignment.chunkKeys or {}), transitKeys = common.copy(assignment.transitKeys or {}), seedKey = assignment.seedKey, bayChunkKey = assignment.bayChunkKey,
+        homeY = assignment.homeY, bottomY = assignment.bottomY, targetY = assignment.bottomY, layers = assignment.layers, width = job.width, length = job.length, depth = assignment.layers or job.depth,
+        chunkMode = job.chunkMode, name = job.name, profile = job.profile, waterMode = job.waterMode, lighting = common.copy(job.lighting or {}), workerId = assignment.workerId, targetWorkerId = assignment.workerId,
+        bay = assignment.bay, bayId = assignment.bayId, dock = common.copy(assignment.dock or {}), dockId = assignment.dockId, homeWorld = common.copy(assignment.homeWorld), maxDepth = assignment.maxDepth, facing = assignment.facing,
+        lease = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) },
+        leases = { transit = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "transit", chunks = common.copy(assignment.transitKeys or {}) }, mine = { groupJobId = job.groupJobId, assignmentId = assignment.assignmentId, workerId = assignment.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(assignment.chunkKeys or {}) } },
+      }
+      payload.command = "start"
+      payload.assignment = common.copy(assignment)
+      local ok = sendCommand(assignment.workerId, "start", payload)
+      job.pending[key] = nil
+      if ok then
+        job.awaitingAck[key] = { sentAt = now, attempts = tonumber(job.attempts and job.attempts[key] or 0) + 1, assignmentId = assignment.assignmentId }

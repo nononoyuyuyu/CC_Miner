@@ -1,199 +1,261 @@
-  local startableStatus = workerStatus == "idle" or workerStatus == "complete" or workerStatus == "completed" or workerStatus == "aborted"
-  check("start state", startableStatus and "ok" or "bad", workerStatus, not startableStatus)
-  check("home", data.atHome == true and "ok" or "bad", data.atHome == true and "at home" or "worker is not at home", data.atHome ~= true)
-  local poseDir = tonumber(data.pose and data.pose.dir)
-  check("facing", poseDir == 0 and "ok" or "bad", poseDir == 0 and "facing quarry" or (poseDir and ("direction=" .. tostring(poseDir)) or "direction unknown"), poseDir ~= 0)
-  local recoveryRequired = data.recoveryRequired == true or data.pendingAction ~= nil
-  check("recovery", recoveryRequired and "bad" or "ok", recoveryRequired and "pending physical recovery" or "ready", recoveryRequired)
-  local unfinished = data.job ~= nil and workerStatus ~= "complete" and workerStatus ~= "completed" and workerStatus ~= "aborted"
-  check("existing job", unfinished and "bad" or "ok", unfinished and "abort or clear the unfinished job first" or "clear", unfinished)
-  if fuel and fuel >= requiredFuel then
-    check("worker fuel", "ok", ("available %s / need %d"):format(tostring(fuel), requiredFuel), false)
-  elseif fuel then
-    check("worker fuel", "warn", ("available %s / need %d (dock refill expected)"):format(tostring(fuel), requiredFuel), false)
-  else
-    check("worker fuel", "warn", ("unknown / need %d"):format(requiredFuel), false)
-  end
-  if data.inventoryEmpty ~= nil then
-    check("inventory", tonumber(data.inventoryEmpty) > 0 and "ok" or "warn", tostring(data.inventoryEmpty or 0) .. " empty", false)
-  else check("inventory", "warn", "unknown", false) end
-  local seal = tonumber(data.materials and (data.materials.sealCount or data.materials.seal) or data.seal and data.seal.count)
-  local torchStock = tonumber(data.lighting and data.lighting.torchCount or data.materials and data.materials.torchCount)
-  if draft.waterMode == "seal" and seal and seal <= 0 then check("seal material", "warn", "0 (dock refill expected)", false)
-  elseif draft.waterMode == "seal" then check("seal material", "warn", "seal stock unknown", false) end
-  if draft.lighting and draft.lighting.mode ~= "off" and torchStock and torchStock < torchNeed then check("torch material", "warn", tostring(torchStock) .. "/" .. tostring(torchNeed) .. " (dock refill expected)", false)
-  elseif draft.lighting and draft.lighting.mode ~= "off" then check("torch material", "warn", "torch stock unknown", false) end
-  local caps = data.capabilities or {}
-  if draft.waterMode ~= "ignore" then
-    if caps.waterHandling == false then check("water capability", "bad", "worker lacks waterHandling", true)
-    elseif caps.waterHandling == nil then check("water capability", "warn", "worker capability unknown", false)
-    else check("water capability", "ok", "ready", false) end
-  else check("water capability", "ok", "ignore", false) end
-  if draft.lighting and draft.lighting.mode ~= "off" then
-    if caps.lighting == false then check("lighting capability", "bad", "worker lacks lighting", true)
-    elseif caps.lighting == nil then check("lighting capability", "warn", "worker capability unknown", false)
-    else check("lighting capability", "ok", "ready", false) end
-  else check("lighting capability", "ok", "off", false) end
-  local selectedChunkKeys = {}
-  for _, chunk in ipairs(catalog) do
-    local excluded = false
-    for _, item in ipairs(excludedChunks) do if item.key == chunk.key then excluded = true; break end end
-    if not excluded then selectedChunkKeys[#selectedChunkKeys + 1] = chunk.key end
-  end
-  local leaseConflict = (not draft.queueing) and id and activeLeaseOverlap and activeLeaseOverlap(chunkMode, id, selectedChunkKeys)
-  if leaseConflict then check("lease", "bad", "overlaps active job " .. tostring(leaseConflict.jobId or "unknown"), true) end
-  local fatal = false
-  for _, item in ipairs(checks) do if item.fatal or item.state == "bad" and item.fatal then fatal = true end end
-  local result = {
-    checks = checks, fatal = fatal, catalog = catalog, plan = plan, planError = planError,
-    chunkMode = chunkMode, calibration = calibration, rootKey = rootKey,
-    excludedChunks = excludedChunks, cells = estimate and (estimate.surfaceCells or estimate.columns) or (cells - cellExcluded), blocks = estimate and (estimate.blocks or estimate.totalBlocks) or blocks,
-    chunks = plan and plan.catalogCount or #catalog, selectedChunks = (plan and plan.selectedChunks) or (#catalog - #excludedChunks), totalChunks = #catalog, exclusions = #excludedChunks,
-    torches = torchNeed, fuel = requiredFuel, baseFuel = baseFuelEstimate, estimate = estimate, jobDepth = jobDepth, targetY = targetY,
-    profile = profileInfo.profile, requestedInterval = profileInfo.requestedInterval, effectiveInterval = profileInfo.effectiveInterval,
-    fuelMultiplier = profileInfo.fuelMultiplier,
-  }
-  draft.preflight = result
-  return result
-end
-
-activeLeaseOverlap = function(mode, workerId, chunks)
-  for _, lease in ipairs(db.leases or {}) do
-    local leaseMode = lease.mode == "world" and "world" or "local"
-    if mode == "world" and leaseMode == "world" then
-      local set = {}
-      for _, key in ipairs(lease.chunks or {}) do set[tostring(key)] = true end
-      for _, key in ipairs(chunks or {}) do if set[tostring(key)] then return lease end end
-    elseif mode == "local" and leaseMode == "local" and tonumber(lease.workerId) == tonumber(workerId) then
-      return lease
-    end
-  end
+  if type(payload) ~= "table" then return nil end
+  if type(payload.result) == "table" then return payload.result end
+  if type(payload.response) == "table" then return payload.response end
+  if type(payload.data) == "table" then return payload.data end
   return nil
 end
 
-local function reserveLease(jobId, workerId, mode, chunks, assignmentId)
-  local conflict = activeLeaseOverlap(mode, workerId, chunks)
-  if conflict then return nil, "Active lease overlap with " .. tostring(conflict.jobId or conflict.assignmentId) end
-  local lease = {
-    jobId = tostring(jobId), assignmentId = assignmentId, workerId = tonumber(workerId) or workerId,
-    mode = mode, chunks = common.copy(chunks or {}), createdAt = common.nowSeconds(),
-  }
-  db.leases[#db.leases + 1] = lease
-  db.activeLeases = common.copy(db.leases)
-  local ok, err = saveControllerDb()
-  if not ok then table.remove(db.leases); return nil, err or "Could not persist active lease" end
-  return lease
+local function remoteAckMessage(payload)
+  local result = remoteResultTable(payload)
+  local message = payload and (payload.message or payload.reason or payload.error) or nil
+  if message == nil and result then message = result.message or result.reason or result.error end
+  if message == nil and result then message = remoteValueText(result) end
+  if message == nil then message = "Unknown remote-console response." end
+  if type(message) == "table" then message = remoteValueText(message) end
+  return remoteRedactText(message)
 end
 
-local function chunkKeySet(catalog)
-  local set = {}
-  for _, chunk in ipairs(catalog or {}) do set[chunk.key] = true end
-  return set
-end
-
-local function deterministicPartition(chunks, count)
-  local out = {}
-  count = math.max(1, tonumber(count) or 1)
-  for index = 1, count do out[index] = {} end
-  for index, chunk in ipairs(chunks or {}) do out[((index - 1) % count) + 1][#out[((index - 1) % count) + 1] + 1] = chunk end
-  return out
-end
-
--- Group planning ---------------------------------------------------------
--- The quarry module may expose the richer partitionGroup API in newer
--- runtimes.  Controllers assembled with an older quarry.lua still work for
--- world plans through partitionChunks; local plans intentionally never get an
--- automatic split because their coordinates are dock-relative.
-local function groupWorkerSpecs(group)
-  local specs = {}
-  for _, id in ipairs(groupWorkerIds(group)) do
-    local data = workerData(id) or {}
-    local calibration = data.gps and data.gps.calibration or data.calibration
-    local home = calibration and calibration.home or data.home
-    local world = data.world or data.position
-    local bayId, bay = groupWorkerResource(group, id, "bay")
-    local dockId, dock = groupWorkerResource(group, id, "dock")
-    local bayPoint = bay and (bay.world or bay.position or bay) or nil
-    local bayChunkKey = bayPoint and tonumber(bayPoint.x) and tonumber(bayPoint.z)
-      and quarry.chunkKey("world", math.floor(tonumber(bayPoint.x) / 16), math.floor(tonumber(bayPoint.z) / 16)) or nil
-    specs[#specs + 1] = {
-      workerId = tonumber(id) or id,
-      id = tonumber(id) or id,
-      version = data.version or data.workerVersion,
-      home = common.copy(home),
-      calibration = common.copy(calibration),
-      world = common.copy(world),
-      facing = data.facing or data.pose and data.pose.dir,
-      homeY = tonumber(home and home.y or data.homeY),
-      maxDepth = tonumber(data.maxDepth or data.capabilities and data.capabilities.maxDepth),
-      capability = common.copy(data.capabilities or {}),
-      bayId = bayId, bay = common.copy(bayPoint), bayChunkKey = bayChunkKey, bayMeta = common.copy(bay), dockId = dockId, dock = common.copy(dock),
-    }
+local function printRemoteAck(payload, action)
+  payload = type(payload) == "table" and payload or {}
+  if payload.ok ~= true then
+    print("Remote console rejected: " .. remoteAckMessage(payload))
+    return false
   end
-  return specs
-end
-
-local function normalizeGroupAssignments(raw, workerSpecs)
-  local source = type(raw) == "table" and (raw.byWorker or raw.assignments or raw) or nil
-  if type(source) ~= "table" then return nil, "invalid_group_assignments" end
-  local out, count = {}, 0
-  for index, spec in ipairs(workerSpecs or {}) do
-    local id, key = spec.workerId, tostring(spec.workerId)
-    -- Never pair assignments by array index: quarry is allowed to sort worker
-    -- IDs.  Match the explicit workerId (or byWorker map key) only.
-    local value = source[key] or source[id]
-    if type(value) ~= "table" then
-      for candidateKey, candidate in pairs(source) do
-        if type(candidate) == "table" and tostring(candidate.workerId or candidate.id) == key then value = candidate; break end
-        if tostring(candidateKey) == key and type(candidate) == "table" then value = candidate; break end
+  local result = remoteResultTable(payload) or payload
+  local output = result.output or result.stdout or result.text or payload.output or payload.stdout
+  if output ~= nil and tostring(output) ~= "" then print(remoteRedactText(output)) end
+  if result.exitCode ~= nil then print("exitCode: " .. remoteValueText(result.exitCode)) end
+  if result.truncated ~= nil then print("truncated: " .. remoteValueText(result.truncated)) end
+  if action == "open" then
+    print("Remote console opened. Type exit or quit to close.")
+  elseif action == "close" and result.closed ~= true then
+    print("Remote console closed.")
+  elseif output == nil and action == "exec" then
+    local visible = {}
+    for key, value in pairs(result) do
+      if not remoteSensitiveKey(key) and key ~= "output" and key ~= "stdout" and key ~= "text" then
+        visible[key] = value
       end
     end
-    if type(value) ~= "table" then return nil, "group_assignment_missing_worker_" .. key end
-    local chunks = value.chunkKeys or value.chunks or value.assignmentChunks or {}
-    if type(chunks) ~= "table" then return nil, "group_assignment_invalid_chunks_" .. key end
-    local assignment = {
-      workerId = tonumber(value.workerId or id) or value.workerId or id,
-      chunkKeys = common.copy(chunks),
-      transitKeys = common.copy(value.transitKeys or value.transit or {}),
-      seedKey = value.seedKey,
-      estimatedCost = tonumber(value.estimatedCost or value.cost or value.cells) or 0,
-      homeY = tonumber(value.homeY or spec.homeY),
-      bottomY = tonumber(value.bottomY),
-      layers = tonumber(value.layers),
-    }
-    if #assignment.chunkKeys == 0 then return nil, "group_assignment_empty_" .. key end
-    out[key] = assignment
-    count = count + 1
+    if next(visible) ~= nil then print("Result: " .. remoteValueText(visible)) end
   end
-  return out, count
+  return true
 end
 
-local function partitionGroupCatalog(catalog, group, options, workerSpecs)
-  local specs = workerSpecs or groupWorkerSpecs(group)
-  if #specs == 0 then return nil, "group_workers_required" end
-  options = type(options) == "table" and options or {}
-  options.strategy = options.strategy or (group and group.partition) or "stripe"
-  options.stripeFirst = options.stripeFirst ~= false
-  options.connected = true
-  options.balanced = true
-  options.requireConnected = true
-  if type(quarry.partitionGroup) == "function" then
-    local ok, raw, err = pcall(quarry.partitionGroup, catalog, specs, options)
-    if ok and raw then
-      local normalized, count = normalizeGroupAssignments(raw, specs)
-      local unassigned = raw and raw.unassigned
-      local hasUnassigned = type(unassigned) == "table" and ((#unassigned > 0) or next(unassigned) ~= nil)
-      if normalized and count == #specs and not hasUnassigned then return normalized, nil, raw end
-      if not err then err = count end
+local function remoteTimeoutSeconds()
+  local remoteConfig = type(config.remoteConsole) == "table" and config.remoteConsole or {}
+  local value = tonumber(remoteConfig.ackTimeoutSeconds or remoteConfig.timeoutSeconds or config.remoteTimeoutSeconds) or 8
+  return math.max(1, math.min(60, value))
+end
+
+local function remoteRequest(session, action, commandText)
+  if type(session) ~= "table" then return nil, "remote session unavailable" end
+  local sequence
+  if action == "open" then sequence = 0 else sequence = (tonumber(session.seq) or 0) + 1 end
+  session.seq = sequence
+  local payload = {
+    command = "remote_console", action = tostring(action), sessionId = session.sessionId,
+    nonce = session.nonce, seq = sequence,
+  }
+  if commandText ~= nil then
+    payload.commandText = tostring(commandText)
+    -- commandLine is an additive alias understood by workers from the first
+    -- remote-console revision; commandText remains the canonical field.
+    payload.commandLine = payload.commandText
+  end
+  local wireMessage = protocol.message("command", config.networkKey, payload, session.workerId)
+  local pending = { action = action, seq = sequence, messageId = wireMessage.id, startedAt = common.nowSeconds() }
+  session.pending, session.lastResult, session.lastAction = pending, nil, nil
+  local ok, err = protocol.send(session.workerId, wireMessage)
+  if not ok then session.pending = nil; return nil, "send failed: " .. tostring(err) end
+  local deadline = common.nowSeconds() + (session.timeoutSeconds or remoteTimeoutSeconds())
+  while session.pending == pending and common.nowSeconds() < deadline do
+    local remaining = math.max(0.05, math.min(0.25, deadline - common.nowSeconds()))
+    local sender, message = protocol.receive(remaining)
+    if sender then handleMessage(sender, message) end
+  end
+  if session.pending == pending then
+    session.pending = nil
+    return nil, ("timeout waiting for remote-console %s ACK from #%s"):format(tostring(action), tostring(session.workerId))
+  end
+  return session.lastResult
+end
+
+local function remoteWorkerReady(workerId)
+  local worker = workers[workerId] or workers[tostring(workerId)]
+  if worker and statusOf(worker) == "offline" then return false, "Worker is offline." end
+  return true
+end
+
+noticeState.remoteApi.consoleCommand = function(workerId, oneShot)
+  workerId = tonumber(workerId)
+  if not workerId or workerId < 1 or workerId ~= math.floor(workerId) then
+    print("Usage: ccm remote <workerId> [-- <command...>]")
+    return true
+  end
+  local ready, readyError = remoteWorkerReady(workerId)
+  if not ready then print("Remote console rejected: " .. tostring(readyError)); return true end
+  local session = {
+    workerId = workerId, sessionId = remoteToken("session"), nonce = remoteToken("nonce"),
+    seq = 0, timeoutSeconds = remoteTimeoutSeconds(),
+  }
+  noticeState.remoteSession = session
+  local opened, openError = remoteRequest(session, "open")
+  if not opened then
+    noticeState.remoteSession = nil
+    print("Remote console unavailable: " .. remoteRedactText(openError or remoteAckMessage(opened)))
+    if opened then printRemoteAck(opened, "open") end
+    return true
+  end
+  if not printRemoteAck(opened, "open") then noticeState.remoteSession = nil; return true end
+
+  local function closeSession()
+    if not noticeState.remoteSession then return end
+    local closed, closeError = remoteRequest(session, "close")
+    if not closed then print("Remote console close warning: " .. remoteRedactText(closeError or "unknown error"))
+    elseif closed.ok ~= true then printRemoteAck(closed, "close") end
+    noticeState.remoteSession = nil
+  end
+
+  if oneShot ~= nil then
+    local text = tostring(oneShot)
+    if common.trim(text):lower() ~= "exit" and common.trim(text):lower() ~= "quit" then
+      local result, requestError = remoteRequest(session, "exec", text)
+      if result then printRemoteAck(result, "exec") else print("Remote console timeout: " .. remoteRedactText(requestError or "unknown error")) end
+    end
+    closeSession()
+    return true
+  end
+
+  while true do
+    write(("remote #%s> "):format(tostring(workerId)))
+    local text = read()
+    text = tostring(text or "")
+    local trimmed = common.trim(text)
+    local lower = trimmed:lower()
+    if lower == "exit" or lower == "quit" then break end
+    if trimmed ~= "" then
+      local result, requestError = remoteRequest(session, "exec", text)
+      if result then printRemoteAck(result, "exec") else print("Remote console timeout: " .. remoteRedactText(requestError or "unknown error")) end
     end
   end
-  local mode = options.chunkMode == "world" and "world" or "local"
-  if mode ~= "world" and #specs > 1 then return nil, "local_group_partition_disabled" end
-  if #specs > 1 then return nil, "partitionGroup_required_for_multi_worker" end
-  if type(quarry.partitionChunks) ~= "function" then return nil, "group_partition_api_unavailable" end
-  local ids = {}
-  for _, spec in ipairs(specs) do ids[#ids + 1] = spec.workerId end
-  local ok, legacy = pcall(quarry.partitionChunks, catalog, ids)
-  if not ok or not legacy then return nil, tostring(legacy or "group_partition_api_unavailable") end
-  local normalized = {}
-  for _, spec in ipairs(specs) do
+  closeSession()
+  return true
+end
+end
+
+local GROUP_WIRE_COMMAND = { start = "start", pause = "pause", resume = "resume", return_home = "recall", recall = "recall", service = "service", abort = "abort", clear = "clear" }
+
+local function groupCommand(groupId, command, payload)
+  local group = groupRecord(groupId)
+  if not group then setNotice("Group not found: " .. tostring(groupId), true); return false, 0 end
+  command = tostring(command or ""):lower()
+  local requestedCommand = command
+  if command == "return" then command = "return_home" end
+  if command == "start" and not (payload and payload.groupJobId) then
+    local current = activeGroupJob(groupId)
+    if current then payload = common.copy(payload or {}); payload.groupJobId = current.groupJobId or current.id end
+  end
+  payload = type(payload) == "table" and common.copy(payload) or {}
+  payload.group = true
+  payload.scope = "group"
+  payload.groupId = tostring(groupId)
+  payload.requestedCommand = requestedCommand
+  payload.groupCommand = string.upper(command == "return_home" and "RETURN" or command)
+  local groupJob = payload.groupJobId and db.groupJobs[tostring(payload.groupJobId)] or activeGroupJob(groupId)
+  if command == "clear" and groupJob and not groupWorkersTerminalAtHome(groupJob, true) then
+    setNotice("Group CLEAR blocked until every worker is terminal and home.", true)
+    return false, 0
+  end
+  if groupJob then
+    payload.groupJobId = tostring(groupJob.groupJobId or groupJob.id)
+    groupJob.acks = groupJob.acks or {}
+    groupJob.lastCommand = payload.groupCommand
+    groupJob.commandSentAt = common.nowSeconds()
+  end
+  local sent, attempted = 0, 0
+  for _, id in ipairs(groupWorkerIds(group)) do
+    attempted = attempted + 1
+    local individual = common.copy(payload)
+    individual.targetWorkerId = tonumber(id) or id
+    individual.workerId = tonumber(id) or id
+    individual.command = GROUP_WIRE_COMMAND[command] or command
+    local assignment = groupJob and groupJob.assignments and (groupJob.assignments[tostring(id)] or groupJob.assignments[id])
+    if assignment and command == "start" then
+      individual.assignmentId = assignment.assignmentId
+      individual.assignment = common.copy(assignment)
+      individual.assignmentChunks = common.copy(assignment.chunkKeys or assignment.chunks or {})
+    end
+    if sendCommand(id, individual.command, individual) then
+      sent = sent + 1
+      if groupJob then groupJob.acks[tostring(id)] = { ok = nil, command = individual.groupCommand, sentAt = common.nowSeconds() } end
+    end
+  end
+  if groupJob then updateGroupAggregate(groupJob); saveControllerDb() end
+  if groupJob and (command == "clear" or command == "abort") then
+    groupJob.status = command == "clear" and "clear_requested" or "aborting"
+    if command == "abort" then
+      -- Assignments that were never sent cannot later race an ABORT.  Keep
+      -- awaiting ACK entries until their worker confirms/returns, since the
+      -- START packet may already be in flight.
+      groupJob.pending = {}
+    end
+    groupJob.returnReason = groupJob.returnReason or (command == "abort" and "group_abort" or "group_clear")
+    maybeFinalizeGroup(groupJob)
+    saveControllerDb()
+  end
+  if sent < attempted then setNotice(("Group %s: %d/%d commands sent."):format(payload.groupCommand, sent, attempted), true) else setNotice(("Group %s sent to %d workers."):format(payload.groupCommand, sent), false) end
+  return sent == attempted and attempted > 0, sent
+end
+
+local function groupCommandBySelected(command)
+  local id = selectedGroupRecord()
+  if not id then setNotice("No group selected.", true); return false end
+  return groupCommand(id, command)
+end
+
+local function progressText(data)
+  if not data or not data.job then return "-" end
+  local p = data.progress or {}
+  return ("%3d%% %s/%s"):format(
+    tonumber(p.percent or data.job.percent) or 0,
+    common.humanNumber(p.cursor or data.job.cursor or 0),
+    common.humanNumber(p.total or data.job.total or 0)
+  )
+end
+
+local function resetHitboxes(key)
+  hitboxes[key] = {}
+end
+
+local function addHitbox(key, x1, y1, x2, y2, action)
+  hitboxes[key] = hitboxes[key] or {}
+  hitboxes[key][#hitboxes[key] + 1] = {
+    x1 = math.floor(x1), y1 = math.floor(y1), x2 = math.floor(x2), y2 = math.floor(y2), action = action,
+  }
+end
+
+local function drawButton(key, x, y, width, label, action, enabled, selectedButton)
+  width = math.max(3, math.floor(width))
+  local background = colors and (selectedButton and colors.lightBlue or enabled == false and colors.gray or colors.blue) or nil
+  local foreground = colors and (enabled == false and colors.lightGray or colors.white) or nil
+  common.writeAt(x, y, common.center(label, width), foreground, background)
+  if enabled ~= false and action then addHitbox(key, x, y, x + width - 1, y, action) end
+end
+
+local function buttonRow(key, y, width, definitions)
+  if width < 1 or y < 1 then return end
+  local count = math.max(1, #definitions)
+  local base = math.max(1, math.floor(width / count))
+  local x = 1
+  for index, definition in ipairs(definitions) do
+    local buttonWidth = index == count and (width - x + 1) or base
+    drawButton(key, x, y, buttonWidth, definition[1], definition[2], definition[3] ~= false, definition[4])
+    x = x + buttonWidth
+  end
+end
+
+local function draftWorker()
+  if not draft then return nil, nil end
+  return draft.workerId, workers[draft.workerId]
+end

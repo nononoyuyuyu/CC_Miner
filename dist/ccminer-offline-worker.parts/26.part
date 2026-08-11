@@ -1,3 +1,283 @@
+
+local function materialsConfig()
+  local materials = config.materials or {}
+  local recycle = config.recycle or {}
+  return materials, recycle
+end
+
+-- Profiles adjust operating margins and cadence only.  Job-level settings for
+-- safety modes (lighting/water) remain authoritative elsewhere in the worker.
+-- Keep an invalid legacy config from silently selecting a more aggressive
+-- profile; balanced is the neutral, backward-compatible fallback.
+local function effectiveProfile()
+  local profile = state.job and state.job.profile or config.profile or "balanced"
+  profile = tostring(profile)
+  if profile ~= "safe" and profile ~= "balanced" and profile ~= "turbo" then
+    profile = "balanced"
+  end
+  return profile
+end
+
+local function profileReserveEmptySlots()
+  local materials = config.materials or {}
+  local base = math.max(0, math.floor(tonumber(materials.reserveEmptySlots or config.reserveEmptySlots) or 3))
+  local profile = effectiveProfile()
+  if profile == "safe" then return math.min(8, base + 2) end
+  if profile == "turbo" then return math.max(1, base - 1) end
+  return base
+end
+
+local function profileFuelBuffer()
+  local base = math.max(0, tonumber(config.fuelBuffer) or 256)
+  if effectiveProfile() == "safe" then return math.ceil(base * 1.5) end
+  -- Turbo may not reduce the configured fuel safety margin.  There is no
+  -- speed-up worth weakening the return-home guarantee, so retain base.
+  return base
+end
+
+local function profileCompactEvery()
+  local materials = config.materials or {}
+  local base = math.max(0, math.floor(tonumber(materials.compactEveryMoves or config.compactEveryMoves) or 32))
+  local profile = effectiveProfile()
+  if profile == "safe" then return math.min(base, 16) end
+  if profile == "turbo" then return math.max(base, 64) end
+  return base
+end
+
+local function profileMaxContinuousSeal()
+  local base = math.max(1, math.floor(tonumber(
+    config.maxContinuousSeal or config.fluidSealLimit or config.waterSealLimit
+  ) or 8))
+  local profile = effectiveProfile()
+  -- maxContinuousSeal is a user-configured absolute ceiling.  A profile can
+  -- only tighten it (safe) or use a larger documented cap when configured
+  -- (turbo); it must never raise a default 32 to 64 implicitly.
+  if profile == "safe" then return math.min(base, 8) end
+  if profile == "turbo" then return math.min(base, 64) end
+  return math.min(base, 32)
+end
+
+local function profileLightingInterval(requested)
+  requested = math.max(1, math.floor(tonumber(requested) or 32))
+  local profile = effectiveProfile()
+  if profile == "safe" then return math.min(requested, 8) end
+  if profile == "turbo" then return math.min(12, math.max(requested, 12)) end
+  return requested
+end
+
+-- Shared by status reporting and the movement implementation so the
+-- controller sees the same explicit mode and profile-adjusted cadence that
+-- physical placement will use.
+local function effectiveLightingValues()
+  local lighting = config.lighting or {}
+  local mode = state.job and state.job.lighting and state.job.lighting.mode or nil
+  mode = mode or state.lighting.mode or lighting.mode or config.lightMode or "off"
+  if mode ~= "off" and mode ~= "safe" and mode ~= "custom" then mode = "off" end
+  local requested = state.job and state.job.lighting and state.job.lighting.interval or nil
+  requested = tonumber(requested or state.lighting.interval or lighting.interval or config.torchInterval) or 32
+  return mode, profileLightingInterval(requested)
+end
+
+local function lightingConfig()
+  local lighting = config.lighting or {}
+  local mode = lighting.mode or config.lightMode or "off"
+  if mode ~= "off" and mode ~= "safe" and mode ~= "custom" then mode = "off" end
+  local interval = tonumber(lighting.interval or config.torchInterval) or 32
+  return lighting, mode, math.max(1, math.floor(interval))
+end
+
+local function torchBlocks()
+  local lighting = config.lighting or {}
+  local blocks = lighting.torchBlocks or config.torchBlocks or {
+    ["minecraft:torch"] = true,
+    ["minecraft:soul_torch"] = true,
+  }
+  return blocks
+end
+
+local function isTorchItemName(name)
+  return name and torchBlocks()[name] == true
+end
+
+local function slotSet(value)
+  local result = {}
+  if type(value) ~= "table" then return result end
+  -- Lists such as {13,14} store slots in values; maps such as {[13]=true}
+  -- store them in keys.  Accept both forms for old and new configurations.
+  for key, item in pairs(value) do
+    local numberItem, numberKey = tonumber(item), tonumber(key)
+    if type(item) == "boolean" then
+      if item and numberKey then result[math.floor(numberKey)] = true end
+    elseif numberItem then
+      result[math.floor(numberItem)] = true
+    elseif numberKey then
+      result[math.floor(numberKey)] = true
+    end
+  end
+  return result
+end
+
+local function materialSlotSets()
+  local materials, recycle = materialsConfig()
+  local sets = {
+    generic = slotSet(materials.reservedSlots or recycle.reservedSlots or config.reservedSlots),
+    seal = slotSet(materials.sealSlots or config.sealSlots),
+    torch = slotSet(materials.torchSlots or config.torchSlots),
+    fuel = slotSet(materials.fuelReserveSlots or config.fuelReserveSlots),
+  }
+  return sets
+end
+
+local function isReservedSlot(slot, role)
+  local sets = materialSlotSets()
+  local number = tonumber(slot) or 0
+  if sets.generic[number] then return true end
+  if role == "seal" then return sets.torch[number] or sets.fuel[number] end
+  if role == "torch" then return sets.seal[number] or sets.fuel[number] end
+  if role == "fuel" then return sets.seal[number] or sets.torch[number] end
+  if role == "generic" or role == nil then
+    return sets.seal[number] or sets.torch[number] or sets.fuel[number]
+  end
+  return false
+end
+
+local function slotRoleContains(slot, role)
+  local sets = materialSlotSets()
+  return sets[role] and sets[role][tonumber(slot) or 0] == true
+end
+
+local function isFuelItem(slot)
+  if not slot or turtle.getItemCount(slot) <= 0 or type(turtle.refuel) ~= "function" then return false end
+  local original = turtle.getSelectedSlot()
+  turtle.select(slot)
+  local ok, result = pcall(turtle.refuel, 0)
+  turtle.select(original)
+  return ok and result == true
+end
+
+local function sealMaterialCount()
+  local count = 0
+  for slot = 1, 16 do
+    if isSealItemName(itemName(slot)) then count = count + turtle.getItemCount(slot) end
+  end
+  return count
+end
+
+local function selectSealMaterial()
+  local materials = materialsConfig()
+  local preferred = materials.sealSlots or (config.recycle and config.recycle.sealSlots) or config.sealSlots
+  if type(preferred) == "table" then
+    for _, candidate in ipairs(preferred) do
+      local slot = tonumber(candidate)
+      if slot and not isReservedSlot(slot, "seal") and turtle.getItemCount(slot) > 0 and isSealItemName(itemName(slot)) then
+        turtle.select(slot)
+        return slot
+      end
+    end
+  end
+  for slot = 1, 16 do
+    if not isReservedSlot(slot, "seal") and isSealItemName(itemName(slot)) and turtle.getItemCount(slot) > 0 then
+      turtle.select(slot)
+      return slot
+    end
+  end
+  return nil
+end
+
+local function torchMaterialCount()
+  local count = 0
+  for slot = 1, 16 do
+    if isTorchItemName(itemName(slot)) then count = count + turtle.getItemCount(slot) end
+  end
+  return count
+end
+
+local function preferredTorchSlots()
+  local materials = materialsConfig()
+  local lighting = config.lighting or {}
+  local configured = lighting.preferredSlots or materials.torchSlots or config.torchSlots
+  local result, seen = {}, {}
+  if lighting.slot and tonumber(lighting.slot) then
+    local slot = math.floor(tonumber(lighting.slot))
+    result[#result + 1], seen[slot] = slot, true
+  end
+  if type(configured) == "table" then
+    for _, candidate in ipairs(configured) do
+      local slot = tonumber(candidate)
+      if slot and not seen[math.floor(slot)] then
+        slot = math.floor(slot)
+        result[#result + 1], seen[slot] = slot, true
+      end
+    end
+  end
+  return result
+end
+
+local function selectTorchMaterial()
+  local preferred = preferredTorchSlots()
+  if type(preferred) == "table" then
+    for _, candidate in ipairs(preferred) do
+      local slot = tonumber(candidate)
+      if slot and not isReservedSlot(slot, "torch") and turtle.getItemCount(slot) > 0 and isTorchItemName(itemName(slot)) then
+        turtle.select(slot)
+        return slot
+      end
+    end
+  end
+  for slot = 1, 16 do
+    if not isReservedSlot(slot, "torch") and turtle.getItemCount(slot) > 0 and isTorchItemName(itemName(slot)) then
+      turtle.select(slot)
+      return slot
+    end
+  end
+  return nil
+end
+
+local function gpsConfig()
+  config.gps = config.gps or {}
+  return config.gps
+end
+
+local function gpsCalibration()
+  local gpsSettings = gpsConfig()
+  if geo.validCalibration(gpsSettings.calibration) then return gpsSettings.calibration end
+  return nil
+end
+
+local function gpsSummary()
+  local calibration = gpsCalibration()
+  return {
+    enabled = gpsConfig().enabled ~= false,
+    required = gpsConfig().required == true,
+    available = state.gps and state.gps.available == true,
+    calibrated = calibration ~= nil,
+    calibration = calibration and common.copy(calibration) or nil,
+    lastFix = state.gps and common.copy(state.gps.lastFix) or nil,
+    lastFixAt = state.gps and state.gps.lastFixAt or nil,
+    lastError = state.gps and state.gps.lastError or nil,
+    corrections = state.gps and state.gps.corrections or 0,
+  }
+end
+
+local function jobSnapshot()
+  if not state.job then return nil end
+  local route = state.job.route
+  local layer, row, currentChunk
+  if state.job.strategy == "chunk_plan" and route then
+    layer = (tonumber(route.layer) or 0) + 1
+    currentChunk = route.currentKey
+  else
+    local cursor = tonumber(state.job.cursor) or 0
+    local rowWidth = math.max(1, tonumber(state.job.length) or 1)
+    local rowVolume = rowWidth * math.max(1, tonumber(state.job.width) or 1)
+    layer = math.floor(cursor / rowVolume) + 1
+    row = math.floor((cursor % rowVolume) / rowWidth) + 1
+  end
+  return {
+    id = state.job.id,
+    assignmentId = state.job.assignmentId,
+    groupJobId = state.job.groupJobId,
+    groupId = state.job.groupId,
     bay = state.job.bay or state.job.bayId,
     dock = state.job.dock and common.copy(state.job.dock) or nil,
     seedKey = state.job.seedKey,
@@ -37,236 +317,3 @@ local function throughputSnapshot()
   local started = tonumber(state.job and state.job.startedAt)
     or tonumber(state.timeMetrics and state.timeMetrics.startedAt)
   local elapsed = started and math.max(0, now - started) or 0
-  local blocks = tonumber(state.job and state.job.cursor) or tonumber(state.stats and state.stats.blocksDug) or 0
-  local perSecond = elapsed > 0 and blocks / elapsed or 0
-  state.timeMetrics = state.timeMetrics or {}
-  state.timeMetrics.updatedAt = now
-  state.timeMetrics.elapsedSeconds = elapsed
-  return {
-    blocks = blocks,
-    elapsedSeconds = elapsed,
-    perSecond = perSecond,
-    cellsPerSecond = perSecond,
-    startedAt = started,
-  }
-end
-
-local function returnSnapshot()
-  local service = state.service or {}
-  local metrics = state.serviceReturn or {}
-  local started = tonumber(metrics.startedAt or service.startedAt)
-  local ended = tonumber(metrics.endedAt)
-  local seconds = tonumber(metrics.seconds)
-  if started and not seconds then seconds = math.max(0, (ended or common.nowSeconds()) - started) end
-  return {
-    reason = state.returnReason or service.reason or state.lastReturnReason,
-    distance = tonumber(metrics.distance or service.returnDistance) or 0,
-    seconds = seconds or tonumber(metrics.returnSeconds) or 0,
-    startedAt = started,
-    endedAt = ended,
-    active = state.service ~= nil,
-  }
-end
-
-local function statusPayload()
-  local used, empty, items = inventoryStats()
-  local profile = effectiveProfile()
-  local progress = nil
-  if state.job then
-    local snap = jobSnapshot()
-    progress = {
-      cursor = state.job.cursor or 0,
-      total = state.job.total or 0,
-      percent = common.percent(state.job.cursor or 0, state.job.total or 0),
-      layer = snap and snap.currentLayer or nil,
-      row = snap and snap.currentRow or nil,
-      currentChunk = snap and snap.currentChunk or nil,
-      completedChunks = snap and snap.completedChunks or 0,
-    }
-  end
-  local lightMode, lightInterval = effectiveLightingValues()
-  local waterMode = tostring((config.waterMode or (config.water and config.water.mode) or state.water.mode or "ignore"))
-  local discardStatus = common.copy(state.discardStats or state.discard or {})
-  discardStatus.mode = config.discard and config.discard.mode or discardStatus.mode or "KEEP_ALL"
-  discardStatus.triggerEmptySlots = tonumber(config.discard and config.discard.triggerEmptySlots) or discardStatus.triggerEmptySlots or 3
-  discardStatus.maxStacksPerPass = tonumber(config.discard and config.discard.maxStacksPerPass) or discardStatus.maxStacksPerPass or 8
-  discardStatus.retainSealTarget = tonumber(config.discard and config.discard.retainSealTarget) or 64
-  discardStatus.allowlist = config.discard and common.copy(config.discard.allowlist or {}) or {}
-  local assignmentResume = state.assignmentResumeToken and common.copy(state.assignmentResumeToken)
-  if not assignmentResume and state.status ~= "complete" then
-    assignmentResume = assignmentResumeSnapshot(state.resumeToken or state.checkpoint)
-  end
-  return {
-    id = os.getComputerID(),
-    label = config.workerName or common.safeComputerLabel("Miner"),
-    status = state.status,
-    phase = state.phase,
-    pose = poseCopy(),
-    atHome = isHome(),
-    world = state.gps and common.copy(state.gps.lastFix) or nil,
-    gps = gpsSummary(),
-    seal = {
-      mode = config.lavaMode or "seal",
-      count = sealMaterialCount(),
-      target = tonumber((config.materials or {}).retainSealTarget or config.sealTarget) or 64,
-      reserve = tonumber(config.sealReserve) or 8,
-    },
-    lighting = {
-      mode = lightMode,
-      interval = lightInterval,
-      torchCount = torchMaterialCount(),
-      placed = state.stats.torchesPlaced or 0,
-      shortages = state.stats.torchShortages or 0,
-    },
-    profile = profile,
-    effectiveProfile = profile,
-    water = {
-      mode = waterMode,
-      detected = state.stats.waterDetected or 0,
-      sealed = state.stats.waterSealed or 0,
-      blocked = state.stats.waterBlocked or 0,
-      last = state.water and common.copy(state.water.last) or nil,
-    },
-    materials = {
-      torchCount = torchMaterialCount(),
-      sealCount = sealMaterialCount(),
-      recycled = state.stats.recycledBlocks or state.stats.recycled or 0,
-      retained = state.recycle and state.recycle.held or 0,
-      overflow = state.recycle and state.recycle.overflow or 0,
-    },
-    discard = discardStatus,
-    assignmentResumeToken = assignmentResume,
-    throughput = throughputSnapshot(),
-    performance = {
-      gpsVerifyEveryMoves = tonumber(config.performance and config.performance.gpsVerifyEveryMoves) or 32,
-      lightweightCheckpointEveryMoves = tonumber(config.performance and config.performance.lightweightCheckpointEveryMoves) or 16,
-      checkpointEveryMoves = tonumber(config.performance and config.performance.checkpointEveryMoves) or 32,
-      effective = {
-        gpsVerifyEveryMoves = tonumber(config.performance and config.performance.gpsVerifyEveryMoves) or 32,
-        lightweightCheckpointEveryMoves = tonumber(config.performance and config.performance.lightweightCheckpointEveryMoves) or 16,
-        checkpointEveryMoves = tonumber(config.performance and config.performance.checkpointEveryMoves) or 32,
-      },
-    },
-    returnRoute = returnSnapshot(),
-    ["return"] = returnSnapshot(),
-    lastReturn = returnSnapshot(),
-    returnReason = state.returnReason or state.lastReturnReason,
-    serviceReason = state.service and state.service.reason or state.lastReturnReason,
-    service = state.service and {
-      reason = state.service.reason,
-      startedAt = state.service.startedAt,
-      returnDistance = state.service.returnDistance,
-      returnSeconds = state.service.returnSeconds,
-      adaptive = config.service and config.service.adaptive == true,
-    } or nil,
-    group = state.group and common.copy(state.group) or (state.job and {
-      groupJobId = state.job.groupJobId, groupId = state.job.groupId,
-      assignmentId = state.job.assignmentId, bay = state.job.bay, bayId = state.job.bayId,
-      dock = state.job.dock and common.copy(state.job.dock) or nil,
-      lease = state.job.lease and common.copy(state.job.lease) or nil,
-      bottomY = state.job.bottomY, maxDepth = state.job.maxDepth,
-    } or nil),
-    dock = state.dock and common.copy(state.dock) or (config.dock and common.copy(config.dock) or nil),
-    bay = state.job and (state.job.bay or state.job.bayId) or state.group and (state.group.bay or state.group.bayId) or nil,
-    stagedStop = state.stagedStop == false and false or (state.stagedStop and common.copy(state.stagedStop) or nil),
-    progress = progress,
-    report = state.report and common.copy(state.report) or nil,
-    lastReport = state.report and common.copy(state.report) or state.lastReport,
-    jobReport = state.jobReport and common.copy(state.jobReport) or nil,
-    estimate = state.estimate and common.copy(state.estimate) or nil,
-    capabilities = {
-      gps = true,
-      gpsCalibration = true,
-      lavaSeal = true,
-      chunkExclusions = true,
-      worldPartition = true,
-      localPartition = false,
-      touchController = true,
-      lighting = true,
-      waterHandling = true,
-      materialRecycle = true,
-      stagedStop = true,
-      stateJournal = true,
-      completionReport = true,
-      discardPolicy = true,
-      shortestServiceRoute = type(quarry.shortestServiceRoute) == "function",
-      edgeTransition = type(quarry.edgeTransition) == "function",
-      groupAssignment = true,
-    },
-    job = jobSnapshot(),
-    fuel = fuelLevel(),
-    fuelLimit = fuelLimit(),
-    inventoryUsed = used,
-    inventoryEmpty = empty,
-    inventoryItems = items,
-    lastError = state.lastError,
-    completionReason = state.completionReason,
-    recoveryRequired = state.pendingAction ~= nil,
-    pendingAction = state.pendingAction and {
-      kind = state.pendingAction.kind,
-      startedAt = state.pendingAction.startedAt,
-    } or nil,
-    request = state.request,
-    stats = common.copy(state.stats),
-    version = common.VERSION,
-    updatedAt = state.updatedAt,
-  }
-end
-
-local function sendStatus(target, request)
-  if not networkReady then return false end
-  local message = protocol.message("status", config.networkKey, statusPayload(), target)
-  if request and request.id then message.replyTo = request.id end
-  if target then return protocol.send(target, message) end
-  return protocol.broadcast(message)
-end
-
-local function sendAck(target, request, ok, text)
-  local payload = request and type(request.payload) == "table" and request.payload or {}
-  local ack = {
-    ok = ok == true,
-    message = tostring(text or ""),
-    status = statusPayload(),
-    -- Echo only sanitized assignment identity fields so a controller can
-    -- correlate negative/duplicate ACKs with the intended group dispatch.
-    command = payload.command and tostring(payload.command) or nil,
-    groupJobId = payload.groupJobId and tostring(payload.groupJobId) or nil,
-    assignmentId = payload.assignmentId and tostring(payload.assignmentId) or nil,
-    groupId = payload.groupId and tostring(payload.groupId) or nil,
-  }
-  return protocol.reply(target, config.networkKey, request, "ack", ack)
-end
-
-local function markBlocked(message)
-  state.status = "blocked"
-  state.phase = state.pendingAction and "recovery_required" or "blocked"
-  state.lastError = tostring(message or "Unknown error")
-  common.log("ERROR", state.lastError)
-  saveState()
-  sendStatus()
-end
-
-local function commandSeen(id)
-  if not id then return false end
-  state.recentCommands = state.recentCommands or {}
-  for _, existing in ipairs(state.recentCommands) do if existing == id then return true end end
-  state.recentCommands[#state.recentCommands + 1] = id
-  while #state.recentCommands > 32 do table.remove(state.recentCommands, 1) end
-  return false
-end
-
-local function locateGPS()
-  state.gps = state.gps or common.defaultState().gps
-  if gpsConfig().enabled == false then
-    state.gps.available = false
-    state.gps.lastError = "GPS is disabled in configuration."
-    return nil, state.gps.lastError
-  end
-  if not gps or type(gps.locate) ~= "function" then
-    state.gps.available = false
-    state.gps.lastError = "GPS API is unavailable."
-    return nil, state.gps.lastError
-  end
-  local ok, x, y, z = pcall(gps.locate, tonumber(gpsConfig().timeout) or 2, false)
-  if not ok then
-    local text = tostring(x)

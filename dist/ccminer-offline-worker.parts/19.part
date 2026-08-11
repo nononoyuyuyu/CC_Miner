@@ -1,3 +1,215 @@
+  local referenceRoot
+  for _, chunk in ipairs(catalog) do
+    if contains(chunk, 0, 1) then referenceRoot = chunk.key; break end
+  end
+  catalog.rootKey = referenceRoot
+  local bounds
+  for _, chunk in ipairs(catalog) do
+    bounds = bounds or { minX = chunk.minX, maxX = chunk.maxX, minZ = chunk.minZ, maxZ = chunk.maxZ }
+    bounds.minX, bounds.maxX = math.min(bounds.minX, chunk.minX), math.max(bounds.maxX, chunk.maxX)
+    bounds.minZ, bounds.maxZ = math.min(bounds.minZ, chunk.minZ), math.max(bounds.maxZ, chunk.maxZ)
+  end
+  catalog.bounds = bounds
+  return catalog
+end
+
+M.catalogFromWorldSeed = M.buildWorldCatalog
+M.worldCatalog = M.buildWorldCatalog
+M.buildGpsCatalog = M.buildWorldCatalog
+M.buildCatalogFromWorldSeed = M.buildWorldCatalog
+M.worldCatalogFromSeed = M.buildWorldCatalog
+
+local function groupCatalogInput(catalog, options)
+  options = type(options) == "table" and options or {}
+  if catalog == nil and options.width ~= nil and options.length ~= nil then
+    local generated, generatedError = M.buildWorldCatalog(options.width, options.length, options.worldSeed, options)
+    if not generated then return nil, nil, generatedError end
+    local chunks, keys = catalogGraph(generated)
+    if not chunks then return nil, nil, keys end
+    return chunks, keys
+  end
+  if type(catalog) ~= "table" then return nil, nil, "invalid_chunk_catalog" end
+  local descriptor = catalog
+  local hasChunks = type(descriptor.chunks) == "table" or #descriptor > 0
+  if not hasChunks and descriptor.width ~= nil and descriptor.length ~= nil then
+    local generated, generatedError = M.buildWorldCatalog(descriptor, options)
+    if not generated then return nil, nil, generatedError end
+    local chunks, keys = catalogGraph(generated)
+    if not chunks then return nil, nil, keys end
+    return chunks, keys
+  end
+  -- A caller may pass { worldSeed = ..., width = ..., length = ... } with no
+  -- explicit calibration.  Treat this as the same descriptor form above.
+  if not hasChunks and options.width ~= nil and options.length ~= nil then
+    local generated, generatedError = M.buildWorldCatalog(options.width, options.length,
+      descriptor.worldSeed or descriptor.seed or options.worldSeed, options)
+    if not generated then return nil, nil, generatedError end
+    local chunks, keys = catalogGraph(generated)
+    if not chunks then return nil, nil, keys end
+    return chunks, keys
+  end
+  local chunks, keys = catalogGraph(catalog)
+  if not chunks then return nil, nil, keys end
+  return chunks, keys
+end
+
+local function groupWorkerList(values)
+  if type(values) ~= "table" then return nil, "invalid_worker_ids" end
+  local raw = {}
+  if #values > 0 then
+    for i = 1, #values do raw[#raw + 1] = { value = values[i], order = i } end
+  else
+    local keys = {}
+    for key in pairs(values) do keys[#keys + 1] = key end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    for index, key in ipairs(keys) do raw[#raw + 1] = { value = values[key], idKey = key, order = index } end
+  end
+  if #raw == 0 then return nil, "no_workers" end
+  if #raw > MAX_WORKERS then return nil, "too_many_workers" end
+  local workers, seen = {}, {}
+  local function nestedPoint(value, depth)
+    if type(value) ~= "table" then return nil end
+    depth = (depth or 0) + 1
+    if depth > 4 then return nil end
+    local x, z = numberValue(value.x), numberValue(value.z)
+    if (not x or not z) and value.cx ~= nil and value.cz ~= nil then
+      local cx, cz = integerValue(value.cx), integerValue(value.cz)
+      if cx and cz then x, z = cx * 16 + 8, cz * 16 + 8 end
+    end
+    if x and z then return { x = x, z = z } end
+    local candidates = { value.bay, value.bayWorld, value.world, value.worldSeed,
+      value.position, value.homeWorld, value.gps, value.seed }
+    for index = 1, 8 do
+      local nested = candidates[index]
+      if nested ~= value then
+        local point = nestedPoint(nested, depth)
+        if point then return point end
+      end
+    end
+    return nil
+  end
+  for _, item in ipairs(raw) do
+    local value = item.value
+    local id, key, homeY, bay, seedKey, homeYProvided, bayInvalid
+    if type(value) == "table" then
+      id = value.id
+      if id == nil then id = value.workerId end
+      if id == nil then id = value.name end
+      if id == nil then id = item.idKey end
+      homeY = value.homeY
+      homeYProvided = homeY ~= nil
+      if homeY == nil and type(value.home) == "table" then homeY = value.home.y end
+      if homeY ~= nil then homeYProvided = true end
+      if homeY == nil and type(value.calibration) == "table" and type(value.calibration.home) == "table" then
+        homeY = value.calibration.home.y
+        homeYProvided = true
+      end
+      bay = nestedPoint(value)
+      local bayInput = value.bay or value.bayWorld or value.world or value.worldSeed or value.position or value.homeWorld or value.gps
+      if bayInput == nil and type(value.seed) == "table" then bayInput = value.seed end
+      bayInvalid = bayInput ~= nil and bay == nil
+      seedKey = value.seedKey or value.chunkKey or value.chunk
+    else
+      id = value
+    end
+    if id == nil or tostring(id) == "" then return nil, "invalid_worker_id" end
+    key = tostring(id)
+    if seen[key] then return nil, "duplicate_worker_id" end
+    seen[key] = true
+    homeY = homeY == nil and nil or integerValue(homeY)
+    if homeY == nil and homeYProvided then return nil, "invalid_home_y" end
+    workers[#workers + 1] = {
+      id = id,
+      key = key,
+      homeY = homeY,
+      bay = bay,
+      bayInvalid = bayInvalid,
+      seedKey = seedKey and tostring(seedKey) or nil,
+      order = item.order,
+    }
+  end
+  table.sort(workers, function(a, b) return a.key < b.key end)
+  return workers
+end
+
+local function uniqueSortedKeys(keys, chunks)
+  local result, seen = {}, {}
+  for _, key in ipairs(keys or {}) do
+    key = tostring(key)
+    if chunks[key] and not seen[key] then seen[key] = true; result[#result + 1] = key end
+  end
+  table.sort(result, function(a, b) return chunkComparator(chunks[a], chunks[b]) end)
+  return result
+end
+
+local function catalogGridShape(chunks, keys)
+  local xs, zs, seenX, seenZ, byCoord = {}, {}, {}, {}, {}
+  for _, key in ipairs(keys) do
+    local chunk = chunks[key]
+    local coordKey = tostring(chunk.cx) .. ":" .. tostring(chunk.cz)
+    if byCoord[coordKey] then return nil end
+    byCoord[coordKey] = key
+    if not seenX[chunk.cx] then seenX[chunk.cx] = true; xs[#xs + 1] = chunk.cx end
+    if not seenZ[chunk.cz] then seenZ[chunk.cz] = true; zs[#zs + 1] = chunk.cz end
+  end
+  table.sort(xs); table.sort(zs)
+  if #xs * #zs ~= #keys then return nil end
+  for _, cx in ipairs(xs) do
+    for _, cz in ipairs(zs) do
+      if not byCoord[tostring(cx) .. ":" .. tostring(cz)] then return nil end
+    end
+  end
+  return xs, zs, byCoord
+end
+
+local function workerBayChunk(worker, chunks, keys)
+  -- In world group mode the bay entrance is the authoritative seed.  An
+  -- optional seedKey is only a legacy hint and must not move a worker away
+  -- from its own bay chunk.
+  if worker.bayChunkKey and chunks[worker.bayChunkKey] then return worker.bayChunkKey end
+  if worker.seedKey and chunks[worker.seedKey] then return worker.seedKey end
+  if worker.bay then
+    local cx, cz = math.floor(worker.bay.x / 16), math.floor(worker.bay.z / 16)
+    local exact
+    for _, key in ipairs(keys) do
+      local chunk = chunks[key]
+      if chunk.cx == cx and chunk.cz == cz then exact = key; break end
+    end
+    if exact then return exact end
+    local best, bestDistance
+    for _, key in ipairs(keys) do
+      local chunk = chunks[key]
+      local centerX, centerZ = chunk.cx * 16 + 8, chunk.cz * 16 + 8
+      local distance = math.abs(worker.bay.x - centerX) + math.abs(worker.bay.z - centerZ)
+      if not best or distance < bestDistance or (distance == bestDistance and chunkComparator(chunk, chunks[best])) then
+        best, bestDistance = key, distance
+      end
+    end
+    return best
+  end
+  return nil
+end
+
+local function stripeOwner(chunks, keys, workers, options)
+  local xs, zs, byCoord = catalogGridShape(chunks, keys)
+  if not xs or not zs then return nil, "stripe_partition_unavailable" end
+  local explicitAxis = options.stripeAxis == "x" or options.stripeAxis == "z"
+  local axis = explicitAxis and options.stripeAxis or (#xs >= #zs and "x" or "z")
+
+  -- A bay-aware stripe can only satisfy the ownership contract when each bay
+  -- occupies a distinct stripe level.  If the automatically selected axis
+  -- collides, try the other axis before falling back to graph growth.
+  local function levelData(candidateAxis)
+    local candidateLevels = candidateAxis == "x" and xs or zs
+    if #workers > #candidateLevels then return nil end
+    local positions, used = {}, {}
+    local anyBay = false
+    for index, worker in ipairs(workers) do
+      if worker.bayChunkKey then
+        anyBay = true
+        local chunk = chunks[worker.bayChunkKey]
+        if not chunk then return nil end
+        local level = candidateAxis == "x" and chunk.cx or chunk.cz
         local position
         for levelIndex, value in ipairs(candidateLevels) do
           if value == level then position = levelIndex; break end
@@ -70,213 +282,3 @@
     local levelIndex, remainingWeight = 1, 0
     for _, weight in ipairs(weights) do remainingWeight = remainingWeight + weight end
     for rank = 1, #workers do
-      local remainingWorkers = #workers - rank
-      local target = remainingWeight / (remainingWorkers + 1)
-      local selected = 0
-      while levelIndex <= #levels do
-        local canStop = selected > 0 and (#levels - levelIndex + 1) >= remainingWorkers
-        local weight = weights[levelIndex]
-        if canStop and selected + weight > target and selected > 0 then break end
-        selected = selected + weight
-        levelIndex = levelIndex + 1
-        if levelIndex > #levels or (#levels - levelIndex + 1) == remainingWorkers then break end
-      end
-      if rank == #workers then selected = remainingWeight end
-      cuts[rank] = levelIndex - 1
-      remainingWeight = remainingWeight - selected
-    end
-  end
-
-  local startLevel = 1
-  for rank = 1, #workers do
-    local workerIndex = workerOrder[rank]
-    local endLevel = cuts[rank]
-    for _, key in ipairs(keys) do
-      local chunk = chunks[key]
-      local level = axis == "x" and chunk.cx or chunk.cz
-      local levelPos = levelPositions[level]
-      if levelPos and levelPos >= startLevel and levelPos <= endLevel then
-        owner[key] = workerIndex
-        owned[workerIndex][#owned[workerIndex] + 1] = key
-        loads[workerIndex] = loads[workerIndex] + chunk.cells
-      end
-    end
-    startLevel = endLevel + 1
-  end
-  return owner, owned, loads, "stripe", axis
-end
-
-local function graphOwner(chunks, keys, workers, strategyLabel, distanceWeight)
-  if #workers > #keys then return nil, "more_workers_than_chunks" end
-  local owner, owned, loads = {}, {}, {}
-  for index = 1, #workers do owned[index], loads[index] = {}, 0 end
-  local seeds, seedSet = {}, {}
-  local seedDistanceCache = {}
-  -- First honour explicit/bay seeds.  Bay chunks are validated as unique by
-  -- partitionGroup; a duplicate can still only arise from a legacy caller,
-  -- in which case choose the next deterministic frontier rather than aliasing
-  -- ownership.
-  for index, worker in ipairs(workers) do
-    local selected = workerBayChunk(worker, chunks, keys)
-    if selected and seedSet[selected] then selected = nil end
-    if not selected then
-      local best, bestDistance
-      for _, key in ipairs(keys) do
-        if not seedSet[key] then
-          local distance = 0
-          if worker.bay then
-            local chunk = chunks[key]
-            distance = math.abs(worker.bay.x - (chunk.cx * 16 + 8)) + math.abs(worker.bay.z - (chunk.cz * 16 + 8))
-          else
-            distance = MAX_CHUNKS
-            local maps = seedDistanceCache
-            for _, seed in ipairs(seeds) do
-              if not maps[seed] then maps[seed] = graphDistances(chunks, seed) end
-              local d = maps[seed][key] or MAX_CHUNKS
-              -- Farthest-point seeding maximises the nearest distance to an
-              -- existing seed (maximin), rather than clustering all workers
-              -- around the first seed.
-              if d < distance then distance = d end
-            end
-            if #seeds == 0 then distance = 0 end
-          end
-          local farther = not worker.bay
-          if not best
-              or (farther and distance > bestDistance)
-              or ((not farther) and distance < bestDistance)
-              or (distance == bestDistance and chunkComparator(chunks[key], chunks[best])) then
-            best, bestDistance = key, distance
-          end
-        end
-      end
-      selected = best
-    end
-    if not selected then return nil, "worker_seed_failed" end
-    seeds[index], seedSet[selected] = selected, true
-    owner[selected] = index
-    owned[index][#owned[index] + 1] = selected
-    loads[index] = loads[index] + chunks[selected].cells
-  end
-  local total, target = 0, 0
-  for _, key in ipairs(keys) do total = total + chunks[key].cells end
-  target = total / #workers
-  local assigned = #workers
-  while assigned < #keys do
-    local bestKey, bestOwner, bestScore, bestProjected
-    for _, key in ipairs(keys) do
-      if not owner[key] then
-        local candidateOwners = {}
-        for _, neighbor in ipairs(chunks[key].neighbors or {}) do
-          local index = owner[neighbor]
-          if index then candidateOwners[index] = true end
-        end
-        for index in pairs(candidateOwners) do
-          local projected = math.abs((loads[index] + chunks[key].cells) - target)
-          local score = projected
-          if distanceWeight and workers[index].bay then
-            local chunk = chunks[key]
-            score = score + distanceWeight * (math.abs(workers[index].bay.x - (chunk.cx * 16 + 8))
-              + math.abs(workers[index].bay.z - (chunk.cz * 16 + 8)))
-          end
-          if not bestKey or score < bestScore or (score == bestScore and (chunkComparator(chunks[key], chunks[bestKey]) or (key == bestKey and index < bestOwner))) then
-            bestKey, bestOwner, bestScore, bestProjected = key, index, score, projected
-          end
-        end
-      end
-    end
-    if not bestKey then return nil, "chunk_catalog_disconnected" end
-    owner[bestKey] = bestOwner
-    owned[bestOwner][#owned[bestOwner] + 1] = bestKey
-    loads[bestOwner] = loads[bestOwner] + chunks[bestKey].cells
-    assigned = assigned + 1
-  end
-  return owner, owned, loads, strategyLabel or "graph", seeds
-end
-
-local function cloneStringArray(values)
-  local copy = {}
-  for index, value in ipairs(values or {}) do copy[index] = tostring(value) end
-  return copy
-end
-
-local function groupAssignmentCopy(source)
-  local copy = {}
-  for key, value in pairs(source or {}) do
-    if key == "chunkKeys" or key == "transitKeys" or key == "leaseKeys" or key == "transitLeaseKeys" then
-      copy[key] = cloneStringArray(value)
-    elseif key == "layersInfo" and type(value) == "table" then
-      local info = {}; for infoKey, infoValue in pairs(value) do info[infoKey] = infoValue end; copy[key] = info
-    else
-      copy[key] = value
-    end
-  end
-  return copy
-end
-
-local function groupLeaseKey(groupJobId, workerId, chunkKeyValue)
-  return tostring(groupJobId) .. ":" .. tostring(workerId) .. ":" .. tostring(chunkKeyValue)
-end
-
-function M.partitionGroup(catalog, workersInput, options)
-  options = type(options) == "table" and options or {}
-  local chunks, keys, catalogError = groupCatalogInput(catalog, options)
-  if not chunks then return nil, catalogError end
-  if #keys > MAX_CHUNKS then return nil, "too_many_chunks" end
-  local catalogCells = 0
-  for _, key in ipairs(keys) do
-    catalogCells = catalogCells + chunks[key].cells
-    if catalogCells > MAX_BLOCKS then return nil, "group_too_large" end
-  end
-  local workers, workerError = groupWorkerList(workersInput)
-  if not workers then return nil, workerError end
-  if #workers > #keys then return nil, "more_workers_than_chunks" end
-  for _, worker in ipairs(workers) do
-    if worker.seedKey and not chunks[worker.seedKey] then return nil, "unknown_seed_chunk:" .. worker.seedKey end
-    if worker.bayInvalid then return nil, "invalid_worker_bay" end
-  end
-  local bayMap = options.workerBays or options.bays
-  if type(bayMap) == "table" then
-    for _, worker in ipairs(workers) do
-      if not worker.bay then
-        local bay = bayMap[worker.id] or bayMap[worker.key]
-        if type(bay) == "table" then
-          local point = bay.position or bay.world or bay.bay or bay.homeWorld or bay
-          if type(point) == "table" and (not numberValue(point.x) or not numberValue(point.z)) then
-            point = point.world or point.position or point.bay or point
-          end
-          local x, z = numberValue(point.x), numberValue(point.z)
-          if (not x or not z) and point.cx ~= nil and point.cz ~= nil then
-            local cx, cz = integerValue(point.cx), integerValue(point.cz)
-            if cx and cz then x, z = cx * 16 + 8, cz * 16 + 8 end
-          end
-          if x and z then worker.bay = { x = x, z = z } end
-        end
-        if bay ~= nil and not worker.bay then return nil, "invalid_worker_bay" end
-      end
-    end
-  end
-  -- When bay metadata is supplied, every worker must have one distinct bay
-  -- chunk inside the authoritative world catalog.  Never silently snap an
-  -- out-of-catalog bay to its nearest chunk: that would let a worker start
-  -- from another worker's region and defeats the transit lease boundary.
-  local bayAware, bayChunks = false, {}
-  for _, worker in ipairs(workers) do
-    if worker.bay then
-      bayAware = true
-      local cx, cz = math.floor(worker.bay.x / 16), math.floor(worker.bay.z / 16)
-      local bayKey
-      for _, key in ipairs(keys) do
-        local chunk = chunks[key]
-        if chunk.cx == cx and chunk.cz == cz then bayKey = key; break end
-      end
-      if not bayKey then return nil, "worker_bay_outside_catalog:" .. worker.key end
-      if bayChunks[bayKey] then return nil, "duplicate_worker_bay_chunk:" .. bayKey end
-      bayChunks[bayKey] = worker.key
-      worker.bayChunkKey = bayKey
-    end
-  end
-  if bayAware then
-    for _, worker in ipairs(workers) do
-      if not worker.bayChunkKey then return nil, "worker_bay_required:" .. worker.key end
-    end
-  end

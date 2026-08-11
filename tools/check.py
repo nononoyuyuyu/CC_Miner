@@ -1095,6 +1095,8 @@ def main() -> None:
     check_lua_syntax(lua)
     lua_tests = [
         "tests/test_setup_v4.lua",
+        "tests/test_remote_console.lua",
+        "tests/test_worker_remote_console.lua",
         "tests/test_worker_v4_contract.lua",
         "tests/test_controller_v4_contract.lua",
         "tests/test_distribution_v4.lua",

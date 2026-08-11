@@ -1,9 +1,147 @@
+-- command strings.  A command may contain one space-separated subcommand (for
+-- example `ccm status` or `label get`), but shell syntax and arguments are
+-- never accepted here.  The worker performs the final command-head check;
+-- this normalizer only keeps persisted configuration portable and safe.
+local function normalizeRemoteAllowlist(value, fallback)
+  fallback = type(fallback) == "table" and fallback or M.defaultRemoteConsoleConfig().allowlist
+  local function command(value)
+    if type(value) ~= "string" then return nil end
+    if #value < 1 or #value > 128 or value:find("[%c]") then return nil end
+    local trimmed = M.trim(value)
+    if trimmed ~= value then return nil end
+    local normalized = string.lower(trimmed):gsub("%s+", " ")
+    if normalized == "" or normalized:find("[^a-z0-9_%.%- ]") then return nil end
+    -- Do not let a command silently change when a hand-edited value has
+    -- leading/trailing whitespace; this is easier to audit than accepting a
+    -- visually ambiguous entry.
+    if normalized:gsub("%s+", " ") ~= string.lower(value) then return nil end
+    return normalized
+  end
+
+  local out, seen = {}, {}
+  local invalid = false
+  local function add(item)
+    local normalized = command(item)
+    if not normalized then invalid = true; return end
+    if not seen[normalized] then
+      seen[normalized] = true
+      out[#out + 1] = normalized
+    end
+  end
+
+  if type(value) == "string" then
+    -- Early V4 drafts used a comma-separated text field.  Read it once and
+    -- write the canonical array on the next save.
+    if value == "" then return {} end
+    for item in value:gmatch("[^,;]+") do add(item) end
+    if value:match("^[,;]") or value:match("[,;]$") or value:find("[,;][,;]") then invalid = true end
+  elseif type(value) == "table" then
+    local isArray = #value > 0
+    if isArray then
+      for index = 1, #value do add(value[index]) end
+      for key in pairs(value) do
+        if type(key) ~= "number" or key < 1 or key > #value or key ~= math.floor(key) then invalid = true end
+      end
+    else
+      -- Accept a legacy `{ ["ccm status"] = true }` map, but never persist
+      -- that shape.  False entries are ignored; non-boolean values fail safe.
+      local names = {}
+      for key, enabled in pairs(value) do
+        if type(key) ~= "string" or type(enabled) ~= "boolean" then
+          invalid = true
+        elseif enabled then
+          names[#names + 1] = key
+        end
+      end
+      table.sort(names)
+      for _, key in ipairs(names) do add(key) end
+    end
+  elseif value == nil then
+    return M.copy(fallback)
+  else
+    return M.copy(fallback)
+  end
+
+  -- An explicitly supplied malformed allowlist must not widen access.  Keep
+  -- valid entries when possible; if every entry was rejected, persist an
+  -- empty list (deny by default) rather than restoring a surprising grant.
+  if invalid and #out == 0 then return {} end
+  return out
+end
+
+function M.normalizeRemoteConsoleConfig(value)
+  local defaults = M.defaultRemoteConsoleConfig()
+  local source = type(value) == "table" and value or {}
+  local out = {
+    enabled = normalizeBoolean(source.enabled, defaults.enabled),
+    allowShell = normalizeBoolean(source.allowShell, defaults.allowShell),
+    sessionSeconds = normalizeInteger(source.sessionSeconds, 1, 3600, defaults.sessionSeconds),
+    maxOutputBytes = normalizeInteger(source.maxOutputBytes, 256, 65536, defaults.maxOutputBytes),
+    auditLimit = normalizeInteger(source.auditLimit, 1, 1000, defaults.auditLimit),
+    allowlist = normalizeRemoteAllowlist(source.allowlist, defaults.allowlist),
+  }
+  -- `allowShell` is a separate privilege and must never be inferred from the
+  -- command list.  Keep a boolean false for malformed/non-boolean values.
+  if out.allowShell ~= true then out.allowShell = false end
+  return out
+end
+
+local function firstNonNil(...)
+  for index = 1, select("#", ...) do
+    local value = select(index, ...)
+    if value ~= nil then return value end
+  end
+  return nil
+end
+
+local function normalizeTable(defaults, loaded)
+  if type(loaded) ~= "table" then return M.copy(defaults) end
+  return M.merge(defaults, loaded)
+end
+
+local function normalizeWorkerConfig(raw)
+  local defaults = M.defaultWorkerConfig()
+  local config = normalizeTable(defaults, raw)
+  config.role = "worker"
+  config.schema, config.version = M.SCHEMA, M.VERSION
+
+  -- The new schema is additive.  Read legacy flat names first, then let an
+  -- explicitly nested value win.  This keeps hand-edited V2/V4 files valid
+  -- while producing one canonical nested contract for new code.
+  local loaded = type(raw) == "table" and raw or {}
+  local loadedMaterials = type(loaded.materials) == "table" and loaded.materials or {}
+  local loadedDiscard = type(loaded.discard) == "table" and loaded.discard
+    or (type(loadedMaterials.discard) == "table" and loadedMaterials.discard or {})
   local loadedPerformance = type(loaded.performance) == "table" and loaded.performance or {}
   local loadedDock = type(loaded.dock) == "table" and loaded.dock or {}
   local loadedJournal = type(loaded.journal) == "table" and loaded.journal or {}
 
   config.networkKey = normalizeString(config.networkKey, defaults.networkKey, 8, 40)
   config.workerName = normalizeString(config.workerName, defaults.workerName, 1, 20)
+  config.controllerId = normalizeInteger(config.controllerId, 0, 65535, defaults.controllerId)
+  -- Remote-console settings were introduced additively.  Read the canonical
+  -- nested record first, then the short aliases used by early V4 drafts, and
+  -- always emit a fresh canonical table for serializer safety.
+  local loadedRemote = type(loaded.remoteConsole) == "table" and loaded.remoteConsole
+    or (type(loaded.remote_console) == "table" and loaded.remote_console)
+    or (type(loaded.remote) == "table" and loaded.remote) or {}
+  local remoteScalar = type(loaded.remoteConsole) == "boolean" and loaded.remoteConsole or nil
+  local remoteSource = {
+    enabled = firstNonNil(loadedRemote.enabled, remoteScalar, loaded.remoteConsoleEnabled,
+      loaded.remote_console_enabled, loaded.remoteEnabled),
+    allowShell = firstNonNil(loadedRemote.allowShell, loadedRemote.shell,
+      loaded.remoteConsoleAllowShell, loaded.remote_allow_shell, loaded.remoteShell),
+    sessionSeconds = firstNonNil(loadedRemote.sessionSeconds, loadedRemote.session,
+      loadedRemote.timeoutSeconds, loaded.remoteSessionSeconds, loaded.remoteConsoleSessionSeconds),
+    maxOutputBytes = firstNonNil(loadedRemote.maxOutputBytes, loadedRemote.maxOutput,
+      loaded.remoteMaxOutputBytes, loaded.remoteConsoleMaxOutputBytes),
+    auditLimit = firstNonNil(loadedRemote.auditLimit, loadedRemote.auditEntries,
+      loaded.remoteAuditLimit, loaded.remoteConsoleAuditLimit),
+    allowlist = firstNonNil(loadedRemote.allowlist, loadedRemote.allowList, loadedRemote.commands,
+      loadedRemote.allowedCommands, loaded.remoteAllowlist, loaded.remote_allowlist,
+      loaded.remoteConsoleAllowlist),
+  }
+  config.remoteConsole = M.normalizeRemoteConsoleConfig(remoteSource)
   config.profile = normalizeEnum(config.profile, { safe = true, balanced = true, turbo = true }, defaults.profile)
   config.waterMode = normalizeEnum(config.waterMode, { ignore = true, stop = true, seal = true }, defaults.waterMode)
   config.maxContinuousSeal = normalizeInteger(config.maxContinuousSeal, 1, 4096, defaults.maxContinuousSeal)
@@ -75,96 +213,3 @@
   config.lighting = normalizeTable(defaults.lighting, config.lighting)
   config.lighting.mode = normalizeEnum(config.lighting.mode, { off = true, safe = true, custom = true }, defaults.lighting.mode)
   config.lighting.interval = normalizeInteger(config.lighting.interval, 1, 4096, defaults.lighting.interval)
-  config.lighting.temporaryFloor = normalizeBoolean(config.lighting.temporaryFloor, defaults.lighting.temporaryFloor)
-  config.lighting.torchTarget = normalizeInteger(config.lighting.torchTarget, 1, 512, defaults.lighting.torchTarget)
-  config.lighting.torchReserve = normalizeInteger(config.lighting.torchReserve, 0, math.max(0, config.lighting.torchTarget - 1), defaults.lighting.torchReserve)
-  config.lighting.reserve = normalizeInteger(config.lighting.reserve, 0, 512, defaults.lighting.reserve)
-  config.lighting.preferredSlots = normalizeSlotList(config.lighting.preferredSlots, defaults.lighting.preferredSlots)
-  config.lighting.torchBlocks = normalizeBlockMap(config.lighting.torchBlocks, defaults.lighting.torchBlocks)
-  config.lighting.slot = normalizeInteger(config.lighting.slot, 1, 16, defaults.lighting.slot)
-  local loadedLighting = type(raw) == "table" and raw.lighting or nil
-  local requestedTorchSide = type(loadedLighting) == "table" and loadedLighting.side or nil
-  if requestedTorchSide == nil and type(raw) == "table" then requestedTorchSide = raw.torchSide end
-  config.lighting.side = normalizeEnum(requestedTorchSide or config.lighting.side,
-    { left = true, right = true }, defaults.lighting.side)
-  if config.lavaMode == "seal" and config.lighting.side == config.sealSide then
-    config.lighting.side = config.sealSide == "left" and "right" or "left"
-  end
-  -- V4 uses lighting.side; retain the flat alias for older draft configs.
-  config.torchSide = config.lighting.side
-
-  config.materials = normalizeTable(defaults.materials, config.materials)
-  for _, key in ipairs({ "sealSlots", "torchSlots", "fuelReserveSlots" }) do
-    config.materials[key] = normalizeSlotList(config.materials[key], defaults.materials[key])
-  end
-  config.materials.compactEveryMoves = normalizeInteger(config.materials.compactEveryMoves, 1, 100000, defaults.materials.compactEveryMoves)
-  config.materials.recycleMinedBlocks = normalizeBoolean(config.materials.recycleMinedBlocks, defaults.materials.recycleMinedBlocks)
-  config.materials.retainSealTarget = normalizeInteger(config.discard.retainSealTarget, 1, 512, defaults.materials.retainSealTarget)
-  config.discard.retainSealTarget = config.materials.retainSealTarget
-  config.retainSealTarget = config.discard.retainSealTarget
-  -- Keep legacy material compatibility as an independent copy.  Some
-  -- ComputerCraft serializers reject shared table references.
-  config.materials.discard = M.copy(config.discard)
-
-  config.performance = normalizeTable(defaults.performance, config.performance)
-  local requestedGpsVerify = loadedPerformance.gpsVerifyEveryMoves
-    or loadedPerformance.gpsVerifyMoves
-    or loadedPerformance.gpsVerifyCadence
-    or config.performance.gpsVerifyEveryMoves
-  config.performance.gpsVerifyEveryMoves = normalizeInteger(requestedGpsVerify, 32, 64,
-    defaults.performance.gpsVerifyEveryMoves)
-  config.performance.gpsVerifyMoves = config.performance.gpsVerifyEveryMoves
-  config.performance.gpsVerifyCadence = config.performance.gpsVerifyEveryMoves
-  local requestedLightweight = loadedPerformance.lightweightCheckpointEveryMoves
-    or loadedPerformance.lightweightCheckpointCadence
-    or loadedPerformance.journalEveryMoves
-    or loadedJournal.lightweightCheckpointEveryMoves
-    or loadedJournal.checkpointEvery
-    or config.performance.lightweightCheckpointEveryMoves
-  config.performance.lightweightCheckpointEveryMoves = normalizeInteger(requestedLightweight, 1, 100000,
-    defaults.performance.lightweightCheckpointEveryMoves)
-  config.performance.lightweightCheckpointCadence = config.performance.lightweightCheckpointEveryMoves
-  config.performance.journalEveryMoves = config.performance.lightweightCheckpointEveryMoves
-  local requestedCheckpoint = loadedPerformance.checkpointEveryMoves
-    or loadedPerformance.checkpointCadence
-    or config.performance.checkpointEveryMoves
-  config.performance.checkpointEveryMoves = normalizeInteger(requestedCheckpoint, 1, 100000,
-    defaults.performance.checkpointEveryMoves)
-  config.performance.checkpointCadence = config.performance.checkpointEveryMoves
-
-  -- Journal settings predate `performance`; preserve their values but expose
-  -- the lightweight cadence as the canonical checkpoint hint.
-  config.journal = normalizeTable(defaults.journal, config.journal)
-  config.journal.enabled = normalizeBoolean(config.journal.enabled, defaults.journal.enabled)
-  config.journal.checkpointEvery = normalizeInteger(config.journal.checkpointEvery, 1, 100000, defaults.journal.checkpointEvery)
-  config.journal.lightweightCheckpointEveryMoves = normalizeInteger(
-    config.journal.lightweightCheckpointEveryMoves,
-    1,
-    100000,
-    defaults.journal.lightweightCheckpointEveryMoves
-  )
-  config.journal.maxEntries = normalizeInteger(config.journal.maxEntries, 1, 10000, defaults.journal.maxEntries)
-  if type(config.journal.path) ~= "string" or M.trim(config.journal.path) == "" then config.journal.path = defaults.journal.path end
-  if type(config.journal.pendingPath) ~= "string" or M.trim(config.journal.pendingPath) == "" then config.journal.pendingPath = defaults.journal.pendingPath end
-  config.journal.lightweightCheckpointEveryMoves = config.performance.lightweightCheckpointEveryMoves
-
-  config.dock = normalizeTable(defaults.dock, config.dock)
-  local legacyAssignment = loaded.groupId or loaded.group or loaded.groupAssignment or loaded.assignment
-  if type(legacyAssignment) == "table" then
-    legacyAssignment = legacyAssignment.groupId or legacyAssignment.id or legacyAssignment.name
-  end
-  local legacyDockId = type(loaded.dock) == "string" and loaded.dock or nil
-  local dockId = loadedDock.id or loaded.dockId or loaded.homeDockId or legacyDockId or config.dock.id
-  local groupId = loadedDock.groupId or legacyAssignment or config.dock.groupId
-  local bayId = loadedDock.bayId or loaded.bayId or loaded.bay or config.dock.bayId
-  if type(dockId) == "table" then dockId = dockId.id or dockId.name end
-  if type(groupId) == "table" then groupId = groupId.id or groupId.name or groupId.groupId end
-  if type(bayId) == "table" then bayId = bayId.id or bayId.name or bayId.bayId end
-  config.dock.id = normalizeIdentifier(dockId, defaults.dock.id, 64)
-  config.dock.groupId = normalizeIdentifier(groupId, defaults.dock.groupId, 64)
-  config.dock.bayId = normalizeIdentifier(bayId, defaults.dock.bayId, 64)
-  local homeWorld = loadedDock.homeWorld or loadedDock.world or loadedDock.position or loadedDock.home
-    or loaded.homeWorld or loaded.gpsHome
-  if not homeWorld and type(config.gps) == "table" and type(config.gps.calibration) == "table" then
-    homeWorld = config.gps.calibration.home
-  end

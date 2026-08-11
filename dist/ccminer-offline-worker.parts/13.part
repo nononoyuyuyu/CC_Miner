@@ -1,3 +1,166 @@
+        else finding("WARN", "controller.db", tostring(path) .. " has no history table") end
+
+        local docks = type(db.docks) == "table" and db.docks or {}
+        local bays = type(db.bays) == "table" and db.bays or {}
+        local groups = db.groups
+        local groupJobs = db.groupJobs or db.group_jobs
+        if groups == nil then
+          finding("PASS", "group", "no groups configured")
+        elseif type(groups) ~= "table" then
+          finding("FAIL", "group", "groups table is malformed")
+        else
+          local groupCount = 0; local groupErrors = 0
+          for key, group in pairs(groups) do
+            groupCount = groupCount + 1
+            if type(group) ~= "table" then
+              groupErrors = groupErrors + 1
+            else
+              local workers = group.workerIds or group.workers
+              if workers ~= nil and type(workers) ~= "table" then groupErrors = groupErrors + 1 end
+              local dockId = group.dockId or (type(group.dock) == "string" and group.dock or nil)
+              local bayId = group.bayId or (type(group.bay) == "string" and group.bay or nil)
+              if dockId and docks[dockId] == nil and docks[tostring(dockId)] == nil then groupErrors = groupErrors + 1 end
+              if bayId and bays[bayId] == nil and bays[tostring(bayId)] == nil then groupErrors = groupErrors + 1 end
+              if group.bottomY ~= nil and not tonumber(group.bottomY) then groupErrors = groupErrors + 1 end
+            end
+          end
+          if groupErrors > 0 then finding("FAIL", "group", ("%d malformed of %d"):format(groupErrors, groupCount))
+          else finding("PASS", "group", tostring(groupCount) .. " configured") end
+        end
+        if db.docks == nil then finding("PASS", "dock", "no dock registry")
+        elseif type(db.docks) ~= "table" then finding("FAIL", "dock", "dock registry is malformed")
+        else
+          local errors, count = 0, 0
+          for _, dock in pairs(db.docks) do
+            count = count + 1
+            if type(dock) ~= "table" then errors = errors + 1
+            elseif dock.world and not coordinateTable(dock.world) then errors = errors + 1
+            elseif dock.x ~= nil and (not tonumber(dock.x) or not tonumber(dock.y) or not tonumber(dock.z)) then errors = errors + 1 end
+          end
+          if errors > 0 then finding("FAIL", "dock", ("%d malformed of %d"):format(errors, count))
+          else finding("PASS", "dock", tostring(count) .. " registered") end
+        end
+        if db.bays == nil then finding("PASS", "bay", "no bay registry")
+        elseif type(db.bays) ~= "table" then finding("FAIL", "bay", "bay registry is malformed")
+        else
+          local errors, count = 0, 0
+          for _, bay in pairs(db.bays) do
+            count = count + 1
+            if type(bay) ~= "table" then errors = errors + 1
+            elseif bay.world and not coordinateTable(bay.world) then errors = errors + 1
+            elseif bay.capacity ~= nil and (not tonumber(bay.capacity) or tonumber(bay.capacity) < 1) then errors = errors + 1 end
+          end
+          if errors > 0 then finding("FAIL", "bay", ("%d malformed of %d"):format(errors, count))
+          else finding("PASS", "bay", tostring(count) .. " registered") end
+        end
+        if groupJobs ~= nil and type(groupJobs) ~= "table" then
+          finding("FAIL", "group.ack", "groupJobs table is malformed")
+        elseif type(groupJobs) == "table" then
+          local ackWarnings = 0
+          for _, job in pairs(groupJobs) do
+            if type(job) == "table" then
+              local assignments = job.assignments or job.assignmentCount
+              local acks = job.acks or job.ackSummary or job.ackCount
+              local aggregate = type(job.aggregate) == "table" and job.aggregate or nil
+              local aggregateAcks = aggregate and tonumber(aggregate.acks) or nil
+              local aggregateTotal = aggregate and tonumber(aggregate.ackTotal or aggregate.total) or nil
+              if type(assignments) == "table" then assignments = #assignments end
+              if type(acks) == "table" then
+                local count = 0
+                for _ in pairs(acks) do count = count + 1 end
+                acks = count
+              end
+              if assignments and acks and tonumber(acks) and tonumber(assignments) and tonumber(acks) > tonumber(assignments) then ackWarnings = ackWarnings + 1 end
+              if aggregateAcks and aggregateTotal and (aggregateAcks < 0 or aggregateAcks > aggregateTotal) then ackWarnings = ackWarnings + 1 end
+            end
+          end
+          if ackWarnings > 0 then finding("FAIL", "group.ack", "ACK count exceeds assignments")
+          else finding("PASS", "group.ack", "group ACK summaries are consistent") end
+        else finding("PASS", "group.ack", "no group jobs") end
+        break
+      elseif dbError and dbError ~= "missing" then finding("WARN", "controller.db", tostring(path) .. ": " .. tostring(dbError)) end
+    end
+    if not found then finding("WARN", "controller.db", "history database not found") end
+  end
+
+  print("")
+  print(("Doctor summary: PASS=%d WARN=%d FAIL=%d"):format(counts.PASS, counts.WARN, counts.FAIL))
+  if counts.FAIL > 0 then print("Doctor result: FAIL")
+  elseif counts.WARN > 0 then print("Doctor result: WARN")
+  else print("Doctor result: PASS") end
+end
+
+if command == "help" or command == "?" then
+  printHelp()
+elseif command == "version" then
+  print("CC Miner " .. tostring(common.VERSION or ""))
+elseif command == "setup" then
+  shell.run("/ccminer/setup.lua", args[2])
+elseif command == "dashboard" then
+  shell.run("/ccminer/controller.lua")
+elseif command == "discover" then
+  shell.run("/ccminer/controller.lua", "discover")
+elseif command == "doctor" then
+  runDoctor()
+elseif command == "report" then
+  runReport()
+elseif command == "rehome" then
+  local config, configError = common.loadConfig()
+  if not config then
+    reportError(configError or "Not configured.")
+  elseif config.role == "worker" then
+    if args[2] ~= "RESET" then
+      reportError("Place the turtle in its dock facing the quarry, then run: ccm rehome RESET")
+    else
+      local calibration = config.gps and config.gps.calibration or nil
+      if calibration and gps and gps.locate then
+        local x, y, z = gps.locate(2, false)
+        if not x then
+          reportError("A GPS fix is required to verify the calibrated dock. Rehome was cancelled.")
+          return
+        end
+        if common.round(x) ~= calibration.home.x or common.round(y) ~= calibration.home.y or common.round(z) ~= calibration.home.z then
+          reportError("GPS position does not match the calibrated dock. Rehome was cancelled.")
+          return
+        end
+      elseif calibration then
+        reportError("GPS is unavailable, so the calibrated dock cannot be verified. Rehome was cancelled.")
+        return
+      end
+      local previous = common.loadTable(common.STATE_PATH, common.defaultState())
+      local reset = common.defaultState()
+      if previous and previous.stats then reset.stats = previous.stats end
+      local ok, err = common.saveTable(common.STATE_PATH, reset)
+      if not ok then reportError("Cannot reset worker state: " .. tostring(err))
+      else print("Worker coordinates and job were reset to home. Run: reboot") end
+    end
+  elseif config.role == "controller" then
+    if not tonumber(args[2]) or args[3] ~= "RESET" then reportError("Usage: ccm rehome <id> RESET") else forwardController() end
+  else
+    reportError("Rehome is not available for role " .. tostring(config.role))
+  end
+elseif command == "start" or command == "pause" or command == "resume" or command == "recall"
+  or command == "service" or command == "abort" or command == "clear" or command == "gps" or command == "calibrate"
+  or command == "queue" or command == "preset" or command == "presets" or command == "stop"
+  or command == "group" or command == "dock" or command == "bay" or command == "remote" then
+  local config = loadConfigForCommand()
+  if config and config.role ~= "controller" then reportError("Run this command on the controller computer.")
+  elseif config then
+    if command == "group" then
+      local sub = string.lower(tostring(args[2] or "list"))
+      local groupCommands = {
+        list = true, show = true, register = true, start = true, pause = true, resume = true,
+        ["return"] = true, service = true, abort = true, clear = true, reassign = true,
+      }
+      if not groupCommands[sub] then
+        reportError("Usage: ccm group list|show <id>|register <id> <workerIds comma> [name dock bay mode partition workerBayMap workerDockMap]|start|pause|resume|return|service|abort|clear|reassign <id> <stopped> [target]")
+      else
+        -- Keep the complete argument vector intact.  The controller owns
+        -- group validation, worker selection, partial-start policy and ACK
+        -- aggregation; command.lua only preserves the legacy forwarding
+        -- boundary and role check.
+        forwardController()
+      end
     elseif command == "dock" or command == "bay" then
       local sub = string.lower(tostring(args[2] or "list"))
       if sub ~= "list" and sub ~= "register" then
@@ -52,240 +215,3 @@ elseif command == "status" then
     printStatusFeature("Lighting", state.lighting, config.lighting or config.lightMode)
     printStatusFeature("Water", state.water, config.water or config.waterMode)
     printStatusFeature("Profile", state.profile, config.profile)
-    printStatusFeature("Materials", state.materials, config.materials)
-    printStatusFeature("Staged stop", state.stagedStop, config.stagedStop)
-    if state.job then print(("Job: %s %s/%s [%s]"):format(tostring(state.job.name), tostring(state.job.cursor), tostring(state.job.total), tostring(state.job.strategy))) end
-    printOperationalFields(state, config)
-    if state.lastError then print("Error: " .. tostring(state.lastError)) end
-  elseif config.role == "gps" then
-    print(("Coordinates: %s, %s, %s"):format(config.x, config.y, config.z))
-  end
-elseif command == "logs" then
-  if not fs.exists(common.LOG_PATH) then print("No log file yet."); return end
-  local handle = fs.open(common.LOG_PATH, "r")
-  local lines = {}
-  while true do
-    local line = handle.readLine()
-    if not line then break end
-    lines[#lines + 1] = line
-    if #lines > 30 then table.remove(lines, 1) end
-  end
-  handle.close()
-  for _, line in ipairs(lines) do print(line) end
-elseif command == "update" then
-  if not http then reportError("HTTP API is disabled."); return end
-  shell.run("wget", "run", "https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua", "update")
-else
-  reportError("Unknown command: " .. command)
-  printHelp()
-end
-]] },
-  { source = [[src/ccminer/lib/geo.lua]], target = [[lib/geo.lua]], digest = [[ab6a36054b267471ca0bd4e60b7fe0a68cd059d5abb3fb2f9a75fa2db671dbec]], content = [[-- CC Miner V4 - GPS and coordinate transforms.
-
-local M = {}
-
-local function rounded(value)
-  if type(value) ~= "number" then return nil end
-  if value >= 0 then return math.floor(value + 0.5) end
-  return math.ceil(value - 0.5)
-end
-
-function M.integerFix(x, y, z, tolerance)
-  tolerance = tonumber(tolerance) or 0.35
-  local rx, ry, rz = rounded(x), rounded(y), rounded(z)
-  if not rx or not ry or not rz then return nil, "invalid_fix" end
-  if math.abs(x - rx) > tolerance or math.abs(y - ry) > tolerance or math.abs(z - rz) > tolerance then
-    return nil, "non_block_fix"
-  end
-  return { x = rx, y = ry, z = rz }
-end
-
-function M.validCalibration(calibration)
-  if type(calibration) ~= "table" or type(calibration.home) ~= "table" or type(calibration.forward) ~= "table" then
-    return false
-  end
-  local fx, fz = tonumber(calibration.forward.x), tonumber(calibration.forward.z)
-  if not fx or not fz or math.abs(fx) + math.abs(fz) ~= 1 then return false end
-  return tonumber(calibration.home.x) ~= nil
-    and tonumber(calibration.home.y) ~= nil
-    and tonumber(calibration.home.z) ~= nil
-end
-
-function M.rightVector(calibration)
-  if not M.validCalibration(calibration) then return nil end
-  local forward = calibration.forward
-  return { x = -forward.z, z = forward.x }
-end
-
-function M.localToWorld(calibration, pose)
-  if not M.validCalibration(calibration) then return nil, "gps_not_calibrated" end
-  pose = pose or {}
-  local home, forward = calibration.home, calibration.forward
-  local right = M.rightVector(calibration)
-  local x, y, z = tonumber(pose.x) or 0, tonumber(pose.y) or 0, tonumber(pose.z) or 0
-  return {
-    x = home.x + right.x * x + forward.x * z,
-    y = home.y + y,
-    z = home.z + right.z * x + forward.z * z,
-  }
-end
-
-function M.worldToLocal(calibration, world, dir)
-  if not M.validCalibration(calibration) then return nil, "gps_not_calibrated" end
-  world = world or {}
-  local wx, wy, wz = tonumber(world.x), tonumber(world.y), tonumber(world.z)
-  if not wx or not wy or not wz then return nil, "invalid_world_position" end
-  local home, forward = calibration.home, calibration.forward
-  local right = M.rightVector(calibration)
-  local dx, dz = wx - home.x, wz - home.z
-  return {
-    x = dx * right.x + dz * right.z,
-    y = wy - home.y,
-    z = dx * forward.x + dz * forward.z,
-    dir = tonumber(dir) or 0,
-  }
-end
-
-function M.samePosition(a, b)
-  if type(a) ~= "table" or type(b) ~= "table" then return false end
-  return tonumber(a.x) == tonumber(b.x)
-    and tonumber(a.y) == tonumber(b.y)
-    and tonumber(a.z) == tonumber(b.z)
-end
-
-function M.poseAfterMove(pose, direction)
-  pose = {
-    x = tonumber(pose and pose.x) or 0,
-    y = tonumber(pose and pose.y) or 0,
-    z = tonumber(pose and pose.z) or 0,
-    dir = (tonumber(pose and pose.dir) or 0) % 4,
-  }
-  if direction == "up" then pose.y = pose.y + 1
-  elseif direction == "down" then pose.y = pose.y - 1
-  elseif direction == "forward" then
-    if pose.dir == 0 then pose.z = pose.z + 1
-    elseif pose.dir == 1 then pose.x = pose.x + 1
-    elseif pose.dir == 2 then pose.z = pose.z - 1
-    else pose.x = pose.x - 1 end
-  elseif direction == "back" then
-    if pose.dir == 0 then pose.z = pose.z - 1
-    elseif pose.dir == 1 then pose.x = pose.x - 1
-    elseif pose.dir == 2 then pose.z = pose.z + 1
-    else pose.x = pose.x + 1 end
-  end
-  return pose
-end
-
-function M.chunkCoord(value)
-  return math.floor((tonumber(value) or 0) / 16)
-end
-
-function M.chunkKey(cx, cz)
-  return tostring(math.floor(tonumber(cx) or 0)) .. ":" .. tostring(math.floor(tonumber(cz) or 0))
-end
-
-function M.worldChunk(world)
-  return M.chunkCoord(world.x), M.chunkCoord(world.z)
-end
-
-function M.calibrationFromFixes(home, forwardFix)
-  if type(home) ~= "table" or type(forwardFix) ~= "table" then return nil, "missing_fix" end
-  local dx, dy, dz = forwardFix.x - home.x, forwardFix.y - home.y, forwardFix.z - home.z
-  if dy ~= 0 or math.abs(dx) + math.abs(dz) ~= 1 then
-    return nil, "Forward calibration move was not exactly one horizontal block."
-  end
-  return {
-    home = { x = home.x, y = home.y, z = home.z },
-    forward = { x = dx, z = dz },
-    calibratedAt = os and os.epoch and os.epoch("utc") or 0,
-  }
-end
-
-function M.resolvePending(pending, fix, calibration)
-  if type(pending) ~= "table" or type(pending.poseBefore) ~= "table" then return nil, "invalid_pending" end
-  local actual, err = M.worldToLocal(calibration, fix, pending.poseBefore.dir)
-  if not actual then return nil, err end
-  local before = pending.poseBefore
-  local kind = tostring(pending.kind or "")
-  if M.samePosition(actual, before) then
-    return { outcome = "before", pose = {
-      x = before.x, y = before.y, z = before.z, dir = before.dir,
-    } }
-  end
-  local expected = pending.poseAfter
-  if type(expected) == "table" and M.samePosition(actual, expected) then
-    return { outcome = "after", pose = {
-      x = expected.x, y = expected.y, z = expected.z, dir = expected.dir,
-    } }
-  end
-  if kind:match("^dig_") or kind:match("^seal_") then
-    return nil, "position_changed_during_stationary_action"
-  end
-  return nil, "gps_position_matches_neither_side_of_pending_action"
-end
-
-return M
-]] },
-  { source = [[src/ccminer/lib/quarry.lua]], target = [[lib/quarry.lua]], digest = [[f731d69df70b013baf8e62f6d47d838f291b41743e286fbc460e2b1e2c7d3340]], content = [=[-- CC Miner V4 - deterministic quarry paths, chunk plans, and helpers.
-
-local M = {}
-
--- The guards are deliberately conservative.  A quarry larger than these limits
--- is not useful in a single in-memory plan and would make an accidental UI/API
--- call allocate an unexpectedly large table.
-local MAX_DIMENSION = 4096
-local MAX_COLUMNS = 1024 * 1024
-local MAX_BLOCKS = 16 * 1024 * 1024
-local MAX_CHUNKS = 65536
-local MAX_WORKERS = 128
-local MAX_SELECTION_CELLS = 262144
-
-M.MAX_DIMENSION = MAX_DIMENSION
-M.MAX_COLUMNS = MAX_COLUMNS
-M.MAX_BLOCKS = MAX_BLOCKS
-M.MAX_CHUNKS = MAX_CHUNKS
-M.MAX_WORKERS = MAX_WORKERS
-
-local function numberValue(value)
-  local number = tonumber(value)
-  if not number or number ~= number or number == math.huge or number == -math.huge then
-    return nil
-  end
-  return number
-end
-
-local function integerValue(value, minimum, maximum)
-  local number = numberValue(value)
-  if not number or number % 1 ~= 0 then return nil end
-  if minimum and number < minimum then return nil end
-  if maximum and number > maximum then return nil end
-  return number
-end
-
-local function dimensions(width, length, depth)
-  width = integerValue(width, 1, MAX_DIMENSION)
-  length = integerValue(length, 1, MAX_DIMENSION)
-  if not width or not length then return nil, "invalid_dimensions" end
-  local columns = width * length
-  if columns > MAX_COLUMNS then return nil, "quarry_too_large" end
-  if depth ~= nil then
-    depth = integerValue(depth, 1, MAX_DIMENSION)
-    if not depth then return nil, "invalid_dimensions" end
-    if columns * depth > MAX_BLOCKS then return nil, "quarry_too_large" end
-  end
-  return width, length, depth, columns
-end
-
-function M.total(width, length, depth)
-  local validWidth, validLength, validDepth, columns = dimensions(width, length, depth)
-  if not validWidth then return nil, validLength end
-  if not validDepth then return nil, "invalid_dimensions" end
-  return columns * validDepth
-end
-
--- Fast continuous serpentine path used when no chunk is excluded.
-function M.cell(width, length, depth, index)
-  local validWidth, validLength, validDepth, totalColumns = dimensions(width, length, depth)
-  if not validWidth then return nil, validLength end
-  if not validDepth then return nil, "invalid_dimensions" end
-  index = integerValue(index, 0)

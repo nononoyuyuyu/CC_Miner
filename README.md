@@ -25,6 +25,8 @@ CC Minerは、CC: Restitched / CC:Tweakedの採掘タートルを、管理用コ
 - 最初はGPSなし、たいまつなし、水・溶岩で停止する設定がおすすめです。
 - チャンクの読み込み状態は、CC Minerから確認・変更できません。
 - 設定の合言葉は強い暗号ではありません。画面写真や配信へ写さないでください。
+- 遠隔コンソールは既定でOFFです。使う場合も、採掘を停止してドックへ戻し、`controllerId`（controller pin）を確認してください。
+- `ccm remote 12` を使う手順、`exit`、更新方法、allowShellの危険性は[設定の説明](docs/settings.html#remote-console)にあります。CCのrednet無線は暗号化されません。
 
 ## 開発者向け
 

@@ -1,3 +1,222 @@
+    printStatusFeature("Water", state.water, config.water or config.waterMode)
+    printStatusFeature("Profile", state.profile, config.profile)
+    printStatusFeature("Materials", state.materials, config.materials)
+    printStatusFeature("Staged stop", state.stagedStop, config.stagedStop)
+    if state.job then print(("Job: %s %s/%s [%s]"):format(tostring(state.job.name), tostring(state.job.cursor), tostring(state.job.total), tostring(state.job.strategy))) end
+    printOperationalFields(state, config)
+    if state.lastError then print("Error: " .. tostring(state.lastError)) end
+  elseif config.role == "gps" then
+    print(("Coordinates: %s, %s, %s"):format(config.x, config.y, config.z))
+  end
+elseif command == "logs" then
+  if not fs.exists(common.LOG_PATH) then print("No log file yet."); return end
+  local handle = fs.open(common.LOG_PATH, "r")
+  local lines = {}
+  while true do
+    local line = handle.readLine()
+    if not line then break end
+    lines[#lines + 1] = line
+    if #lines > 30 then table.remove(lines, 1) end
+  end
+  handle.close()
+  for _, line in ipairs(lines) do print(line) end
+elseif command == "update" then
+  if not http then reportError("HTTP API is disabled."); return end
+  shell.run("wget", "run", "https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua", "update")
+else
+  reportError("Unknown command: " .. command)
+  printHelp()
+end
+]] },
+  { source = [[src/ccminer/lib/quarry.lua]], target = [[lib/quarry.lua]], digest = [[f731d69df70b013baf8e62f6d47d838f291b41743e286fbc460e2b1e2c7d3340]], content = [=[-- CC Miner V4 - deterministic quarry paths, chunk plans, and helpers.
+
+local M = {}
+
+-- The guards are deliberately conservative.  A quarry larger than these limits
+-- is not useful in a single in-memory plan and would make an accidental UI/API
+-- call allocate an unexpectedly large table.
+local MAX_DIMENSION = 4096
+local MAX_COLUMNS = 1024 * 1024
+local MAX_BLOCKS = 16 * 1024 * 1024
+local MAX_CHUNKS = 65536
+local MAX_WORKERS = 128
+local MAX_SELECTION_CELLS = 262144
+
+M.MAX_DIMENSION = MAX_DIMENSION
+M.MAX_COLUMNS = MAX_COLUMNS
+M.MAX_BLOCKS = MAX_BLOCKS
+M.MAX_CHUNKS = MAX_CHUNKS
+M.MAX_WORKERS = MAX_WORKERS
+
+local function numberValue(value)
+  local number = tonumber(value)
+  if not number or number ~= number or number == math.huge or number == -math.huge then
+    return nil
+  end
+  return number
+end
+
+local function integerValue(value, minimum, maximum)
+  local number = numberValue(value)
+  if not number or number % 1 ~= 0 then return nil end
+  if minimum and number < minimum then return nil end
+  if maximum and number > maximum then return nil end
+  return number
+end
+
+local function dimensions(width, length, depth)
+  width = integerValue(width, 1, MAX_DIMENSION)
+  length = integerValue(length, 1, MAX_DIMENSION)
+  if not width or not length then return nil, "invalid_dimensions" end
+  local columns = width * length
+  if columns > MAX_COLUMNS then return nil, "quarry_too_large" end
+  if depth ~= nil then
+    depth = integerValue(depth, 1, MAX_DIMENSION)
+    if not depth then return nil, "invalid_dimensions" end
+    if columns * depth > MAX_BLOCKS then return nil, "quarry_too_large" end
+  end
+  return width, length, depth, columns
+end
+
+function M.total(width, length, depth)
+  local validWidth, validLength, validDepth, columns = dimensions(width, length, depth)
+  if not validWidth then return nil, validLength end
+  if not validDepth then return nil, "invalid_dimensions" end
+  return columns * validDepth
+end
+
+-- Fast continuous serpentine path used when no chunk is excluded.
+function M.cell(width, length, depth, index)
+  local validWidth, validLength, validDepth, totalColumns = dimensions(width, length, depth)
+  if not validWidth then return nil, validLength end
+  if not validDepth then return nil, "invalid_dimensions" end
+  index = integerValue(index, 0)
+  if not index or index >= totalColumns * validDepth then return nil, "index_out_of_range" end
+  local perLayer = validWidth * validLength
+  local layer = math.floor(index / perLayer)
+  local offset = index % perLayer
+  if layer % 2 == 1 then offset = perLayer - 1 - offset end
+  local row = math.floor(offset / validLength)
+  local column = offset % validLength
+  local z = row % 2 == 0 and (column + 1) or (validLength - column)
+  return { x = row, y = -layer, z = z }
+end
+
+function M.cellForJob(job, index)
+  if type(job) ~= "table" then return nil, "invalid_job" end
+  return M.cell(job.width, job.length, job.depth, index)
+end
+
+local function validCalibration(calibration)
+  if type(calibration) ~= "table" or type(calibration.home) ~= "table" or type(calibration.forward) ~= "table" then
+    return false
+  end
+  local fx, fz = numberValue(calibration.forward.x), numberValue(calibration.forward.z)
+  local hx, hy, hz = numberValue(calibration.home.x), numberValue(calibration.home.y), numberValue(calibration.home.z)
+  return fx ~= nil and fz ~= nil and hx ~= nil and hy ~= nil and hz ~= nil
+    and math.abs(fx) + math.abs(fz) == 1
+end
+
+local function localToWorld(calibration, x, z)
+  local forward = { x = numberValue(calibration.forward.x), z = numberValue(calibration.forward.z) }
+  local homeX, homeZ = numberValue(calibration.home.x), numberValue(calibration.home.z)
+  local rightX, rightZ = -forward.z, forward.x
+  return homeX + rightX * x + forward.x * z,
+    homeZ + rightZ * x + forward.z * z
+end
+
+-- Inverse of localToWorld for worker-local rebasing.  GPS calibrations are
+-- cardinal (one-block forward/right vectors), so the result remains integral
+-- for integral world positions while still accepting numeric coordinates for
+-- diagnostics.
+local function worldToLocalXZ(calibration, worldX, worldZ)
+  if not validCalibration(calibration) then return nil, nil, "gps_not_calibrated" end
+  worldX, worldZ = numberValue(worldX), numberValue(worldZ)
+  if not worldX or not worldZ then return nil, nil, "invalid_world_position" end
+  local forwardX, forwardZ = numberValue(calibration.forward.x), numberValue(calibration.forward.z)
+  local homeX, homeZ = numberValue(calibration.home.x), numberValue(calibration.home.z)
+  local dx, dz = worldX - homeX, worldZ - homeZ
+  local rightX, rightZ = -forwardZ, forwardX
+  return dx * rightX + dz * rightZ, dx * forwardX + dz * forwardZ
+end
+
+M.worldToLocalXZ = worldToLocalXZ
+function M.inverseWorldToLocal(calibration, worldX, worldZ)
+  if type(worldX) == "table" then worldZ, worldX = worldX.z, worldX.x end
+  local localX, localZ, inverseError = worldToLocalXZ(calibration, worldX, worldZ)
+  if not localX then return nil, inverseError end
+  return { x = localX, z = localZ }
+end
+function M.referenceLocalToWorld(calibration, x, z)
+  if not validCalibration(calibration) then return nil, "gps_not_calibrated" end
+  x, z = numberValue(x), numberValue(z)
+  if not x or not z then return nil, "invalid_position" end
+  local worldX, worldZ = localToWorld(calibration, x, z)
+  return { x = worldX, z = worldZ }
+end
+M.worldToLocal = M.inverseWorldToLocal
+
+local function chunkKey(mode, cx, cz)
+  return (mode == "world" and "W:" or "L:") .. tostring(cx) .. ":" .. tostring(cz)
+end
+
+M.chunkKey = chunkKey
+
+function M.chunkForCell(mode, calibration, x, z)
+  x, z = numberValue(x), numberValue(z)
+  if not x or not z then return nil, nil, "invalid_position" end
+  if mode == "world" then
+    if not validCalibration(calibration) then return nil, nil, "gps_not_calibrated" end
+    local wx, wz = localToWorld(calibration, x, z)
+    return math.floor(wx / 16), math.floor(wz / 16)
+  end
+  return math.floor(x / 16), math.floor((z - 1) / 16)
+end
+
+local function chunkComparator(a, b)
+  if a.cz ~= b.cz then return a.cz < b.cz end
+  if a.cx ~= b.cx then return a.cx < b.cx end
+  return tostring(a.key) < tostring(b.key)
+end
+
+function M.buildCatalog(width, length, mode, calibration)
+  local validWidth, validLength, _, columns = dimensions(width, length)
+  if not validWidth then return nil, validLength end
+  mode = mode == "world" and "world" or "local"
+  if mode == "world" and not validCalibration(calibration) then return nil, "gps_not_calibrated" end
+
+  local byKey, catalogSize = {}, 0
+  for x = 0, validWidth - 1 do
+    for z = 1, validLength do
+      local cx, cz, err = M.chunkForCell(mode, calibration, x, z)
+      if not cx then return nil, err end
+      local key = chunkKey(mode, cx, cz)
+      local chunk = byKey[key]
+      if not chunk then
+        catalogSize = catalogSize + 1
+        if catalogSize > MAX_CHUNKS then return nil, "too_many_chunks" end
+        chunk = {
+          key = key,
+          mode = mode,
+          cx = cx,
+          cz = cz,
+          minX = x,
+          maxX = x,
+          minZ = z,
+          maxZ = z,
+          cells = 0,
+        }
+        byKey[key] = chunk
+      end
+      if x < chunk.minX then chunk.minX = x end
+      if x > chunk.maxX then chunk.maxX = x end
+      if z < chunk.minZ then chunk.minZ = z end
+      if z > chunk.maxZ then chunk.maxZ = z end
+      chunk.cells = chunk.cells + 1
+    end
+  end
+
+  local catalog = {}
   for _, chunk in pairs(byKey) do catalog[#catalog + 1] = chunk end
   table.sort(catalog, chunkComparator)
   return catalog
@@ -82,226 +301,3 @@ local function buildNeighborGraph(chunks, keys)
     end
     collect(byMinX[chunk.maxX + 1])
     collect(byMaxX[chunk.minX - 1])
-    collect(byMinZ[chunk.maxZ + 1])
-    collect(byMaxZ[chunk.minZ - 1])
-    table.sort(candidates, function(a, b) return order[a] < order[b] end)
-    for _, candidate in ipairs(candidates) do addPair(key, candidate) end
-  end
-  for _, key in ipairs(keys) do
-    table.sort(chunks[key].neighbors, function(left, right)
-      return order[left] < order[right]
-    end)
-  end
-end
-
-local function copyChunk(source)
-  local copy = {}
-  for key, value in pairs(source) do copy[key] = value end
-  copy.neighbors = {}
-  copy.parent = nil
-  copy.anchor = { x = copy.minX, z = copy.minZ }
-  return copy
-end
-
--- Return a deterministic boundary cell on `chunk` closest to `previous`.
--- `previous` may be a chunk, an anchor, or a point containing x/z.
-function M.chunkAnchor(chunk, previous)
-  if type(chunk) ~= "table" or not numberValue(chunk.minX) or not numberValue(chunk.maxX)
-      or not numberValue(chunk.minZ) or not numberValue(chunk.maxZ) then
-    return nil, "invalid_chunk"
-  end
-  local minX, maxX = chunk.minX, chunk.maxX
-  local minZ, maxZ = chunk.minZ, chunk.maxZ
-  local px, pz
-  if type(previous) == "table" then
-    px, pz = numberValue(previous.x), numberValue(previous.z)
-    if (not px or not pz) and previous.anchor then
-      px, pz = numberValue(previous.anchor.x), numberValue(previous.anchor.z)
-    end
-    if (not px or not pz) and previous.minX and previous.minZ then
-      px, pz = numberValue(previous.minX), numberValue(previous.minZ)
-    end
-  end
-  if not px or not pz then return { x = minX, z = minZ } end
-
-  local function clamp(value, low, high)
-    if value < low then return low end
-    if value > high then return high end
-    return value
-  end
-  local previousMinX, previousMaxX = numberValue(previous and previous.minX), numberValue(previous and previous.maxX)
-  local previousMinZ, previousMaxZ = numberValue(previous and previous.minZ), numberValue(previous and previous.maxZ)
-  if previousMinX and previousMaxX and previousMinZ and previousMaxZ then
-    if previousMaxX + 1 == minX and overlaps(minZ, maxZ, previousMinZ, previousMaxZ) then
-      return { x = minX, z = clamp(pz, math.max(minZ, previousMinZ), math.min(maxZ, previousMaxZ)) }
-    elseif maxX + 1 == previousMinX and overlaps(minZ, maxZ, previousMinZ, previousMaxZ) then
-      return { x = maxX, z = clamp(pz, math.max(minZ, previousMinZ), math.min(maxZ, previousMaxZ)) }
-    elseif previousMaxZ + 1 == minZ and overlaps(minX, maxX, previousMinX, previousMaxX) then
-      return { x = clamp(px, math.max(minX, previousMinX), math.min(maxX, previousMaxX)), z = minZ }
-    elseif maxZ + 1 == previousMinZ and overlaps(minX, maxX, previousMinX, previousMaxX) then
-      return { x = clamp(px, math.max(minX, previousMinX), math.min(maxX, previousMaxX)), z = maxZ }
-    end
-  end
-
-  -- For a non-adjacent reference, choose the closest point on the rectangle
-  -- perimeter, with a stable x-then-z tie break.
-  local candidates = {
-    { x = minX, z = clamp(pz, minZ, maxZ) },
-    { x = maxX, z = clamp(pz, minZ, maxZ) },
-    { x = clamp(px, minX, maxX), z = minZ },
-    { x = clamp(px, minX, maxX), z = maxZ },
-  }
-  local best, bestDistance
-  for _, candidate in ipairs(candidates) do
-    local distance = math.abs(candidate.x - px) + math.abs(candidate.z - pz)
-    if not best or distance < bestDistance or (distance == bestDistance and (candidate.x < best.x or (candidate.x == best.x and candidate.z < best.z))) then
-      best, bestDistance = candidate, distance
-    end
-  end
-  return best
-end
-
-M.selectChunkAnchor = M.chunkAnchor
-M.chooseChunkAnchor = M.chunkAnchor
-M.chunkEntry = M.chunkAnchor
-M.chunkEntrance = M.chunkAnchor
-
-local function shortestPathInternal(chunks, fromKey, toKey)
-  if not chunks or not chunks[fromKey] then return nil, "unknown_chunk:" .. tostring(fromKey) end
-  if not chunks[toKey] then return nil, "unknown_chunk:" .. tostring(toKey) end
-  if fromKey == toKey then return { fromKey } end
-  local queue, head, tail = { fromKey }, 1, 1
-  local previous, seen = {}, { [fromKey] = true }
-  while head <= tail do
-    local key = queue[head]; head = head + 1
-    for _, neighbor in ipairs(chunks[key].neighbors or {}) do
-      if not seen[neighbor] then
-        seen[neighbor] = true
-        previous[neighbor] = key
-        if neighbor == toKey then
-          local path, current = { toKey }, toKey
-          while current ~= fromKey do
-            current = previous[current]
-            path[#path + 1] = current
-          end
-          local reversed = {}
-          for index = #path, 1, -1 do reversed[#reversed + 1] = path[index] end
-          return reversed
-        end
-        tail = tail + 1; queue[tail] = neighbor
-      end
-    end
-  end
-  return nil, "chunks_disconnected"
-end
-
-function M.shortestChunkPath(plan, fromKey, toKey)
-  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
-  local function normalizeKey(value)
-    if type(value) == "table" then
-      if value.key ~= nil then return tostring(value.key) end
-      local cx, cz = integerValue(value.cx), integerValue(value.cz)
-      if cx and cz then return chunkKey(plan.mode, cx, cz) end
-      return nil
-    end
-    return value == nil and nil or tostring(value)
-  end
-  fromKey, toKey = normalizeKey(fromKey), normalizeKey(toKey)
-  if fromKey == nil or toKey == nil then return nil, "invalid_chunk" end
-  return shortestPathInternal(plan.chunks, tostring(fromKey), tostring(toKey))
-end
-
-M.shortestPath = M.shortestChunkPath
-
-local function nearestUnvisitedPath(chunks, startKey, visited)
-  local queue, head, tail = { startKey }, 1, 1
-  local previous, seen = {}, { [startKey] = true }
-  while head <= tail do
-    local key = queue[head]; head = head + 1
-    for _, neighbor in ipairs(chunks[key].neighbors or {}) do
-      if not seen[neighbor] then
-        seen[neighbor] = true
-        previous[neighbor] = key
-        if not visited[neighbor] then
-          local path, current = { neighbor }, neighbor
-          while current ~= startKey do
-            current = previous[current]
-            path[#path + 1] = current
-          end
-          local reversed = {}
-          for index = #path, 1, -1 do reversed[#reversed + 1] = path[index] end
-          return reversed
-        end
-        tail = tail + 1; queue[tail] = neighbor
-      end
-    end
-  end
-  return nil
-end
-
-local function optimizedWalk(chunks, keys, rootKey)
-  local walk, order, visited = {}, {}, { [rootKey] = true }
-  local current = rootKey
-  -- Every plan is persisted in worker state.  CC:Tweaked's serializer rejects
-  -- shared table references, so keep compatibility fields as independent
-  -- point values instead of aliasing the chunk's anchor table.
-  local rootAnchor = chunks[rootKey].anchor
-    and { x = chunks[rootKey].anchor.x, z = chunks[rootKey].anchor.z }
-    or (contains(chunks[rootKey], 0, 1) and { x = 0, z = 1 } or { x = chunks[rootKey].minX, z = chunks[rootKey].minZ })
-  chunks[rootKey].optimizedAnchor = { x = rootAnchor.x, z = rootAnchor.z }
-  walk[1] = { key = rootKey, first = true, anchor = { x = rootAnchor.x, z = rootAnchor.z } }
-  order[1] = rootKey
-  while #order < #keys do
-    local nextKey
-    for _, neighbor in ipairs(chunks[current].neighbors or {}) do
-      if not visited[neighbor] then nextKey = neighbor; break end
-    end
-    local path
-    if nextKey then
-      path = { nextKey }
-    else
-      path = nearestUnvisitedPath(chunks, current, visited)
-      if not path then break end
-    end
-    local previous = current
-    for _, key in ipairs(path) do
-      local first = not visited[key]
-      if first then
-        visited[key] = true
-        order[#order + 1] = key
-      end
-      local anchor = M.chunkAnchor(chunks[key], chunks[previous]) or chunks[key].anchor
-      if first then chunks[key].optimizedAnchor = { x = anchor.x, z = anchor.z } end
-      walk[#walk + 1] = {
-        key = key,
-        first = first,
-        anchor = { x = anchor.x, z = anchor.z },
-      }
-      previous, current = key, key
-    end
-  end
-  return walk, order, visited
-end
-
-function M.buildChunkPlan(job, calibration)
-  job = type(job) == "table" and job or {}
-  local mode = job.chunkMode == "world" and "world" or "local"
-  local validWidth, validLength, validDepth = dimensions(job.width, job.length, job.depth)
-  if not validWidth then return nil, validLength end
-  local catalog, catalogError = M.buildCatalog(validWidth, validLength, mode, calibration)
-  if not catalog then return nil, catalogError end
-  local excluded, exclusionError = exclusionSet(job.excludedChunks, mode)
-  if not excluded then return nil, exclusionError end
-  local chunks, rootKey, columns = {}, nil, 0
-  local excludedCount = 0
-
-  for _, source in ipairs(catalog) do
-    if contains(source, 0, 1) then rootKey = source.key end
-    if excluded[source.key] then
-      excludedCount = excludedCount + 1
-    else
-      local copy = copyChunk(source)
-      chunks[copy.key] = copy
-      columns = columns + copy.cells
-    end
-  end

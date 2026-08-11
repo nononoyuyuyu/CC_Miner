@@ -1,253 +1,223 @@
-      -- awaiting ACK entries until their worker confirms/returns, since the
-      -- START packet may already be in flight.
-      groupJob.pending = {}
+    if payload.ok == true and (sessionId == nil or tostring(sessionId) == ""
+      or nonce == nil or tostring(nonce) == "") then return false end
+    if sessionId ~= nil and tostring(sessionId) ~= "" then session.sessionId = tostring(sessionId) end
+    if nonce ~= nil and tostring(nonce) ~= "" then session.nonce = tostring(nonce) end
+    local nextSequence = tonumber(remoteAckField(payload, result, "nextSeq"))
+    if nextSequence and nextSequence >= 1 and nextSequence == math.floor(nextSequence) then
+      session.seq = nextSequence - 1
     end
-    groupJob.returnReason = groupJob.returnReason or (command == "abort" and "group_abort" or "group_clear")
-    maybeFinalizeGroup(groupJob)
-    saveControllerDb()
   end
-  if sent < attempted then setNotice(("Group %s: %d/%d commands sent."):format(payload.groupCommand, sent, attempted), true) else setNotice(("Group %s sent to %d workers."):format(payload.groupCommand, sent), false) end
-  return sent == attempted and attempted > 0, sent
+  session.lastResult, session.lastAction = common.copy(payload), pending.action
+  session.pending = nil
+  return true
+end
 end
 
-local function groupCommandBySelected(command)
-  local id = selectedGroupRecord()
-  if not id then setNotice("No group selected.", true); return false end
-  return groupCommand(id, command)
-end
-
-local function progressText(data)
-  if not data or not data.job then return "-" end
-  local p = data.progress or {}
-  return ("%3d%% %s/%s"):format(
-    tonumber(p.percent or data.job.percent) or 0,
-    common.humanNumber(p.cursor or data.job.cursor or 0),
-    common.humanNumber(p.total or data.job.total or 0)
-  )
-end
-
-local function resetHitboxes(key)
-  hitboxes[key] = {}
-end
-
-local function addHitbox(key, x1, y1, x2, y2, action)
-  hitboxes[key] = hitboxes[key] or {}
-  hitboxes[key][#hitboxes[key] + 1] = {
-    x1 = math.floor(x1), y1 = math.floor(y1), x2 = math.floor(x2), y2 = math.floor(y2), action = action,
-  }
-end
-
-local function drawButton(key, x, y, width, label, action, enabled, selectedButton)
-  width = math.max(3, math.floor(width))
-  local background = colors and (selectedButton and colors.lightBlue or enabled == false and colors.gray or colors.blue) or nil
-  local foreground = colors and (enabled == false and colors.lightGray or colors.white) or nil
-  common.writeAt(x, y, common.center(label, width), foreground, background)
-  if enabled ~= false and action then addHitbox(key, x, y, x + width - 1, y, action) end
-end
-
-local function buttonRow(key, y, width, definitions)
-  if width < 1 or y < 1 then return end
-  local count = math.max(1, #definitions)
-  local base = math.max(1, math.floor(width / count))
-  local x = 1
-  for index, definition in ipairs(definitions) do
-    local buttonWidth = index == count and (width - x + 1) or base
-    drawButton(key, x, y, buttonWidth, definition[1], definition[2], definition[3] ~= false, definition[4])
-    x = x + buttonWidth
-  end
-end
-
-local function draftWorker()
-  if not draft then return nil, nil end
-  return draft.workerId, workers[draft.workerId]
-end
-
-local function draftCalibration(workerId)
-  local worker
-  if workerId then worker = workers[workerId] else local _, selectedWorkerValue = draftWorker(); worker = selectedWorkerValue end
-  local gpsData = worker and worker.data and worker.data.gps
-  if gpsData and gpsData.calibrated and type(gpsData.calibration) == "table" then return gpsData.calibration end
-  return nil
-end
-
-local function cellKey(x, z)
-  return tostring(math.floor(x)) .. ":" .. tostring(math.floor(z))
-end
-
-local function parseCellKey(key)
-  local x, z = tostring(key):match("^(-?%d+):(-?%d+)$")
-  return tonumber(x), tonumber(z)
-end
-
--- V4 selection is chunk-granular.  A short-lived V2 draft could contain the
--- old cellExcluded map; migrate complete chunks, but keep a fatal marker for a
--- partial chunk instead of silently dropping the user's selection.
-local function normalizeChunkMask(catalog, rootKey)
-  if not draft then return false end
-  draft.excluded = draft.excluded or {}
-  local legacy = draft.cellExcluded
-  if type(legacy) ~= "table" then return draft.partialMask == true end
-  local partial = draft.partialMask == true
-  for _, chunk in ipairs(catalog or {}) do
-    local total, selectedCells = 0, 0
-    for x = chunk.minX, chunk.maxX do
-      for z = chunk.minZ, chunk.maxZ do
-        total = total + 1
-        if legacy[cellKey(x, z)] then selectedCells = selectedCells + 1 end
+local function handleMessage(sender, message)
+  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
+  if not valid then return false end
+  if message.kind == "status" then
+    local payload = normalizeStatus(message.payload)
+    local id = tonumber(payload.id)
+    if not id or id ~= tonumber(sender) then return false end
+    workers[id] = workers[id] or {}
+    local previous = workers[id].data
+    workers[id].data = payload
+    workers[id].lastSeen = common.nowSeconds()
+    workers[id].sender = sender
+    reconcileSingleWorkerLeases(id, payload)
+    local groupJob = findGroupJobForWorker(id, payload)
+    if groupJob then
+      if groupJob.status == "starting" and payload.job and payload.job.assignmentId then acceptGroupStart(groupJob, id, payload.job.assignmentId) end
+      finalizePendingReassignment(groupJob, id, payload)
+      local assignment = groupJob.assignments and (groupJob.assignments[tostring(id)] or groupJob.assignments[id])
+      if assignment then
+        assignment.status = payload.status or payload.phase or assignment.status
+        if payload.status == "complete" or payload.status == "completed" or payload.status == "aborted" or payload.status == "idle" then
+          if groupJob.awaitingAck then groupJob.awaitingAck[tostring(id)] = nil end
+          if groupJob.pending then groupJob.pending[tostring(id)] = nil end
+        end
+        assignment.progress = common.copy(payload.progress or payload.job and payload.job.progress or {})
+        assignment.lastSeen = common.nowSeconds()
+        if payload.status == "complete" or payload.status == "completed" then assignment.finishedAt = common.nowSeconds() end
+        if payload.completionReason then assignment.returnReason = payload.completionReason end
+        if payload.report or payload.stats then assignment.report = common.copy(payload.report or payload.stats) end
+      end
+      updateGroupAggregate(groupJob)
+      if payload.completionReason then groupJob.returnReason = payload.completionReason end
+      if payload.report or payload.stats then
+        groupJob.metrics = groupJob.metrics or {}
+        local report = payload.report or payload.stats
+        for key, value in pairs(report or {}) do if type(value) ~= "table" then groupJob.metrics[key] = value end end
+        if report and (report.discard or report.discardStats) then groupJob.metrics.discard = common.copy(report.discard or report.discardStats) end
+        groupJob.report = common.copy(groupJob.metrics)
+      end
+      local allDone = true
+      for _, item in pairs(groupJob.assignments or {}) do if type(item) == "table" and item.status ~= "complete" and item.status ~= "completed" and item.status ~= "reassigned" then allDone = false; break end end
+      if allDone and groupJob.status == "working" then
+        groupJob.status, groupJob.finishedAt = "complete", common.nowSeconds()
+        releaseGroupLeases(groupJob)
+        if not groupJob.historyRecorded then
+          db.history[#db.history + 1] = { id = tostring(groupJob.groupJobId), kind = "group", groupJobId = groupJob.groupJobId, groupId = groupJob.groupId, workerId = nil, worker = groupName(groupRecord(groupJob.groupId), groupJob.groupId), name = groupJob.name, status = "complete", reason = groupJob.returnReason or "complete", startedAt = groupJob.startedAt, finishedAt = groupJob.finishedAt, metrics = common.copy(groupJob.metrics or groupJob.report or {}) }
+          groupJob.historyRecorded = true
+        end
+      end
+      maybeFinalizeGroup(groupJob)
+      saveControllerDb()
+    end
+    acknowledgeQueuedStart(id, payload)
+    local oldStatus = previous and tostring(previous.status or "") or ""
+    local newStatus = tostring(payload.status or "unknown")
+    if newStatus == "complete" and oldStatus ~= "complete" then
+      addHistory(id, payload, payload.completionReason or "complete")
+      releaseLeasesForWorker(id, activeJobId(previous))
+      alert("complete", id, "Worker #" .. tostring(id) .. " completed a job.")
+    elseif newStatus == "aborted" and oldStatus ~= "aborted" then
+      addHistory(id, payload, payload.completionReason or "aborted")
+      releaseLeasesForWorker(id, activeJobId(previous))
+    elseif newStatus == "blocked" and oldStatus ~= "blocked" then
+      alert("blocked", id, "Worker #" .. tostring(id) .. " is blocked.")
+    elseif newStatus == "waiting_fuel" or newStatus == "waiting_output" or newStatus == "waiting_seal" or newStatus == "waiting_torch" or newStatus == "waiting_water" then
+      alert("material", id, "Worker #" .. tostring(id) .. " needs materials.")
+    else
+      clearAlert(id, "blocked"); clearAlert(id, "material")
+    end
+    invalidate()
+    return true
+  elseif message.kind == "ack" then
+    local payload = message.payload or {}
+    local remoteMatched = noticeState.remoteApi.ackMatches(sender, message, payload)
+    if payload.ok ~= true and not remoteMatched then
+      db.lastCommandError = {
+        workerId = tonumber(sender) or sender,
+        command = tostring(payload.command or "unknown"),
+        message = tostring(payload.message or "Unknown rejection"),
+        at = common.nowSeconds(),
+      }
+      saveControllerDb()
+    end
+    if not remoteMatched then
+      setNotice((payload.ok and "OK: " or "ERROR: ") .. tostring(payload.message or ""), not payload.ok)
+    end
+    handleSingleStartAck(sender, message, payload)
+    local ackGroupJobId = payload.groupJobId or payload.parentGroupJobId or payload.group and payload.group.groupJobId
+    if ackGroupJobId and db.groupJobs[tostring(ackGroupJobId)] then
+      local ackJob = db.groupJobs[tostring(ackGroupJobId)]
+      ackJob.acks = ackJob.acks or {}
+      ackJob.acks[tostring(sender)] = { ok = payload.ok == true, message = payload.message, command = payload.command, at = common.nowSeconds() }
+      updateGroupAggregate(ackJob)
+      saveControllerDb()
+    end
+    if type(payload.status) == "table" and payload.status.id then
+      local id = tonumber(payload.status.id)
+      if not id or id ~= tonumber(sender) then return false end
+      local previous = workers[id] and workers[id].data
+      workers[id] = workers[id] or {}
+      workers[id].data = normalizeStatus(payload.status)
+      workers[id].lastSeen = common.nowSeconds()
+      workers[id].sender = sender
+      local groupJob = findGroupJobForWorker(id, workers[id].data)
+      if groupJob then
+        local statusJob = workers[id].data.job or {}
+        if payload.ok and statusJob.assignmentId and groupJob.status == "starting" then acceptGroupStart(groupJob, id, statusJob.assignmentId)
+        elseif payload.ok == false and groupJob.status == "starting" then rejectGroupStart(groupJob, id, payload.message or "start rejected")
+        elseif payload.ok == false and (groupJob.status == "aborting" or groupJob.status == "clear_requested") then
+          if groupJob.awaitingAck then groupJob.awaitingAck[tostring(id)] = nil end
+          if groupJob.pending then groupJob.pending[tostring(id)] = nil end
+        end
+        local pending = groupJob.pendingReassignment
+        local ackMatchesReassignment = not pending
+          or (payload.assignmentId ~= nil and tostring(payload.assignmentId) == tostring(pending.assignmentId))
+        if pending and payload.ok == false and (payload.assignmentId == nil or tostring(payload.assignmentId) == tostring(pending.assignmentId)) then
+          groupJob.pendingReassignment = nil
+          groupJob.alerts = groupJob.alerts or {}
+          groupJob.alerts[#groupJob.alerts + 1] = "REASSIGN_REJECTED:#" .. tostring(id) .. ":" .. tostring(payload.message or "worker rejected")
+        elseif ackMatchesReassignment then
+          finalizePendingReassignment(groupJob, id, workers[id].data)
+        end
+        groupJob.acks = groupJob.acks or {}
+        groupJob.acks[tostring(id)] = { ok = payload.ok == true, message = payload.message, at = common.nowSeconds() }
+        updateGroupAggregate(groupJob)
+        saveControllerDb()
+      end
+      acknowledgeQueuedStart(id, workers[id].data)
+      local st = workers[id].data.status
+      if (st == "complete" or st == "aborted") and previous and previous.status ~= st then
+        addHistory(id, workers[id].data, workers[id].data.completionReason or st)
+        releaseLeasesForWorker(id, activeJobId(previous))
       end
     end
-    if selectedCells > 0 and selectedCells < total then partial = true end
-    if selectedCells == total and chunk.key ~= rootKey then draft.excluded[chunk.key] = true end
+    return true
   end
-  draft.cellExcluded = nil
-  draft.partialMask = partial
-  return partial
+  return false
 end
 
-local function buildDraftCatalog()
-  if not draft then return nil, "No draft." end
-  local calibration = draftCalibration()
-  local chunkMode = calibration and "world" or "local"
-  local catalog, err = quarry.buildCatalog(draft.width, draft.length, chunkMode, calibration)
-  if not catalog then return nil, err end
-  local rootKey
-  for _, chunk in ipairs(catalog) do
-    if 0 >= chunk.minX and 0 <= chunk.maxX and 1 >= chunk.minZ and 1 <= chunk.maxZ then rootKey = chunk.key end
-  end
-  return catalog, nil, chunkMode, calibration, rootKey
+local function discover()
+  protocol.broadcast(protocol.message("discover", config.networkKey, { controllerName = config.controllerName, v3 = true }))
+  lastDiscovery = common.nowSeconds()
+  setNotice("Discovery broadcast sent.", false)
 end
 
-local function excludedChunksForDraft(catalog, chunkMode, rootKey)
-  local out = {}
-  local chunkExcluded = draft and draft.excluded or {}
-  for _, chunk in ipairs(catalog or {}) do
-    if chunk.key ~= rootKey and chunkExcluded[chunk.key] == true then
-      out[#out + 1] = { mode = chunkMode, cx = chunk.cx, cz = chunk.cz, key = chunk.key }
+local function sendCommand(id, command, payload)
+  if not id then setNotice("No worker selected.", true); return false end
+  payload = payload or {}
+  payload.command = command
+  local wireMessage = protocol.message("command", config.networkKey, payload, id)
+  local ok, err = protocol.send(id, wireMessage)
+  if ok then setNotice(("Command '%s' sent to #%s."):format(command, tostring(id)), false)
+  else setNotice("Send failed: " .. tostring(err), true) end
+  return ok, err, wireMessage.id
+end
+
+do
+local function remoteToken(prefix)
+  local millis = common.nowMillis and common.nowMillis() or math.floor(common.nowSeconds() * 1000)
+  return ("%s-%d-%d-%d"):format(tostring(prefix or "remote"), os.getComputerID(), millis, math.random(100000, 999999))
+end
+
+local function remoteRedactText(value)
+  local text = tostring(value or "")
+  local key = type(config.networkKey) == "string" and config.networkKey or ""
+  -- Replace the configured key using plain-string searches.  Network keys may
+  -- contain Lua pattern characters, and they must never appear in CLI output.
+  if key ~= "" then
+    local output, cursor = {}, 1
+    while true do
+      local startAt, endAt = text:find(key, cursor, true)
+      if not startAt then output[#output + 1] = text:sub(cursor); break end
+      output[#output + 1] = text:sub(cursor, startAt - 1)
+      output[#output + 1] = "[REDACTED]"
+      cursor = endAt + 1
     end
+    text = table.concat(output)
   end
-  return out, #out
+  return text
 end
 
-local function draftCells(catalog, rootKey)
-  local total, excluded = 0, 0
-  local chunkExcluded = draft and draft.excluded or {}
-  for _, chunk in ipairs(catalog or {}) do
-    total = total + 1
-    if chunk.key ~= rootKey and chunkExcluded[chunk.key] then excluded = excluded + 1 end
-  end
-  return total, excluded
+local function remoteSensitiveKey(key)
+  local name = tostring(key or ""):lower():gsub("[^%a%d]", "")
+  return name == "networkkey" or name == "password" or name == "passwd"
+    or name == "secret" or name == "token" or name == "nonce"
+    or name == "sessionid" or name == "apikey" or name == "auth"
 end
 
-local function estimateFuel(blocks, width, length, depth)
-  -- Conservative enough to gate an obviously empty turtle, but unknown fuel
-  -- remains yellow rather than fatal so old workers can still be used.
-  local travel = (width or 1) * (length or 1) + (depth or 1) * 2
-  return math.max(16, math.floor((blocks or 0) * 2 + travel * 3 + 32))
+local function remoteValueText(value, depth, field)
+  if remoteSensitiveKey(field) then return "[REDACTED]" end
+  depth = tonumber(depth) or 0
+  if value == nil then return "-" end
+  if type(value) == "string" then return remoteRedactText(value) end
+  if type(value) == "number" or type(value) == "boolean" then return tostring(value) end
+  if type(value) ~= "table" then return remoteRedactText(value) end
+  if depth >= 3 then return "{...}" end
+  local keys = {}
+  for key in pairs(value) do keys[#keys + 1] = key end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  local parts = {}
+  for _, key in ipairs(keys) do
+    parts[#parts + 1] = tostring(key) .. "=" .. remoteValueText(value[key], depth + 1, key)
+    if #parts >= 32 then parts[#parts + 1] = "..."; break end
+  end
+  return "{" .. table.concat(parts, ",") .. "}"
 end
 
-local function profileParameters(profile, lighting)
-  local name = tostring(profile or "balanced")
-  if name ~= "safe" and name ~= "balanced" and name ~= "turbo" then return nil, "Invalid profile: " .. name end
-  local light = type(lighting) == "table" and lighting or {}
-  local mode = tostring(light.mode or "safe")
-  local requested = math.max(1, math.floor(tonumber(light.interval) or 10))
-  local interval
-  if mode == "off" then interval = 0
-  elseif name == "safe" then interval = math.min(requested, 8)
-  elseif name == "turbo" then interval = 12
-  else interval = requested end
-  return {
-    profile = name,
-    lightingMode = mode,
-    requestedInterval = requested,
-    effectiveInterval = interval,
-    fuelMultiplier = name == "safe" and 1.5 or 1,
-  }
-end
-
-local function effectiveJobDepth(chunkMode, calibration)
-  if chunkMode == "world" then
-    if not (calibration and calibration.home and tonumber(calibration.home.y)) then return nil, "GPS calibration home Y is unavailable." end
-    local homeY = tonumber(calibration.home.y)
-    local targetY = tonumber(draft.targetY) or (homeY - (tonumber(draft.depth) or 1) + 1)
-    draft.targetY = targetY
-    local depth = math.floor(homeY - targetY + 1)
-    if depth < 1 then return nil, "targetY must be at or below the calibrated home Y." end
-    return depth, targetY
-  end
-  return math.max(1, math.floor(tonumber(draft.depth) or 1)), nil
-end
-
-local activeLeaseOverlap
-
-local function computePreflight()
-  if not draft then return nil, "No draft." end
-  local profileInfo, profileError = profileParameters(draft.profile, draft.lighting)
-  if not profileInfo then
-    draft.preflight = { fatal = true, checks = { { name = "profile", state = "bad", detail = profileError, fatal = true } }, profile = draft.profile }
-    return draft.preflight
-  end
-  local catalog, catalogError, chunkMode, calibration, rootKey = buildDraftCatalog()
-  if not catalog then return nil, catalogError end
-  local partialMask = normalizeChunkMask(catalog, rootKey)
-  local excludedChunks, excludedColumns = excludedChunksForDraft(catalog, chunkMode, rootKey)
-  local jobDepth, targetY = effectiveJobDepth(chunkMode, calibration)
-  if not jobDepth then
-    draft.preflight = { fatal = true, checks = { { name = "targetY", state = "bad", detail = targetY, fatal = true } } }
-    return draft.preflight
-  end
-  local plan, planError = quarry.buildChunkPlan({
-    width = draft.width, length = draft.length, depth = jobDepth,
-    chunkMode = chunkMode, excludedChunks = excludedChunks,
-  }, calibration)
-  local cells, cellExcluded = draftCells(catalog, rootKey)
-  local blocks = plan and (plan.columns * jobDepth) or ((cells - cellExcluded) * jobDepth)
-  local interval = math.max(1, profileInfo.effectiveInterval > 0 and profileInfo.effectiveInterval or 1)
-  local estimate, estimateError
-  if type(quarry.estimateJob) == "function" then
-    estimate, estimateError = quarry.estimateJob({
-      width = draft.width, length = draft.length, depth = jobDepth,
-      chunkMode = chunkMode, excludedChunks = excludedChunks,
-      lighting = common.copy(draft.lighting), waterMode = draft.waterMode,
-      targetY = targetY,
-    }, calibration, { torchInterval = interval })
-  end
-  if not estimate and estimateError then planError = estimateError end
-  local id, worker = draftWorker()
-  local data = worker and worker.data or {}
-  if id and worker then reconcileSingleWorkerLeases(id, data) end
-  local checks = {}
-  local function check(name, state, detail, fatal)
-    checks[#checks + 1] = { name = name, state = state, detail = detail, fatal = fatal == true }
-  end
-  local baseFuelEstimate = estimate and (estimate.minimumFuel or estimate.minFuel) or estimateFuel(blocks, draft.width, draft.length, jobDepth)
-  local requiredFuel = math.ceil(baseFuelEstimate * profileInfo.fuelMultiplier)
-  local fuel = tonumber(data.fuel)
-  local fuelState = fuel and fuel >= requiredFuel and "ok" or "warn"
-  local fuelDetail = ("estimate need %d (base %d), worker %s"):format(requiredFuel, baseFuelEstimate, tostring(data.fuel or "unknown"))
-  check("cells", "ok", tostring(estimate and (estimate.surfaceCells or estimate.columns) or (cells - cellExcluded)), false)
-  check("chunks", "ok", tostring((plan and plan.catalogCount or #catalog) - #excludedChunks) .. "/" .. tostring(#catalog), false)
-  check("blocks", "ok", common.humanNumber(estimate and (estimate.blocks or estimate.totalBlocks) or blocks), false)
-  check("fuel", fuelState, fuelDetail, false)
-  local torchNeed = profileInfo.effectiveInterval == 0 and 0 or (estimate and (estimate.torches or estimate.estimatedTorches) or math.ceil((blocks or 0) / interval))
-  check("profile", "ok", profileInfo.profile .. " interval=" .. tostring(profileInfo.effectiveInterval), false)
-  if profileInfo.effectiveInterval == 0 then
-    check("torches", "ok", "0 (lighting off)", false)
-  else
-    check("torches", "warn", tostring(torchNeed) .. " estimated @" .. tostring(profileInfo.effectiveInterval), false)
-  end
-  check("exclusions", #excludedChunks > 0 and "warn" or "ok", tostring(#excludedChunks), false)
-  if plan then check("connectivity", "ok", "connected", false) else check("connectivity", "bad", tostring(planError), true) end
-  if partialMask then check("selection", "bad", "partial cell mask cannot be sent; select whole chunks", true) end
-  if chunkMode == "world" then
-    local gpsData = type(data.gps) == "table" and data.gps or {}
-    local calibrated = gpsData.calibrated == true and calibration ~= nil
-    local available = gpsData.available == true and type(gpsData.lastFix) == "table"
-    check("GPS calibration", calibrated and "ok" or "bad", calibrated and "calibrated" or "run GPS CAL at the dock", not calibrated)
-    check("GPS fix", available and "ok" or "bad", available and "current position available" or tostring(gpsData.lastError or "GPS hosts are not reachable"), not available)
-  else
-    check("GPS", "ok", "local mode (world features unavailable)", false)
-  end
-  local workerStatus = worker and statusOf(worker) or "offline"
-  if id and worker and workerStatus ~= "offline" then check("worker", "ok", workerLabel(worker, id), false)
-  else check("worker", "bad", "offline or not selected", true) end
+local function remoteResultTable(payload)

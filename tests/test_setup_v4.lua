@@ -41,6 +41,10 @@ for _, expected in ipairs({
   'local group = ensureTable(config, "group", workerDefaults.group)',
   'ensureTable(config, "service", workerDefaults.service)',
   'local journal = ensureTable(config, "journal", workerDefaults.journal)',
+  'local remoteConsole = ensureTable(config, "remoteConsole", workerDefaults.remoteConsole)',
+  'remoteConsole.enabled = common.promptYesNo',
+  'remoteConsole.allowShell = common.promptYesNo',
+  'config.controllerId = common.promptNumber',
   'discardModePrompt(discard.mode)',
   'allowlistPrompt(discard.allowlist)',
   'discard.retainSealTarget',
@@ -78,6 +82,11 @@ marker(setup, "until side ~= sealSide", "torch side collision retry")
 marker(setup, "Warning: torch chest side must not match the seal-block chest side.", "torch side warning")
 marker(setup, "現場廃棄方向", "discard direction explanation")
 marker(setup, "設定方向に inventory が見つかった場合は、誤投入防止のため world 廃棄をスキップします。", "discard side safety explanation")
+marker(setup, "【強い警告】遠隔コンソールは", "remote console strong warning")
+marker(setup, "遠隔コンソールを有効にしますか（既定OFF）", "remote console opt-in prompt")
+marker(setup, "allowShell（シェル実行）を許可しますか", "remote shell separate confirmation")
+marker(setup, "controllerId=0 のままでは遠隔コンソールを有効にできません。", "remote controller id guard")
+marker(setup, "Controller computer ID (1-65535)", "remote controller id prompt")
 
 -- Controller prompts expose group capacity, service concurrency, explicit
 -- partition mode, GPS safety gate, and dock floor checks.

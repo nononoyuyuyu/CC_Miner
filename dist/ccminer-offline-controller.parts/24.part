@@ -1,3 +1,239 @@
+local confirmState = nil
+local hitboxes = {}
+local renderCache = {}
+local dirty = true
+local monitors = common.findPeripherals("monitor")
+local speakers = common.findPeripherals("speaker")
+local redstoneDevices = common.findPeripherals("redstoneIntegrator")
+local alertLedger = {}
+local alertTimers = {}
+local lastSorting = 0
+local sortingWarned = false
+-- Remote-console sessions are intentionally memory-only.  Reuse the existing
+-- notice-state table so these fields neither enter controller.db nor consume
+-- more top-level locals (CC Lua caps a chunk at 200 active locals).
+noticeState.remoteSession = nil
+noticeState.remoteApi = {}
+
+for _, entry in ipairs(monitors) do
+  if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end
+end
+
+local function invalidate()
+  dirty = true
+end
+
+local function setNotice(text, isError)
+  local errorNotice = isError == true
+  -- Keep the last error visible without stealing the whole screen. Normal
+  -- status/heartbeat messages cannot erase it; the operator can continue
+  -- working and open LAST ERR only when the full text is needed.
+  if not errorNotice and noticeIsError then return end
+  notice, noticeIsError = tostring(text or ""), errorNotice
+  if errorNotice then
+    noticeState.detail = notice
+  end
+  invalidate()
+end
+
+noticeState.dismiss = function()
+  notice, noticeIsError, noticeState.detail = "Error acknowledged.", false, nil
+  mode = noticeState.returnMode or "dashboard"
+  noticeState.returnMode = nil
+  invalidate()
+end
+
+noticeState.showLast = function()
+  local record = db.lastCommandError
+  if type(record) ~= "table" then setNotice("No saved command error.", false); return end
+  noticeState.detail = tostring(record.message or "Unknown command error")
+  notice = noticeState.detail
+  noticeIsError = true
+  noticeState.returnMode = mode
+  mode = "error_detail"
+  invalidate()
+end
+
+local function orderedIds()
+  local ids = {}
+  for id in pairs(workers) do ids[#ids + 1] = tonumber(id) or id end
+  table.sort(ids, function(a, b)
+    if type(a) == type(b) then return a < b end
+    return tostring(a) < tostring(b)
+  end)
+  if #ids == 0 then selected = 1 else selected = common.clamp(selected, 1, #ids) end
+  return ids
+end
+
+local function selectedWorker()
+  local ids = orderedIds()
+  local id = ids[selected]
+  return id, id and workers[id] or nil
+end
+
+local function statusOf(worker)
+  if not worker then return "offline" end
+  if common.nowSeconds() - (worker.lastSeen or 0) > (config.workerTimeoutSeconds or 10) then return "offline" end
+  local data = worker.data or {}
+  return tostring(data.status or data.phase or "unknown")
+end
+
+local function workerLabel(worker, id)
+  if worker and worker.data and worker.data.label then return worker.data.label end
+  return "Miner-" .. tostring(id)
+end
+
+local function workerData(id)
+  local worker = workers[id]
+  return worker and worker.data or nil
+end
+
+-- Group registry ---------------------------------------------------------
+-- Groups are controller-owned durable records.  Keeping worker IDs in the
+-- record (rather than storing live worker tables) makes the database safe to
+-- serialize and lets discovery update status without mutating group config.
+local function orderedGroupIds()
+  local ids = {}
+  for id, group in pairs(db.groups or {}) do
+    if type(group) == "table" then ids[#ids + 1] = tostring(group.id or id) end
+  end
+  table.sort(ids)
+  if #ids == 0 then selectedGroup = 1 else selectedGroup = common.clamp(selectedGroup, 1, #ids) end
+  return ids
+end
+
+local function groupRecord(groupId)
+  if groupId == nil then return nil end
+  local key = tostring(groupId)
+  local direct = db.groups and (db.groups[groupId] or db.groups[key])
+  if type(direct) == "table" then return direct end
+  for id, group in pairs(db.groups or {}) do
+    if type(group) == "table" and tostring(group.id or id) == key then return group end
+  end
+  return nil
+end
+
+local function groupWorkerIds(group)
+  local out, seen = {}, {}
+  if type(group) ~= "table" then return out end
+  local source = type(group.workerIds) == "table" and group.workerIds or group.workers
+  if type(source) ~= "table" then return out end
+  for _, value in ipairs(source) do
+    local id = tonumber(value) or value
+    local key = tostring(id)
+    if key ~= "" and not seen[key] then seen[key] = true; out[#out + 1] = id end
+  end
+  if #out == 0 then
+    for key, value in pairs(source) do
+      local id = tonumber(value) or tonumber(key) or value
+      local text = tostring(id)
+      if text ~= "" and not seen[text] then seen[text] = true; out[#out + 1] = id end
+    end
+  end
+  table.sort(out, function(a, b) return tostring(a) < tostring(b) end)
+  return out
+end
+
+local function groupName(group, groupId)
+  return type(group) == "table" and tostring(group.name or group.id or groupId) or ("Group-" .. tostring(groupId or "?"))
+end
+
+local function groupWorkerResourceId(group, id, kind)
+  local source = kind == "bay" and (group and (group.workerBays or group.bays)) or (group and (group.workerDocks or group.docks))
+  local value = type(source) == "table" and (source[tostring(id)] or source[id]) or nil
+  if type(value) == "table" then value = value.id or value.bayId or value.dockId end
+  if value == nil then value = kind == "bay" and group and group.bayId or group and group.dockId end
+  if value == nil then
+    local data = workerData(id) or {}
+    value = kind == "bay" and (data.bayId or data.bay) or (data.dockId or data.dock)
+    if type(value) == "table" then value = value.id or value.bayId or value.dockId end
+  end
+  return value and tostring(value) or nil
+end
+
+local function groupWorkerResource(group, id, kind)
+  local resourceId = groupWorkerResourceId(group, id, kind)
+  if not resourceId then return nil, nil end
+  local registry = kind == "bay" and db.bays or db.docks
+  local value = registry and (registry[resourceId] or registry[tonumber(resourceId)]) or nil
+  return resourceId, type(value) == "table" and value or nil
+end
+
+local function normalizeFacingValue(value)
+  if value == nil or value == "" then return nil end
+  if type(value) == "number" then
+    local n = math.floor(value)
+    if n >= 0 and n <= 3 and n == value then return n end
+    return nil
+  end
+  local text = tostring(value):lower():gsub("[%s%-]", "_")
+  local names = { south = 0, front = 0, east = 1, right = 1, north = 2, back = 2, west = 3, left = 3 }
+  if names[text] ~= nil then return names[text] end
+  local n = tonumber(text)
+  if n and math.floor(n) == n and n >= 0 and n <= 3 then return n end
+  return nil
+end
+
+local function normalizeRegisteredResource(value)
+  if type(value) ~= "table" then return nil, "resource_value_required" end
+  local world = value.world or value.position
+  if type(world) ~= "table" then return nil, "world_coordinates_required" end
+  local x, y, z = tonumber(world.x), tonumber(world.y), tonumber(world.z)
+  if not x or not y or not z or x ~= math.floor(x) or y ~= math.floor(y) or z ~= math.floor(z) then
+    return nil, "world_coordinates_must_be_integers"
+  end
+  local normalized = common.copy(value)
+  normalized.world = { x = x, y = y, z = z }
+  normalized.position = nil
+  local facing = normalizeFacingValue(value.facing or value.direction)
+  if (value.facing ~= nil or value.direction ~= nil) and facing == nil then return nil, "invalid_facing" end
+  normalized.facing, normalized.direction = facing, nil
+  if value.maxDepth ~= nil then
+    local maxDepth = tonumber(value.maxDepth)
+    if not maxDepth or maxDepth < 1 or maxDepth ~= math.floor(maxDepth) then return nil, "maxDepth_must_be_positive_integer" end
+    normalized.maxDepth = maxDepth
+  end
+  return normalized
+end
+
+local function registerDock(dockId, value)
+  dockId = common.trim(dockId or "")
+  if dockId == "" then return false, "dock_id_required" end
+  local normalized, err = normalizeRegisteredResource(value)
+  if not normalized then return false, err end
+  value = normalized
+  value.id, value.updatedAt = dockId, common.nowSeconds()
+  db.docks[dockId] = persistentGroupValue(value)
+  saveControllerDb()
+  return true
+end
+
+local function registerBay(bayId, value)
+  bayId = common.trim(bayId or "")
+  if bayId == "" then return false, "bay_id_required" end
+  local normalized, err = normalizeRegisteredResource(value)
+  if not normalized then return false, err end
+  value = normalized
+  value.id, value.updatedAt = bayId, common.nowSeconds()
+  db.bays[bayId] = persistentGroupValue(value)
+  saveControllerDb()
+  return true
+end
+
+local function registerGroup(groupId, workerIds, options)
+  groupId = common.trim(groupId or "")
+  if groupId == "" then return false, "group_id_required" end
+  options = type(options) == "table" and options or {}
+  local ids, seen = {}, {}
+  for _, value in ipairs(workerIds or {}) do
+    local id = tonumber(value) or value
+    if tostring(id) ~= "" and not seen[tostring(id)] then seen[tostring(id)] = true; ids[#ids + 1] = id end
+  end
+  if #ids == 0 then return false, "group_workers_required" end
+  local maxWorkers = tonumber(config.group and config.group.maxWorkers)
+  if maxWorkers and #ids > maxWorkers then return false, "group_max_workers_exceeded:" .. tostring(maxWorkers) end
+  table.sort(ids, function(a, b) return tostring(a) < tostring(b) end)
+  local previous = groupRecord(groupId) or {}
   local mode = tostring(options.mode or previous.mode or "world"):lower()
   if mode ~= "world" and mode ~= "local" then return false, "group_mode_unsupported:" .. mode end
   local partition = tostring(options.partition or previous.partition or (config.group and config.group.partitionMode) or "stripe"):lower()
@@ -49,163 +285,3 @@ end
 
 local function activeGroupJob(groupId)
   local latest
-  for id, job in pairs(db.groupJobs or {}) do
-    if type(job) == "table" and tostring(job.groupId or id) == tostring(groupId) then
-      if not latest or tonumber(job.updatedAt or job.startedAt or 0) > tonumber(latest.updatedAt or latest.startedAt or 0) then latest = job end
-    end
-  end
-  return latest
-end
-
-local function groupWorkersTerminalAtHome(groupJob, requireAll)
-  if type(groupJob) ~= "table" then return true end
-  local group = groupRecord(groupJob.groupId)
-  local partialStart = groupJob.status == "PARTIAL_START" and requireAll ~= true
-  for _, id in ipairs(groupWorkerIds(group)) do
-    local key = tostring(id)
-    -- A PARTIAL_START must wait only for workers that actually accepted the
-    -- assignment.  Unstarted/offline targets have no physical lease or
-    -- return route and must not hold finalization forever.
-    if not (partialStart and not (groupJob.started and groupJob.started[key])) then
-      local worker = workers[id]
-      local data = worker and worker.data or {}
-      if statusOf(worker) == "offline" then return false end
-      if groupJob.awaitingAck and groupJob.awaitingAck[key] then return false end
-      local status = tostring(data.status or data.phase or "unknown")
-      if status ~= "complete" and status ~= "completed" and status ~= "aborted" and status ~= "idle" then return false end
-      if data.atHome ~= true then return false end
-    end
-  end
-  return true
-end
-
-local function maybeFinalizeGroup(groupJob)
-  if type(groupJob) ~= "table" then return false end
-  if (groupJob.status == "aborting" or groupJob.status == "clear_requested" or groupJob.status == "PARTIAL_START") and groupWorkersTerminalAtHome(groupJob) then
-    local clear = groupJob.status == "clear_requested"
-    groupJob.status = clear and "cleared" or "aborted"
-    groupJob.finishedAt = common.nowSeconds()
-    releaseGroupLeases(groupJob)
-    if not groupJob.historyRecorded then
-      db.history[#db.history + 1] = { id = tostring(groupJob.groupJobId), kind = "group", groupJobId = groupJob.groupJobId, groupId = groupJob.groupId, worker = groupName(groupRecord(groupJob.groupId), groupJob.groupId), name = groupJob.name, status = groupJob.status, reason = groupJob.returnReason or groupJob.status, startedAt = groupJob.startedAt, finishedAt = groupJob.finishedAt, metrics = common.copy(groupJob.metrics or groupJob.report or {}) }
-      groupJob.historyRecorded = true
-    end
-    return true
-  end
-  return false
-end
-
-finalizePendingReassignment = function(groupJob, workerId, data)
-  local pending = groupJob and groupJob.pendingReassignment
-  if type(pending) ~= "table" or tonumber(pending.targetWorkerId) ~= tonumber(workerId) then return false end
-  local job = data and data.job or {}
-  -- A status response can arrive late (or be the target's pre-dispatch idle
-  -- snapshot).  Never treat that as acceptance of a pending reassignment:
-  -- the echoed assignment and parent group identity are mandatory, and the
-  -- worker must report an actually accepted/running job state.
-  local assignmentId = data and (data.assignmentId or job.assignmentId) or nil
-  if assignmentId == nil or tostring(assignmentId) ~= tostring(pending.assignmentId) then return false end
-  local reportedGroupJobId = data and (data.groupJobId or (data.group and data.group.groupJobId)) or nil
-  reportedGroupJobId = reportedGroupJobId or (job and (job.groupJobId or job.parentGroupJobId))
-  if reportedGroupJobId == nil or tostring(reportedGroupJobId) ~= tostring(groupJob.groupJobId) then return false end
-  local status = tostring((data and (data.status or data.phase)) or ""):lower()
-  local acceptedStates = {
-    accepted = true, starting = true, working = true, mining = true, transit = true,
-    servicing = true, service = true, service_requested = true, waiting_fuel = true,
-    waiting_output = true, waiting_seal = true, waiting_torch = true, waiting_water = true,
-  }
-  if not acceptedStates[status] then return false end
-  local source = groupJob.assignments and (groupJob.assignments[tostring(pending.sourceWorkerId)] or groupJob.assignments[pending.sourceWorkerId])
-  if not source then return false end
-  local targetKey = tostring(pending.targetWorkerId)
-  local target = groupJob.assignments[targetKey] or {
-    workerId = pending.targetWorkerId, groupJobId = groupJob.groupJobId, parentJobId = groupJob.groupJobId,
-    jobId = groupJob.groupJobId .. "/reassign-" .. targetKey, assignmentId = pending.assignmentId, chunkKeys = {}, transitKeys = {},
-  }
-  target.chunkKeys = common.copy(pending.chunkKeys or {})
-  target.transitKeys = common.copy(pending.transitKeys or {})
-  target.assignmentResumeToken = pending.assignmentResumeToken and common.copy(pending.assignmentResumeToken) or nil
-  target.status, target.reassignedFrom, target.reassignedAt = "reassigned", pending.sourceWorkerId, common.nowSeconds()
-  target.bay, target.bayId, target.dock, target.dockId = pending.bay, pending.bayId, common.copy(pending.dock or {}), pending.dockId
-  target.homeWorld, target.maxDepth, target.facing = common.copy(pending.homeWorld), pending.maxDepth, pending.facing
-  groupJob.assignments[targetKey] = target
-  source.chunkKeys, source.status = {}, "reassigned"
-  groupJob.pendingReassignment = nil
-  groupJob.alerts = groupJob.alerts or {}
-  groupJob.alerts[#groupJob.alerts + 1] = "REASSIGNED:#" .. tostring(pending.sourceWorkerId) .. "->#" .. targetKey
-  for _, collection in ipairs({ db.leases or {}, db.groupLeases or {} }) do
-    for _, lease in ipairs(collection) do
-      if tostring(lease.groupJobId or "") == tostring(groupJob.groupJobId) and tostring(lease.assignmentId or "") == tostring(source.assignmentId) then
-        lease.workerId = pending.targetWorkerId
-        lease.assignmentId = pending.assignmentId
-        lease.jobId = target.jobId
-        lease.chunks = common.copy(lease.kind == "transit" and pending.transitKeys or pending.chunkKeys or {})
-      end
-    end
-  end
-  updateGroupAggregate(groupJob)
-  saveControllerDb()
-  return true
-end
-
-acceptGroupStart = function(groupJob, workerId, assignmentId)
-  if type(groupJob) ~= "table" then return false end
-  local key = tostring(workerId)
-  local assignment = groupJob.assignments and (groupJob.assignments[key] or groupJob.assignments[workerId])
-  if not assignment then return false end
-  if assignmentId and tostring(assignment.assignmentId or "") ~= tostring(assignmentId) then return false end
-  assignment.status, assignment.acceptedAt = "started", common.nowSeconds()
-  groupJob.started = groupJob.started or {}; groupJob.started[key] = true
-  groupJob.awaitingAck = groupJob.awaitingAck or {}; groupJob.awaitingAck[key] = nil
-  groupJob.pending = groupJob.pending or {}; groupJob.pending[key] = nil
-  groupJob.acks = groupJob.acks or {}; groupJob.acks[key] = { ok = true, command = "START", at = common.nowSeconds() }
-  local remaining = false
-  for _, candidate in ipairs(sortedJobAssignments(groupJob)) do
-    local candidateKey = tostring(candidate.workerId)
-    if not groupJob.started[candidateKey] and not groupJob.failed[candidateKey] then remaining = true; break end
-  end
-  if not remaining and not groupJob.pendingReassignment then groupJob.status = "working"; groupJob.startedAt = groupJob.startedAt or common.nowSeconds() end
-  groupJob.updatedAt = common.nowSeconds()
-  updateGroupAggregate(groupJob)
-  saveControllerDb()
-  return true
-end
-
-rejectGroupStart = function(groupJob, workerId, reason)
-  if type(groupJob) ~= "table" then return false end
-  local key = tostring(workerId)
-  local assignment = groupJob.assignments and (groupJob.assignments[key] or groupJob.assignments[workerId])
-  if assignment then assignment.status, assignment.error = "failed", reason or "start_rejected" end
-  groupJob.failed = groupJob.failed or {}; groupJob.failed[key] = true
-  groupJob.awaitingAck = groupJob.awaitingAck or {}; groupJob.awaitingAck[key] = nil
-  groupJob.pending = groupJob.pending or {}; groupJob.pending[key] = nil
-  groupJob.status = "PARTIAL_START"
-  for startedKey in pairs(groupJob.started or {}) do groupSafeStop(groupJob, startedKey, "start_rejected") end
-  releaseGroupLeases(groupJob, true)
-  groupJob.alerts = groupJob.alerts or {}
-  groupJob.alerts[#groupJob.alerts + 1] = "PARTIAL_START"
-  groupJob.alerts[#groupJob.alerts + 1] = "worker #" .. key .. ": " .. tostring(reason or "start rejected")
-  updateGroupAggregate(groupJob)
-  saveControllerDb()
-  return false
-end
-
-local function groupJobIdForWorker(id, data)
-  local job = data and data.job or {}
-  local candidate = data and (data.groupJobId or data.group and data.group.groupJobId) or nil
-  candidate = candidate or job.groupJobId or job.parentGroupJobId or job.groupId
-  if candidate then return tostring(candidate) end
-  for key, groupJob in pairs(db.groupJobs or {}) do
-    if type(groupJob) == "table" then
-      for _, assignment in pairs(groupJob.assignments or {}) do
-        if type(assignment) == "table" and tonumber(assignment.workerId) == tonumber(id) and (not job.id or tostring(assignment.jobId or "") == tostring(job.id or "") or tostring(assignment.assignmentId or "") == tostring(job.assignmentId or "")) then
-          return tostring(groupJob.groupJobId or groupJob.id or key)
-        end
-      end
-    end
-  end
-  return nil
-end
-
-local function groupStatusLabel(status)
-  status = tostring(status or "unknown")

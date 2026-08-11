@@ -1,0 +1,48 @@
+  local finalPath = ROOT .. "/" .. ENTRYPOINT
+  local wrote, writeError = atomicWrite(finalPath, finalContent)
+  if not wrote then lowSpaceFailure("Cannot atomically commit final role loader: " .. tostring(writeError)) end
+  if readFile(finalPath) ~= finalContent then
+    lowSpaceFailure("Final role loader could not be verified after atomic commit.")
+  end
+  local cleared, clearError = clearMarker()
+  if not cleared then lowSpaceFailure(clearError) end
+  print("Low-space update installed: " .. VERSION .. " (schema " .. SCHEMA .. ")")
+  print("User data under /ccminer was left in place. Run: reboot")
+end
+
+if action == "update-low-space" then
+  term.clear(); term.setCursorPos(1, 1)
+  print("CC MINER V4 OFFLINE UPDATE-LOW-SPACE / " .. ROLE); print("")
+  lowSpaceUpdate()
+  return
+end
+
+if fs.exists(BACKUP) then fs.delete(BACKUP) end
+local hadRoot = fs.exists(ROOT)
+if hadRoot then
+  local backedUp, backupError = moveChecked(ROOT, BACKUP)
+  if not backedUp then fs.delete(TEMP); fail("Cannot back up existing installation: " .. backupError) end
+end
+local moved, moveError = moveChecked(TEMP, ROOT)
+if not moved then
+  if fs.exists(ROOT) then fs.delete(ROOT) end
+  local restored, restoreError = true, nil
+  if hadRoot then
+    if fs.exists(BACKUP) then restored, restoreError = moveChecked(BACKUP, ROOT)
+    else restored, restoreError = false, "Backup directory is missing." end
+  end
+  if not restored then
+    fail("Install swap failed and rollback failed. Previous files remain at " .. BACKUP .. ": "
+      .. tostring(moveError) .. "; rollback: " .. tostring(restoreError))
+  end
+  fail("Install swap failed; previous installation was restored: " .. tostring(moveError))
+end
+print("")
+if action == "update" then
+  print("Offline update installed: " .. VERSION .. " (schema " .. SCHEMA .. ")")
+  print("Previous files: /ccminer.backup"); print("Run: reboot")
+else
+  local setupOk = shell.run(ROOT .. "/setup.lua", ROLE)
+  if not setupOk then printError("Setup did not complete. Run: " .. ROOT .. "/setup.lua " .. ROLE)
+  else print(""); print("Installation complete. Run: reboot") end
+end

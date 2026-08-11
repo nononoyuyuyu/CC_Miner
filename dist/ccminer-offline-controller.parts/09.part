@@ -1,3 +1,242 @@
+print("")
+print("Reboot with: reboot")
+]=] },
+  { source = [[src/ccminer/boot.lua]], target = [[boot.lua]], digest = [[e78dedb9650ffc10004eed5856f0d30a4c3a1941aa79058a5f49ae58d1369e94]], content = [[-- CC Miner V4 boot dispatcher
+
+local common = dofile("/ccminer/lib/common.lua")
+local config, err = common.loadConfig()
+if not config or not config.role then
+  printError(err or "CC Miner is not configured.")
+  print("Run: ccm setup")
+  return
+end
+
+local programs = {
+  worker = "/ccminer/worker.lua",
+  controller = "/ccminer/controller.lua",
+  gps = "/ccminer/gps_host.lua",
+}
+local program = programs[config.role]
+if not program then error("Unknown CC Miner role: " .. tostring(config.role), 0) end
+
+if config.role ~= "worker" then
+  local ok, runError = pcall(dofile, program)
+  if not ok then common.log("ERROR", config.role .. " stopped: " .. tostring(runError)); printError(runError) end
+  return
+end
+
+while true do
+  local ok, runError = pcall(dofile, program)
+  if ok then return end
+  local text = tostring(runError)
+  common.log("ERROR", "Worker crashed: " .. text)
+  printError("CC Miner worker stopped: " .. text)
+  if text == "Terminated" or text:find("Terminated", 1, true) then
+    print("Worker stopped locally. Run 'reboot' to restart.")
+    return
+  end
+  print("Restarting worker in 5 seconds...")
+  sleep(5)
+end
+]] },
+  { source = [[src/ccminer/command.lua]], target = [[command.lua]], digest = [[70737b4c18ac75172eb963e17276a4d630ab262c7a319ca6cbeaa92ce21262c8]], content = [[-- CC Miner command launcher (V2/V4 compatible)
+
+local args = { ... }
+local common = dofile("/ccminer/lib/common.lua")
+local command = string.lower(tostring(args[1] or "help"))
+
+local function reportError(message)
+  if printError then printError(tostring(message or "")) else print(tostring(message or "")) end
+end
+
+local function unpackArgs(values)
+  local unpackFunction = table.unpack or unpack
+  return unpackFunction(values)
+end
+
+local function printHelp()
+  print("CC Miner " .. tostring(common.VERSION or ""))
+  print("")
+  print("ccm help | version | status | report | doctor | logs")
+  print("ccm setup [worker|controller|gps]")
+  print("ccm dashboard | discover | update")
+  print("ccm rehome RESET                 Local worker recovery")
+  print("")
+  print("Controller CLI:")
+  print("ccm start <id> <W> <L> <D>")
+  print("ccm queue [list|add|run|remove|clear] [args...]")
+  print("ccm preset(s) [list|save|use|delete] [args...]")
+  print("ccm stop <id> <now|row|layer|home|abort>")
+  print("ccm pause|resume|recall|service|abort|clear <id>")
+  print("ccm group list")
+  print("ccm group show <id>")
+  print("ccm group register <id> <workerIds comma> [name dock bay mode partition workerBayMap workerDockMap]")
+  print("ccm group start|pause|resume|return|service|abort|clear <id>")
+  print("ccm group reassign <id> <stopped> [target]")
+  print("ccm dock|bay list")
+  print("ccm dock|bay register <id> <x> <y> <z> [facing] [maxDepth]")
+  print("ccm gps <id>                    Request GPS fix")
+  print("ccm calibrate <id>              Calibrate worker GPS")
+  print("ccm rehome <id> RESET")
+  print("ccm remote <workerId> [-- <command...>]  Remote console (CLI only)")
+end
+
+local function forwardController(forwarded)
+  forwarded = forwarded or {}
+  if #forwarded == 0 then
+    for index = 1, #args do forwarded[index] = args[index] end
+  end
+  shell.run("/ccminer/controller.lua", unpackArgs(forwarded))
+end
+
+local function loadConfigForCommand()
+  local config, configError = common.loadConfig()
+  if not config then
+    reportError(configError or "Not configured.")
+    return nil
+  end
+  return config
+end
+
+-- This loader intentionally never rotates a .bak file or writes a recovery
+-- copy.  `doctor` is a read-only diagnostic and must not change on-disk state.
+local function readTableNoWrite(path)
+  if not fs or not fs.exists or not fs.exists(path) then return nil, "missing" end
+  if fs.isDir and fs.isDir(path) then return nil, "directory" end
+  local handle = fs.open(path, "r")
+  if not handle then return nil, "unreadable" end
+  local text = handle.readAll()
+  handle.close()
+  if type(textutils) ~= "table" or type(textutils.unserialize) ~= "function" then
+    return nil, "unserialize unavailable"
+  end
+  local ok, value = pcall(textutils.unserialize, text)
+  if not ok or type(value) ~= "table" then return nil, "invalid" end
+  return value
+end
+
+local function readTextNoWrite(path)
+  if not fs or not fs.exists or not fs.exists(path) then return nil, "missing" end
+  if fs.isDir and fs.isDir(path) then return nil, "directory" end
+  local handle = fs.open(path, "r")
+  if not handle then return nil, "unreadable" end
+  local text = handle.readAll()
+  handle.close()
+  return text
+end
+
+local function tableValue(value, ...)
+  local current = value
+  for index = 1, select("#", ...) do
+    if type(current) ~= "table" then return nil end
+    current = current[select(index, ...)]
+  end
+  return current
+end
+
+local function valueString(value, depth)
+  depth = depth or 0
+  if value == nil then return "-" end
+  if type(value) == "boolean" then return value and "true" or "false" end
+  if type(value) ~= "table" then return tostring(value) end
+  if depth >= 2 then return "{...}" end
+  local keys = {}
+  for key in pairs(value) do keys[#keys + 1] = key end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  local parts = {}
+  for _, key in ipairs(keys) do
+    parts[#parts + 1] = tostring(key) .. "=" .. valueString(value[key], depth + 1)
+    if #parts >= 8 then
+      parts[#parts + 1] = "..."
+      break
+    end
+  end
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+
+local function sortedKeys(value)
+  local keys = {}
+  if type(value) == "table" then
+    for key in pairs(value) do keys[#keys + 1] = key end
+  end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  return keys
+end
+
+local function printField(label, value)
+  print(tostring(label) .. ": " .. valueString(value))
+end
+
+local function printStatusFeature(label, value, fallback)
+  if value ~= nil then printField(label, value)
+  elseif fallback ~= nil then printField(label, fallback)
+  end
+end
+
+-- Status/report payloads grew a few additive fields during V4 (and workers
+-- can still be running an older payload).  Keep the CLI tolerant by looking
+-- through the known aliases and only printing a field when it is present.
+-- This deliberately does not stringify networkKey or any credential-like
+-- value; status output must retain the existing masked-key contract.
+local function firstNestedValue(roots, paths)
+  roots = roots or {}
+  -- `roots` intentionally contains optional entries; numeric iteration keeps
+  -- searching past nil job/report/service slots instead of stopping at the
+  -- first hole as `ipairs` would.
+  for index = 1, #roots do
+    local root = roots[index]
+    if type(root) == "table" then
+      for _, path in ipairs(paths or {}) do
+        local value = tableValue(root, unpackArgs(path))
+        if value ~= nil then return value end
+      end
+    end
+  end
+  return nil
+end
+
+local function printOperationalFields(root, config)
+  root = type(root) == "table" and root or {}
+  config = type(config) == "table" and config or {}
+  local job = type(root.job) == "table" and root.job or nil
+  local report = type(root.report) == "table" and root.report or nil
+  local lastReport = type(root.lastReport) == "table" and root.lastReport or nil
+  local service = type(root.service) == "table" and root.service or nil
+  local group = type(root.group) == "table" and root.group or nil
+  local stats = type(root.stats) == "table" and root.stats or nil
+  local roots = {}
+  local function addRoot(value)
+    if type(value) == "table" then roots[#roots + 1] = value end
+  end
+  addRoot(root); addRoot(job); addRoot(report); addRoot(lastReport)
+  addRoot(service); addRoot(group); addRoot(stats); addRoot(config)
+
+  local dock = firstNestedValue(roots, {
+    { "dock" }, { "dockInfo" }, { "location", "dock" },
+    { "gps", "calibration", "home" }, { "homeWorld" },
+  })
+  if dock ~= nil then printField("Dock", dock) end
+  local bay = firstNestedValue(roots, {
+    { "bay" }, { "bayInfo" }, { "location", "bay" },
+  })
+  if bay ~= nil then printField("Bay", bay) end
+
+  local groupId = firstNestedValue(roots, {
+    { "groupId" }, { "group", "id" }, { "group", "groupId" },
+  })
+  local groupJobId = firstNestedValue(roots, {
+    { "groupJobId" }, { "group", "groupJobId" }, { "group", "jobId" },
+    { "job", "groupJobId" },
+  })
+  local assignmentId = firstNestedValue(roots, {
+    { "assignmentId" }, { "assignment", "id" }, { "group", "assignmentId" },
+    { "job", "assignmentId" },
+  })
+  if groupId ~= nil then printField("Group", groupId) end
+  if groupJobId ~= nil then printField("Group job", groupJobId) end
+  if assignmentId ~= nil then printField("Assignment", assignmentId) end
+
+  local bottomY = firstNestedValue(roots, {
     { "bottomY" }, { "bottom_y" }, { "targetY" },
     { "job", "bottomY" }, { "job", "targetY" }, { "job", "bottom_y" },
     { "dock", "bottomY" }, { "dock", "bottom_y" },
@@ -68,198 +307,3 @@
 end
 
 local function controllerDbCandidates(config)
-  local paths, seen = {}, {}
-  local function add(path)
-    if type(path) == "string" and path ~= "" and not seen[path] then
-      seen[path] = true
-      paths[#paths + 1] = path
-    end
-  end
-  if type(config) == "table" then
-    add(config.controllerDbPath)
-    add(config.controllerDBPath)
-    add(tableValue(config.controller, "dbPath"))
-    add(tableValue(config.history, "path"))
-  end
-  add(common.CONTROLLER_DB_PATH)
-  add(common.CONTROLLER_DB)
-  add(common.CONTROLLER_STATE_PATH)
-  add("/ccminer/data/controller.db")
-  add("/ccminer/controller.db")
-  return paths
-end
-
-local function historyFromDb(db)
-  if type(db) ~= "table" then return nil end
-  if type(db.history) == "table" then
-    if type(db.history.entries) == "table" then return db.history.entries end
-    if type(db.history.rows) == "table" then return db.history.rows end
-    return db.history
-  end
-  if type(db.jobs) == "table" then return db.jobs end
-  if type(db.records) == "table" then return db.records end
-  if type(db.entries) == "table" then return db.entries end
-  -- Some V4 snapshots are themselves a numeric history array.
-  if #db > 0 then return db end
-  return nil
-end
-
-local function printReportTable(prefix, report)
-  if type(report) ~= "table" then
-    print(prefix .. ": none")
-    return
-  end
-  local printed = false
-  for _, key in ipairs(sortedKeys(report)) do
-    local value = report[key]
-    if type(value) ~= "table" then
-      print(prefix .. "." .. tostring(key) .. ": " .. valueString(value))
-      printed = true
-    end
-  end
-  if not printed then print(prefix .. ": " .. valueString(report)) end
-end
-
-local function printWorkerReport(state, config)
-  print("Worker report")
-  local current = state.currentReport or state.activeReport or state.progressReport or state.currentJobReport
-  local last = state.lastReport or state.report or state.lastJobReport or state.completionReport
-  if current then printReportTable("Current report", current) else print("Current report: none") end
-  if last then printReportTable("Last report", last) else print("Last report: none") end
-  -- V4 keeps both names while older state files only have `report`; show both
-  -- when they are genuinely distinct so no completion data is hidden.
-  if state.report and state.report ~= last then printReportTable("Report", state.report) end
-  if state.jobReport and state.jobReport ~= last and state.jobReport ~= state.report then
-    printReportTable("Job report", state.jobReport)
-  end
-  printOperationalFields(state, config or state.config)
-  local stats = type(state.stats) == "table" and state.stats or {}
-  print("Stats")
-  for _, key in ipairs(sortedKeys(stats)) do
-    if type(stats[key]) ~= "table" then print("  " .. tostring(key) .. ": " .. valueString(stats[key])) end
-  end
-  if state.job then
-    local job = state.job
-    print(("Job: %s %s/%s (%s%%)"):format(
-      tostring(job.name or job.id or "-"), tostring(job.cursor or 0), tostring(job.total or 0),
-      tostring(common.percent and common.percent(job.cursor or 0, job.total or 0) or 0)
-    ))
-  else
-    print("Job: none")
-  end
-end
-
-local function printControllerGroups(db)
-  if type(db) ~= "table" then return end
-  local groups = db.groups
-  local docks = db.docks
-  local bays = db.bays
-  local groupJobs = db.groupJobs or db.group_jobs
-  if type(groups) == "table" then
-    local count = 0
-    for _ in pairs(groups) do count = count + 1 end
-    print("Groups: " .. tostring(count))
-    for _, key in ipairs(sortedKeys(groups)) do
-      local group = groups[key]
-      if type(group) == "table" then
-        print(("  group=%s name=%s workers=%s dock=%s bay=%s mode=%s"):format(
-          tostring(group.id or key), tostring(group.name or "-"),
-          valueString(group.workerIds or group.workers or group.assignments or {}),
-          tostring(group.dockId or group.dock or "-"), tostring(group.bayId or group.bay or "-"),
-          tostring(group.mode or "-")))
-      else
-        print("  group=" .. tostring(key) .. " " .. valueString(group))
-      end
-    end
-  end
-  if type(docks) == "table" then
-    local count = 0; for _ in pairs(docks) do count = count + 1 end
-    print("Docks: " .. tostring(count))
-  end
-  if type(bays) == "table" then
-    local count = 0; for _ in pairs(bays) do count = count + 1 end
-    print("Bays: " .. tostring(count))
-  end
-  if type(groupJobs) == "table" then
-    local count = 0; for _ in pairs(groupJobs) do count = count + 1 end
-    print("Group jobs: " .. tostring(count))
-    for _, key in ipairs(sortedKeys(groupJobs)) do
-      local job = groupJobs[key]
-      if type(job) == "table" then
-        local assignments = job.assignments or job.assignmentCount or job.workers
-        local acks = job.acks or job.ackSummary or job.ackCount
-        local aggregate = type(job.aggregate) == "table" and job.aggregate or nil
-        local ackText = aggregate and ((tostring(aggregate.acks or 0)) .. "/" .. tostring(aggregate.ackTotal or "-")) or valueString(acks or "-")
-        local partial = job.partialStart or job.partial
-        print(("  groupJob=%s status=%s assignments=%s ACK=%s partial=%s bottomY=%s"):format(
-          tostring(job.groupJobId or job.id or key), tostring(job.status or "-"),
-          valueString(assignments or "-"), ackText, valueString(partial or "-"),
-          tostring(job.bottomY or job.targetY or "-")))
-      else
-        print("  groupJob=" .. tostring(key) .. " " .. valueString(job))
-      end
-    end
-  end
-end
-
-local function printControllerReport(config)
-  print("Controller history report")
-  local loaded, loadedPath, loadError
-  for _, path in ipairs(controllerDbCandidates(config)) do
-    local candidate, err = readTableNoWrite(path)
-    if candidate then loaded, loadedPath = candidate, path; break end
-    loadError = err
-  end
-  if not loaded then
-    print("History: none (controller.db not found)")
-    if loadError and loadError ~= "missing" then print("History read warning: " .. tostring(loadError)) end
-    return
-  end
-  local history = historyFromDb(loaded)
-  print("Database: " .. tostring(loadedPath))
-  printControllerGroups(loaded)
-  if not history then
-    print("History entries: 0")
-    return
-  end
-  local historyCount = 0
-  for _ in pairs(history) do historyCount = historyCount + 1 end
-  print("History entries: " .. tostring(historyCount))
-  local shown = 0
-  if #history > 0 then
-    for index = #history, 1, -1 do
-      local row = history[index]
-      if type(row) == "table" then
-        local rowReport = type(row.report) == "table" and row.report or row
-        local rowStats = type(row.stats) == "table" and row.stats or (type(rowReport.stats) == "table" and rowReport.stats or {})
-        local rowGroup = row.groupJobId or row.groupId or rowReport.groupJobId or rowReport.groupId
-        local rowBottomY = row.bottomY or row.targetY or rowReport.bottomY or rowReport.targetY
-        local rowDiscard = row.discard or row.discardStats or rowReport.discard or rowReport.discardStats
-          or rowStats.discarded or rowStats.discardedBlocks or rowStats.discardStats
-        local rowThroughput = row.throughput or rowReport.throughput or rowStats.throughput or row.performance or rowReport.performance
-        local rowReturn = row.lastReturn or row.returnInfo or row.returnRoute or rowReport.lastReturn or rowReport["return"] or rowReport.returnRoute
-        print(("  #%d id=%s status=%s mode=%s at=%s"):format(
-          index, tostring(row.id or row.jobId or row.workerId or "-"),
-          tostring(row.status or row.result or row.outcome or "-"),
-          tostring(row.stopMode or row.mode or row.command or "-"),
-          tostring(row.updatedAt or row.finishedAt or row.completedAt or row.at or "-")))
-        if rowGroup ~= nil or rowBottomY ~= nil or rowDiscard ~= nil or rowThroughput ~= nil or rowReturn ~= nil then
-          print(("      group=%s BOTTOM Y=%s discard=%s throughput=%s return=%s"):format(
-            tostring(rowGroup or "-"), tostring(rowBottomY or "-"), valueString(rowDiscard or "-"),
-            valueString(rowThroughput or "-"), valueString(rowReturn or "-")))
-        end
-      else
-        print("  #" .. tostring(index) .. " " .. valueString(row))
-      end
-      shown = shown + 1
-      if shown >= 10 then break end
-    end
-  else
-    for _, key in ipairs(sortedKeys(history)) do
-      local row = history[key]
-      if type(row) == "table" then
-        local rowReport = type(row.report) == "table" and row.report or row
-        local rowStats = type(row.stats) == "table" and row.stats or (type(rowReport.stats) == "table" and rowReport.stats or {})
-        local rowGroup = row.groupJobId or row.groupId or rowReport.groupJobId or rowReport.groupId
-        local rowBottomY = row.bottomY or row.targetY or rowReport.bottomY or rowReport.targetY
-        local rowDiscard = row.discard or row.discardStats or rowReport.discard or rowReport.discardStats

@@ -1,266 +1,267 @@
+      turtle.select(originalSlot)
+      return false, "Turtle refused the selected fuel item."
+    end
+    if turtle.getItemCount(slot) > 0 then
+      runInventoryPhysicalAction("refuel_excess", {
+        slot = slot, item = itemName(slot), direction = fuelSide,
+      }, dropFunction)
+    end
+    if type(before) == "number" and type(after) == "number" and after > before then
+      state.stats.refuels = (state.stats.refuels or 0) + 1
+    end
   end
-  if targetDir ~= nil then
-    local ok, err = turnTo(targetDir)
-    if not ok then markBlocked("Turn failed: " .. tostring(err)); return end
-  end
-  local ok, err = moveOne(direction, "mining")
-  if not ok then
-    if handleMoveFailure("Mining stopped at cell " .. tostring(job.cursor), err, verticalDelta == -1) then return end
-    markBlocked("Mining stopped at cell " .. tostring(job.cursor) .. ": " .. tostring(err))
-    return
-  end
-  job.cursor = job.cursor + 1
-  if layerBoundary(job) then
-    local layerGPS, layerGPSError = verifyGPS(true)
-    if not layerGPS then markBlocked("GPS verification at layer boundary failed: " .. tostring(layerGPSError)); return end
-  end
+  local restored, restoreError = restoreSideDirection(fuelSide, restoreDir)
+  turtle.select(originalSlot)
+  if not restored then return false, restoreError end
   saveState()
-  if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or (rowBoundary(job) and "row" or nil)) then return end
-  heartbeat(false)
+  return true
 end
 
-local function runChunkPlanStep(job)
-  local plan, route = job.chunkPlan, job.route
-  if not plan or not route then markBlocked("Chunk plan state is missing."); return end
-  route.layer = tonumber(route.layer) or 0
-  route.walkIndex = tonumber(route.walkIndex) or 1
-  route.localCursor = tonumber(route.localCursor) or 0
-  route.phase = route.phase or "travel"
-  route.breadcrumbs = route.breadcrumbs or {}
-  if route.currentKey and route.breadcrumbs[#route.breadcrumbs] ~= route.currentKey then
-    route.breadcrumbs[#route.breadcrumbs + 1] = route.currentKey
-    while #route.breadcrumbs > 128 do table.remove(route.breadcrumbs, 1) end
+local function refillSlotForSeal()
+  local materials, recycle = materialsConfig()
+  local preferred = materials.sealSlots or recycle.sealSlots or config.sealSlots
+  if type(preferred) == "table" then
+    for _, candidate in ipairs(preferred) do
+      local slot = tonumber(candidate)
+      if slot and not isReservedSlot(slot, "seal") and turtle.getItemCount(slot) > 0 and isSealItemName(itemName(slot)) and turtle.getItemSpace(slot) > 0 then return slot end
+    end
+    for _, candidate in ipairs(preferred) do
+      local slot = tonumber(candidate)
+      if slot and not isReservedSlot(slot, "seal") and turtle.getItemCount(slot) == 0 then return slot end
+    end
+  end
+  for slot = 1, 16 do
+    if not isReservedSlot(slot, "seal") and isSealItemName(itemName(slot)) and turtle.getItemSpace(slot) > 0 then return slot end
+  end
+  for slot = 1, 16 do if not isReservedSlot(slot, "seal") and turtle.getItemCount(slot) == 0 then return slot end end
+  return nil
+end
+
+local function refillSealAtHome()
+  if (config.lavaMode or "seal") ~= "seal" then return true end
+  state.phase, state.status = "refilling_seal", "working"
+  saveState()
+  local target = math.max(1, tonumber(config.sealTarget) or 64)
+  local materials, recycle = materialsConfig()
+  target = math.max(1, tonumber(materials.retainSealTarget or recycle.maxHeld or config.retainSealTarget) or target)
+  compressSealStacks()
+  updateRecycleInventoryState()
+  if sealMaterialCount() >= target then return true end
+  local side = config.sealSide or "right"
+  local inspectFunction, suckFunction, dropFunction, restoreDir, sideError = sideFunctions(side)
+  if not inspectFunction then return false, sideError end
+  local checkSide = (side == "top" and "top") or (side == "bottom" and "bottom") or "front"
+  if not inventoryPresent(checkSide, inspectFunction) then
+    restoreSideDirection(side, restoreDir)
+    return false, "Lava-seal block inventory missing on configured side " .. side .. "."
   end
 
-  if route.walkIndex > #plan.walk then
-    if route.layer + 1 >= job.depth then completeJob("completed"); return end
-    local ok, err = moveOne("down", "mining")
-    if not ok then
-      if handleMoveFailure("Cannot descend to the next layer", err, true) then return end
-      markBlocked("Cannot descend to the next layer: " .. tostring(err))
-      return
+  local originalSlot = turtle.getSelectedSlot()
+  local attempts = 0
+  while sealMaterialCount() < target do
+    drainNetwork(3)
+    if movementInterrupted("service") then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "control_request"
     end
-    route.layer = route.layer + 1
-    route.walkIndex, route.localCursor, route.phase = 1, 0, "travel"
-    route.currentKey = plan.rootKey
-    local layerGPS, layerGPSError = verifyGPS(true)
-    if not layerGPS then markBlocked("GPS verification after layer change failed: " .. tostring(layerGPSError)); return end
-    saveState()
-    return
+    attempts = attempts + 1
+    if attempts > 64 then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+]=] },
+  { source = [[src/ccminer/worker_parts/04.part]], target = [[worker_parts/04.part]], digest = [[fbc125a385c7b9fe8ddbd65fc66320420dbdc3759a9df33db0b5523e2c96bee5]], content = [[      return false, "Seal-block loading safety limit reached."
+    end
+    local slot = refillSlotForSeal()
+    if not slot then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "No inventory space for lava-seal blocks."
+    end
+    turtle.select(slot)
+    local need = math.min(target - sealMaterialCount(), turtle.getItemSpace(slot))
+    if need <= 0 then need = 1 end
+    local sucked = runInventoryPhysicalAction("refill_seal_suck", {
+      slot = slot, count = need, direction = side,
+    }, function() return suckFunction(need) end)
+    if not sucked then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Lava-seal block inventory is empty."
+    end
+    if not isSealItemName(itemName(slot)) then
+      runInventoryPhysicalAction("refill_seal_reject", {
+        slot = slot, item = itemName(slot), direction = side,
+      }, dropFunction)
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Seal inventory contains an unsupported item. Use configured solid blocks only."
+    end
+    state.stats.sealRefills = (state.stats.sealRefills or 0) + 1
   end
+  local restored, restoreError = restoreSideDirection(side, restoreDir)
+  turtle.select(originalSlot)
+  if not restored then return false, restoreError end
+  saveState()
+  return true
+end
 
-  local walkStep = plan.walk[route.walkIndex]
-  local chunk = plan.chunks[walkStep.key]
-  if not chunk then markBlocked("Chunk plan references an unknown chunk: " .. tostring(walkStep.key)); return end
-  local y = -route.layer
-  local anchor = { x = chunk.anchor.x, y = y, z = chunk.anchor.z }
-
-  if route.phase == "travel" then
-    local ok, err
-    if not quarry.findChunk(plan, state.pose.x, state.pose.z) then
-      -- The physical dock (0,0) is outside the quarry footprint.  The first
-      -- trip must bridge home -> dock and then follow the assigned
-      -- dock/transit BFS route, never a direct home -> seed shortcut.
-      ok, err = navigateChunkPlanWork(anchor, "mining")
-    elseif samePosePosition(state.pose, anchor) then
-      ok = true
-    elseif route.currentKey and route.currentKey ~= walkStep.key then
-      ok, err = moveBetweenChunkAnchors(plan, route.currentKey, walkStep.key, y, "mining")
-    else
-      ok, err = navigateTo(anchor, "inside", "mining")
-    end
-    if not ok then
-      if handleMoveFailure("Chunk transit failed", err, false) then return end
-      markBlocked("Chunk transit failed: " .. tostring(err)); return
-    end
-    route.currentKey = walkStep.key
-    if route.breadcrumbs[#route.breadcrumbs] ~= walkStep.key then
-      route.breadcrumbs[#route.breadcrumbs + 1] = walkStep.key
-      while #route.breadcrumbs > 128 do table.remove(route.breadcrumbs, 1) end
-    end
-    if walkStep.first then
-      route.phase, route.localCursor = "mine", 0
-    else
-      route.walkIndex = route.walkIndex + 1
-    end
-    saveState()
-    return
+local function refillTorchAtHome()
+  local mode = effectiveLighting()
+  if mode == "off" then return true end
+  state.phase, state.status = "refilling_torch", "working"
+  saveState("refill_torch")
+  local materials = materialsConfig()
+  local lighting = config.lighting or {}
+  local target = tonumber(lighting.target or lighting.torchTarget or materials.torchTarget or config.torchTarget) or 32
+  target = math.max(1, math.floor(target))
+  if torchMaterialCount() >= target then return true end
+  local side = lighting.side or config.torchSide or "left"
+  local inspectFunction, suckFunction, dropFunction, restoreDir, sideError = sideFunctions(side)
+  if not inspectFunction then return false, sideError end
+  local checkSide = (side == "top" and "top") or (side == "bottom" and "bottom") or "front"
+  if not inventoryPresent(checkSide, inspectFunction) then
+    restoreSideDirection(side, restoreDir)
+    return false, "Torch inventory missing on configured side " .. side .. "."
   end
-
-  if route.phase == "mine" then
-    if job.transitSet and job.transitSet[chunk.key] and not (job.assignmentSet and job.assignmentSet[chunk.key]) then
-      -- Transit-only chunks exist to keep the assigned region connected.  We
-      -- walk through them for service safety but never count or mine cells.
-      route.phase, route.localCursor = "return", 0
-      saveState("transit_chunk")
-      return
+  local originalSlot = turtle.getSelectedSlot()
+  local attempts = 0
+  while torchMaterialCount() < target do
+    drainNetwork(3)
+    if movementInterrupted("service") then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "control_request"
     end
-    local count = quarry.chunkCellCount(chunk)
-    if route.localCursor >= count then
-      route.phase = "return"
-      saveState()
-      return
+    attempts = attempts + 1
+    if attempts > 64 then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Torch loading safety limit reached."
     end
-    local target = quarry.chunkCell(chunk, route.localCursor, y)
-    if samePosePosition(state.pose, target) then
-      route.localCursor = route.localCursor + 1
-      job.cursor = (job.cursor or 0) + 1
-      if layerBoundary(job) then
-        local layerGPS, layerGPSError = verifyGPS(true)
-        if not layerGPS then markBlocked("GPS verification at recovered chunk layer boundary failed: " .. tostring(layerGPSError)); return end
+    local slot = nil
+    local preferred = preferredTorchSlots()
+    if type(preferred) == "table" then
+      for _, candidate in ipairs(preferred) do
+        local candidateSlot = tonumber(candidate)
+        if candidateSlot and not isReservedSlot(candidateSlot, "torch") and turtle.getItemCount(candidateSlot) == 0 then
+          slot = candidateSlot
+          break
+        end
       end
-      saveState()
-      if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or ((route.localCursor >= count) and "row" or nil)) then return end
-      return
     end
-    local direction, targetDir = requiredDirectionTo(target)
-    if not direction then
-      markBlocked(("Chunk cell path mismatch in %s at local cell %d."):format(chunk.key, route.localCursor))
-      return
+    if not slot then
+      for candidate = 1, 16 do
+        if not isReservedSlot(candidate, "torch") and turtle.getItemCount(candidate) == 0 then slot = candidate; break end
+      end
     end
-    if targetDir ~= nil then
-      local turned, turnError = turnTo(targetDir)
-      if not turned then markBlocked("Chunk turn failed: " .. tostring(turnError)); return end
+    if not slot then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "No inventory space for torches."
     end
-    local moved, moveError = moveOne(direction, "mining")
-    if not moved then
-      if handleMoveFailure("Chunk mining failed", moveError, false) then return end
-      markBlocked("Chunk mining failed: " .. tostring(moveError)); return
+    turtle.select(slot)
+    local need = math.min(target - torchMaterialCount(), turtle.getItemSpace(slot))
+    if need <= 0 then need = 1 end
+    local sucked = runInventoryPhysicalAction("refill_torch_suck", {
+      slot = slot, count = need, direction = side,
+    }, function() return suckFunction(need) end)
+    if not sucked then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Torch inventory is empty."
     end
-    route.localCursor = route.localCursor + 1
-    job.cursor = (job.cursor or 0) + 1
-    if layerBoundary(job) then
-      local layerGPS, layerGPSError = verifyGPS(true)
-      if not layerGPS then markBlocked("GPS verification at chunk layer boundary failed: " .. tostring(layerGPSError)); return end
+    if not isTorchItemName(itemName(slot)) then
+      runInventoryPhysicalAction("refill_torch_reject", {
+        slot = slot, item = itemName(slot), direction = side,
+      }, dropFunction)
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Torch inventory contains an unsupported item."
     end
-    saveState()
-    if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or ((route.localCursor >= count) and "row" or nil)) then return end
-    return
+    state.stats.torchRefills = (state.stats.torchRefills or 0) + 1
   end
-
-  if route.phase == "return" then
-    local ok, err = navigateTo(anchor, "inside", "mining")
-    if not ok then
-      if handleMoveFailure("Cannot return to chunk anchor", err, false) then return end
-      markBlocked("Cannot return to chunk anchor: " .. tostring(err)); return
-    end
-    route.phase, route.localCursor = "travel", 0
-    job.completedChunks = (job.completedChunks or 0) + 1
-    route.walkIndex = route.walkIndex + 1
-    route.currentKey = walkStep.key
-    saveState()
-    return
-  end
-
-  markBlocked("Unknown chunk route phase: " .. tostring(route.phase))
+  local restored, restoreError = restoreSideDirection(side, restoreDir)
+  turtle.select(originalSlot)
+  if not restored then return false, restoreError end
+  saveState("refill_torch_done")
+  return true
 end
 
-local function runMiningStep()
-  if handlePendingRequest() then return end
-  if state.service then continueService(); return end
-  if not state.job then
-    state.status = "idle"
-    state.phase = isHome() and "home" or "unknown_position"
-    saveState()
-    return
-  end
-
-  local compactEvery = profileCompactEvery()
-  local moves = tonumber(state.stats.moves) or 0
-  if compactEvery > 0 and moves > 0 and moves % math.floor(compactEvery) == 0
-    and tonumber(state.stats.lastCompressionMove or -1) ~= moves then
-    compressInventoryAtField()
-    state.stats.lastCompressionMove = moves
-    saveState("field_compress")
-  end
-
-  local discardOK, discardError = discardAtField()
-  if not discardOK and discardError then
-    state.lastError = tostring(discardError)
-  end
-
-  local serviceNeeded, reason = shouldService()
-  if serviceNeeded then beginAutomaticService(reason); return end
-  state.phase, state.status, state.lastError = "mining", "working", nil
-  if state.job.strategy == "chunk_plan" then runChunkPlanStep(state.job) else runSerpentineStep(state.job) end
-end
-
-local function displayLocalStatus()
-  common.clear(colors and colors.black or nil, colors and colors.white or nil)
-  print("CC Miner V4 Worker " .. common.VERSION)
-  print("ID: " .. os.getComputerID() .. "  " .. tostring(config.workerName))
-  print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
-  print(("Pose: x=%d y=%d z=%d d=%d"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir))
-  if state.gps and state.gps.lastFix then
-    print(("GPS: %d,%d,%d%s"):format(
-      state.gps.lastFix.x, state.gps.lastFix.y, state.gps.lastFix.z,
-      gpsCalibration() and " calibrated" or " uncalibrated"
-]] },
-  { source = [[src/ccminer/worker_parts/05.part]], target = [[worker_parts/05.part]], digest = [[7807e70cc70294234d8716894ee8580dd4b068ac3c3a829759a736bc524d06ed]], content = [[    ))
+local function beginService(resumeAfter, finalStatus, reason, preserveCheckpoint)
+  if not state.service then
+    if not isHome() and not state.checkpoint then installCheckpointToken(checkpointToken()) end
+    state.serviceReturn = {}
+    state.service = {
+      resumeAfter = resumeAfter == true,
+      finalStatus = finalStatus or (resumeAfter and "working" or "paused"),
+      preserveCheckpoint = preserveCheckpoint == true,
+      reason = reason or "service",
+      startedAt = common.nowSeconds(),
+      returnDistance = 0,
+      returnStartedAt = nil,
+      returnEndedAt = nil,
+    }
   else
-    print("GPS: " .. (gpsCalibration() and "no fix" or "not calibrated"))
+    if resumeAfter == false then state.service.resumeAfter = false end
+    if finalStatus then state.service.finalStatus = finalStatus end
+    if preserveCheckpoint ~= nil then state.service.preserveCheckpoint = preserveCheckpoint == true end
+    if reason then state.service.reason = reason end
   end
-  print("Fuel: " .. tostring(fuelLevel()) .. " / " .. tostring(fuelLimit()))
-  local used, empty, items = inventoryStats()
-  print(("Inventory: %d used, %d empty, %d items"):format(used, empty, items))
-  print(("Lava seal: %d/%d (%s)"):format(sealMaterialCount(), tonumber(config.sealTarget) or 64, config.lavaMode or "seal"))
-  local lightMode, lightInterval = effectiveLighting()
-  print(("Lighting: %s every %d, torches=%d, placed=%d"):format(
-    lightMode, lightInterval, torchMaterialCount(), state.stats.torchesPlaced or 0
-  ))
-  print(("Water: %s, detected=%d sealed=%d"):format(
-    waterMode(), state.stats.waterDetected or 0, state.stats.waterSealed or 0
-  ))
-  local throughput = throughputSnapshot()
-  local returnInfo = returnSnapshot()
-  print(("Throughput: %.2f/s  Return: %s d=%d t=%ds"):format(
-    throughput.perSecond or 0, tostring(returnInfo.reason or "-"),
-    tonumber(returnInfo.distance) or 0, tonumber(returnInfo.seconds) or 0
-  ))
-  local discard = state.discardStats or state.discard or {}
-  print(("Discard: %s stacks=%d items=%d"):format(
-    tostring((config.discard and config.discard.mode) or discard.mode or "KEEP_ALL"),
-    tonumber(discard.stacks) or 0, tonumber(discard.items or discard.discarded) or 0
-  ))
-  if state.group and (state.group.groupJobId or state.group.assignmentId or state.group.bay) then
-    print(("Group: %s bay=%s"):format(
-      tostring(state.group.groupJobId or state.group.groupId or "-"), tostring(state.group.bay or state.group.bayId or "-")))
+  if state.checkpoint and not state.resumeToken then state.resumeToken = common.copy(state.checkpoint) end
+  if state.job and state.job.groupJobId then
+    state.assignmentResumeToken = assignmentResumeSnapshot(state.resumeToken or state.checkpoint or checkpointToken())
   end
-  if state.job then
-    print(("Job: %s %dx%dx%d [%s]"):format(
-      tostring(state.job.name), state.job.width, state.job.length, state.job.depth, state.job.strategy or "serpentine"
-    ))
-    print(("Progress: %d/%d (%d%%)"):format(
-      state.job.cursor or 0, state.job.total or 0, common.percent(state.job.cursor or 0, state.job.total or 0)
-    ))
-  else
-    print("Job: none")
-  end
-  if state.lastError then print("Error: " .. common.fit(state.lastError, 50)) end
-  print("")
-  print("Remote control active. Hold Ctrl+T to stop locally.")
+  if resumeAfter and not isHome() and not state.checkpoint then installCheckpointToken(checkpointToken()) end
+  state.returnReason = reason or state.returnReason
+  state.lastReturnReason = reason or state.lastReturnReason
+  state.status, state.phase, state.request = "working", "service_requested", nil
+  saveState()
 end
 
-local function inspectPendingSide(kind)
-  if common.startsWith(kind, "torch_floor") then return turtle.inspectDown() end
-  if common.endsWith(kind, "_up") then return turtle.inspectUp() end
-  if common.endsWith(kind, "_down") then return turtle.inspectDown() end
-  if common.endsWith(kind, "_forward") then return turtle.inspect() end
-  -- Torch wall actions record the relative side.  Re-inspect in the same
-  -- deterministic order used for placement; no turn result is assumed.
-  return nil, nil
-end
-
-local function resolveNonMovementPending(pending)
-  local kind = tostring(pending.kind or "")
-  if common.startsWith(kind, "discard_") or common.startsWith(kind, "refill_")
-    or common.startsWith(kind, "refuel_") or kind == "unload_home" then
-    -- A drop/suck transfer can change inventory while the pose stays fixed;
-    -- GPS cannot distinguish "before" from "after".  Stop for explicit
-    -- inventory/world revalidation instead of silently retrying or counting
-    -- a stack twice after power loss.
-    return false, "Pending inventory transfer requires manual revalidation before continuing."
-  end
-  if common.startsWith(kind, "dig_") then
-    local present, data = inspectPendingSide(kind)
-    if present then
+local function finishService()
+  local service = state.service or {}
+  local finalStatus = service.finalStatus or (service.resumeAfter and "working" or "paused")
+  local preserveCheckpoint = service.preserveCheckpoint == true
+  state.lastReturnReason = service.reason or state.returnReason or state.lastReturnReason
+  state.service, state.request, state.lastError = nil, nil, nil
+  state.stagedStop = false
+  state.stats.services = (state.stats.services or 0) + 1
+  if finalStatus == "complete" then
+    state.stats.jobsCompleted = (state.stats.jobsCompleted or 0) + 1
+    state.checkpoint = nil
+    -- Completion is terminal: do not leave a stale work-point token that
+    -- could be overlaid by a later pending snapshot or mistaken for a
+    -- resumable assignment.
+    state.resumeToken = nil
+    state.assignmentResumeToken = nil
+    state.status, state.phase = "complete", "home"
+    state.estimate = state.estimate or {}
+    state.estimate.actual = state.job and state.job.cursor or 0
+    state.estimate.variance = (state.estimate.actual or 0) - (tonumber(state.estimate.estimated) or (state.estimate.actual or 0))
+    state.report = {
+      jobId = state.job and state.job.id or nil,
+      assignmentId = state.job and state.job.assignmentId or nil,
+      groupJobId = state.job and state.job.groupJobId or nil,
+      group = state.group and common.copy(state.group) or nil,
+      reason = state.completionReason,
+      returnReason = state.lastReturnReason or state.returnReason,
+      ["return"] = state.serviceReturn and common.copy(state.serviceReturn) or nil,
+      completedAt = common.nowSeconds(),
+      elapsed = state.job and math.max(0, common.nowSeconds() - (state.job.startedAt or common.nowSeconds())) or 0,
+      progress = state.job and { cursor = state.job.cursor or 0, total = state.job.total or 0 } or nil,
+      stats = common.copy(state.stats),
+      estimated = state.estimate and state.estimate.estimated or nil,
+      actual = state.job and state.job.cursor or nil,
+      materials = {
+        torchCount = torchMaterialCount(), sealCount = sealMaterialCount(),
+      },
+      discard = common.copy(state.discardStats or state.discard or {}),
+      throughput = throughputSnapshot(),
+      assignmentResumeToken = nil,
+    }
+    state.stats.jobReports = (state.stats.jobReports or 0) + 1
+    state.job.report = common.copy(state.report)
+    state.lastReport = common.copy(state.report)
+    state.jobReport = common.copy(state.report)
+  elseif finalStatus == "aborted" then

@@ -1,275 +1,267 @@
-        -- Keep seal/torch/fuel material on the turtle.  It is never sent to
-        -- either output or discard, even when the output chest is available.
-      elseif not protected then
-        if outputTargetDir ~= nil then turnTo(outputTargetDir) else turnTo(outRestore) end
-        turtle.select(slot)
-        local before = turtle.getItemCount(slot)
-        local prepared, prepareError = beginPhysicalAction("unload_home", {
-          slot = slot, item = name, count = before, direction = outputSide,
-        }, poseCopy())
-        if not prepared then
-          allDropped = false
-          discardStats.lastError = prepareError or "Could not journal output action."
-          break
-        end
-        local dropped = outDrop() -- output receives all non-discard items
-        if dropped and turtle.getItemCount(slot) == 0 then commitPhysicalAction()
-        else cancelPhysicalAction(); allDropped = false end
-      else
-        -- Reserved seal/torch/fuel remain on the turtle.  Unknown and ore
-        -- stacks are retained in the output path when they are not reserved.
-          if not keepReserved then
-            if outputTargetDir ~= nil then turnTo(outputTargetDir) else turnTo(outRestore) end
-            turtle.select(slot)
-          local before = turtle.getItemCount(slot)
-          local prepared, prepareError = beginPhysicalAction("unload_home", {
-            slot = slot, item = name, count = before, direction = outputSide,
-          }, poseCopy())
-          if not prepared then
-            allDropped = false
-            discardStats.lastError = prepareError or "Could not journal output action."
-            break
-          end
-          local dropped = outDrop()
-          if dropped and turtle.getItemCount(slot) == 0 then commitPhysicalAction()
-          else cancelPhysicalAction(); allDropped = false end
-        end
-      end
+local function dfsChunkPath(plan, fromKey, toKey)
+  if fromKey == toKey then return { fromKey } end
+  local chunks = plan and plan.chunks or {}
+  if not chunks[fromKey] or not chunks[toKey] then return nil end
+  local visited = { [fromKey] = true }
+  local stack = { { key = fromKey, next = 1 } }
+  local parent = {}
+  while #stack > 0 do
+    local frame = stack[#stack]
+    if frame.key == toKey then
+      local path, key = {}, toKey
+      while key do path[#path + 1] = key; key = parent[key] end
+      local reversed = {}
+      for index = #path, 1, -1 do reversed[#reversed + 1] = path[index] end
+      return reversed
+    end
+    local neighbors = chunks[frame.key].neighbors or {}
+    local nextKey
+    while frame.next <= #neighbors do
+      local candidate = tostring(neighbors[frame.next]); frame.next = frame.next + 1
+      if chunks[candidate] and not visited[candidate] then nextKey = candidate; break end
+    end
+    if nextKey then
+      visited[nextKey] = true; parent[nextKey] = frame.key
+      stack[#stack + 1] = { key = nextKey, next = 1 }
+    else
+      stack[#stack] = nil
     end
   end
-  discardStats.passes = (discardStats.passes or 0) + (discardEnabled and 1 or 0)
-  discardStats.enabled = mode ~= "KEEP_ALL"
-  discardStats.triggered = discardEnabled
-  discardStats.mode = mode
-  local _, _, heldItems = inventoryStats()
-  discardStats.held = heldItems
-  if discardEnabled then discardStats.lastError = nil end
-
-  local restored, restoreError = turnTo(outRestore)
-  turtle.select(originalSlot)
-  if not restored then return false, restoreError end
-  if not allDropped then
-    return false, "Output/discard inventory is full or a protected stack could not be retained safely."
-  end
-  updateRecycleInventoryState()
-  state.stats.unloads = (state.stats.unloads or 0) + 1
-  saveState("unload_done")
-  return true
-end
-
-local function discardAtField()
-  local policy, mode = discardPolicy()
-  if mode == "KEEP_ALL" then return true end
-  local _, emptySlots = inventoryStats()
-  local trigger = tonumber(policy.triggerEmptySlots) or 3
-  if emptySlots > trigger then return true end
-
-  local discardStats = discardStatsTable()
-  discardStats.lastError = nil
-  local side = policy.direction or "back"
-  if side == "up" then side = "top" end
-  if side == "down" then side = "bottom" end
-  local originalSlot = turtle.getSelectedSlot()
-  local inspectFunction, _, dropFunction, restoreDir, sideError = sideFunctions(side)
-  if not inspectFunction then
-    discardStats.lastError = sideError or "Discard direction is invalid."
-    turtle.select(originalSlot)
-    return false, discardStats.lastError
-  end
-  local checkSide = (side == "top" and "top") or (side == "bottom" and "bottom") or "front"
-  -- A configured inventory at the field direction is an explicit safety
-  -- boundary: never accidentally inject a discard stack into it.
-  if inventoryPresent(checkSide, inspectFunction) then
-    discardStats.skipped = (discardStats.skipped or 0) + 1
-    discardStats.lastError = "Field discard skipped because the configured direction contains an inventory."
-    state.stats.discardSkipped = (state.stats.discardSkipped or 0) + 1
-    restoreSideDirection(side, restoreDir)
-    turtle.select(originalSlot)
-    saveState("field_discard_inventory")
-    return true
-  end
-
-  local _, _, totalItems = inventoryStats()
-  local totalSeal = updateRecycleInventoryState()
-  local maxStacks = math.max(1, math.floor(tonumber(policy.maxStacksPerPass) or 8))
-  local discardedStacks = 0
-  for slot = 1, 16 do
-    if discardedStacks >= maxStacks then break end
-    local count, name = turtle.getItemCount(slot), itemName(slot)
-    if count > 0 and discardCandidate(slot, name, totalSeal, policy, mode)
-      and not (isSealItemName(name) and totalSeal - count < (tonumber(policy.retainSealTarget) or 64)) then
-      turtle.select(slot)
-      discardStats.attempts = (discardStats.attempts or 0) + 1
-      local before = turtle.getItemCount(slot)
-      local prepared, prepareError = beginPhysicalAction("discard_field", {
-        slot = slot, item = name, count = before, direction = side,
-      }, poseCopy())
-      if not prepared then
-        discardStats.lastError = prepareError or "Could not journal field discard action."
-        break
-      end
-      local dropped = dropFunction() -- world discard is always stack-at-a-time
-      local after = turtle.getItemCount(slot)
-      if dropped and after == 0 then
-        commitPhysicalAction()
-        discardedStacks = discardedStacks + 1
-        noteDiscard(name, before)
-        if isSealItemName(name) then totalSeal = totalSeal - before end
-      else
-        cancelPhysicalAction()
-        noteDiscardSkip(name, isUnknownModItem(name))
-        discardStats.lastError = "Field discard failed; stack retained."
-      end
-    end
-  end
-  discardStats.passes = (discardStats.passes or 0) + 1
-  discardStats.enabled = true
-  discardStats.mode = mode
-  discardStats.lastAt = common.nowSeconds()
-  discardStats.lastInventoryItems = totalItems
-  restoreSideDirection(side, restoreDir)
-  turtle.select(originalSlot)
-  saveState("field_discard")
-  return discardStats.lastError == nil, discardStats.lastError
-end
-
-local function targetFuelForService()
-  local target = tonumber(config.fuelTarget) or 12000
-  if state.service and state.service.resumeAfter and state.checkpoint then
-    local checkpointDistance = estimatedReturnDistance(state.checkpoint)
-    if not checkpointDistance then
-      checkpointDistance = distance({ x = 0, y = 0, z = 0 }, state.checkpoint)
-    end
-    target = math.max(target, checkpointDistance * 2 + profileFuelBuffer())
-  end
-  local limit = fuelLimit()
-  if limit == "unlimited" then return "unlimited" end
-  if type(limit) == "number" and limit > 0 then target = math.min(target, limit) end
-  return math.max(1, math.floor(target))
-end
-
-local function refuelAtHome()
-  state.phase, state.status = "refueling", "working"
-  saveState()
-  local current = fuelLevel()
-  if current == "unlimited" then return true end
-  local target = targetFuelForService()
-  local fuelSide = config.fuelSide or "top"
-  local inspectFunction, suckFunction, dropFunction, restoreDir, sideError = sideFunctions(fuelSide)
-  if not inspectFunction then return false, sideError end
-  local checkSide = (fuelSide == "top" and "top") or (fuelSide == "bottom" and "bottom") or "front"
-  if not inventoryPresent(checkSide, inspectFunction) then
-    restoreSideDirection(fuelSide, restoreDir)
-    return false, "Fuel inventory missing on configured side " .. fuelSide .. "."
-  end
-  if target == "unlimited" or current >= target then
-    restoreSideDirection(fuelSide, restoreDir)
-    return true
-  end
-
-  local originalSlot = turtle.getSelectedSlot()
-  local attempts = 0
-  while fuelLevel() ~= "unlimited" and fuelLevel() < target do
-    drainNetwork(3)
-    if movementInterrupted("service") then
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "control_request"
-    end
-    attempts = attempts + 1
-    if attempts > 1024 then
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Fuel loading safety limit reached."
-    end
-    local slot = firstFuelSlot()
-    if not slot then
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "No empty slot available while refueling."
-    end
-    turtle.select(slot)
-    local sucked = runInventoryPhysicalAction("refuel_suck", {
-      slot = slot, count = 1, direction = fuelSide,
-    }, function() return suckFunction(1) end)
-    if not sucked then
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Fuel inventory is empty."
-    end
-    local validFuel = runInventoryPhysicalAction("refuel_probe", {
-      slot = slot, count = turtle.getItemCount(slot), direction = fuelSide,
-    }, function() return turtle.refuel(0) end)
-    if not validFuel then
-      runInventoryPhysicalAction("refuel_reject", {
-        slot = slot, item = itemName(slot), direction = fuelSide,
-      }, dropFunction)
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Fuel inventory contains a non-fuel item."
-    end
-    local before = fuelLevel()
-    local consumed = runInventoryPhysicalAction("refuel_consume", {
-      slot = slot, item = itemName(slot), direction = fuelSide,
-    }, function() return turtle.refuel(1) end)
-    local after = fuelLevel()
-    if not consumed then
-      runInventoryPhysicalAction("refuel_reject", {
-        slot = slot, item = itemName(slot), direction = fuelSide,
-      }, dropFunction)
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Turtle refused the selected fuel item."
-    end
-    if turtle.getItemCount(slot) > 0 then
-      runInventoryPhysicalAction("refuel_excess", {
-        slot = slot, item = itemName(slot), direction = fuelSide,
-      }, dropFunction)
-    end
-    if type(before) == "number" and type(after) == "number" and after > before then
-      state.stats.refuels = (state.stats.refuels or 0) + 1
-    end
-  end
-  local restored, restoreError = restoreSideDirection(fuelSide, restoreDir)
-  turtle.select(originalSlot)
-  if not restored then return false, restoreError end
-  saveState()
-  return true
-end
-
-local function refillSlotForSeal()
-  local materials, recycle = materialsConfig()
-  local preferred = materials.sealSlots or recycle.sealSlots or config.sealSlots
-  if type(preferred) == "table" then
-    for _, candidate in ipairs(preferred) do
-      local slot = tonumber(candidate)
-      if slot and not isReservedSlot(slot, "seal") and turtle.getItemCount(slot) > 0 and isSealItemName(itemName(slot)) and turtle.getItemSpace(slot) > 0 then return slot end
-    end
-    for _, candidate in ipairs(preferred) do
-      local slot = tonumber(candidate)
-      if slot and not isReservedSlot(slot, "seal") and turtle.getItemCount(slot) == 0 then return slot end
-    end
-  end
-  for slot = 1, 16 do
-    if not isReservedSlot(slot, "seal") and isSealItemName(itemName(slot)) and turtle.getItemSpace(slot) > 0 then return slot end
-  end
-  for slot = 1, 16 do if not isReservedSlot(slot, "seal") and turtle.getItemCount(slot) == 0 then return slot end end
   return nil
 end
 
-local function refillSealAtHome()
-  if (config.lavaMode or "seal") ~= "seal" then return true end
-  state.phase, state.status = "refilling_seal", "working"
-  saveState()
-  local target = math.max(1, tonumber(config.sealTarget) or 64)
-  local materials, recycle = materialsConfig()
-  target = math.max(1, tonumber(materials.retainSealTarget or recycle.maxHeld or config.retainSealTarget) or target)
-  compressSealStacks()
-  updateRecycleInventoryState()
-  if sealMaterialCount() >= target then return true end
-  local side = config.sealSide or "right"
-  local inspectFunction, suckFunction, dropFunction, restoreDir, sideError = sideFunctions(side)
-  if not inspectFunction then return false, sideError end
-  local checkSide = (side == "top" and "top") or (side == "bottom" and "bottom") or "front"
-  if not inventoryPresent(checkSide, inspectFunction) then
-    restoreSideDirection(side, restoreDir)
+local function transitionWaypoints(plan, fromKey, toKey, y)
+  if type(quarry.edgeTransition) == "function" then
+    local attempts = {
+      function() return quarry.edgeTransition(plan, fromKey, toKey, y) end,
+      function() return quarry.edgeTransition(plan, plan.chunks[fromKey], plan.chunks[toKey], y) end,
+    }
+    for _, attempt in ipairs(attempts) do
+      local ok, result = pcall(attempt)
+      if ok and result then
+        if type(result) == "table" and (result.waypoints or result.path) then result = result.waypoints or result.path end
+        if type(result) == "table" and result.from and result.to then
+          -- New quarry API returns one validated edge as `{from,to}`;
+          -- normalize it to the waypoint sequence consumed by the turtle.
+          result = { result.from, result.to }
+        end
+        if type(result) == "table" then
+          local normalized = {}
+          for _, waypoint in ipairs(result) do
+            local item = normalizeWaypoint(waypoint, y)
+            if item then normalized[#normalized + 1] = item end
+          end
+          if #normalized > 0 then return normalized end
+        end
+      end
+    end
+  end
+  return nil
+end
+
+local function navigateServiceRoute(plan, fromPose, toPose, context, mode)
+  if not plan then return navigateTo(toPose, mode or "work", context) end
+  fromPose, toPose = poseCopy(fromPose), poseCopy(toPose)
+  local endpointFromKey = quarry.findChunk(plan, fromPose.x, fromPose.z)
+  local endpointToKey = quarry.findChunk(plan, toPose.x, toPose.z)
+  if not endpointFromKey or not endpointToKey then
+    return false, "Service route endpoint is outside the assigned chunk plan."
+  end
+  local routeResult
+  if type(quarry.shortestServiceRoute) == "function" then
+    local ok, result = pcall(quarry.shortestServiceRoute, plan, fromPose, toPose, {
+      mode = mode or "work", context = context,
+      breadcrumbs = state.job and state.job.route and state.job.route.breadcrumbs or nil,
+    })
+    if ok and type(result) == "table" then routeResult = result end
+  end
+  if routeResult and type(routeResult.waypoints) == "table" then
+    local waypoints = routeResult.waypoints
+    if waypoints.from and waypoints.to then waypoints = { waypoints.from, waypoints.to } end
+    for _, waypoint in ipairs(waypoints) do
+      local target = normalizeWaypoint(waypoint, toPose.y)
+      if target and not samePosePosition(state.pose, target) then
+        local ok, err = navigateTo(target, "inside", context)
+        if not ok then return false, err end
+      end
+    end
+    if routeResult.distance then
+      state.routeMetrics = state.routeMetrics or {}
+      state.routeMetrics.lastRoute = { distance = routeResult.distance, fallback = routeResult.fallback }
+    end
+    return navigateTo(toPose, "inside", context)
+  end
+
+  local fromKey, toKey = endpointFromKey, endpointToKey
+  if fromKey and toKey then
+    local keys, routeKind = routeChunkKeys(plan, fromKey, toKey)
+    if not keys and state.job and state.job.route and type(state.job.route.breadcrumbs) == "table" then
+      -- Breadcrumbs are only a fallback.  They are generated from accepted
+      -- chunk transitions and therefore cannot introduce an unplanned edge.
+      local crumbs = state.job.route.breadcrumbs
+      local start = nil
+      for index, key in ipairs(crumbs) do if key == fromKey then start = index; break end end
+      if start then
+        keys = {}
+        for index = start, #crumbs do keys[#keys + 1] = crumbs[index] end
+        if keys[#keys] ~= toKey then keys[#keys + 1] = toKey end
+        routeKind = "breadcrumbs"
+      end
+    end
+    if not keys then
+      keys = dfsChunkPath(plan, fromKey, toKey)
+      if keys then routeKind = "dfs" end
+    end
+    if not keys then
+      local path, pathError = quarry.pathToRoot(plan, fromKey)
+      if path and toKey == plan.rootKey then keys, routeKind = path, "dfs" end
+      if not keys then
+        local reverse, reverseError = quarry.pathFromRoot(plan, toKey)
+        if reverse and fromKey == plan.rootKey then keys, routeKind = reverse, "dfs" end
+        if not keys then return false, pathError or reverseError or "No safe chunk service route." end
+      end
+    end
+    for index = 2, #keys do
+      local edge = transitionWaypoints(plan, keys[index - 1], keys[index], fromPose.y)
+      if edge then
+        for _, waypoint in ipairs(edge) do
+          local ok, err = navigateTo(waypoint, "inside", context)
+          if not ok then return false, err end
+        end
+      else
+        local ok, err = moveBetweenChunkAnchors(plan, keys[index - 1], keys[index], fromPose.y, context)
+        if not ok then return false, err end
+      end
+    end
+    state.routeMetrics = state.routeMetrics or {}
+    state.routeMetrics.lastRoute = { kind = routeKind or "fallback", chunkKeys = common.copy(keys) }
+    return navigateTo(toPose, "inside", context)
+  end
+  return false, "No safe chunk service route."
+end
+
+local function navigateChunkPlanHome(context)
+  local plan = state.job and state.job.chunkPlan
+  if not plan then return navigateTo({ x = 0, y = 0, z = 0 }, "home", context) end
+  if isHome() then return true end
+  local currentKey = quarry.findChunk(plan, state.pose.x, state.pose.z)
+  if not currentKey then return false, "Current position is outside every allowed chunk." end
+  local dock, dockError = serviceDockAnchor(plan, state.pose.y)
+  if not dock then return false, dockError end
+  local ok, err = navigateServiceRoute(plan, state.pose, dock, context, "home")
+  if not ok then return false, err end
+  return navigateTo({ x = 0, y = 0, z = 0 }, "home", context)
+end
+
+local function navigateChunkPlanWork(checkpoint, context)
+  local plan = state.job and state.job.chunkPlan
+  if not plan then return navigateTo(checkpoint, "work", context) end
+  local targetKey = quarry.findChunk(plan, checkpoint.x, checkpoint.z)
+  if not targetKey then return false, "Checkpoint is outside every allowed chunk." end
+  local fromKey = quarry.findChunk(plan, state.pose.x, state.pose.z)
+  if not fromKey then
+    local dock, dockError = serviceDockAnchor(plan, state.pose.y)
+    if not dock then return false, dockError end
+    local bridged, bridgeError = navigateTo(dock, "home", context)
+    if not bridged then return false, bridgeError end
+    return navigateServiceRoute(plan, dock, checkpoint, context, "work")
+  end
+  return navigateServiceRoute(plan, state.pose, checkpoint, context, "work")
+end
+
+local function estimatedReturnDistance(pose)
+  pose = pose or state.pose
+  if tonumber(pose.x) == 0 and tonumber(pose.y) == 0 and tonumber(pose.z) == 0 then return 0 end
+  if not state.job or state.job.strategy ~= "chunk_plan" or not state.job.chunkPlan then
+    return distance(pose, { x = 0, y = 0, z = 0 })
+  end
+
+  local plan = state.job.chunkPlan
+  local currentKey = quarry.findChunk(plan, pose.x, pose.z)
+  if not currentKey then return nil, "Current position is outside every allowed chunk." end
+  if type(quarry.shortestServiceRoute) == "function" then
+    local dockKey = plan.dockKey or plan.entranceKey or plan.rootKey
+    local dock = plan.chunks and plan.chunks[dockKey]
+    if dock then
+      local dockPose = { x = dock.anchor.x, y = pose.y, z = dock.anchor.z }
+      local ok, route = pcall(quarry.shortestServiceRoute, plan, pose, dockPose, { allowFallback = true })
+      if ok and type(route) == "table" and tonumber(route.distance) then
+        return tonumber(route.distance) + math.abs(dock.anchor.x) + math.abs(dock.anchor.z) + math.abs(tonumber(pose.y) or 0)
+      end
+    end
+  end
+  local dockKey = plan.dockKey or plan.entranceKey or plan.rootKey
+  local path, pathError = quarry.pathToRoot(plan, currentKey)
+  if not path or path[#path] ~= dockKey then path = dfsChunkPath(plan, currentKey, dockKey); pathError = pathError or "dfs_unavailable" end
+  if not path then return nil, pathError end
+
+  local current = plan.chunks[currentKey]
+  local total = math.abs(pose.x - current.anchor.x) + math.abs(pose.z - current.anchor.z)
+  for index = 2, #path do
+    local from, target = plan.chunks[path[index - 1]], plan.chunks[path[index]]
+    if not from or not target then return nil, "Chunk return path references a missing chunk." end
+    total = total + math.abs(from.anchor.x - target.anchor.x) + math.abs(from.anchor.z - target.anchor.z)
+  end
+  local root = plan.chunks[dockKey]
+  if not root then return nil, "Chunk return path has no entrance chunk." end
+  total = total + math.abs(tonumber(pose.y) or 0)
+  total = total + math.abs(root.anchor.x) + math.abs(root.anchor.z)
+  return total
+end
+
+local function firstEmptySlot()
+  for slot = 1, 16 do if not isReservedSlot(slot) and turtle.getItemCount(slot) == 0 then return slot end end
+  return nil
+end
+
+local function firstFuelSlot()
+  local materials = materialsConfig()
+  local preferred = materials.fuelReserveSlots or config.fuelReserveSlots
+  if type(preferred) == "table" then
+    for _, candidate in ipairs(preferred) do
+      local slot = tonumber(candidate)
+      if slot and not isReservedSlot(slot, "fuel") and turtle.getItemCount(slot) == 0 then return slot end
+    end
+  end
+  for slot = 1, 16 do
+    if not isReservedSlot(slot, "fuel") and turtle.getItemCount(slot) == 0 then return slot end
+  end
+  return nil
+end
+
+local function looksLikeInventoryBlock(data)
+  local name = string.lower(blockName(data))
+  if name == "minecraft:chest" or name == "minecraft:trapped_chest" or name == "minecraft:barrel" then return true end
+  return name:match("^minecraft:[%w_]+shulker_box$") ~= nil
+end
+
+local function discardPolicy()
+  local policy = config.discard or {}
+  local mode = tostring(policy.mode or policy.policy or "KEEP_ALL"):upper()
+  if mode ~= "KEEP_ALL" and mode ~= "DISCARD_EXCESS_STONE" and mode ~= "CUSTOM_ALLOWLIST" then mode = "KEEP_ALL" end
+  return policy, mode
+end
+
+local function isOreOrRawMaterial(name)
+  name = string.lower(tostring(name or ""))
+  -- Keep all ores/raw materials regardless of the selected allowlist.  The
+  -- broad suffix/prefix checks intentionally err on the side of retention
+  -- for modded names (an unknown resource is safer in the output chest).
+  return name:find("_ore", 1, true) ~= nil
+    or name:find("ore_", 1, true) ~= nil
+    or name:find("raw_", 1, true) ~= nil
+    or name:find("_raw", 1, true) ~= nil
+    or name:find("rawore", 1, true) ~= nil
+end
+
+local function isUnknownModItem(name)
+  local namespace = tostring(name or ""):match("^([^:]+):")
+  if not namespace or namespace == "" then return true end
+  if namespace == "minecraft" or namespace == "computercraft" or namespace == "cc_tweaked" then return false end
+  local policy = config.discard or {}
+  local known = policy.knownNamespaces or policy.knownMods
+  if type(known) == "table" and (known[namespace] == true or known[namespace] == 1) then return false end
+  return true
+end
+
+local function discardProtectedItem(slot, name)

@@ -1,60 +1,265 @@
-  for index = first, #LOW_SPACE_STEPS do
-    local step = LOW_SPACE_STEPS[index]
-    marked, markerError = markerWrite("committing", index)
-    if not marked then lowSpaceFailure("Cannot record commit progress for step " .. tostring(index) .. ": " .. tostring(markerError)) end
-    local applied, applyError = applyLowSpaceStep(step)
-    if not applied then lowSpaceFailure(applyError) end
-    marked, markerError = markerWrite("committing", index + 1)
-    if not marked then lowSpaceFailure("Applied low-space step " .. tostring(index) .. ", but cannot advance recovery marker: " .. tostring(markerError)) end
+  print(("Throughput: %.2f/s  Return: %s d=%d t=%ds"):format(
+    throughput.perSecond or 0, tostring(returnInfo.reason or "-"),
+    tonumber(returnInfo.distance) or 0, tonumber(returnInfo.seconds) or 0
+  ))
+  local discard = state.discardStats or state.discard or {}
+  print(("Discard: %s stacks=%d items=%d"):format(
+    tostring((config.discard and config.discard.mode) or discard.mode or "KEEP_ALL"),
+    tonumber(discard.stacks) or 0, tonumber(discard.items or discard.discarded) or 0
+  ))
+  if state.group and (state.group.groupJobId or state.group.assignmentId or state.group.bay) then
+    print(("Group: %s bay=%s"):format(
+      tostring(state.group.groupJobId or state.group.groupId or "-"), tostring(state.group.bay or state.group.bayId or "-")))
   end
-  local finalContent = embeddedEntrypoint()
-  marked, markerError = markerWrite("final-ready", #LOW_SPACE_STEPS + 1)
-  if not marked then lowSpaceFailure("Cannot mark the validated final role loader: " .. tostring(markerError)) end
-  local finalPath = ROOT .. "/" .. ENTRYPOINT
-  local wrote, writeError = atomicWrite(finalPath, finalContent)
-  if not wrote then lowSpaceFailure("Cannot atomically commit final role loader: " .. tostring(writeError)) end
-  if readFile(finalPath) ~= finalContent then
-    lowSpaceFailure("Final role loader could not be verified after atomic commit.")
+  if state.job then
+    print(("Job: %s %dx%dx%d [%s]"):format(
+      tostring(state.job.name), state.job.width, state.job.length, state.job.depth, state.job.strategy or "serpentine"
+    ))
+    print(("Progress: %d/%d (%d%%)"):format(
+      state.job.cursor or 0, state.job.total or 0, common.percent(state.job.cursor or 0, state.job.total or 0)
+    ))
+  else
+    print("Job: none")
   end
-  local cleared, clearError = clearMarker()
-  if not cleared then lowSpaceFailure(clearError) end
-  print("Low-space update installed: " .. VERSION .. " (schema " .. SCHEMA .. ")")
-  print("User data under /ccminer was left in place. Run: reboot")
+  if state.lastError then print("Error: " .. common.fit(state.lastError, 50)) end
+  print("")
+  print("Remote control active. Hold Ctrl+T to stop locally.")
 end
 
-if action == "update-low-space" then
-  term.clear(); term.setCursorPos(1, 1)
-  print("CC MINER V4 OFFLINE UPDATE-LOW-SPACE / " .. ROLE); print("")
-  lowSpaceUpdate()
-  return
+local function inspectPendingSide(kind)
+  if common.startsWith(kind, "torch_floor") then return turtle.inspectDown() end
+  if common.endsWith(kind, "_up") then return turtle.inspectUp() end
+  if common.endsWith(kind, "_down") then return turtle.inspectDown() end
+  if common.endsWith(kind, "_forward") then return turtle.inspect() end
+  -- Torch wall actions record the relative side.  Re-inspect in the same
+  -- deterministic order used for placement; no turn result is assumed.
+  return nil, nil
 end
 
-if fs.exists(BACKUP) then fs.delete(BACKUP) end
-local hadRoot = fs.exists(ROOT)
-if hadRoot then
-  local backedUp, backupError = moveChecked(ROOT, BACKUP)
-  if not backedUp then fs.delete(TEMP); fail("Cannot back up existing installation: " .. backupError) end
-end
-local moved, moveError = moveChecked(TEMP, ROOT)
-if not moved then
-  if fs.exists(ROOT) then fs.delete(ROOT) end
-  local restored, restoreError = true, nil
-  if hadRoot then
-    if fs.exists(BACKUP) then restored, restoreError = moveChecked(BACKUP, ROOT)
-    else restored, restoreError = false, "Backup directory is missing." end
+local function resolveNonMovementPending(pending)
+  local kind = tostring(pending.kind or "")
+  if common.startsWith(kind, "discard_") or common.startsWith(kind, "refill_")
+    or common.startsWith(kind, "refuel_") or kind == "unload_home" then
+    -- A drop/suck transfer can change inventory while the pose stays fixed;
+    -- GPS cannot distinguish "before" from "after".  Stop for explicit
+    -- inventory/world revalidation instead of silently retrying or counting
+    -- a stack twice after power loss.
+    return false, "Pending inventory transfer requires manual revalidation before continuing."
   end
-  if not restored then
-    fail("Install swap failed and rollback failed. Previous files remain at " .. BACKUP .. ": "
-      .. tostring(moveError) .. "; rollback: " .. tostring(restoreError))
+  if common.startsWith(kind, "dig_") then
+    local present, data = inspectPendingSide(kind)
+    if present then
+      local expected = pending.details and pending.details.block
+      if not expected or blockName(data) == expected then
+        return false, "Pending dig target is still present; refusing a blind retry."
+      end
+      return false, "Pending dig target changed to " .. blockName(data) .. "."
+    end
+    return true
   end
-  fail("Install swap failed; previous installation was restored: " .. tostring(moveError))
+  if common.startsWith(kind, "seal_") then
+    local present, data = inspectPendingSide(kind)
+    if present and (isLava(data) or isWater(data)) then
+      return false, "Pending fluid seal target remains present; refusing a blind retry."
+    end
+    local direction = kind:match("_(forward|up|down)$")
+    if direction then
+      state.fluidSealRun = (tonumber(state.fluidSealRun) or 0) + 1
+      state.water.continuousSeals = state.fluidSealRun
+      state.fluidSealMarker = {
+        kind = (pending.details and pending.details.fluidKind) or (common.startsWith(kind, "seal_water") and "water" or "lava"),
+        direction = direction,
+        material = pending.details and pending.details.material or nil,
+        pose = poseCopy(),
+        at = common.nowSeconds(),
+      }
+    end
+    return true
+  end
+  if common.startsWith(kind, "torch_") then
+    if common.startsWith(kind, "torch_wall") and tonumber(pending.details and pending.details.side or 0) ~= 0 then
+      return false, "Pending wall torch requires orientation recovery before re-inspection."
+    end
+    local present, data = inspectPendingSide(kind)
+    if present and isTorchItemName(blockName(data)) then return true end
+    if not present then return true end
+    return false, "Pending torch target is occupied by " .. blockName(data) .. "."
+  end
+  return nil
 end
-print("")
-if action == "update" then
-  print("Offline update installed: " .. VERSION .. " (schema " .. SCHEMA .. ")")
-  print("Previous files: /ccminer.backup"); print("Run: reboot")
-else
-  local setupOk = shell.run(ROOT .. "/setup.lua", ROLE)
-  if not setupOk then printError("Setup did not complete. Run: " .. ROOT .. "/setup.lua " .. ROLE)
-  else print(""); print("Installation complete. Run: reboot") end
+
+local function tryResolvePendingAction()
+  local pending = state.pendingAction
+  if not pending then return true end
+  local kind = tostring(pending.kind or "")
+  if common.startsWith(kind, "turn_") or kind == "gps_calibration" then return false, "GPS cannot determine the result of " .. kind end
+  local nonMovement, nonMovementError = resolveNonMovementPending(pending)
+  if nonMovement ~= nil then
+    if not nonMovement then return false, nonMovementError end
+    state.pendingAction = nil
+    state.stats.journalRecoveries = (state.stats.journalRecoveries or 0) + 1
+    if common.startsWith(kind, "torch_") then
+      state.stats.torchesRecovered = (state.stats.torchesRecovered or 0) + 1
+      state.lighting.torchesRecovered = (state.lighting.torchesRecovered or 0) + 1
+    end
+    state.stats.powerRecoveries = (state.stats.powerRecoveries or 0) + 1
+    common.log("WARN", "Re-inspected pending action " .. kind .. " as resolved")
+    saveState("pending_recovered_" .. kind)
+    return true
+  end
+  if gpsConfig().autoResolvePending == false or not gpsCalibration() then return false, "GPS pending-action recovery is unavailable." end
+  local fix, fixError = locateGPS()
+  if not fix then return false, fixError end
+  local resolved, resolveError = geo.resolvePending(pending, fix, gpsCalibration())
+  if not resolved then return false, resolveError end
+  state.pose = poseCopy(resolved.pose)
+  state.pendingAction = nil
+  if resolved.outcome == "after" and common.startsWith(kind, "move_") then
+    state.stats.moves = (state.stats.moves or 0) + 1
+  end
+  state.stats.gpsRecoveries = (state.stats.gpsRecoveries or 0) + 1
+  state.stats.powerRecoveries = (state.stats.powerRecoveries or 0) + 1
+  state.gps.corrections = (state.gps.corrections or 0) + 1
+  common.log("WARN", "GPS resolved pending action " .. kind .. " as " .. resolved.outcome)
+  saveState()
+  return true
 end
+
+local function preflight()
+  if not os.getComputerLabel or not os.getComputerLabel() then
+    if os.setComputerLabel then os.setComputerLabel(config.workerName) end
+  end
+  local opened, names = protocol.open()
+  networkReady = opened
+  if not opened then
+    common.log("ERROR", "No wireless modem found.")
+    printError("No wireless modem found. Equip one on the turtle.")
+  else
+    common.log("INFO", "Wireless modem opened: " .. table.concat(names, ","))
+  end
+
+  state.pose = poseCopy(state.pose)
+  ensureV3State()
+  state.stats = common.merge(common.defaultState().stats, state.stats)
+  state.gps = common.merge(common.defaultState().gps, state.gps)
+  if state.job and not state.job.strategy then state.job.strategy = "serpentine" end
+  if state.job and state.job.strategy == "chunk_plan" and not state.job.chunkPlan then
+    local plan, planError = quarry.buildChunkPlan(state.job, gpsCalibration())
+    if plan then state.job.chunkPlan = plan else state.lastError = planError end
+  end
+
+  if state.pendingAction then
+    local resolved, resolveError = tryResolvePendingAction()
+    if not resolved then
+      local pending = state.pendingAction
+      state.status, state.phase, state.request, state.service = "blocked", "recovery_required", nil, nil
+      state.lastError = ("Power loss occurred during '%s' from x=%s y=%s z=%s dir=%s. GPS recovery failed: %s. Return the turtle to its dock, face the quarry, then use REHOME."):format(
+        tostring(pending.kind or "unknown"), tostring(pending.poseBefore and pending.poseBefore.x or "?"),
+        tostring(pending.poseBefore and pending.poseBefore.y or "?"), tostring(pending.poseBefore and pending.poseBefore.z or "?"),
+        tostring(pending.poseBefore and pending.poseBefore.dir or "?"), tostring(resolveError)
+      )
+      common.log("ERROR", state.lastError)
+    end
+  elseif stateError then
+    state.status, state.phase = "blocked", "state_corrupt"
+    state.lastError = tostring(stateError)
+  elseif gpsCalibration() then
+    local fix, fixError = locateGPS()
+    if fix then
+      local expected = geo.localToWorld(gpsCalibration(), state.pose)
+      if not geo.samePosition(fix, expected) then
+        if not state.job and state.status ~= "working" then
+          local corrected = geo.worldToLocal(gpsCalibration(), fix, state.pose.dir)
+          state.pose = poseCopy(corrected)
+          state.gps.corrections = (state.gps.corrections or 0) + 1
+          common.log("WARN", "GPS corrected idle local coordinates at boot.")
+        else
+          state.status, state.phase = "blocked", "gps_drift"
+          state.lastError = ("Boot GPS mismatch: expected %d,%d,%d, located %d,%d,%d."):format(
+            expected.x, expected.y, expected.z, fix.x, fix.y, fix.z
+          )
+        end
+      end
+    elseif gpsConfig().required then
+      state.status, state.phase = "blocked", "gps_error"
+      state.lastError = "Required GPS fix failed at boot: " .. tostring(fixError)
+    end
+  elseif gpsConfig().required then
+    state.status, state.phase = "blocked", "gps_error"
+    state.lastError = "GPS is required but no calibration is stored."
+  end
+
+  saveState()
+  displayLocalStatus()
+  heartbeat(true)
+end
+
+preflight()
+
+while true do
+  drainNetwork(12)
+  if state.request and state.status ~= "working" then state.status = "working" end
+  if state.status == "working" then
+    if state.request then handlePendingRequest() end
+    if state.service then continueService() else runMiningStep() end
+  elseif state.status == "waiting_output" or state.status == "waiting_fuel" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+    if state.service then
+      continueService()
+      if state.status == "waiting_output" or state.status == "waiting_fuel" or state.status == "waiting_seal" or state.status == "waiting_torch" then sleep(3) end
+    else
+      markBlocked("Service state is missing while waiting.")
+    end
+  else
+    pollNetwork(0.5)
+  end
+  heartbeat(false)
+  if state.status ~= "working" then displayLocalStatus() end
+end
+]] },
+}
+local FILE_COUNT = 13
+local WORKER_PARTS = {[[worker_parts/01.part]], [[worker_parts/02.part]], [[worker_parts/03.part]], [[worker_parts/04.part]], [[worker_parts/05.part]]}
+local CONTROLLER_PARTS = {}
+local ENTRYPOINT = [[worker.lua]]
+local UPDATE_SENTINEL = [[-- CC Miner V4 update-incomplete sentinel for worker
+error("CC Miner runtime update is incomplete. Re-transfer the offline bundle and run update-low-space.", 0)
+]]
+local LOW_SPACE_STEPS = {
+  { kind = "runtime", index = 1 },
+  { kind = "runtime", index = 2 },
+  { kind = "runtime", index = 3 },
+  { kind = "runtime", index = 4 },
+  { kind = "runtime", index = 5 },
+  { kind = "runtime", index = 6 },
+  { kind = "runtime", index = 7 },
+  { kind = "runtime", index = 9 },
+  { kind = "runtime", index = 10 },
+  { kind = "runtime", index = 11 },
+  { kind = "runtime", index = 12 },
+  { kind = "runtime", index = 13 },
+  { kind = "obsolete", target = [[controller.lua]] },
+  { kind = "obsolete", target = [[controller_parts/01.part]] },
+  { kind = "obsolete", target = [[controller_parts/02.part]] },
+  { kind = "obsolete", target = [[controller_parts/03.part]] },
+  { kind = "obsolete", target = [[gps_host.lua]] },
+}
+
+local function fail(message)
+  error(tostring(message), 0)
+end
+local function ensureDir(path)
+  if not path or path == "" or fs.exists(path) then return end
+  local parent = fs.getDir(path)
+  if parent and parent ~= "" and parent ~= path then ensureDir(parent) end
+  fs.makeDir(path)
+end
+local function readFile(path)
+  if not fs.exists(path) or fs.isDir(path) then return nil end
+  local handle = fs.open(path, "rb")
+  if not handle then return nil end
+  local text = handle.readAll(); handle.close(); return text
+end
+local function writeFile(path, text)
+  ensureDir(fs.getDir(path))
+  local handle = fs.open(path, "wb")
+  if not handle then return false, "Cannot write " .. path end

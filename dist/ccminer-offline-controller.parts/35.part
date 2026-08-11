@@ -1,170 +1,235 @@
-  buttonRow(key, bottom + 2, width, {
-    { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
-    { "RECALL", dashboardAction("recall") }, { "SERVICE", dashboardAction("service") },
-  })
-  buttonRow(key, bottom + 3, width, {
-    { "ABORT", dashboardAction("abort") }, { "CLEAR", dashboardAction("clear") },
-    { "REHOME", dashboardAction("rehome") }, { "LAST ERR", dashboardAction("last_error") },
-  })
-  -- Group controls are additive; the legacy single-worker rows above remain
-  -- unchanged so old monitors and keyboard shortcuts continue to work.
-  buttonRow(key, math.max(1, bottom - 1), width, {
-    { "GROUPS", dashboardAction("groups") }, { "G START", dashboardAction("group_start") },
-    { "G PAUSE", dashboardAction("group_pause") }, { "G RETURN", dashboardAction("group_return") },
-  })
-  local groupIds = orderedGroupIds()
-  if #groupIds > 0 then
-    local gy = math.max(2, bottom - 2)
-    local gid, g = selectedGroupRecord()
-    local gj = gid and activeGroupJob(gid) or nil
-    local aggregate = gj and (gj.aggregate or updateGroupAggregate(gj)) or nil
-    local line = ("Group %s %s %d workers %s%% minFuel=%s ACK=%s/%s"):format(tostring(gid), groupName(g, gid), #(groupWorkerIds(g)), tostring(aggregate and aggregate.percent or 0), tostring(aggregate and aggregate.minFuel or "-"), tostring(aggregate and aggregate.acks or 0), tostring(aggregate and aggregate.ackTotal or #groupWorkerIds(g)))
-    common.writeAt(1, gy, common.fit(line, width), colors and colors.cyan or nil)
+    if conflict then setNotice("Cannot queue: world chunks overlap active job " .. tostring(conflict.jobId or "unknown"), true); return false end
+    for _, queued in ipairs(db.queue or {}) do
+      if queued.chunkMode == "world" and type(queued.chunkKeys) == "table" then
+        local seen = {}; for _, value in ipairs(queued.chunkKeys) do seen[tostring(value)] = true end
+        for _, value in ipairs(queuedKeys) do if seen[tostring(value)] then setNotice("Cannot queue: world chunks overlap another queued job.", true); return false end end
+      end
+    end
   end
-  noticeLine(target, height)
+  local item = persistentDraft(draft)
+  item.workerId, item.queuedAt = draft.workerId, common.nowSeconds()
+  item.chunkMode, item.chunkKeys = result.chunkMode, queuedKeys
+  item.excludedChunks, item.jobDepth, item.targetY = common.copy(result.excludedChunks), result.jobDepth, result.targetY
+  item.retryAt, item.awaiting = common.nowSeconds(), nil
+  db.queue[#db.queue + 1] = item
+  saveControllerDb()
+  setNotice("Job added to queue.", false)
+  return true
 end
 
-local function groupAction(groupCommandName)
-  return function()
-    local gid = selectedGroupRecord()
-    if not gid then setNotice("No group selected.", true); return end
-    if groupCommandName == "start" then
-      groupDraft = groupDraftDefaults(groupRecord(gid))
-      groupDraft.selectedField = "width"
-      groupDraft.buffer = tostring(groupDraft.width or 1)
-      groupDraft.preflight = nil
-      mode = "group_dimensions"
-    else
-      groupCommand(gid, groupCommandName)
+local lastQueueDispatch = 0
+local function workerCanStart(worker)
+  local status = statusOf(worker)
+  if not worker or not worker.data or worker.data.atHome == false then return false end
+  return status == "idle" or status == "complete" or status == "aborted"
+end
+
+local function idleWorkerId(preferred)
+  if preferred and workers[preferred] and workerCanStart(workers[preferred]) then return preferred end
+  for _, id in ipairs(orderedIds()) do
+    local worker = workers[id]
+    if workerCanStart(worker) then return id end
+  end
+  return nil
+end
+
+local function dispatchQueue()
+  local now = common.nowSeconds()
+  if config.queueEnabled == false or now - lastQueueDispatch < 5 or #db.queue == 0 then return end
+  lastQueueDispatch = now
+  for index, item in ipairs(db.queue) do
+    if item.awaiting and now - (item.awaiting.sentAt or now) > 10 then item.awaiting, item.retryAt, item.lastError = nil, now + 5, "start acknowledgement timeout" end
+    if not item.awaiting and (not item.retryAt or now >= item.retryAt) then
+      -- A queued job is dock-relative (and world calibration is worker
+      -- specific), so it must run only on its explicitly selected worker.
+      local id = item.workerId and idleWorkerId(item.workerId) or nil
+      if id then
+        local candidate = common.copy(item)
+        candidate.workerId, candidate.queueIndex = id, index
+        candidate.lighting = normalizedLighting(candidate.lighting)
+        candidate.waterMode = normalizedWaterMode(candidate.waterMode)
+        candidate.profile = normalizedProfile(candidate.profile)
+        draft = candidate
+        local result = computePreflight()
+        local sent = false
+        if result and not result.fatal then
+          sent = startDraft()
+          if not sent and db.queue[index] then db.queue[index].retryAt, db.queue[index].lastError = now + 5, notice end
+        elseif db.queue[index] then
+          db.queue[index].retryAt, db.queue[index].lastError = now + 15, result and "preflight blocked" or "preflight unavailable"
+          saveControllerDb()
+        end
+        if draft then draft = nil end
+        if sent then return end
+      end
     end
+  end
+end
+
+local function applyPreset(name)
+  for _, preset in ipairs(db.presets or {}) do
+    if tostring(preset.name) == tostring(name) then
+      if draft then
+        local source = type(preset.draft) == "table" and preset.draft or preset
+        for key, value in pairs(source) do if key ~= "name" and key ~= "schema" and key ~= "version" and key ~= "updatedAt" then draft[key] = common.copy(value) end end
+      end
+      db.lastPreset = name
+      saveControllerDb()
+      return true
+    end
+  end
+  return false
+end
+
+local function savePreset(name, source)
+  name = common.trim(name or "")
+  if name == "" then return false, "Preset name is empty." end
+  local draftValue = persistentDraft(source or draft or db.lastDraft or {})
+  local value = { name = name, schema = common.SCHEMA, version = common.VERSION, updatedAt = common.nowSeconds(), draft = draftValue }
+  local replaced = false
+  for index, preset in ipairs(db.presets) do
+    if tostring(preset.name) == name then db.presets[index] = value; replaced = true end
+  end
+  if not replaced then db.presets[#db.presets + 1] = value end
+  db.lastPreset = name
+  saveControllerDb()
+  return true
+end
+
+local function stageStop(id, stopMode)
+  if not id then setNotice("No worker selected.", true); return false end
+  local worker = workers[id]
+  local caps = worker and worker.data and worker.data.capabilities or {}
+  local sent = sendCommand(id, "stop", { mode = stopMode, staged = true })
+  -- V2 workers do not know `stop`; provide the old command after the explicit
+  -- V4 request, but only when capability is absent/false.
+  if not caps.stagedStop then
+    local legacy = ({ pause_now = "pause", finish_row = "pause", finish_layer = "pause", return_home = "recall", abort = "abort" })[stopMode]
+    if legacy then sent = sendCommand(id, legacy, { stopMode = stopMode }) or sent end
+  end
+  return sent
+end
+
+local function recoveryAction(action)
+  local id = selectedWorker()
+  if not id then setNotice("No worker selected.", true); return end
+  if action == "gps_fix" then sendCommand(id, "gps_fix")
+  elseif action == "retry" or action == "resume" then sendCommand(id, "resume")
+  elseif action == "return" then stageStop(id, "return_home")
+  elseif action == "rehome" then
+    confirmState = { command = "rehome", payload = { confirm = "RESET" }, twoStep = true, message = "REHOME RESET clears the active job. Press YES twice only when the turtle is physically in its dock." }
+    mode = "confirm"
+  end
+end
+
+normalizedProfile = function(value)
+  value = tostring(value or "balanced")
+  if value == "fast" then value = "turbo" end
+  if value == "" then return "balanced" end
+  if value == "safe" or value == "balanced" or value == "turbo" then return value end
+  return value -- preserve invalid values so preflight can block explicitly.
+end
+
+normalizedWaterMode = function(value)
+  value = tostring(value or "seal")
+  if value == "skip" then value = "ignore" elseif value == "drain" then value = "stop" end
+  if value == "ignore" or value == "stop" then return value end
+  return "seal"
+end
+
+normalizedLighting = function(value)
+  local source = type(value) == "table" and value or {}
+  local mode = tostring(source.mode or "safe")
+  if mode == "auto" then mode = "safe" elseif mode == "on" then mode = "custom" end
+  if mode ~= "off" and mode ~= "safe" and mode ~= "custom" then mode = "safe" end
+  return { mode = mode, interval = math.max(1, math.floor(tonumber(source.interval) or 10)) }
+end
+
+local function dashboardAction(name)
+  return function()
+    local id = selectedWorker()
+    if name == "discover" then discover()
+    elseif name == "groups" then mode = "groups"
+    elseif name == "group_start" or name == "group_pause" or name == "group_resume" or name == "group_return" then
+      local groupCommandName = ({ group_start = "start", group_pause = "pause", group_resume = "resume", group_return = "return" })[name]
+      local groupId = selectedGroupRecord()
+      if groupId then
+        if groupCommandName == "start" then
+          groupDraft = groupDraftDefaults(groupRecord(groupId))
+          local result = computeGroupPreflight(groupId, groupDraft)
+          if result and not result.fatal then startGroup(groupId, groupDraft) else setNotice("Group preflight blocked START.", true) end
+        else groupCommand(groupId, groupCommandName) end
+      else setNotice("No group selected.", true) end
+    elseif name == "new" then
+      local workerId, worker = selectedWorker()
+      if not workerId or not worker then setNotice("Select a worker first.", true); return end
+      if statusOf(worker) == "offline" then setNotice("Selected worker is offline.", true); return end
+      local previous = db.lastDraft or {}
+      local previousLighting = normalizedLighting(previous.lighting)
+      local previousWater = normalizedWaterMode(previous.waterMode)
+      local previousProfile = normalizedProfile(previous.profile)
+      local previousDepth = tonumber(previous.depth) or 16
+      local calibration = draftCalibration(workerId)
+      local previousTarget = tonumber(previous.targetY)
+      if calibration and calibration.home and tonumber(calibration.home.y) then
+        previousTarget = previousTarget or (tonumber(calibration.home.y) - previousDepth + 1)
+      else
+        previousTarget = nil
+      end
+      draft = {
+        workerId = workerId, width = tonumber(previous.width) or 8, length = tonumber(previous.length) or 32,
+        depth = previousDepth, targetY = previousTarget,
+        lighting = previousLighting, waterMode = previousWater, profile = previousProfile,
+        selectedField = "width", buffer = tostring(previous.width or 8), excluded = common.copy(previous.excluded or {}),
+        partialMask = previous.partialMask == true, chunkPage = 1, gridPageX = 1, gridPageZ = 1,
+        rectMode = false, rectStart = nil, autoAssign = false, name = previous.name,
+      }
+      db.lastDraft = persistentDraft(draft)
+      mode = "job_dimensions"
+      invalidate()
+    elseif name == "info" then
+      if id then mode = "info" else setNotice("No worker selected.", true) end
+    elseif name == "remote" then
+      if id then
+        setNotice(("Remote console is CLI-only: ccm remote %s [-- <command...>]"):format(tostring(id)), false)
+      else
+        setNotice("Select a worker, then use ccm remote <workerId> in the terminal.", true)
+      end
+    elseif name == "progress" then
+      if id then mode = "progress" else setNotice("No worker selected.", true) end
+    elseif name == "recovery" then
+      if id then mode = "recovery" else setNotice("No worker selected.", true) end
+    elseif name == "report" then mode = "report"
+    elseif name == "last_error" then noticeState.showLast()
+    elseif name == "stop" then if id then mode = "stop_menu" else setNotice("No worker selected.", true) end
+    elseif name == "pause" or name == "resume" or name == "recall" or name == "service" then sendCommand(id, name)
+    elseif name == "abort" then
+      if id then confirmState = { command = "stop", payload = { mode = "abort" }, message = "Abort the active job and return home?" }; mode = "confirm" end
+    elseif name == "clear" then
+      if id then confirmState = { command = "clear", message = "Clear the completed or aborted job record?" }; mode = "confirm" end
+    elseif name == "rehome" then
+      if id then confirmState = { command = "rehome", payload = { confirm = "RESET" }, twoStep = true, message = "REHOME RESET clears the active job. Press YES twice only when the turtle is physically in its dock." }; mode = "confirm" end
+    elseif name == "gps" then
+      if id then confirmState = { command = "calibrate_gps", message = "GPS calibration moves forward one block and back. Is the dock front clear?" }; mode = "confirm" end
+    elseif name == "quit" then running = false end
     invalidate()
   end
 end
 
-local function groupAssignmentCount(result)
-  local count = 0
-  for _, assignment in pairs(result and result.assignments or {}) do if type(assignment) == "table" then count = count + 1 end end
-  return count
-end
-
-local function renderGroupDimensions(target, key)
-  local width, height = target.getSize()
-  local gid, group = selectedGroupRecord()
-  writeHeader("GROUP JOB / DIMENSIONS", target, colors and colors.cyan or nil)
-  if not gid or not group then
-    common.writeAt(1, 3, common.fit("No group selected.", width), colors and colors.yellow or nil)
-    buttonRow(key, math.max(1, height - 2), width, { { "BACK", function() mode = "groups" end } })
-    noticeLine(target, height)
+local function sortingTick()
+  local settings = config.sorting
+  if not settings or settings.enabled ~= true or common.nowSeconds() - lastSorting < (tonumber(settings.interval) or 30) then return end
+  lastSorting = common.nowSeconds()
+  if not peripheral or not peripheral.wrap then return end
+  local source = peripheral.wrap(settings.source or "")
+  local valuable = peripheral.wrap(settings.valuableTarget or "")
+  local bulk = peripheral.wrap(settings.bulkTarget or "")
+  local seal = peripheral.wrap(settings.sealTarget or "")
+  if not source or type(source.list) ~= "function" or type(source.pushItems) ~= "function" then
+    if not sortingWarned then sortingWarned = true; setNotice("Sorting WARN: source inventory is not configured.", false) end
     return
   end
-  groupDraft = groupDraft or groupDraftDefaults(group)
-  local ids = groupWorkerIds(group)
-  local worldMode = groupDraftWorldMode()
-  common.writeAt(1, 2, common.fit(("Group %s (%s) | workers=%d | %s | partition=%s"):format(groupName(group, gid), tostring(gid), #ids, worldMode and "WORLD" or "LOCAL", tostring(groupDraft.partition or group.partition or "stripe")), width), colors and colors.lightGray or nil)
-  common.writeAt(1, 3, common.fit(worldMode and "BOTTOM Y is absolute; each worker reports HOME Y/LAYERS." or "LOCAL uses DEPTH; multi-worker automatic splitting is disabled.", width), colors and colors.lightGray or nil)
-  local visibleFields = groupFieldOrder()
-  local fieldWidth = math.min(32, math.max(14, math.floor(width * 0.52)))
-  local rows = math.min(#visibleFields, math.max(1, math.floor((height - 13) / 2)))
-  for index = 1, rows do
-    local field = visibleFields[index]
-    local y = 4 + (index - 1) * 2
-    local active = groupDraft.selectedField == field
-    local shown = active and groupDraft.buffer or tostring(groupDraft[field] or 0)
-    common.writeAt(1, y, common.fit(fieldLabels[field], fieldWidth - 2), active and (colors and colors.black or nil) or (colors and colors.white or nil), active and (colors and colors.yellow or nil) or (colors and colors.black or nil))
-    drawButton(key, 1, y + 1, 3, "-", function() adjustGroupDraft(field, -1) end, true)
-    drawButton(key, 5, y + 1, math.max(5, fieldWidth - 11), shown, function() chooseGroupDraftField(field) end, true, active)
-    drawButton(key, fieldWidth - 5, y + 1, 3, "+", function() adjustGroupDraft(field, 1) end, true)
+  if not valuable or not bulk or not seal then
+    if not sortingWarned then sortingWarned = true; setNotice("Sorting WARN: one or more target inventories are missing.", false) end
+    return
   end
-  local keypadX = math.min(width - 12, fieldWidth + 2)
-  local keypadWidth = math.max(12, width - keypadX + 1)
-  local cellWidth = math.max(4, math.floor(keypadWidth / 3))
-  local labels = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "CLR", "0", "<" }
-  for index, label in ipairs(labels) do
-    local row = math.floor((index - 1) / 3)
-    local column = (index - 1) % 3
-    local x, y = keypadX + column * cellWidth, 4 + row * 2
-    if y <= height - 8 then
-      local action
-      if label == "CLR" then action = function() groupDraft.buffer = "0" end
-      elseif label == "<" then action = groupDraftBackspace
-      else local digit = label; action = function() groupDraftDigit(digit) end end
-      drawButton(key, x, y, math.max(3, cellWidth - 1), label, action, true)
-      addHitbox(key, x, y, x + math.max(2, cellWidth - 2), math.min(height - 8, y + 1), action)
-    end
-  end
-  local summaryY = math.max(8, height - 10)
-  local homeBits = {}
-  for _, id in ipairs(ids) do
-    local data = workerData(id) or {}
-    local homeY = data.homeY or data.gps and data.gps.calibration and data.gps.calibration.home and data.gps.calibration.home.y or "-"
-    homeBits[#homeBits + 1] = "#" .. tostring(id) .. " HOME=" .. tostring(homeY)
-  end
-  common.writeAt(1, summaryY, common.fit(table.concat(homeBits, " "), width), colors and colors.lightGray or nil)
-  local result = groupDraft.preflight
-  if result then
-    local assignmentText = (result.fatal and "PREFLIGHT BLOCKED" or "PREFLIGHT OK") .. " assignments=" .. tostring(groupAssignmentCount(result)) .. "/" .. tostring(#ids) .. " chunks=" .. tostring(result.selectedChunks or 0)
-    common.writeAt(1, summaryY + 1, common.fit(assignmentText, width), result.fatal and (colors and colors.red or nil) or (colors and colors.lime or nil))
-    local row = summaryY + 2
-    for _, id in ipairs(ids) do
-      if row >= height - 5 then break end
-      local assignment = result.assignments and (result.assignments[tostring(id)] or result.assignments[id]) or nil
-      local chunks = assignment and #(assignment.chunkKeys or {}) or 0
-      local homeY = assignment and assignment.homeY or (workerData(id) or {}).homeY or "-"
-      local layers = assignment and assignment.layers or (homeY ~= "-" and result.bottomY and tonumber(homeY) and math.floor(tonumber(homeY) - tonumber(result.bottomY) + 1) or "-")
-      common.writeAt(1, row, common.fit(("#%s chunks=%d HOME Y=%s LAYERS=%s"):format(tostring(id), chunks, tostring(homeY), tostring(layers)), width), colors and colors.white or nil)
-      row = row + 1
-    end
-  else
-    common.writeAt(1, summaryY + 1, common.fit("PRECHECK required before START.", width), colors and colors.yellow or nil)
-  end
-  buttonRow(key, math.max(1, height - 4), width, {
-    { "LIGHT " .. tostring(groupDraft.lighting and groupDraft.lighting.mode or "safe"), function() local modes = { "off", "safe", "custom" }; local now = groupDraft.lighting and groupDraft.lighting.mode or "safe"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; groupDraft.lighting.mode = modes[n % #modes + 1]; groupDraft.preflight = nil; invalidate() end },
-    { "WATER " .. tostring(groupDraft.waterMode or "seal"), function() local modes = { "ignore", "stop", "seal" }; local now = groupDraft.waterMode or "seal"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; groupDraft.waterMode = modes[n % #modes + 1]; groupDraft.preflight = nil; invalidate() end },
-    { "PROFILE " .. tostring(groupDraft.profile or "balanced"), function() local modes = { "safe", "balanced", "turbo" }; local now = groupDraft.profile or "balanced"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; groupDraft.profile = modes[n % #modes + 1]; groupDraft.preflight = nil; invalidate() end },
-    { "PART " .. tostring(groupDraft.partition or group.partition or "stripe"), function() groupDraft.partition = (tostring(groupDraft.partition or group.partition or "stripe") == "stripe") and "round_robin" or "stripe"; groupDraft.preflight = nil; invalidate() end },
-  })
-  local canStart = result and not result.fatal
-  buttonRow(key, math.max(1, height - 2), width, {
-    { "PRECHECK", function() commitGroupDraftField(); groupDraft.preflight = computeGroupPreflight(gid, groupDraft); invalidate() end },
-    { "START", function() commitGroupDraftField(); local checked = groupDraft.preflight or computeGroupPreflight(gid, groupDraft); groupDraft.preflight = checked; if checked and not checked.fatal then startGroup(gid, groupDraft) end; invalidate() end, canStart },
-    { "BACK", function() mode = "groups"; invalidate() end },
-  })
-  noticeLine(target, height)
-end
-
-local function renderGroups(target, key)
-  local width, height = target.getSize()
-  writeHeader("WORKER GROUPS", target)
-  local ids = orderedGroupIds()
-  common.writeAt(1, 2, common.fit(("Groups %d | selected=%d"):format(#ids, selectedGroup), width), colors and colors.lightGray or nil)
-  local maxRows = math.max(1, height - 9)
-  if #ids == 0 then
-    common.writeAt(2, 4, common.fit("No groups. Register: group register <id> <workers> [name dock bay mode partition]", width), colors and colors.yellow or nil)
-    common.writeAt(2, 5, common.fit("Per-bay maps: worker=bay,worker=bay (dock map follows).", width), colors and colors.lightGray or nil)
-  else
-    local first = selectedGroup > maxRows and selectedGroup - maxRows + 1 or 1
-    for row = 1, maxRows do
-      local index = first + row - 1
-      local gid = ids[index]
-      if not gid then break end
-      local group = groupRecord(gid)
-      local job = activeGroupJob(gid)
-      local aggregate = job and (job.aggregate or updateGroupAggregate(job)) or { percent = 0, online = 0, total = #groupWorkerIds(group), minFuel = nil, warnings = {}, acks = 0, ackTotal = #groupWorkerIds(group) }
-      local warning = aggregate.warnings and aggregate.warnings[1] or "-"
-      local line = ("%s%-12s %-10s W=%d/%d P=%3d%% F=%s ACK=%d/%d %s"):format(index == selectedGroup and ">" or " ", common.fit(groupName(group, gid), 12), tostring(job and job.status or "idle"), aggregate.online or 0, aggregate.total or 0, aggregate.percent or 0, tostring(aggregate.minFuel or "-"), aggregate.acks or 0, aggregate.ackTotal or 0, common.fit(warning, math.max(1, width - 70)))
-      local y = 3 + row
-      common.writeAt(1, y, common.fit(line, width), index == selectedGroup and (colors and colors.black or nil) or colors and colors.white or nil, index == selectedGroup and (colors and colors.white or nil) or nil)
-      addHitbox(key, 1, y, width, y, function() selectedGroup = index; invalidate() end)
-    end
-  end
-  local bottom = math.max(1, height - 5)
-  buttonRow(key, bottom, width, { { "START", groupAction("start") }, { "PAUSE", groupAction("pause") }, { "RESUME", groupAction("resume") }, { "RETURN", groupAction("return") } })
-  buttonRow(key, bottom + 1, width, { { "SERVICE", groupAction("service") }, { "ABORT", groupAction("abort") }, { "CLEAR", groupAction("clear") }, { "DRILLDOWN", function() mode = "group_info"; invalidate() end } })
-  buttonRow(key, bottom + 2, width, { { "BACK", function() mode = "dashboard" end }, { "REFRESH", function() local gid = selectedGroupRecord(); local job = gid and activeGroupJob(gid); if job then updateGroupAggregate(job) end; invalidate() end } })
-  noticeLine(target, height)
-end
-
-local function renderGroupInfo(target, key)
-  local width, height = target.getSize()
-  local gid, group = selectedGroupRecord()
-  local job = gid and activeGroupJob(gid) or nil

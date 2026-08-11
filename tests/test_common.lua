@@ -159,6 +159,23 @@ assert(loaded.role == "worker" and loaded.nested.state == "idle")
 local workerDefaults = common.defaultWorkerConfig()
 assert(workerDefaults.schema == 4 and workerDefaults.version == "4.0.0" and workerDefaults.role == "worker")
 assert(workerDefaults.profile == "balanced" and workerDefaults.waterMode == "seal")
+assert(type(workerDefaults.remoteConsole) == "table")
+assert(workerDefaults.remoteConsole.enabled == false and workerDefaults.remoteConsole.allowShell == false)
+assert(workerDefaults.remoteConsole.sessionSeconds == 120)
+assert(workerDefaults.remoteConsole.maxOutputBytes == 8192)
+assert(workerDefaults.remoteConsole.auditLimit == 50)
+assert(type(workerDefaults.remoteConsole.allowlist) == "table")
+assert(workerDefaults.remoteConsole.allowlist[1] == "ccm status")
+assert(workerDefaults.remoteConsole.allowlist[2] == "ccm report")
+assert(workerDefaults.remoteConsole.allowlist[3] == "ccm doctor")
+assert(workerDefaults.remoteConsole.allowlist[4] == "id")
+assert(workerDefaults.remoteConsole.allowlist[5] == "label get")
+assert(workerDefaults.remoteConsole.allowlist[6] == "ls")
+assert(workerDefaults.remoteConsole.allowlist[7] == "dir")
+assert(workerDefaults.remoteConsole.allowlist[8] == "df")
+assert(workerDefaults.remoteConsole.allowlist[9] == "free")
+assert(workerDefaults.remoteConsole.allowlist[10] == "version")
+assert(workerDefaults.remoteConsole.allowlist ~= common.defaultWorkerConfig().remoteConsole.allowlist)
 assert(workerDefaults.discard.mode == "KEEP_ALL")
 assert(count(workerDefaults.discard.allowlist) == 0)
 assert(workerDefaults.discard.stoneAllowlist["minecraft:stone"] == true)
@@ -252,11 +269,57 @@ assert(migratedWorker.discard.allowlist["minecraft:stone"] == true)
 assert(migratedWorker.discard.retainSealTarget == 48 and migratedWorker.materials.retainSealTarget == 48)
 assert(migratedWorker.materials.discard ~= migratedWorker.discard)
 assert(migratedWorker.dock.id == "dock-old" and migratedWorker.dock.groupId == "group-old" and migratedWorker.dock.bayId == "bay-old")
+assert(migratedWorker.controllerId == 0)
+assert(migratedWorker.remoteConsole.enabled == false and migratedWorker.remoteConsole.allowShell == false)
+assert(migratedWorker.remoteConsole.sessionSeconds == 120 and migratedWorker.remoteConsole.maxOutputBytes == 8192)
+assert(migratedWorker.remoteConsole.auditLimit == 50 and migratedWorker.remoteConsole.allowlist[1] == "ccm status")
 local migratedSaved, migratedSaveError = common.saveConfig(migratedWorker)
 assert(migratedSaved, migratedSaveError)
 local migratedStored, migratedStoredError = common.loadTable(common.CONFIG_PATH, {})
 assert(not migratedStoredError, migratedStoredError)
 assert(migratedStored.schema == 4 and migratedStored.version == "4.0.0")
+
+-- Remote-console aliases from early V4 drafts migrate to the canonical
+-- nested record.  Unsafe command syntax is removed without widening access.
+local migratedRemote = loadConfigFrom({
+  role = "worker",
+  schema = 3,
+  version = "3.0.0",
+  controllerId = "12",
+  remote = {
+    enabled = true,
+    shell = true,
+    session = "180",
+    maxOutput = "4096",
+    auditEntries = 9,
+    commands = { "CCM STATUS", "label get", "rm -rf /" },
+  },
+})
+assert(migratedRemote.controllerId == 12)
+assert(migratedRemote.remoteConsole.enabled == true and migratedRemote.remoteConsole.allowShell == true)
+assert(migratedRemote.remoteConsole.sessionSeconds == 180)
+assert(migratedRemote.remoteConsole.maxOutputBytes == 4096)
+assert(migratedRemote.remoteConsole.auditLimit == 9)
+assert(migratedRemote.remoteConsole.allowlist[1] == "ccm status")
+assert(migratedRemote.remoteConsole.allowlist[2] == "label get")
+assert(migratedRemote.remoteConsole.allowlist[3] == nil)
+
+local malformedRemote = loadConfigFrom({
+  role = "worker",
+  remoteConsole = {
+    enabled = "yes",
+    allowShell = 1,
+    sessionSeconds = 0,
+    maxOutputBytes = 99,
+    auditLimit = 9999,
+    allowlist = { "ccm status; reboot", "../startup", "" },
+  },
+})
+assert(malformedRemote.remoteConsole.enabled == false and malformedRemote.remoteConsole.allowShell == false)
+assert(malformedRemote.remoteConsole.sessionSeconds == 120)
+assert(malformedRemote.remoteConsole.maxOutputBytes == 8192)
+assert(malformedRemote.remoteConsole.auditLimit == 50)
+assert(count(malformedRemote.remoteConsole.allowlist) == 0)
 
 -- Controller V3 names are migrated from the older top-level service,
 -- partition, and dock records into the canonical V4 group/dock contract.
@@ -419,5 +482,18 @@ assert(not storedError, storedError)
 assert(stored.schema == 4 and stored.version == "4.0.0" and stored.role == "worker")
 assert(type(stored.materials) == "table" and type(stored.discard) == "table")
 assert(stored.materials.discard ~= stored.discard)
+
+-- A hand-edited config may accidentally share the allowlist with another
+-- field.  saveConfig must still detach the remote-console record before the
+-- strict ComputerCraft serializer sees it.
+local sharedRemote = common.defaultWorkerConfig()
+sharedRemote.allowedCommands = sharedRemote.remoteConsole.allowlist
+sharedRemote.remoteConsole.allowlist = sharedRemote.allowedCommands
+local sharedRemoteSaved, sharedRemoteSaveError = common.saveConfig(sharedRemote)
+assert(sharedRemoteSaved, sharedRemoteSaveError)
+local sharedRemoteStored, sharedRemoteStoredError = common.loadTable(common.CONFIG_PATH, {})
+assert(not sharedRemoteStoredError, sharedRemoteStoredError)
+assert(type(sharedRemoteStored.remoteConsole.allowlist) == "table")
+assert(sharedRemoteStored.remoteConsole.allowlist[1] == "ccm status")
 
 print("common V4 defaults, migration, normalization, persistence, and portable fs tests passed")

@@ -28,6 +28,22 @@ config.gps = config.gps or {}
 config.discard = config.discard or config.materials.discard or {}
 config.dock = config.dock or {}
 config.group = config.group or {}
+-- Remote console is deliberately fail-closed.  Keep its policy in one nested
+-- table so older V2 configs (which have no remoteConsole key) remain disabled
+-- until an operator opts in explicitly.
+config.remoteConsole = config.remoteConsole or {}
+config.remoteConsole.enabled = config.remoteConsole.enabled == true
+config.remoteConsole.allowShell = config.remoteConsole.allowShell == true
+config.remoteConsole.sessionSeconds = math.max(1, math.floor(
+  tonumber(config.remoteConsole.sessionSeconds) or 120
+))
+config.remoteConsole.maxOutputBytes = math.max(1, math.floor(
+  tonumber(config.remoteConsole.maxOutputBytes) or 8192
+))
+config.remoteConsole.auditLimit = math.max(1, math.floor(
+  tonumber(config.remoteConsole.auditLimit) or 50
+))
+if type(config.remoteConsole.allowlist) ~= "table" then config.remoteConsole.allowlist = {} end
 if config.lighting.mode == nil then config.lighting.mode = config.lightMode or "off" end
 if config.lighting.interval == nil then config.lighting.interval = config.torchInterval or 32 end
 if config.lighting.preferredSlots == nil then config.lighting.preferredSlots = config.torchSlots end
@@ -160,6 +176,14 @@ local function ensureV3State()
   }
 end
 ensureV3State()
+
+-- A remote session is intentionally ephemeral: the nonce, command sequence,
+-- and audit ring never enter state.db.  This prevents a network key or shell
+-- input from being persisted.  Status exposes only bounded audit counters;
+-- command prefixes remain local to the worker.
+local remoteSession = nil
+local remoteAudit = {}
+local remoteTokenCounter = 0
 
 local function recoverPendingSnapshot()
   local journalConfig = config.journal or {}
@@ -888,6 +912,8 @@ end
 local function statusPayload()
   local used, empty, items = inventoryStats()
   local profile = effectiveProfile()
+  local remoteActive = remoteSession ~= nil
+    and common.nowSeconds() < tonumber(remoteSession.expiresAt or 0)
   local progress = nil
   if state.job then
     local snap = jobSnapshot()
@@ -1016,6 +1042,14 @@ local function statusPayload()
     inventoryUsed = used,
     inventoryEmpty = empty,
     inventoryItems = items,
+    remoteConsole = {
+      enabled = config.remoteConsole.enabled == true,
+      allowShell = config.remoteConsole.allowShell == true,
+      active = remoteActive == true,
+      expiresAt = remoteActive and remoteSession.expiresAt or nil,
+      auditCount = #remoteAudit,
+      lastAuditAt = remoteAudit[#remoteAudit] and remoteAudit[#remoteAudit].at or nil,
+    },
     lastError = state.lastError,
     completionReason = state.completionReason,
     recoveryRequired = state.pendingAction ~= nil,
@@ -1038,7 +1072,7 @@ local function sendStatus(target, request)
   return protocol.broadcast(message)
 end
 
-local function sendAck(target, request, ok, text)
+local function sendAck(target, request, ok, text, result, session)
   local payload = request and type(request.payload) == "table" and request.payload or {}
   local ack = {
     ok = ok == true,
@@ -1050,6 +1084,11 @@ local function sendAck(target, request, ok, text)
     groupJobId = payload.groupJobId and tostring(payload.groupJobId) or nil,
     assignmentId = payload.assignmentId and tostring(payload.assignmentId) or nil,
     groupId = payload.groupId and tostring(payload.groupId) or nil,
+    -- Remote-console actions return bounded tables without changing the
+    -- existing ACK fields.  Copy the values so no mutable session object (or
+    -- network key) can leak through the response contract.
+    result = type(result) == "table" and common.copy(result) or nil,
+    session = type(session) == "table" and common.copy(session) or nil,
   }
   return protocol.reply(target, config.networkKey, request, "ack", ack)
 end

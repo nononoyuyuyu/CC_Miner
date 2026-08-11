@@ -162,6 +162,11 @@ local alertLedger = {}
 local alertTimers = {}
 local lastSorting = 0
 local sortingWarned = false
+-- Remote-console sessions are intentionally memory-only.  Reuse the existing
+-- notice-state table so these fields neither enter controller.db nor consume
+-- more top-level locals (CC Lua caps a chunk at 200 active locals).
+noticeState.remoteSession = nil
+noticeState.remoteApi = {}
 
 for _, entry in ipairs(monitors) do
   if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end
@@ -838,6 +843,63 @@ local function clearAlert(id, kind)
   alertLedger[tostring(id) .. ":" .. tostring(kind)] = nil
 end
 
+-- Remote-console ACKs are correlated independently from the normal command
+-- notice/last-error path.  A worker may include the correlation fields either
+-- at the ACK root or inside `result`; accept both forms while rejecting a
+-- delayed response from another session or sequence.
+do
+local function remoteAckField(payload, result, key)
+  if type(payload) == "table" and payload[key] ~= nil then return payload[key] end
+  if type(result) == "table" and result[key] ~= nil then return result[key] end
+  if type(payload) == "table" and type(payload.session) == "table" and payload.session[key] ~= nil then
+    return payload.session[key]
+  end
+  return nil
+end
+
+noticeState.remoteApi.ackMatches = function(sender, message, payload)
+  local session = noticeState.remoteSession
+  local pending = session and session.pending
+  if type(pending) ~= "table" or type(payload) ~= "table" then return false end
+  if tonumber(sender) ~= tonumber(session.workerId) then return false end
+  -- A same-worker ACK for another command must never consume the remote wait.
+  -- Supported workers always set replyTo, so a missing value fails closed.
+  if pending.messageId and (not message
+    or tostring(message.replyTo or "") ~= tostring(pending.messageId)) then return false end
+  local result = type(payload.result) == "table" and payload.result or nil
+  local wireCommand = payload.command
+  if tostring(wireCommand or ""):lower() ~= "remote_console" then return false end
+  local action = remoteAckField(payload, result, "action")
+    or remoteAckField(payload, result, "remoteAction")
+  if action ~= nil and tostring(action):lower() ~= tostring(pending.action):lower() then return false end
+  local sessionId = remoteAckField(payload, result, "sessionId")
+  local nonce = remoteAckField(payload, result, "nonce")
+  -- The worker creates fresh session credentials on OPEN and returns them in
+  -- the result table.  Subsequent actions must echo those credentials exactly;
+  -- the controller's provisional values are only an anti-collision hint.
+  if pending.action ~= "open" then
+    if sessionId ~= nil and tostring(sessionId) ~= tostring(session.sessionId) then return false end
+    if nonce ~= nil and tostring(nonce) ~= tostring(session.nonce) then return false end
+  end
+  local sequence = remoteAckField(payload, result, "seq")
+    or remoteAckField(payload, result, "sequence")
+  if sequence ~= nil and tonumber(sequence) ~= tonumber(pending.seq) then return false end
+  if pending.action == "open" then
+    if payload.ok == true and (sessionId == nil or tostring(sessionId) == ""
+      or nonce == nil or tostring(nonce) == "") then return false end
+    if sessionId ~= nil and tostring(sessionId) ~= "" then session.sessionId = tostring(sessionId) end
+    if nonce ~= nil and tostring(nonce) ~= "" then session.nonce = tostring(nonce) end
+    local nextSequence = tonumber(remoteAckField(payload, result, "nextSeq"))
+    if nextSequence and nextSequence >= 1 and nextSequence == math.floor(nextSequence) then
+      session.seq = nextSequence - 1
+    end
+  end
+  session.lastResult, session.lastAction = common.copy(payload), pending.action
+  session.pending = nil
+  return true
+end
+end
+
 local function handleMessage(sender, message)
   local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
   if not valid then return false end
@@ -911,7 +973,8 @@ local function handleMessage(sender, message)
     return true
   elseif message.kind == "ack" then
     local payload = message.payload or {}
-    if payload.ok ~= true then
+    local remoteMatched = noticeState.remoteApi.ackMatches(sender, message, payload)
+    if payload.ok ~= true and not remoteMatched then
       db.lastCommandError = {
         workerId = tonumber(sender) or sender,
         command = tostring(payload.command or "unknown"),
@@ -920,7 +983,9 @@ local function handleMessage(sender, message)
       }
       saveControllerDb()
     end
-    setNotice((payload.ok and "OK: " or "ERROR: ") .. tostring(payload.message or ""), not payload.ok)
+    if not remoteMatched then
+      setNotice((payload.ok and "OK: " or "ERROR: ") .. tostring(payload.message or ""), not payload.ok)
+    end
     handleSingleStartAck(sender, message, payload)
     local ackGroupJobId = payload.groupJobId or payload.parentGroupJobId or payload.group and payload.group.groupJobId
     if ackGroupJobId and db.groupJobs[tostring(ackGroupJobId)] then
@@ -989,6 +1054,204 @@ local function sendCommand(id, command, payload)
   if ok then setNotice(("Command '%s' sent to #%s."):format(command, tostring(id)), false)
   else setNotice("Send failed: " .. tostring(err), true) end
   return ok, err, wireMessage.id
+end
+
+do
+local function remoteToken(prefix)
+  local millis = common.nowMillis and common.nowMillis() or math.floor(common.nowSeconds() * 1000)
+  return ("%s-%d-%d-%d"):format(tostring(prefix or "remote"), os.getComputerID(), millis, math.random(100000, 999999))
+end
+
+local function remoteRedactText(value)
+  local text = tostring(value or "")
+  local key = type(config.networkKey) == "string" and config.networkKey or ""
+  -- Replace the configured key using plain-string searches.  Network keys may
+  -- contain Lua pattern characters, and they must never appear in CLI output.
+  if key ~= "" then
+    local output, cursor = {}, 1
+    while true do
+      local startAt, endAt = text:find(key, cursor, true)
+      if not startAt then output[#output + 1] = text:sub(cursor); break end
+      output[#output + 1] = text:sub(cursor, startAt - 1)
+      output[#output + 1] = "[REDACTED]"
+      cursor = endAt + 1
+    end
+    text = table.concat(output)
+  end
+  return text
+end
+
+local function remoteSensitiveKey(key)
+  local name = tostring(key or ""):lower():gsub("[^%a%d]", "")
+  return name == "networkkey" or name == "password" or name == "passwd"
+    or name == "secret" or name == "token" or name == "nonce"
+    or name == "sessionid" or name == "apikey" or name == "auth"
+end
+
+local function remoteValueText(value, depth, field)
+  if remoteSensitiveKey(field) then return "[REDACTED]" end
+  depth = tonumber(depth) or 0
+  if value == nil then return "-" end
+  if type(value) == "string" then return remoteRedactText(value) end
+  if type(value) == "number" or type(value) == "boolean" then return tostring(value) end
+  if type(value) ~= "table" then return remoteRedactText(value) end
+  if depth >= 3 then return "{...}" end
+  local keys = {}
+  for key in pairs(value) do keys[#keys + 1] = key end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  local parts = {}
+  for _, key in ipairs(keys) do
+    parts[#parts + 1] = tostring(key) .. "=" .. remoteValueText(value[key], depth + 1, key)
+    if #parts >= 32 then parts[#parts + 1] = "..."; break end
+  end
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+
+local function remoteResultTable(payload)
+  if type(payload) ~= "table" then return nil end
+  if type(payload.result) == "table" then return payload.result end
+  if type(payload.response) == "table" then return payload.response end
+  if type(payload.data) == "table" then return payload.data end
+  return nil
+end
+
+local function remoteAckMessage(payload)
+  local result = remoteResultTable(payload)
+  local message = payload and (payload.message or payload.reason or payload.error) or nil
+  if message == nil and result then message = result.message or result.reason or result.error end
+  if message == nil and result then message = remoteValueText(result) end
+  if message == nil then message = "Unknown remote-console response." end
+  if type(message) == "table" then message = remoteValueText(message) end
+  return remoteRedactText(message)
+end
+
+local function printRemoteAck(payload, action)
+  payload = type(payload) == "table" and payload or {}
+  if payload.ok ~= true then
+    print("Remote console rejected: " .. remoteAckMessage(payload))
+    return false
+  end
+  local result = remoteResultTable(payload) or payload
+  local output = result.output or result.stdout or result.text or payload.output or payload.stdout
+  if output ~= nil and tostring(output) ~= "" then print(remoteRedactText(output)) end
+  if result.exitCode ~= nil then print("exitCode: " .. remoteValueText(result.exitCode)) end
+  if result.truncated ~= nil then print("truncated: " .. remoteValueText(result.truncated)) end
+  if action == "open" then
+    print("Remote console opened. Type exit or quit to close.")
+  elseif action == "close" and result.closed ~= true then
+    print("Remote console closed.")
+  elseif output == nil and action == "exec" then
+    local visible = {}
+    for key, value in pairs(result) do
+      if not remoteSensitiveKey(key) and key ~= "output" and key ~= "stdout" and key ~= "text" then
+        visible[key] = value
+      end
+    end
+    if next(visible) ~= nil then print("Result: " .. remoteValueText(visible)) end
+  end
+  return true
+end
+
+local function remoteTimeoutSeconds()
+  local remoteConfig = type(config.remoteConsole) == "table" and config.remoteConsole or {}
+  local value = tonumber(remoteConfig.ackTimeoutSeconds or remoteConfig.timeoutSeconds or config.remoteTimeoutSeconds) or 8
+  return math.max(1, math.min(60, value))
+end
+
+local function remoteRequest(session, action, commandText)
+  if type(session) ~= "table" then return nil, "remote session unavailable" end
+  local sequence
+  if action == "open" then sequence = 0 else sequence = (tonumber(session.seq) or 0) + 1 end
+  session.seq = sequence
+  local payload = {
+    command = "remote_console", action = tostring(action), sessionId = session.sessionId,
+    nonce = session.nonce, seq = sequence,
+  }
+  if commandText ~= nil then
+    payload.commandText = tostring(commandText)
+    -- commandLine is an additive alias understood by workers from the first
+    -- remote-console revision; commandText remains the canonical field.
+    payload.commandLine = payload.commandText
+  end
+  local wireMessage = protocol.message("command", config.networkKey, payload, session.workerId)
+  local pending = { action = action, seq = sequence, messageId = wireMessage.id, startedAt = common.nowSeconds() }
+  session.pending, session.lastResult, session.lastAction = pending, nil, nil
+  local ok, err = protocol.send(session.workerId, wireMessage)
+  if not ok then session.pending = nil; return nil, "send failed: " .. tostring(err) end
+  local deadline = common.nowSeconds() + (session.timeoutSeconds or remoteTimeoutSeconds())
+  while session.pending == pending and common.nowSeconds() < deadline do
+    local remaining = math.max(0.05, math.min(0.25, deadline - common.nowSeconds()))
+    local sender, message = protocol.receive(remaining)
+    if sender then handleMessage(sender, message) end
+  end
+  if session.pending == pending then
+    session.pending = nil
+    return nil, ("timeout waiting for remote-console %s ACK from #%s"):format(tostring(action), tostring(session.workerId))
+  end
+  return session.lastResult
+end
+
+local function remoteWorkerReady(workerId)
+  local worker = workers[workerId] or workers[tostring(workerId)]
+  if worker and statusOf(worker) == "offline" then return false, "Worker is offline." end
+  return true
+end
+
+noticeState.remoteApi.consoleCommand = function(workerId, oneShot)
+  workerId = tonumber(workerId)
+  if not workerId or workerId < 1 or workerId ~= math.floor(workerId) then
+    print("Usage: ccm remote <workerId> [-- <command...>]")
+    return true
+  end
+  local ready, readyError = remoteWorkerReady(workerId)
+  if not ready then print("Remote console rejected: " .. tostring(readyError)); return true end
+  local session = {
+    workerId = workerId, sessionId = remoteToken("session"), nonce = remoteToken("nonce"),
+    seq = 0, timeoutSeconds = remoteTimeoutSeconds(),
+  }
+  noticeState.remoteSession = session
+  local opened, openError = remoteRequest(session, "open")
+  if not opened then
+    noticeState.remoteSession = nil
+    print("Remote console unavailable: " .. remoteRedactText(openError or remoteAckMessage(opened)))
+    if opened then printRemoteAck(opened, "open") end
+    return true
+  end
+  if not printRemoteAck(opened, "open") then noticeState.remoteSession = nil; return true end
+
+  local function closeSession()
+    if not noticeState.remoteSession then return end
+    local closed, closeError = remoteRequest(session, "close")
+    if not closed then print("Remote console close warning: " .. remoteRedactText(closeError or "unknown error"))
+    elseif closed.ok ~= true then printRemoteAck(closed, "close") end
+    noticeState.remoteSession = nil
+  end
+
+  if oneShot ~= nil then
+    local text = tostring(oneShot)
+    if common.trim(text):lower() ~= "exit" and common.trim(text):lower() ~= "quit" then
+      local result, requestError = remoteRequest(session, "exec", text)
+      if result then printRemoteAck(result, "exec") else print("Remote console timeout: " .. remoteRedactText(requestError or "unknown error")) end
+    end
+    closeSession()
+    return true
+  end
+
+  while true do
+    write(("remote #%s> "):format(tostring(workerId)))
+    local text = read()
+    text = tostring(text or "")
+    local trimmed = common.trim(text)
+    local lower = trimmed:lower()
+    if lower == "exit" or lower == "quit" then break end
+    if trimmed ~= "" then
+      local result, requestError = remoteRequest(session, "exec", text)
+      if result then printRemoteAck(result, "exec") else print("Remote console timeout: " .. remoteRedactText(requestError or "unknown error")) end
+    end
+  end
+  closeSession()
+  return true
+end
 end
 
 local GROUP_WIRE_COMMAND = { start = "start", pause = "pause", resume = "resume", return_home = "recall", recall = "recall", service = "service", abort = "abort", clear = "clear" }
@@ -2415,6 +2678,12 @@ local function dashboardAction(name)
       invalidate()
     elseif name == "info" then
       if id then mode = "info" else setNotice("No worker selected.", true) end
+    elseif name == "remote" then
+      if id then
+        setNotice(("Remote console is CLI-only: ccm remote %s [-- <command...>]"):format(tostring(id)), false)
+      else
+        setNotice("Select a worker, then use ccm remote <workerId> in the terminal.", true)
+      end
     elseif name == "progress" then
       if id then mode = "progress" else setNotice("No worker selected.", true) end
     elseif name == "recovery" then

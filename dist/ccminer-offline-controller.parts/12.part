@@ -1,3 +1,146 @@
+    finding("PASS", "config.water", valueString(config.water or config.waterMode or "seal"))
+    finding("PASS", "config.lighting", valueString(config.lighting or config.lightMode or "off"))
+    finding("PASS", "config.materials", valueString(config.materials or {}))
+  elseif role == "controller" then
+    local controllerNumbers = {
+      { "config.historyLimit", config.historyLimit, 1 },
+      { "config.workerTimeoutSeconds", config.workerTimeoutSeconds, 1 },
+      { "config.discoverySeconds", config.discoverySeconds, 1 },
+    }
+    for _, check in ipairs(controllerNumbers) do
+      if tonumber(check[2]) and tonumber(check[2]) >= check[3] then finding("PASS", check[1], tostring(check[2]))
+      else finding("FAIL", check[1], "must be a number >= " .. tostring(check[3])) end
+    end
+    finding("PASS", "config.queueEnabled", valueString(config.queueEnabled))
+    finding("PASS", "config.overlapProtection", valueString(config.overlapProtection))
+    finding("PASS", "config.adaptiveRefresh", valueString(config.adaptiveRefresh))
+    finding("PASS", "config.presets", valueString(config.presets or {}))
+  elseif role == "gps" then
+    finding("PASS", "config.coordinates", ("%s, %s, %s"):format(tostring(config.x), tostring(config.y), tostring(config.z)))
+  end
+
+  if role == "worker" then doctorDiscardAllowlist(config, finding) end
+
+  local labelApi = os and type(os.getComputerLabel) == "function"
+  local label = labelApi and os.getComputerLabel() or nil
+  if not labelApi then finding("WARN", "label.api", "getComputerLabel unavailable")
+  elseif label and label ~= "" then finding("PASS", "label", tostring(label))
+  else finding("WARN", "label", "computer label is not set") end
+
+  local modems = wirelessModems()
+  if #modems > 0 then finding("PASS", "modem", table.concat(modems, ", "))
+  elseif role == "worker" or role == "controller" or role == "gps" then finding("FAIL", "modem", "no wireless modem detected")
+  else finding("WARN", "modem", "role is not configured") end
+
+  local gpsApi = gps and type(gps.locate) == "function"
+  local gpsConfig = type(config.gps) == "table" and config.gps or {}
+  if role == "worker" and gpsConfig.enabled == false then finding("WARN", "gps.api", "disabled in config")
+  elseif gpsApi then finding("PASS", "gps.api", "gps.locate available")
+  elseif role == "worker" and gpsConfig.required == true then finding("FAIL", "gps.api", "required GPS API unavailable")
+  else finding("WARN", "gps.api", "gps.locate unavailable") end
+
+  if role == "worker" then
+    if not turtle then
+      finding("FAIL", "turtle", "worker role is running without a turtle API")
+    else
+      local sides = {
+        { "inventory.output", config.outputSide or "back", true },
+        { "inventory.fuel", config.fuelSide or "top", true },
+      }
+      if (config.lavaMode or "seal") == "seal" then sides[#sides + 1] = { "inventory.seal", config.sealSide or "right", true } end
+      local usedSides = {}
+      for _, item in ipairs(sides) do
+        local side = tostring(item[2])
+        if usedSides[side] then finding("WARN", item[1], "same side as another inventory: " .. side) end
+        usedSides[side] = true
+        if inventoryAvailable(side) then
+          local slots = inventorySlots(side)
+          finding("PASS", item[1], side .. (slots and (" (" .. slots .. " slots)") or ""))
+        else finding("FAIL", item[1], "inventory missing on " .. side) end
+      end
+      local fuel, fuelLimit = fuelStatus()
+      if fuel == nil then finding("FAIL", "fuel.api", "turtle fuel API unavailable")
+      elseif fuel == "unlimited" then finding("PASS", "fuel", "unlimited")
+      else
+        local target = tonumber(config.fuelTarget) or 0
+        local buffer = tonumber(config.fuelBuffer) or 0
+        if tonumber(fuel) and target > 0 and fuel < math.min(target, buffer > 0 and buffer or target) then
+          finding("WARN", "fuel", ("%s / %s (below configured reserve)"):format(tostring(fuel), tostring(fuelLimit or "-")))
+        else finding("PASS", "fuel", ("%s / %s"):format(tostring(fuel), tostring(fuelLimit or "-"))) end
+      end
+      local used, empty = countInventorySlots()
+      if used == nil then finding("FAIL", "inventory.slots", "turtle inventory API unavailable")
+      else
+        local reserve = tonumber(config.reserveEmptySlots) or 0
+        if empty < reserve then finding("WARN", "inventory.reserve", ("%d empty (target %d)"):format(empty, reserve))
+        else finding("PASS", "inventory.reserve", ("%d empty (target %d)"):format(empty, reserve)) end
+        local reserved = configuredReservedSlots(config)
+        if #reserved == 0 then finding("WARN", "inventory.reservedSlots", "no explicit material slots")
+        else
+          local present = {}
+          for _, slot in ipairs(reserved) do
+            local ok, count = pcall(turtle.getItemCount, slot)
+            present[#present + 1] = tostring(slot) .. "=" .. tostring(ok and count or 0)
+          end
+          finding("PASS", "inventory.reservedSlots", table.concat(present, ", "))
+        end
+      end
+    end
+  end
+
+  local rawState, stateError = readTableNoWrite(common.STATE_PATH)
+  if role == "worker" then
+    if not rawState then
+      finding(stateError == "missing" and "WARN" or "FAIL", "state.file", "state is " .. tostring(stateError or "missing"))
+    else
+      finding("PASS", "state.file", "readable")
+      local state = rawState
+      if tonumber(state.schema) ~= tonumber(common.SCHEMA) then finding("FAIL", "state.schema", "schema mismatch")
+      else finding("PASS", "state.schema", tostring(state.schema)) end
+      local statuses = { idle = true, working = true, paused = true, blocked = true, complete = true, aborted = true,
+        waiting_fuel = true, waiting_output = true, waiting_seal = true, waiting_torch = true, waiting_water = true,
+        recovering = true, dormant = true, calibrating = true }
+      if statuses[state.status] then finding("PASS", "state.status", tostring(state.status))
+      else finding("WARN", "state.status", "unknown status: " .. tostring(state.status)) end
+      if state.pendingAction ~= nil then
+        if type(state.pendingAction) ~= "table" or not state.pendingAction.kind then finding("FAIL", "state.pending", "malformed pendingAction")
+        elseif state.status ~= "blocked" and state.phase ~= "recovery_required" then finding("WARN", "state.pending", "pending action exists while state is not blocked")
+        else finding("PASS", "state.pending", tostring(state.pendingAction.kind)) end
+      else finding("PASS", "state.pending", "none") end
+      local active = state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output"
+        or state.status == "waiting_seal" or state.status == "waiting_torch"
+      if active and type(state.job) ~= "table" and type(state.service) ~= "table" then
+        finding("FAIL", "state.job", "active state has no job or service")
+      elseif type(state.job) == "table" then
+        local cursor, total = tonumber(state.job.cursor), tonumber(state.job.total)
+        if not cursor or not total or cursor < 0 or total <= 0 or cursor > total then
+          finding("FAIL", "state.job", "cursor/total is inconsistent")
+        else finding("PASS", "state.job", ("%d/%d"):format(cursor, total)) end
+      else finding("PASS", "state.job", "none") end
+      if state.request ~= nil and type(state.request) ~= "string" then finding("WARN", "state.request", "request is not a string") end
+      if state.stagedStop ~= nil and type(state.stagedStop) ~= "table" and type(state.stagedStop) ~= "boolean" then
+        finding("FAIL", "state.stagedStop", "malformed staged stop")
+      elseif type(state.stagedStop) == "table" then
+        finding("PASS", "state.stagedStop", valueString(state.stagedStop))
+      else
+        finding("PASS", "state.stagedStop", "none")
+      end
+
+      local calibration = tableValue(config, "gps", "calibration") or tableValue(state, "gps", "calibration")
+      local dockMetadata = state.dock or config.dock
+      local dock = dockMetadata
+      if type(dockMetadata) == "table" and not coordinateTable(dockMetadata) then
+        dock = dockMetadata.homeWorld or dockMetadata.world or dockMetadata.position or dockMetadata.home
+      end
+      if dock == nil and type(calibration) == "table" then dock = calibration.home end
+      if dock == nil and type(dockMetadata) == "table" then finding("PASS", "dock", "metadata=" .. valueString(dockMetadata))
+      elseif dock == nil then finding("PASS", "dock", "not configured/calibrated")
+      elseif coordinateTable(dock) then finding("PASS", "dock", coordinateText(dock))
+      elseif type(dockMetadata) == "table" then finding("PASS", "dock", "metadata=" .. valueString(dockMetadata))
+      else finding("FAIL", "dock", "dock coordinates are malformed") end
+
+      local bay = state.bay or config.bay
+      if bay == nil then finding("PASS", "bay", "not configured")
       elseif type(bay) ~= "table" then finding("FAIL", "bay", "bay metadata is malformed")
       elseif bay.capacity ~= nil and (not tonumber(bay.capacity) or tonumber(bay.capacity) < 1) then
         finding("FAIL", "bay", "capacity must be a positive number")
@@ -50,162 +193,3 @@
         if history then
           local historyCount = 0
           for _ in pairs(history) do historyCount = historyCount + 1 end
-          finding("PASS", "controller.db", tostring(path) .. " entries=" .. tostring(historyCount))
-        else finding("WARN", "controller.db", tostring(path) .. " has no history table") end
-
-        local docks = type(db.docks) == "table" and db.docks or {}
-        local bays = type(db.bays) == "table" and db.bays or {}
-        local groups = db.groups
-        local groupJobs = db.groupJobs or db.group_jobs
-        if groups == nil then
-          finding("PASS", "group", "no groups configured")
-        elseif type(groups) ~= "table" then
-          finding("FAIL", "group", "groups table is malformed")
-        else
-          local groupCount = 0; local groupErrors = 0
-          for key, group in pairs(groups) do
-            groupCount = groupCount + 1
-            if type(group) ~= "table" then
-              groupErrors = groupErrors + 1
-            else
-              local workers = group.workerIds or group.workers
-              if workers ~= nil and type(workers) ~= "table" then groupErrors = groupErrors + 1 end
-              local dockId = group.dockId or (type(group.dock) == "string" and group.dock or nil)
-              local bayId = group.bayId or (type(group.bay) == "string" and group.bay or nil)
-              if dockId and docks[dockId] == nil and docks[tostring(dockId)] == nil then groupErrors = groupErrors + 1 end
-              if bayId and bays[bayId] == nil and bays[tostring(bayId)] == nil then groupErrors = groupErrors + 1 end
-              if group.bottomY ~= nil and not tonumber(group.bottomY) then groupErrors = groupErrors + 1 end
-            end
-          end
-          if groupErrors > 0 then finding("FAIL", "group", ("%d malformed of %d"):format(groupErrors, groupCount))
-          else finding("PASS", "group", tostring(groupCount) .. " configured") end
-        end
-        if db.docks == nil then finding("PASS", "dock", "no dock registry")
-        elseif type(db.docks) ~= "table" then finding("FAIL", "dock", "dock registry is malformed")
-        else
-          local errors, count = 0, 0
-          for _, dock in pairs(db.docks) do
-            count = count + 1
-            if type(dock) ~= "table" then errors = errors + 1
-            elseif dock.world and not coordinateTable(dock.world) then errors = errors + 1
-            elseif dock.x ~= nil and (not tonumber(dock.x) or not tonumber(dock.y) or not tonumber(dock.z)) then errors = errors + 1 end
-          end
-          if errors > 0 then finding("FAIL", "dock", ("%d malformed of %d"):format(errors, count))
-          else finding("PASS", "dock", tostring(count) .. " registered") end
-        end
-        if db.bays == nil then finding("PASS", "bay", "no bay registry")
-        elseif type(db.bays) ~= "table" then finding("FAIL", "bay", "bay registry is malformed")
-        else
-          local errors, count = 0, 0
-          for _, bay in pairs(db.bays) do
-            count = count + 1
-            if type(bay) ~= "table" then errors = errors + 1
-            elseif bay.world and not coordinateTable(bay.world) then errors = errors + 1
-            elseif bay.capacity ~= nil and (not tonumber(bay.capacity) or tonumber(bay.capacity) < 1) then errors = errors + 1 end
-          end
-          if errors > 0 then finding("FAIL", "bay", ("%d malformed of %d"):format(errors, count))
-          else finding("PASS", "bay", tostring(count) .. " registered") end
-        end
-        if groupJobs ~= nil and type(groupJobs) ~= "table" then
-          finding("FAIL", "group.ack", "groupJobs table is malformed")
-        elseif type(groupJobs) == "table" then
-          local ackWarnings = 0
-          for _, job in pairs(groupJobs) do
-            if type(job) == "table" then
-              local assignments = job.assignments or job.assignmentCount
-              local acks = job.acks or job.ackSummary or job.ackCount
-              local aggregate = type(job.aggregate) == "table" and job.aggregate or nil
-              local aggregateAcks = aggregate and tonumber(aggregate.acks) or nil
-              local aggregateTotal = aggregate and tonumber(aggregate.ackTotal or aggregate.total) or nil
-              if type(assignments) == "table" then assignments = #assignments end
-              if type(acks) == "table" then
-                local count = 0
-                for _ in pairs(acks) do count = count + 1 end
-                acks = count
-              end
-              if assignments and acks and tonumber(acks) and tonumber(assignments) and tonumber(acks) > tonumber(assignments) then ackWarnings = ackWarnings + 1 end
-              if aggregateAcks and aggregateTotal and (aggregateAcks < 0 or aggregateAcks > aggregateTotal) then ackWarnings = ackWarnings + 1 end
-            end
-          end
-          if ackWarnings > 0 then finding("FAIL", "group.ack", "ACK count exceeds assignments")
-          else finding("PASS", "group.ack", "group ACK summaries are consistent") end
-        else finding("PASS", "group.ack", "no group jobs") end
-        break
-      elseif dbError and dbError ~= "missing" then finding("WARN", "controller.db", tostring(path) .. ": " .. tostring(dbError)) end
-    end
-    if not found then finding("WARN", "controller.db", "history database not found") end
-  end
-
-  print("")
-  print(("Doctor summary: PASS=%d WARN=%d FAIL=%d"):format(counts.PASS, counts.WARN, counts.FAIL))
-  if counts.FAIL > 0 then print("Doctor result: FAIL")
-  elseif counts.WARN > 0 then print("Doctor result: WARN")
-  else print("Doctor result: PASS") end
-end
-
-if command == "help" or command == "?" then
-  printHelp()
-elseif command == "version" then
-  print("CC Miner " .. tostring(common.VERSION or ""))
-elseif command == "setup" then
-  shell.run("/ccminer/setup.lua", args[2])
-elseif command == "dashboard" then
-  shell.run("/ccminer/controller.lua")
-elseif command == "discover" then
-  shell.run("/ccminer/controller.lua", "discover")
-elseif command == "doctor" then
-  runDoctor()
-elseif command == "report" then
-  runReport()
-elseif command == "rehome" then
-  local config, configError = common.loadConfig()
-  if not config then
-    reportError(configError or "Not configured.")
-  elseif config.role == "worker" then
-    if args[2] ~= "RESET" then
-      reportError("Place the turtle in its dock facing the quarry, then run: ccm rehome RESET")
-    else
-      local calibration = config.gps and config.gps.calibration or nil
-      if calibration and gps and gps.locate then
-        local x, y, z = gps.locate(2, false)
-        if not x then
-          reportError("A GPS fix is required to verify the calibrated dock. Rehome was cancelled.")
-          return
-        end
-        if common.round(x) ~= calibration.home.x or common.round(y) ~= calibration.home.y or common.round(z) ~= calibration.home.z then
-          reportError("GPS position does not match the calibrated dock. Rehome was cancelled.")
-          return
-        end
-      elseif calibration then
-        reportError("GPS is unavailable, so the calibrated dock cannot be verified. Rehome was cancelled.")
-        return
-      end
-      local previous = common.loadTable(common.STATE_PATH, common.defaultState())
-      local reset = common.defaultState()
-      if previous and previous.stats then reset.stats = previous.stats end
-      local ok, err = common.saveTable(common.STATE_PATH, reset)
-      if not ok then reportError("Cannot reset worker state: " .. tostring(err))
-      else print("Worker coordinates and job were reset to home. Run: reboot") end
-    end
-  elseif config.role == "controller" then
-    if not tonumber(args[2]) or args[3] ~= "RESET" then reportError("Usage: ccm rehome <id> RESET") else forwardController() end
-  else
-    reportError("Rehome is not available for role " .. tostring(config.role))
-  end
-elseif command == "start" or command == "pause" or command == "resume" or command == "recall"
-  or command == "service" or command == "abort" or command == "clear" or command == "gps" or command == "calibrate"
-  or command == "queue" or command == "preset" or command == "presets" or command == "stop"
-  or command == "group" or command == "dock" or command == "bay" then
-  local config = loadConfigForCommand()
-  if config and config.role ~= "controller" then reportError("Run this command on the controller computer.")
-  elseif config then
-    if command == "group" then
-      local sub = string.lower(tostring(args[2] or "list"))
-      local groupCommands = {
-        list = true, show = true, register = true, start = true, pause = true, resume = true,
-        ["return"] = true, service = true, abort = true, clear = true, reassign = true,
-      }
-      if not groupCommands[sub] then
-        reportError("Usage: ccm group list|show <id>|register <id> <workerIds comma> [name dock bay mode partition workerBayMap workerDockMap]|start|pause|resume|return|service|abort|clear|reassign <id> <stopped> [target]")
-      else
-        -- Keep the complete argument vector intact.  The controller owns

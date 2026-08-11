@@ -1,3 +1,42 @@
+    -- Items that are not selected by the active policy are counted as held or
+    -- skipped rather than silently dropped.
+    discardStats = {
+      enabled = false,
+      mode = "KEEP_ALL",
+      passes = 0,
+      attempts = 0,
+      stacks = 0,
+      discarded = 0,
+      items = 0,
+      skipped = 0,
+      held = 0,
+      unknown = 0,
+      overflow = 0,
+      byName = {},
+      lastAt = nil,
+      lastError = nil,
+      triggerEmptySlots = 3,
+      maxStacksPerPass = 8,
+    },
+    -- Short alias used by worker reports; both tables start with identical
+    -- counters and are normalized together when an older state is loaded by
+    -- the worker runtime.
+    discard = {
+      enabled = false,
+      mode = "KEEP_ALL",
+      passes = 0,
+      attempts = 0,
+      stacks = 0,
+      discarded = 0,
+      items = 0,
+      skipped = 0,
+      held = 0,
+      unknown = 0,
+      overflow = 0,
+      byName = {},
+      lastAt = nil,
+      lastError = nil,
+      triggerEmptySlots = 3,
       maxStacksPerPass = 8,
     },
     -- Route and wall-clock metrics are compact and safe to update on every
@@ -353,30 +392,5 @@ local function normalizeIdentifier(value, fallback, maximum)
   return value
 end
 
-local function firstNonNil(...)
-  for index = 1, select("#", ...) do
-    local value = select(index, ...)
-    if value ~= nil then return value end
-  end
-  return nil
-end
-
-local function normalizeTable(defaults, loaded)
-  if type(loaded) ~= "table" then return M.copy(defaults) end
-  return M.merge(defaults, loaded)
-end
-
-local function normalizeWorkerConfig(raw)
-  local defaults = M.defaultWorkerConfig()
-  local config = normalizeTable(defaults, raw)
-  config.role = "worker"
-  config.schema, config.version = M.SCHEMA, M.VERSION
-
-  -- The new schema is additive.  Read legacy flat names first, then let an
-  -- explicitly nested value win.  This keeps hand-edited V2/V4 files valid
-  -- while producing one canonical nested contract for new code.
-  local loaded = type(raw) == "table" and raw or {}
-  local loadedMaterials = type(loaded.materials) == "table" and loaded.materials or {}
-  local loadedDiscard = type(loaded.discard) == "table" and loaded.discard
-    or (type(loadedMaterials.discard) == "table" and loadedMaterials.discard or {})
-  local loadedPerformance = type(loaded.performance) == "table" and loaded.performance or {}
+-- Remote console commands are deliberately represented as an array of exact
+-- command strings.  A command may contain one space-separated subcommand (for

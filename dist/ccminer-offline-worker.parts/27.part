@@ -1,3 +1,251 @@
+  local blocks = tonumber(state.job and state.job.cursor) or tonumber(state.stats and state.stats.blocksDug) or 0
+  local perSecond = elapsed > 0 and blocks / elapsed or 0
+  state.timeMetrics = state.timeMetrics or {}
+  state.timeMetrics.updatedAt = now
+  state.timeMetrics.elapsedSeconds = elapsed
+  return {
+    blocks = blocks,
+    elapsedSeconds = elapsed,
+    perSecond = perSecond,
+    cellsPerSecond = perSecond,
+    startedAt = started,
+  }
+end
+
+local function returnSnapshot()
+  local service = state.service or {}
+  local metrics = state.serviceReturn or {}
+  local started = tonumber(metrics.startedAt or service.startedAt)
+  local ended = tonumber(metrics.endedAt)
+  local seconds = tonumber(metrics.seconds)
+  if started and not seconds then seconds = math.max(0, (ended or common.nowSeconds()) - started) end
+  return {
+    reason = state.returnReason or service.reason or state.lastReturnReason,
+    distance = tonumber(metrics.distance or service.returnDistance) or 0,
+    seconds = seconds or tonumber(metrics.returnSeconds) or 0,
+    startedAt = started,
+    endedAt = ended,
+    active = state.service ~= nil,
+  }
+end
+
+local function statusPayload()
+  local used, empty, items = inventoryStats()
+  local profile = effectiveProfile()
+  local remoteActive = remoteSession ~= nil
+    and common.nowSeconds() < tonumber(remoteSession.expiresAt or 0)
+  local progress = nil
+  if state.job then
+    local snap = jobSnapshot()
+    progress = {
+      cursor = state.job.cursor or 0,
+      total = state.job.total or 0,
+      percent = common.percent(state.job.cursor or 0, state.job.total or 0),
+      layer = snap and snap.currentLayer or nil,
+      row = snap and snap.currentRow or nil,
+      currentChunk = snap and snap.currentChunk or nil,
+      completedChunks = snap and snap.completedChunks or 0,
+    }
+  end
+  local lightMode, lightInterval = effectiveLightingValues()
+  local waterMode = tostring((config.waterMode or (config.water and config.water.mode) or state.water.mode or "ignore"))
+  local discardStatus = common.copy(state.discardStats or state.discard or {})
+  discardStatus.mode = config.discard and config.discard.mode or discardStatus.mode or "KEEP_ALL"
+  discardStatus.triggerEmptySlots = tonumber(config.discard and config.discard.triggerEmptySlots) or discardStatus.triggerEmptySlots or 3
+  discardStatus.maxStacksPerPass = tonumber(config.discard and config.discard.maxStacksPerPass) or discardStatus.maxStacksPerPass or 8
+  discardStatus.retainSealTarget = tonumber(config.discard and config.discard.retainSealTarget) or 64
+  discardStatus.allowlist = config.discard and common.copy(config.discard.allowlist or {}) or {}
+  local assignmentResume = state.assignmentResumeToken and common.copy(state.assignmentResumeToken)
+  if not assignmentResume and state.status ~= "complete" then
+    assignmentResume = assignmentResumeSnapshot(state.resumeToken or state.checkpoint)
+  end
+  return {
+    id = os.getComputerID(),
+    label = config.workerName or common.safeComputerLabel("Miner"),
+    status = state.status,
+    phase = state.phase,
+    pose = poseCopy(),
+    atHome = isHome(),
+    world = state.gps and common.copy(state.gps.lastFix) or nil,
+    gps = gpsSummary(),
+    seal = {
+      mode = config.lavaMode or "seal",
+      count = sealMaterialCount(),
+      target = tonumber((config.materials or {}).retainSealTarget or config.sealTarget) or 64,
+      reserve = tonumber(config.sealReserve) or 8,
+    },
+    lighting = {
+      mode = lightMode,
+      interval = lightInterval,
+      torchCount = torchMaterialCount(),
+      placed = state.stats.torchesPlaced or 0,
+      shortages = state.stats.torchShortages or 0,
+    },
+    profile = profile,
+    effectiveProfile = profile,
+    water = {
+      mode = waterMode,
+      detected = state.stats.waterDetected or 0,
+      sealed = state.stats.waterSealed or 0,
+      blocked = state.stats.waterBlocked or 0,
+      last = state.water and common.copy(state.water.last) or nil,
+    },
+    materials = {
+      torchCount = torchMaterialCount(),
+      sealCount = sealMaterialCount(),
+      recycled = state.stats.recycledBlocks or state.stats.recycled or 0,
+      retained = state.recycle and state.recycle.held or 0,
+      overflow = state.recycle and state.recycle.overflow or 0,
+    },
+    discard = discardStatus,
+    assignmentResumeToken = assignmentResume,
+    throughput = throughputSnapshot(),
+    performance = {
+      gpsVerifyEveryMoves = tonumber(config.performance and config.performance.gpsVerifyEveryMoves) or 32,
+      lightweightCheckpointEveryMoves = tonumber(config.performance and config.performance.lightweightCheckpointEveryMoves) or 16,
+      checkpointEveryMoves = tonumber(config.performance and config.performance.checkpointEveryMoves) or 32,
+      effective = {
+        gpsVerifyEveryMoves = tonumber(config.performance and config.performance.gpsVerifyEveryMoves) or 32,
+        lightweightCheckpointEveryMoves = tonumber(config.performance and config.performance.lightweightCheckpointEveryMoves) or 16,
+        checkpointEveryMoves = tonumber(config.performance and config.performance.checkpointEveryMoves) or 32,
+      },
+    },
+    returnRoute = returnSnapshot(),
+    ["return"] = returnSnapshot(),
+    lastReturn = returnSnapshot(),
+    returnReason = state.returnReason or state.lastReturnReason,
+    serviceReason = state.service and state.service.reason or state.lastReturnReason,
+    service = state.service and {
+      reason = state.service.reason,
+      startedAt = state.service.startedAt,
+      returnDistance = state.service.returnDistance,
+      returnSeconds = state.service.returnSeconds,
+      adaptive = config.service and config.service.adaptive == true,
+    } or nil,
+    group = state.group and common.copy(state.group) or (state.job and {
+      groupJobId = state.job.groupJobId, groupId = state.job.groupId,
+      assignmentId = state.job.assignmentId, bay = state.job.bay, bayId = state.job.bayId,
+      dock = state.job.dock and common.copy(state.job.dock) or nil,
+      lease = state.job.lease and common.copy(state.job.lease) or nil,
+      bottomY = state.job.bottomY, maxDepth = state.job.maxDepth,
+    } or nil),
+    dock = state.dock and common.copy(state.dock) or (config.dock and common.copy(config.dock) or nil),
+    bay = state.job and (state.job.bay or state.job.bayId) or state.group and (state.group.bay or state.group.bayId) or nil,
+    stagedStop = state.stagedStop == false and false or (state.stagedStop and common.copy(state.stagedStop) or nil),
+    progress = progress,
+    report = state.report and common.copy(state.report) or nil,
+    lastReport = state.report and common.copy(state.report) or state.lastReport,
+    jobReport = state.jobReport and common.copy(state.jobReport) or nil,
+    estimate = state.estimate and common.copy(state.estimate) or nil,
+    capabilities = {
+      gps = true,
+      gpsCalibration = true,
+      lavaSeal = true,
+      chunkExclusions = true,
+      worldPartition = true,
+      localPartition = false,
+      touchController = true,
+      lighting = true,
+      waterHandling = true,
+      materialRecycle = true,
+      stagedStop = true,
+      stateJournal = true,
+      completionReport = true,
+      discardPolicy = true,
+      shortestServiceRoute = type(quarry.shortestServiceRoute) == "function",
+      edgeTransition = type(quarry.edgeTransition) == "function",
+      groupAssignment = true,
+    },
+    job = jobSnapshot(),
+    fuel = fuelLevel(),
+    fuelLimit = fuelLimit(),
+    inventoryUsed = used,
+    inventoryEmpty = empty,
+    inventoryItems = items,
+    remoteConsole = {
+      enabled = config.remoteConsole.enabled == true,
+      allowShell = config.remoteConsole.allowShell == true,
+      active = remoteActive == true,
+      expiresAt = remoteActive and remoteSession.expiresAt or nil,
+      auditCount = #remoteAudit,
+      lastAuditAt = remoteAudit[#remoteAudit] and remoteAudit[#remoteAudit].at or nil,
+    },
+    lastError = state.lastError,
+    completionReason = state.completionReason,
+    recoveryRequired = state.pendingAction ~= nil,
+    pendingAction = state.pendingAction and {
+      kind = state.pendingAction.kind,
+      startedAt = state.pendingAction.startedAt,
+    } or nil,
+    request = state.request,
+    stats = common.copy(state.stats),
+    version = common.VERSION,
+    updatedAt = state.updatedAt,
+  }
+end
+
+local function sendStatus(target, request)
+  if not networkReady then return false end
+  local message = protocol.message("status", config.networkKey, statusPayload(), target)
+  if request and request.id then message.replyTo = request.id end
+  if target then return protocol.send(target, message) end
+  return protocol.broadcast(message)
+end
+
+local function sendAck(target, request, ok, text, result, session)
+  local payload = request and type(request.payload) == "table" and request.payload or {}
+  local ack = {
+    ok = ok == true,
+    message = tostring(text or ""),
+    status = statusPayload(),
+    -- Echo only sanitized assignment identity fields so a controller can
+    -- correlate negative/duplicate ACKs with the intended group dispatch.
+    command = payload.command and tostring(payload.command) or nil,
+    groupJobId = payload.groupJobId and tostring(payload.groupJobId) or nil,
+    assignmentId = payload.assignmentId and tostring(payload.assignmentId) or nil,
+    groupId = payload.groupId and tostring(payload.groupId) or nil,
+    -- Remote-console actions return bounded tables without changing the
+    -- existing ACK fields.  Copy the values so no mutable session object (or
+    -- network key) can leak through the response contract.
+    result = type(result) == "table" and common.copy(result) or nil,
+    session = type(session) == "table" and common.copy(session) or nil,
+  }
+  return protocol.reply(target, config.networkKey, request, "ack", ack)
+end
+
+local function markBlocked(message)
+  state.status = "blocked"
+  state.phase = state.pendingAction and "recovery_required" or "blocked"
+  state.lastError = tostring(message or "Unknown error")
+  common.log("ERROR", state.lastError)
+  saveState()
+  sendStatus()
+end
+
+local function commandSeen(id)
+  if not id then return false end
+  state.recentCommands = state.recentCommands or {}
+  for _, existing in ipairs(state.recentCommands) do if existing == id then return true end end
+  state.recentCommands[#state.recentCommands + 1] = id
+  while #state.recentCommands > 32 do table.remove(state.recentCommands, 1) end
+  return false
+end
+
+local function locateGPS()
+  state.gps = state.gps or common.defaultState().gps
+  if gpsConfig().enabled == false then
+    state.gps.available = false
+    state.gps.lastError = "GPS is disabled in configuration."
+    return nil, state.gps.lastError
+  end
+  if not gps or type(gps.locate) ~= "function" then
+    state.gps.available = false
+    state.gps.lastError = "GPS API is unavailable."
+    return nil, state.gps.lastError
+  end
+  local ok, x, y, z = pcall(gps.locate, tonumber(gpsConfig().timeout) or 2, false)
+  if not ok then
+    local text = tostring(x)
     -- gps.locate waits for events. Preserve Ctrl+T as a real local stop even
     -- when it arrives during a GPS lookup instead of a rednet receive.
     if text == "Terminated" or text:find("Terminated", 1, true) then error(x, 0) end
@@ -24,219 +272,3 @@ end
 local function verifyGPS(force)
   local calibration = gpsCalibration()
   if not calibration then
-    if gpsConfig().required then return false, "GPS is required but the worker is not calibrated." end
-    return true
-  end
-  local interval = math.max(1, tonumber(
-    (config.performance and config.performance.gpsVerifyEveryMoves) or gpsConfig().verifyEveryMoves
-  ) or 32)
-  if not force and ((state.stats.moves or 0) % interval ~= 0) then return true end
-  local fix, fixError = locateGPS()
-  if not fix then
-    if gpsConfig().required then return false, "Required GPS fix failed: " .. tostring(fixError) end
-    return true
-  end
-  local expected = geo.localToWorld(calibration, state.pose)
-  if not geo.samePosition(fix, expected) then
-    return false, ("GPS drift: expected world %d,%d,%d but located %d,%d,%d."):format(
-      expected.x, expected.y, expected.z, fix.x, fix.y, fix.z
-    )
-  end
-  return true
-end
-
-local function assignmentChunkKey(entry, mode)
-  if type(entry) == "string" and entry ~= "" then return entry end
-  if type(entry) ~= "table" then return nil end
-  if entry.key and tostring(entry.key) ~= "" then return tostring(entry.key) end
-  local cx, cz = tonumber(entry.cx), tonumber(entry.cz)
-  if cx and cz and cx == math.floor(cx) and cz == math.floor(cz) then
-    return quarry.chunkKey(entry.mode == "world" and "world" or mode, cx, cz)
-  end
-  return nil
-end
-
-local function localDirectionToWorld(calibration, dir)
-  if not geo.validCalibration(calibration) then return (tonumber(dir) or 0) % 4 end
-  local forward = calibration.forward or {}
-  local right = geo.rightVector(calibration) or { x = 1, z = 0 }
-  local localDir = (tonumber(dir) or 0) % 4
-  local vectors = {
-    [0] = { x = forward.x, z = forward.z },
-    [1] = { x = right.x, z = right.z },
-    [2] = { x = -forward.x, z = -forward.z },
-    [3] = { x = -right.x, z = -right.z },
-  }
-  local vector = vectors[localDir]
-  if vector.x == 0 and vector.z == 1 then return 0 end
-  if vector.x == 1 and vector.z == 0 then return 1 end
-  if vector.x == 0 and vector.z == -1 then return 2 end
-  if vector.x == -1 and vector.z == 0 then return 3 end
-  return localDir
-end
-
-local function worldDirectionToLocal(calibration, dir)
-  if not geo.validCalibration(calibration) then return (tonumber(dir) or 0) % 4 end
-  local forward = calibration.forward or {}
-  local right = geo.rightVector(calibration) or { x = 1, z = 0 }
-  local worldDir = (tonumber(dir) or 0) % 4
-  local vectors = {
-    [0] = { x = 0, z = 1 }, [1] = { x = 1, z = 0 },
-    [2] = { x = 0, z = -1 }, [3] = { x = -1, z = 0 },
-  }
-  local vector = vectors[worldDir]
-  if vector.x == forward.x and vector.z == forward.z then return 0 end
-  if vector.x == right.x and vector.z == right.z then return 1 end
-  if vector.x == -forward.x and vector.z == -forward.z then return 2 end
-  if vector.x == -right.x and vector.z == -right.z then return 3 end
-  return worldDir
-end
-
-assignmentResumeSnapshot = function(source)
-  local job = state.job
-  if not job or not job.groupJobId or not job.assignmentId then return nil end
-  local token = type(source) == "table" and source or checkpointToken()
-  local localPose = token.pose and poseCopy(token.pose) or poseCopy()
-  local calibration = gpsCalibration()
-  if not calibration then return nil end
-  local worldPose = geo.localToWorld(calibration, localPose)
-  if not worldPose then return nil end
-  worldPose.dir = localDirectionToWorld(calibration, localPose.dir)
-  local route = token.route or {
-    layer = job.route and job.route.layer,
-    walkIndex = job.route and job.route.walkIndex,
-    localCursor = job.route and job.route.localCursor,
-    phase = job.route and job.route.phase,
-    currentKey = job.route and job.route.currentKey,
-  }
-  return {
-    schema = common.SCHEMA,
-    jobId = tostring(job.id),
-    -- Controller-side reassignment validation uses the source worker identity
-    -- to prevent a token copied from another miner from being accepted.
-    workerId = tonumber(os.getComputerID and os.getComputerID() or nil) or config.workerId,
-    groupJobId = tostring(job.groupJobId),
-    assignmentId = tostring(job.assignmentId),
-    cursor = tonumber(token.cursor) or tonumber(job.cursor) or 0,
-    route = {
-      layer = tonumber(route.layer) or 0,
-      walkIndex = tonumber(route.walkIndex) or 1,
-      localCursor = tonumber(route.localCursor) or 0,
-      phase = route.phase or "travel",
-      currentKey = route.currentKey,
-    },
-    worldPose = worldPose,
-  }
-end
-
-local function validateAssignmentResumeToken(value, job)
-  if value == nil then return nil end
-  if type(value) ~= "table" then return nil, "assignmentResumeToken must be a table." end
-  if not job or not job.groupJobId or not job.assignmentId or not job.chunkPlan then
-    return nil, "assignmentResumeToken requires a group assignment plan."
-  end
-  if value.jobId == nil or tostring(value.jobId) == "" then
-    return nil, "assignmentResumeToken jobId is required."
-  end
-  if tostring(value.jobId) ~= tostring(job.id) then
-    return nil, "assignmentResumeToken jobId mismatch."
-  end
-  local selfWorkerId = tonumber(os.getComputerID and os.getComputerID() or config.workerId)
-  local tokenWorkerId = tonumber(value.workerId)
-  if tokenWorkerId == nil then
-    return nil, "assignmentResumeToken workerId is required."
-  end
-  if selfWorkerId == nil or tokenWorkerId ~= selfWorkerId then
-    return nil, "assignmentResumeToken workerId does not match this worker."
-  end
-  -- Reassignment carries the source identity for controller auditing.  It
-  -- may legitimately differ from the target worker, but must remain a
-  -- scalar worker id when supplied (initial starts omit it).
-  if value.sourceWorkerId ~= nil and tonumber(value.sourceWorkerId) == nil then
-    return nil, "assignmentResumeToken sourceWorkerId is invalid."
-  end
-  if tostring(value.groupJobId or "") ~= tostring(job.groupJobId)
-    or tostring(value.assignmentId or "") ~= tostring(job.assignmentId) then
-    return nil, "assignmentResumeToken group/assignment identity mismatch."
-  end
-  local world = value.worldPose or value.workWorldPose
-  if type(world) ~= "table" or tonumber(world.x) == nil or tonumber(world.y) == nil or tonumber(world.z) == nil then
-    return nil, "assignmentResumeToken requires an integer worldPose."
-  end
-  for _, coordinate in ipairs({ world.x, world.y, world.z }) do
-    if tonumber(coordinate) ~= math.floor(tonumber(coordinate)) then return nil, "assignmentResumeToken worldPose must be integral." end
-  end
-  local calibration = gpsCalibration()
-  if not calibration then return nil, "assignmentResumeToken requires GPS calibration." end
-  local worldDir = tonumber(world.dir)
-  if worldDir == nil then return nil, "assignmentResumeToken worldPose.dir is required." end
-  if worldDir ~= math.floor(worldDir) or worldDir < 0 or worldDir > 3 then
-    return nil, "assignmentResumeToken worldPose.dir is invalid."
-  end
-  worldDir = math.floor(worldDir) % 4
-  local localDir = worldDirectionToLocal(calibration, worldDir)
-  local localPose, localError = geo.worldToLocal(calibration, {
-    x = tonumber(world.x), y = tonumber(world.y), z = tonumber(world.z),
-  }, localDir)
-  if not localPose then return nil, tostring(localError or "assignmentResumeToken world pose is invalid") end
-  local route = value.route
-  if type(route) ~= "table" then return nil, "assignmentResumeToken route is required." end
-  local layer, walkIndex, localCursor = tonumber(route.layer), tonumber(route.walkIndex), tonumber(route.localCursor)
-  if not layer or layer ~= math.floor(layer) or layer < 0 or layer >= job.depth then return nil, "assignmentResumeToken layer is invalid." end
-  local walkCount = #(job.chunkPlan.walk or {})
-  if not walkIndex or walkIndex ~= math.floor(walkIndex) or walkIndex < 1 or walkIndex > walkCount + 1 then return nil, "assignmentResumeToken walkIndex is invalid." end
-  if not localCursor or localCursor ~= math.floor(localCursor) or localCursor < 0 then return nil, "assignmentResumeToken localCursor is invalid." end
-  local currentKey = route.currentKey and tostring(route.currentKey) or job.chunkPlan.rootKey
-  if not ((job.assignmentSet and job.assignmentSet[currentKey]) or (job.transitSet and job.transitSet[currentKey])) then
-    return nil, "assignmentResumeToken currentKey is outside the assignment."
-  end
-  local walkStep = job.chunkPlan.walk and job.chunkPlan.walk[walkIndex]
-  local terminalWalk = walkIndex == walkCount + 1
-  local walkKey = walkStep and tostring(walkStep.key) or (terminalWalk and tostring(job.chunkPlan.walk[walkCount] and job.chunkPlan.walk[walkCount].key) or nil)
-  if not walkKey then return nil, "assignmentResumeToken walk step is missing." end
-  local phase = tostring(route.phase or "travel")
-  if terminalWalk and (phase ~= "travel" or currentKey ~= walkKey) then
-    return nil, "assignmentResumeToken terminal walk state is inconsistent."
-  end
-  if phase ~= "travel" and currentKey ~= walkKey then
-    return nil, "assignmentResumeToken currentKey does not match route walk step."
-  end
-  if phase == "travel" and currentKey ~= walkKey then
-    local previous = walkIndex > 1 and job.chunkPlan.walk[walkIndex - 1]
-    if not previous or tostring(previous.key) ~= currentKey then
-      return nil, "assignmentResumeToken travel key does not match route walk step."
-    end
-  end
-  local foundKey = quarry.findChunk(job.chunkPlan, localPose.x, localPose.z)
-  if foundKey ~= currentKey then return nil, "assignmentResumeToken worldPose is outside current assignment chunk." end
-  if localPose.y ~= -layer then return nil, "assignmentResumeToken worldPose layer does not match route." end
-  local currentChunk = job.chunkPlan.chunks[currentKey]
-  local count = currentChunk and quarry.chunkCellCount(currentChunk) or 0
-  if localCursor > (tonumber(count) or 0) then return nil, "assignmentResumeToken localCursor is outside chunk." end
-  local cursor = tonumber(value.cursor)
-  if not cursor or cursor ~= math.floor(cursor) or cursor < 0 or cursor > (tonumber(job.total) or 0) then
-    return nil, "assignmentResumeToken cursor is invalid."
-  end
-  if phase ~= "travel" and phase ~= "mine" and phase ~= "return" then return nil, "assignmentResumeToken phase is invalid." end
-  return {
-    pose = localPose,
-    x = localPose.x, y = localPose.y, z = localPose.z, dir = localPose.dir,
-    layer = layer, walkIndex = walkIndex, localCursor = localCursor,
-    phase = phase, currentKey = currentKey, cursor = cursor,
-    route = {
-      layer = layer, walkIndex = walkIndex, localCursor = localCursor,
-      phase = phase, currentKey = currentKey,
-    },
-    jobId = tostring(value.jobId or ""), groupJobId = tostring(value.groupJobId), assignmentId = tostring(value.assignmentId),
-    worldPose = {
-      x = math.floor(tonumber(world.x)), y = math.floor(tonumber(world.y)), z = math.floor(tonumber(world.z)), dir = worldDir,
-    },
-  }
-end
-
-local function validateJob(payload)
-  payload = payload or {}
-  local width, length, depth = tonumber(payload.width), tonumber(payload.length), tonumber(payload.depth)
-  local targetY = tonumber(payload.targetY)
-  local requestedChunkMode = payload.chunkMode == "world" and "world" or "local"
-  if targetY ~= nil then

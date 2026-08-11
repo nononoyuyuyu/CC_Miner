@@ -1,260 +1,284 @@
-    return false, "Lava-seal block inventory missing on configured side " .. side .. "."
-  end
-
-  local originalSlot = turtle.getSelectedSlot()
-  local attempts = 0
-  while sealMaterialCount() < target do
-    drainNetwork(3)
-    if movementInterrupted("service") then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "control_request"
-    end
-    attempts = attempts + 1
-    if attempts > 64 then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-]=] },
-  { source = [[src/ccminer/worker_parts/04.part]], target = [[worker_parts/04.part]], digest = [[fbc125a385c7b9fe8ddbd65fc66320420dbdc3759a9df33db0b5523e2c96bee5]], content = [[      return false, "Seal-block loading safety limit reached."
-    end
-    local slot = refillSlotForSeal()
-    if not slot then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "No inventory space for lava-seal blocks."
-    end
-    turtle.select(slot)
-    local need = math.min(target - sealMaterialCount(), turtle.getItemSpace(slot))
-    if need <= 0 then need = 1 end
-    local sucked = runInventoryPhysicalAction("refill_seal_suck", {
-      slot = slot, count = need, direction = side,
-    }, function() return suckFunction(need) end)
-    if not sucked then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Lava-seal block inventory is empty."
-    end
-    if not isSealItemName(itemName(slot)) then
-      runInventoryPhysicalAction("refill_seal_reject", {
-        slot = slot, item = itemName(slot), direction = side,
-      }, dropFunction)
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Seal inventory contains an unsupported item. Use configured solid blocks only."
-    end
-    state.stats.sealRefills = (state.stats.sealRefills or 0) + 1
-  end
-  local restored, restoreError = restoreSideDirection(side, restoreDir)
-  turtle.select(originalSlot)
-  if not restored then return false, restoreError end
-  saveState()
-  return true
+  if not name or name == "unknown" then return true end
+  if isTorchItemName(name) or isFuelItem(slot) then return true end
+  if isOreOrRawMaterial(name) or isUnknownModItem(name) then return true end
+  return false
 end
 
-local function refillTorchAtHome()
-  local mode = effectiveLighting()
-  if mode == "off" then return true end
-  state.phase, state.status = "refilling_torch", "working"
-  saveState("refill_torch")
-  local materials = materialsConfig()
-  local lighting = config.lighting or {}
-  local target = tonumber(lighting.target or lighting.torchTarget or materials.torchTarget or config.torchTarget) or 32
-  target = math.max(1, math.floor(target))
-  if torchMaterialCount() >= target then return true end
-  local side = lighting.side or config.torchSide or "left"
-  local inspectFunction, suckFunction, dropFunction, restoreDir, sideError = sideFunctions(side)
-  if not inspectFunction then return false, sideError end
-  local checkSide = (side == "top" and "top") or (side == "bottom" and "bottom") or "front"
-  if not inventoryPresent(checkSide, inspectFunction) then
-    restoreSideDirection(side, restoreDir)
-    return false, "Torch inventory missing on configured side " .. side .. "."
+local function explicitAllowlisted(name, policy)
+  local allowlist = policy and (policy.allowlist or policy.allowList or policy.allowedItems)
+  if type(allowlist) ~= "table" then return false end
+  if allowlist[name] == true or allowlist[name] == 1 then return true end
+  for _, item in ipairs(allowlist) do if tostring(item) == tostring(name) then return true end end
+  return false
+end
+
+local function discardCandidate(slot, name, totalSeal, policy, mode)
+  if mode == "KEEP_ALL" then return false end
+  if mode == "CUSTOM_ALLOWLIST" then
+    -- Explicit allowlists never override seal reserve protection.
+    -- Ores/raw materials, torches, and fuel remain hard protected even when
+    -- a broad allowlist is supplied.  Unknown mod items are discardable only
+    -- when their exact name is explicitly allowlisted.
+    if isSealItemName(name) or isTorchItemName(name) or isFuelItem(slot)
+      or isOreOrRawMaterial(name) then return false end
+    return explicitAllowlisted(name, policy)
   end
-  local originalSlot = turtle.getSelectedSlot()
-  local attempts = 0
-  while torchMaterialCount() < target do
-    drainNetwork(3)
-    if movementInterrupted("service") then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "control_request"
+  if discardProtectedItem(slot, name) then return false end
+  if mode == "DISCARD_EXCESS_STONE" then
+    local stone = policy.stoneAllowlist or {
+      ["minecraft:stone"] = true, ["minecraft:cobblestone"] = true,
+      ["minecraft:cobbled_deepslate"] = true,
+    }
+    if not (stone[name] == true or name == "minecraft:stone" or name == "minecraft:cobblestone" or name == "minecraft:cobbled_deepslate") then
+      return false
     end
-    attempts = attempts + 1
-    if attempts > 64 then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Torch loading safety limit reached."
+    -- Seal stock is retained by item count.  We drop whole stacks only when
+    -- doing so leaves the configured 64 (or explicit) reserve intact.
+    if isSealItemName(name) then
+      local keep = math.max(1, tonumber(config.discard and config.discard.retainSealTarget) or 64)
+      return totalSeal > keep
     end
-    local slot = nil
-    local preferred = preferredTorchSlots()
-    if type(preferred) == "table" then
-      for _, candidate in ipairs(preferred) do
-        local candidateSlot = tonumber(candidate)
-        if candidateSlot and not isReservedSlot(candidateSlot, "torch") and turtle.getItemCount(candidateSlot) == 0 then
-          slot = candidateSlot
-          break
+    return true
+  end
+  return false
+end
+
+local function discardStatsTable()
+  state.discardStats = state.discardStats or {}
+  state.discard = state.discard or state.discardStats
+  local stats = state.discardStats
+  state.discard = common.merge(stats, state.discard)
+  stats.mode = (config.discard and config.discard.mode) or stats.mode or "KEEP_ALL"
+  stats.triggerEmptySlots = tonumber(config.discard and config.discard.triggerEmptySlots) or 3
+  stats.maxStacksPerPass = tonumber(config.discard and config.discard.maxStacksPerPass) or 8
+  stats.byName = stats.byName or {}
+  return stats
+end
+
+local function noteDiscard(name, count)
+  local stats = discardStatsTable()
+  count = math.max(0, tonumber(count) or 0)
+  stats.items = (stats.items or 0) + count
+  stats.discarded = (stats.discarded or 0) + count
+  stats.stacks = (stats.stacks or 0) + 1
+  stats.byName[name] = (stats.byName[name] or 0) + count
+  stats.lastAt = common.nowSeconds()
+  state.stats.discardedBlocks = (state.stats.discardedBlocks or 0) + count
+  state.stats.discardPasses = (state.stats.discardPasses or 0) + 1
+end
+
+local function noteDiscardSkip(name, unknown)
+  local stats = discardStatsTable()
+  stats.skipped = (stats.skipped or 0) + 1
+  if unknown then stats.unknown = (stats.unknown or 0) + 1; state.stats.discardUnknown = (state.stats.discardUnknown or 0) + 1 end
+  state.stats.discardSkipped = (state.stats.discardSkipped or 0) + 1
+  stats.lastAt = common.nowSeconds()
+end
+
+local function sideTargetDirection(baseDir, side)
+  side = tostring(side or "front"):lower()
+  if side == "up" then side = "top" end
+  if side == "down" then side = "bottom" end
+  local relative = { front = 0, right = 1, back = 2, left = 3 }
+  if relative[side] == nil then return nil end
+  return ((tonumber(baseDir) or 0) + relative[side]) % 4
+end
+
+local function recycleRetainTarget()
+  local materials, recycle = materialsConfig()
+  local target = materials.retainSealTarget
+    or recycle.maxHeld
+    or recycle.retainSealTarget
+    or config.retainSealTarget
+    or config.sealTarget
+    or 64
+  return math.max(0, math.floor(tonumber(target) or 64))
+end
+
+local function compressSealStacks()
+  local moved = 0
+  for destination = 1, 16 do
+    if not isReservedSlot(destination, "seal") and turtle.getItemCount(destination) > 0 and isSealItemName(itemName(destination)) then
+      local name = itemName(destination)
+      local space = turtle.getItemSpace(destination)
+      if space > 0 then
+        for source = 1, 16 do
+          if source ~= destination and not isReservedSlot(source, "seal")
+            and turtle.getItemCount(source) > 0 and itemName(source) == name then
+            turtle.select(source)
+            local before = turtle.getItemCount(source)
+            local ok = turtle.transferTo(destination, math.min(space, before))
+            local after = turtle.getItemCount(source)
+            if ok and after < before then
+              local amount = before - after
+              moved = moved + amount
+              space = turtle.getItemSpace(destination)
+              if space <= 0 then break end
+            end
+          end
         end
       end
     end
-    if not slot then
-      for candidate = 1, 16 do
-        if not isReservedSlot(candidate, "torch") and turtle.getItemCount(candidate) == 0 then slot = candidate; break end
+  end
+  if moved > 0 then
+    state.stats.compressions = (state.stats.compressions or 0) + 1
+    state.recycle.compressed = (state.recycle.compressed or 0) + moved
+  end
+  return moved
+end
+
+local function compressInventoryAtField()
+  -- compactEvery is a local inventory operation.  It must never create a
+  -- service/return merely to consolidate stacks, and it must not touch
+  -- protected reserve slots or split a stack while moving items.
+  local originalSlot = turtle.getSelectedSlot()
+  local moved = compressSealStacks()
+  for destination = 1, 16 do
+    if not isReservedSlot(destination) and turtle.getItemCount(destination) > 0 then
+      local name = itemName(destination)
+      if name then
+        local space = turtle.getItemSpace(destination)
+        if space > 0 then
+          for source = 1, 16 do
+            if source ~= destination and not isReservedSlot(source)
+              and turtle.getItemCount(source) > 0 and itemName(source) == name then
+              turtle.select(source)
+              local before = turtle.getItemCount(source)
+              local ok = turtle.transferTo(destination, math.min(space, before))
+              local after = turtle.getItemCount(source)
+              if ok and after < before then
+                local amount = before - after
+                moved = moved + amount
+                space = turtle.getItemSpace(destination)
+                if space <= 0 then break end
+              end
+            end
+          end
+        end
       end
     end
-    if not slot then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "No inventory space for torches."
-    end
-    turtle.select(slot)
-    local need = math.min(target - torchMaterialCount(), turtle.getItemSpace(slot))
-    if need <= 0 then need = 1 end
-    local sucked = runInventoryPhysicalAction("refill_torch_suck", {
-      slot = slot, count = need, direction = side,
-    }, function() return suckFunction(need) end)
-    if not sucked then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Torch inventory is empty."
-    end
-    if not isTorchItemName(itemName(slot)) then
-      runInventoryPhysicalAction("refill_torch_reject", {
-        slot = slot, item = itemName(slot), direction = side,
-      }, dropFunction)
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Torch inventory contains an unsupported item."
-    end
-    state.stats.torchRefills = (state.stats.torchRefills or 0) + 1
   end
-  local restored, restoreError = restoreSideDirection(side, restoreDir)
   turtle.select(originalSlot)
-  if not restored then return false, restoreError end
-  saveState("refill_torch_done")
+  if moved > 0 then
+    state.stats.compressions = (state.stats.compressions or 0) + 1
+    state.recycle = state.recycle or {}
+    state.recycle.compressed = (state.recycle.compressed or 0) + moved
+    state.recycle.lastAt = common.nowSeconds()
+  end
+  state.stats.lastCompressionAt = common.nowSeconds()
+  return moved
+end
+
+local function updateRecycleInventoryState()
+  local held, byName = 0, {}
+  for slot = 1, 16 do
+    local name = itemName(slot)
+    if name and isSealItemName(name) then
+      local count = turtle.getItemCount(slot)
+      held = held + count
+      byName[name] = (byName[name] or 0) + count
+    end
+  end
+  state.recycle = state.recycle or {}
+  state.recycle.held, state.recycle.byName = held, byName
+  state.recycle.cap = recycleRetainTarget()
+  state.recycle.overflow = math.max(0, held - state.recycle.cap)
+  return held
+end
+
+local function inventoryPresent(side, inspectFunction)
+  if peripheral and peripheral.hasType then
+    local ok, result = pcall(peripheral.hasType, side, "inventory")
+    if ok and result == true then return true end
+  end
+  local wrapped = peripheral and peripheral.wrap(side) or nil
+  if wrapped and (type(wrapped.list) == "function" or type(wrapped.size) == "function") then return true end
+  if inspectFunction then
+    local ok, present, data = pcall(inspectFunction)
+    if ok and present and looksLikeInventoryBlock(data) then return true end
+  end
+  return false
+end
+
+local function sideFunctions(side)
+  local restoreDir = state.pose.dir
+  if side == "front" then
+    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
+  elseif side == "back" then
+    local ok, err = turnTo(2)
+    if not ok then return nil, nil, nil, restoreDir, err end
+    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
+  elseif side == "right" then
+    local ok, err = turnTo(1)
+    if not ok then return nil, nil, nil, restoreDir, err end
+    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
+  elseif side == "left" then
+    local ok, err = turnTo(3)
+    if not ok then return nil, nil, nil, restoreDir, err end
+    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
+  elseif side == "top" then
+    return turtle.inspectUp, turtle.suckUp, turtle.dropUp, restoreDir
+  elseif side == "bottom" then
+    return turtle.inspectDown, turtle.suckDown, turtle.dropDown, restoreDir
+  end
+  return nil, nil, nil, restoreDir, "Unsupported inventory side: " .. tostring(side)
+end
+
+local function restoreSideDirection(side, restoreDir)
+  if side == "front" or side == "back" or side == "right" or side == "left" then return turnTo(restoreDir) end
   return true
 end
 
-local function beginService(resumeAfter, finalStatus, reason, preserveCheckpoint)
-  if not state.service then
-    if not isHome() and not state.checkpoint then installCheckpointToken(checkpointToken()) end
-    state.serviceReturn = {}
-    state.service = {
-      resumeAfter = resumeAfter == true,
-      finalStatus = finalStatus or (resumeAfter and "working" or "paused"),
-      preserveCheckpoint = preserveCheckpoint == true,
-      reason = reason or "service",
-      startedAt = common.nowSeconds(),
-      returnDistance = 0,
-      returnStartedAt = nil,
-      returnEndedAt = nil,
-    }
-  else
-    if resumeAfter == false then state.service.resumeAfter = false end
-    if finalStatus then state.service.finalStatus = finalStatus end
-    if preserveCheckpoint ~= nil then state.service.preserveCheckpoint = preserveCheckpoint == true end
-    if reason then state.service.reason = reason end
+local function runInventoryPhysicalAction(kind, details, action)
+  local prepared, prepareError = beginPhysicalAction(kind, details, poseCopy())
+  if not prepared then return false, prepareError end
+  local ok, result = pcall(action)
+  if not ok then
+    -- Leave pendingAction intact: an exception leaves inventory outcome
+    -- ambiguous and boot recovery must stop for manual revalidation.
+    return false, tostring(result)
   end
-  if state.checkpoint and not state.resumeToken then state.resumeToken = common.copy(state.checkpoint) end
-  if state.job and state.job.groupJobId then
-    state.assignmentResumeToken = assignmentResumeSnapshot(state.resumeToken or state.checkpoint or checkpointToken())
-  end
-  if resumeAfter and not isHome() and not state.checkpoint then installCheckpointToken(checkpointToken()) end
-  state.returnReason = reason or state.returnReason
-  state.lastReturnReason = reason or state.lastReturnReason
-  state.status, state.phase, state.request = "working", "service_requested", nil
-  saveState()
+  commitPhysicalAction()
+  return result == true, result
 end
 
-local function finishService()
-  local service = state.service or {}
-  local finalStatus = service.finalStatus or (service.resumeAfter and "working" or "paused")
-  local preserveCheckpoint = service.preserveCheckpoint == true
-  state.lastReturnReason = service.reason or state.returnReason or state.lastReturnReason
-  state.service, state.request, state.lastError = nil, nil, nil
-  state.stagedStop = false
-  state.stats.services = (state.stats.services or 0) + 1
-  if finalStatus == "complete" then
-    state.stats.jobsCompleted = (state.stats.jobsCompleted or 0) + 1
-    state.checkpoint = nil
-    -- Completion is terminal: do not leave a stale work-point token that
-    -- could be overlaid by a later pending snapshot or mistaken for a
-    -- resumable assignment.
-    state.resumeToken = nil
-    state.assignmentResumeToken = nil
-    state.status, state.phase = "complete", "home"
-    state.estimate = state.estimate or {}
-    state.estimate.actual = state.job and state.job.cursor or 0
-    state.estimate.variance = (state.estimate.actual or 0) - (tonumber(state.estimate.estimated) or (state.estimate.actual or 0))
-    state.report = {
-      jobId = state.job and state.job.id or nil,
-      assignmentId = state.job and state.job.assignmentId or nil,
-      groupJobId = state.job and state.job.groupJobId or nil,
-      group = state.group and common.copy(state.group) or nil,
-      reason = state.completionReason,
-      returnReason = state.lastReturnReason or state.returnReason,
-      ["return"] = state.serviceReturn and common.copy(state.serviceReturn) or nil,
-      completedAt = common.nowSeconds(),
-      elapsed = state.job and math.max(0, common.nowSeconds() - (state.job.startedAt or common.nowSeconds())) or 0,
-      progress = state.job and { cursor = state.job.cursor or 0, total = state.job.total or 0 } or nil,
-      stats = common.copy(state.stats),
-      estimated = state.estimate and state.estimate.estimated or nil,
-      actual = state.job and state.job.cursor or nil,
-      materials = {
-        torchCount = torchMaterialCount(), sealCount = sealMaterialCount(),
-      },
-      discard = common.copy(state.discardStats or state.discard or {}),
-      throughput = throughputSnapshot(),
-      assignmentResumeToken = nil,
-    }
-    state.stats.jobReports = (state.stats.jobReports or 0) + 1
-    state.job.report = common.copy(state.report)
-    state.lastReport = common.copy(state.report)
-    state.jobReport = common.copy(state.report)
-  elseif finalStatus == "aborted" then
-    state.stats.jobsAborted = (state.stats.jobsAborted or 0) + 1
-    state.checkpoint = nil
-    state.status, state.phase = "aborted", "home"
-    state.estimate = state.estimate or {}
-    state.estimate.actual = state.job and state.job.cursor or 0
-    state.estimate.variance = (state.estimate.actual or 0) - (tonumber(state.estimate.estimated) or (state.estimate.actual or 0))
-    state.report = {
-      jobId = state.job and state.job.id or nil,
-      assignmentId = state.job and state.job.assignmentId or nil,
-      groupJobId = state.job and state.job.groupJobId or nil,
-      group = state.group and common.copy(state.group) or nil,
-      reason = state.completionReason or service.reason or "aborted",
-      returnReason = state.lastReturnReason or state.returnReason,
-      ["return"] = state.serviceReturn and common.copy(state.serviceReturn) or nil,
-      aborted = true,
-      completedAt = common.nowSeconds(),
-      elapsed = state.job and math.max(0, common.nowSeconds() - (state.job.startedAt or common.nowSeconds())) or 0,
-      progress = state.job and { cursor = state.job.cursor or 0, total = state.job.total or 0 } or nil,
-      stats = common.copy(state.stats),
-      estimated = state.estimate and state.estimate.estimated or nil,
-      actual = state.job and state.job.cursor or nil,
-      materials = { torchCount = torchMaterialCount(), sealCount = sealMaterialCount() },
-      discard = common.copy(state.discardStats or state.discard or {}),
-      throughput = throughputSnapshot(),
-      assignmentResumeToken = state.assignmentResumeToken and common.copy(state.assignmentResumeToken)
-        or assignmentResumeSnapshot(state.resumeToken or state.checkpoint),
-    }
-    state.stats.jobReports = (state.stats.jobReports or 0) + 1
-    if state.job then state.job.report = common.copy(state.report) end
-    state.lastReport = common.copy(state.report)
-    state.jobReport = common.copy(state.report)
-  elseif finalStatus == "paused" then
-    if not preserveCheckpoint then state.checkpoint = nil end
-    state.status, state.phase = "paused", "home_paused"
-  else
-    state.checkpoint = nil
-    state.status, state.phase = "working", "mining"
+local function unloadAtHome()
+  state.phase, state.status = "unloading", "working"
+  saveState("unload_start")
+  local originalSlot = turtle.getSelectedSlot()
+  local outputSide = config.outputSide or "back"
+  local outInspect, _, outDrop, outRestore, sideError = sideFunctions(outputSide)
+  if not outInspect then turtle.select(originalSlot); return false, sideError end
+  local outCheck = (outputSide == "top" and "top") or (outputSide == "bottom" and "bottom") or "front"
+  if not inventoryPresent(outCheck, outInspect) then
+    restoreSideDirection(outputSide, outRestore)
+    turtle.select(originalSlot)
+    return false, "Output inventory missing on configured side " .. outputSide .. "."
   end
-  saveState("service_finished", true)
-  heartbeat(true)
-end
 
-local function continueService()
-  if not state.service then return true end
-  state.status = "working"
-  state.service.returnStartedAt = state.service.returnStartedAt or common.nowSeconds()
-  state.service.returnDistance = state.service.returnDistance or 0
-  state.serviceReturn = state.serviceReturn or {}
+  local policy, mode = discardPolicy()
+  local discardStats = discardStatsTable()
+  discardStats.lastError = nil
+  local _, emptySlots = inventoryStats()
+  local trigger = tonumber(policy.triggerEmptySlots) or 3
+  local discardEnabled = mode ~= "KEEP_ALL" and emptySlots <= trigger
+  local discardSide = policy.direction or "back"
+  if discardSide == "up" then discardSide = "top" end
+  if discardSide == "down" then discardSide = "bottom" end
+  local outputTargetDir = sideTargetDirection(outRestore, outputSide)
+  local discardTargetDir = sideTargetDirection(outRestore, discardSide)
+  local discardInspect, _, discardDrop, discardRestore
+  local discardReady, discardError = true, nil
+  if discardEnabled and discardSide ~= outputSide then
+    discardInspect, _, discardDrop, discardRestore, discardError = sideFunctions(discardSide)
+    if not discardInspect then discardReady = false end
+    local checkSide = (discardSide == "top" and "top") or (discardSide == "bottom" and "bottom") or "front"
+    if discardReady and not inventoryPresent(checkSide, discardInspect) then
+      discardReady, discardError = false, "Discard inventory missing on configured side " .. tostring(discardSide) .. "."
+    end
+  elseif discardEnabled then
+    discardInspect, discardDrop, discardRestore = outInspect, outDrop, outRestore
+  end
+  if discardEnabled and not discardReady then
+    restoreSideDirection(discardSide, discardRestore or outRestore)
+    turtle.select(originalSlot)

@@ -1,3 +1,188 @@
+      rebasedMaxZ = rebasedMaxZ and math.max(rebasedMaxZ, localZ) or localZ
+    end
+    chunk.referenceMinX, chunk.referenceMaxX = minX, maxX
+    chunk.referenceMinZ, chunk.referenceMaxZ = minZ, maxZ
+    chunk.minX, chunk.maxX = rebasedMinX, rebasedMaxX
+    chunk.minZ, chunk.maxZ = rebasedMinZ, rebasedMaxZ
+    return true
+  end
+  for _, key in ipairs(sourceKeys) do
+    local ok, rebaseError = rebaseBounds(sourceChunks[key])
+    if not ok then return nil, rebaseError end
+  end
+  if not assignedConnected(sourceChunks, mineKeys) then return nil, "assigned_chunks_disconnected" end
+
+  local seedKey = options.seedKey or (assignment and assignment.seedKey) or mineKeys[1]
+  if seedKey ~= nil then seedKey = tostring(seedKey) end
+  if not seedKey or not mineSet[seedKey] then return nil, "assigned_seed_not_mineable" end
+  local rootKey = options.rootKey or referenceRootKey or sourceKeys[1]
+  rootKey = rootKey and tostring(rootKey) or nil
+  local dockKey = options.dockKey or options.entranceKey or rootKey
+  dockKey = dockKey and tostring(dockKey) or nil
+  if workerCalibration then
+    local dockWorldX, dockWorldZ = localToWorld(workerCalibration, 0, 1)
+    local expectedDockKey = chunkKey("world", math.floor(dockWorldX / 16), math.floor(dockWorldZ / 16))
+    if not sourceChunks[expectedDockKey] then return nil, "worker_entrance_chunk_missing" end
+    if options.dockKey and tostring(options.dockKey) ~= expectedDockKey then return nil, "worker_dock_chunk_mismatch" end
+    dockKey = expectedDockKey
+    -- A group may share one controller dock while workers enter from
+    -- distinct bay chunks.  The worker-local entrance therefore need only be
+    -- present in the catalog and explicitly mineable/transit-allowed below;
+    -- it is not required to equal the reference worker's root chunk.
+  end
+  if not dockKey or not sourceChunks[dockKey] then return nil, "unknown_dock_chunk" end
+  if not mineSet[dockKey] and not transitSet[dockKey] then
+    return nil, "dock_requires_explicit_transit:" .. dockKey
+  end
+
+  local allSet, allKeys = {}, {}
+  for _, key in ipairs(mineKeys) do allSet[key] = true; allKeys[#allKeys + 1] = key end
+  for _, key in ipairs(transitKeys) do
+    if not allSet[key] then allSet[key] = true; allKeys[#allKeys + 1] = key end
+  end
+  table.sort(allKeys, function(left, right) return chunkComparator(sourceChunks[left], sourceChunks[right]) end)
+  local chunks = {}
+  for _, key in ipairs(allKeys) do
+    local source = sourceByKey[key] or sourceChunks[key]
+    local copy = cloneValue(source)
+    if type(copy) ~= "table" then return nil, "invalid_chunk_catalog" end
+    copy.key, copy.mode = key, "world"
+    copy.cx, copy.cz = sourceChunks[key].cx, sourceChunks[key].cz
+    copy.minX, copy.maxX = sourceChunks[key].minX, sourceChunks[key].maxX
+    copy.minZ, copy.maxZ = sourceChunks[key].minZ, sourceChunks[key].maxZ
+    copy.referenceMinX, copy.referenceMaxX = sourceChunks[key].referenceMinX, sourceChunks[key].referenceMaxX
+    copy.referenceMinZ, copy.referenceMaxZ = sourceChunks[key].referenceMinZ, sourceChunks[key].referenceMaxZ
+    copy.cells = sourceChunks[key].cells
+    copy.mine = mineSet[key] == true
+    copy.transit = transitSet[key] == true and not copy.mine
+    copy.parent, copy.anchor, copy.optimizedAnchor = nil, nil, nil
+    chunks[key] = copy
+  end
+  buildNeighborGraph(chunks, allKeys)
+
+  -- Every non-assigned edge on dock -> seed must be explicitly leased as
+  -- transit.  This also permits an entrance outside the worker's mine region
+  -- without silently granting access to arbitrary shared chunks.
+  local servicePath, serviceError = shortestPathInternal(chunks, dockKey, seedKey)
+  if not servicePath then return nil, serviceError or "service_route_disconnected" end
+  for _, key in ipairs(servicePath) do
+    if not mineSet[key] and not transitSet[key] then return nil, "service_route_requires_transit:" .. key end
+  end
+
+  -- Runtime movement still consumes `chunk.anchor`, including on older
+  -- workers that do not understand serviceRoute waypoints.  Populate every
+  -- mine/transit chunk with independent valid cells before constructing the
+  -- assigned DFS walk.
+  for _, key in ipairs(allKeys) do
+    local chunk = chunks[key]
+    local anchor = M.chunkAnchor(chunk) or { x = chunk.minX, z = chunk.minZ }
+    chunk.anchor = { x = anchor.x, z = anchor.z }
+  end
+  if chunks[seedKey] then
+    local entranceAnchor = contains(chunks[seedKey], 0, 1)
+      and { x = 0, z = 1 }
+      or M.chunkAnchor(chunks[seedKey], { x = 0, z = 1 })
+    if entranceAnchor then chunks[seedKey].anchor = { x = entranceAnchor.x, z = entranceAnchor.z } end
+  end
+  if chunks[dockKey] then
+    local dockAnchor = contains(chunks[dockKey], 0, 1)
+      and { x = 0, z = 1 }
+      or M.chunkAnchor(chunks[dockKey], { x = 0, z = 1 })
+    if dockAnchor then chunks[dockKey].anchor = { x = dockAnchor.x, z = dockAnchor.z } end
+  end
+  for index = 2, #servicePath do
+    local previousKey, currentKey = servicePath[index - 1], servicePath[index]
+    local boundary = M.chunkAnchor(chunks[currentKey], chunks[previousKey])
+    if boundary and currentKey ~= seedKey then chunks[currentKey].anchor = { x = boundary.x, z = boundary.z } end
+  end
+
+  local walk, visited = assignedWalk(chunks, mineKeys, seedKey, mineSet)
+  for _, key in ipairs(mineKeys) do
+    if not visited[key] then return nil, "assigned_chunks_disconnected" end
+  end
+  local mineCopies = {}
+  for _, key in ipairs(mineKeys) do mineCopies[key] = cloneValue(chunks[key]); mineCopies[key].neighbors = {} end
+  buildNeighborGraph(mineCopies, mineKeys)
+  local optimized, optimizedOrder = optimizedWalk(mineCopies, mineKeys, seedKey)
+  for _, key in ipairs(mineKeys) do
+    if mineCopies[key].optimizedAnchor then
+      chunks[key].optimizedAnchor = { x = mineCopies[key].optimizedAnchor.x, z = mineCopies[key].optimizedAnchor.z }
+    end
+  end
+  local routeCopy = {}
+  for index, key in ipairs(optimizedOrder) do routeCopy[index] = key end
+  local assignedColumns = 0
+  local assignedBounds
+  for _, key in ipairs(mineKeys) do assignedColumns = assignedColumns + chunks[key].cells end
+  for _, key in ipairs(mineKeys) do
+    local chunk = chunks[key]
+    assignedBounds = assignedBounds or { minX = chunk.minX, maxX = chunk.maxX, minZ = chunk.minZ, maxZ = chunk.maxZ }
+    assignedBounds.minX, assignedBounds.maxX = math.min(assignedBounds.minX, chunk.minX), math.max(assignedBounds.maxX, chunk.maxX)
+    assignedBounds.minZ, assignedBounds.maxZ = math.min(assignedBounds.minZ, chunk.minZ), math.max(assignedBounds.maxZ, chunk.maxZ)
+  end
+  local servicePlan = {
+    mode = "world", chunks = chunks, rootKey = dockKey,
+  }
+  local dockPose = { chunkKey = dockKey }
+  if chunks[dockKey] then
+    local dockAnchor = chunks[dockKey].anchor
+    if contains(chunks[dockKey], 0, 1) then
+      dockPose.x, dockPose.z = 0, 1
+    elseif dockAnchor then
+      dockPose.x, dockPose.z = dockAnchor.x, dockAnchor.z
+    end
+  end
+  local serviceRoute = M.shortestServiceRoute(servicePlan,
+    dockPose, { chunkKey = seedKey }, { y = options.y or options.bottomY or 0 })
+  if not serviceRoute then return nil, "service_route_disconnected" end
+  return {
+    mode = "world",
+    rootKey = seedKey,
+    dockKey = dockKey,
+    entranceKey = dockKey,
+    seedKey = seedKey,
+    chunks = chunks,
+    assignedKeys = cloneStringArray(mineKeys),
+    mineChunkKeys = cloneStringArray(mineKeys),
+    transitKeys = cloneStringArray(transitKeys),
+    serviceRoute = {
+      chunkKeys = cloneStringArray(serviceRoute.chunkKeys),
+      keys = cloneStringArray(serviceRoute.keys or serviceRoute.chunkKeys),
+      path = cloneStringArray(serviceRoute.path or serviceRoute.chunkKeys),
+      transitKeys = cloneStringArray(serviceRoute.transitKeys or serviceRoute.chunkKeys),
+      waypoints = cloneValue(serviceRoute.waypoints),
+      distance = serviceRoute.distance,
+      fallback = serviceRoute.fallback,
+    },
+    transitRouteKeys = cloneStringArray(servicePath),
+    walk = walk,
+    optimizedWalk = optimized,
+    optimizedRoute = optimizedOrder,
+    route = routeCopy,
+    columns = assignedColumns,
+    selectedChunks = #mineKeys,
+    catalogCount = #sourceKeys,
+    bounds = assignedBounds,
+    referenceCalibration = cloneValue(referenceCalibration),
+    workerCalibration = cloneValue(workerCalibration),
+    workerId = assignment and assignment.workerId or options.workerId,
+    groupJobId = assignment and assignment.groupJobId or options.groupJobId,
+    homeY = assignment and assignment.homeY or options.homeY,
+    bottomY = assignment and assignment.bottomY or options.bottomY,
+    depth = assignment and assignment.layers or options.layers,
+  }
+end
+
+M.assignedChunkPlan = M.buildAssignedChunkPlan
+M.buildWorkerChunkPlan = M.buildAssignedChunkPlan
+M.planAssignedChunks = M.buildAssignedChunkPlan
+M.planAssignment = M.buildAssignedChunkPlan
+M.buildAssignmentPlan = M.buildAssignedChunkPlan
+
+local function boundsFrom(value, length, options)
+  options = type(options) == "table" and options or {}
+  local minX, maxX, minZ, maxZ
+  if type(value) == "table" then
     if value.minX ~= nil and value.maxX ~= nil and value.minZ ~= nil and value.maxZ ~= nil then
       minX, maxX = integerValue(value.minX), integerValue(value.maxX)
       minZ, maxZ = integerValue(value.minZ), integerValue(value.maxZ)
@@ -54,218 +239,3 @@ function M.gridPage(bounds, page, pageWidth, pageHeight)
   pageWidth = integerValue(pageWidth, 1, MAX_DIMENSION) or 16
   pageHeight = integerValue(pageHeight, 1, MAX_DIMENSION) or pageWidth
   local pagesX = math.ceil(normalized.width / pageWidth)
-  local pagesZ = math.ceil(normalized.length / pageHeight)
-  local pageCount = pagesX * pagesZ
-  page = integerValue(page, 1, pageCount) or 1
-  local pageIndex = page - 1
-  local pageX, pageZ = pageIndex % pagesX, math.floor(pageIndex / pagesX)
-  local minX = normalized.minX + pageX * pageWidth
-  local minZ = normalized.minZ + pageZ * pageHeight
-  local maxX = math.min(normalized.maxX, minX + pageWidth - 1)
-  local maxZ = math.min(normalized.maxZ, minZ + pageHeight - 1)
-  return {
-    page = page, pageIndex = pageIndex, pageCount = pageCount,
-    pagesX = pagesX, pagesZ = pagesZ, pageX = pageX, pageZ = pageZ,
-    pageWidth = pageWidth, pageHeight = pageHeight,
-    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
-    width = maxX - minX + 1, length = maxZ - minZ + 1,
-    cells = (maxX - minX + 1) * (maxZ - minZ + 1),
-  }
-end
-
-M.getGridPage = M.gridPage
-M.page = M.gridPage
-M.gridPageInfo = M.gridPage
-M.pageInfo = M.gridPage
-
-function M.gridCell(bounds, index)
-  local normalized, boundsError = boundsFrom(bounds)
-  if not normalized then return nil, boundsError end
-  index = integerValue(index, 0)
-  if not index or index >= normalized.cells then return nil, "index_out_of_range" end
-  local row = math.floor(index / normalized.length)
-  local column = index % normalized.length
-  local z = row % 2 == 0 and (normalized.minZ + column) or (normalized.maxZ - column)
-  return { x = normalized.minX + row, z = z, index = index, row = row, column = column }
-end
-
-M.getGridCell = M.gridCell
-
-function M.gridCellInfo(bounds, x, z)
-  local normalized, boundsError = boundsFrom(bounds)
-  if not normalized then return nil, boundsError end
-  x, z = integerValue(x), integerValue(z)
-  if not x or not z then return nil, "invalid_position" end
-  local inside = contains(normalized, x, z)
-  local info = { x = x, z = z, inside = inside }
-  if inside then
-    local row, column = x - normalized.minX, z - normalized.minZ
-    info.row, info.column = row, column
-    info.index = row * normalized.length + (row % 2 == 0 and column or normalized.length - 1 - column)
-  end
-  return info
-end
-
-M.getCellInfo = M.gridCellInfo
-M.cellInfo = M.gridCellInfo
-
-function M.selectRectangle(bounds, x1, z1, x2, z2, options)
-  local normalized, boundsError = boundsFrom(bounds)
-  if not normalized then return nil, boundsError end
-  if type(x1) == "table" then
-    options = z1
-    local selection = x1
-    x1, z1, x2, z2 = selection.x1 or selection.minX, selection.z1 or selection.minZ, selection.x2 or selection.maxX, selection.z2 or selection.maxZ
-  end
-  x1, z1, x2, z2 = integerValue(x1), integerValue(z1), integerValue(x2), integerValue(z2)
-  if not x1 or not z1 or not x2 or not z2 then return nil, "invalid_rectangle" end
-  if x1 > x2 then x1, x2 = x2, x1 end
-  if z1 > z2 then z1, z2 = z2, z1 end
-  local minX, maxX = math.max(x1, normalized.minX), math.min(x2, normalized.maxX)
-  local minZ, maxZ = math.max(z1, normalized.minZ), math.min(z2, normalized.maxZ)
-  if minX > maxX or minZ > maxZ then return nil, "rectangle_out_of_bounds" end
-  local count = (maxX - minX + 1) * (maxZ - minZ + 1)
-  local result = {
-    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
-    width = maxX - minX + 1, length = maxZ - minZ + 1,
-    count = count, cellsCount = count,
-    clipped = minX ~= x1 or maxX ~= x2 or minZ ~= z1 or maxZ ~= z2,
-  }
-  local includeCells = true
-  if type(options) == "table" and options.includeCells == false then includeCells = false end
-  if type(options) == "boolean" then includeCells = options end
-  if includeCells and count <= MAX_SELECTION_CELLS then
-    result.cells = {}
-    for x = minX, maxX do
-      for z = minZ, maxZ do result.cells[#result.cells + 1] = { x = x, z = z } end
-    end
-    result.selectedCells = result.cells
-  elseif includeCells then
-    result.cellsTruncated = true
-  end
-  return result
-end
-
-M.rectangleSelection = M.selectRectangle
-M.selectRect = M.selectRectangle
-M.rectangle = M.selectRectangle
-M.selectRectangleCells = M.selectRectangle
-
-return M
-]=] },
-  { source = [[src/ccminer/controller.lua]], target = [[controller.lua]], digest = [[3781ea475623981ed6154c4c63d1aa29dbd50bb16815e98f7ac2b21cc05f74f2]], content = [[-- CC Miner V4 - generated controller source loader.
-local parts = {
-  "/ccminer/controller_parts/01.part",
-  "/ccminer/controller_parts/02.part",
-  "/ccminer/controller_parts/03.part",
-}
-local source = {}
-for index, path in ipairs(parts) do
-  local handle = fs.open(path, "r")
-  if not handle then error("Missing runtime part: " .. path, 0) end
-  source[index] = handle.readAll()
-  handle.close()
-end
-local loader = loadstring or load
-local program, compileError = loader(table.concat(source), "@/ccminer/controller.assembled.lua")
-if not program then error("Cannot assemble controller: " .. tostring(compileError), 0) end
-return program(...)
-]] },
-  { source = [[src/ccminer/controller_parts/01.part]], target = [[controller_parts/01.part]], digest = [[0dbd6188306870e5075ff888951631cc313bede8237250411a6108450bf56c80]], content = [[-- CC Miner V4 - controller state, persistence and job orchestration.
--- The controller is deliberately tolerant of V2 worker payloads.  New
--- fields are additive and every command has a legacy equivalent where one
--- exists.
-
-local args = { ... }
-local common = dofile("/ccminer/lib/common.lua")
-local protocol = dofile("/ccminer/lib/protocol.lua")
-local quarry = dofile("/ccminer/lib/quarry.lua")
-
-local config, configError = common.loadConfig()
-if not config or config.role ~= "controller" then
-  error(configError or "Controller configuration not found. Run: ccm setup controller", 0)
-end
-
-if not os.getComputerLabel or not os.getComputerLabel() then
-  if os.setComputerLabel then os.setComputerLabel(config.controllerName) end
-end
-
-local networkReady, modemNames = protocol.open()
-if not networkReady then error("No wireless modem found next to the controller.", 0) end
-
-local DB_PATH = "/ccminer/data/controller.db"
-local function dbDefaults()
-  return {
-    schema = common.SCHEMA,
-    version = common.VERSION,
-    presets = {},
-    queue = {},
-    history = {},
-    leases = {},
-    pendingStarts = {},
-    activeLeases = {}, -- independent compatibility snapshot for V4 draft tools.
-    -- Group state is deliberately additive.  The legacy queue/history/preset
-    -- keys above remain authoritative for single-worker operation.
-    groups = {},
-    docks = {},
-    bays = {},
-    groupJobs = {},
-    groupLeases = {},
-    groupScheduler = { replenishConcurrency = 1, staggerSeconds = 0 },
-    lastPreset = nil,
-    lastDraft = nil,
-    lastCommandError = nil,
-    updatedAt = common.nowSeconds(),
-  }
-end
-
-local db = dbDefaults()
-local dbError = nil
-
--- Drafts carry UI-only preflight data.  That data includes chunk plans with
--- compatibility aliases (for example `route`/`optimizedRoute`) which
--- textutils.serialize cannot encode.  Keep only the durable form when a
--- draft is copied into the controller database; copy each field separately
--- so an accidental shared reference between fields cannot leak into storage.
-local function persistentDraft(source)
-  local value = {}
-  if type(source) ~= "table" then return value end
-  for key, item in pairs(source) do
-    if key ~= "preflight" and key ~= "queueIndex" and key ~= "awaiting" then
-      value[key] = common.copy(item)
-    end
-  end
-  return value
-end
-
--- Group records intentionally retain preflight/report fields.  Clone every
--- field independently (rather than copying one shared root) to keep the
--- ComputerCraft serializer free of table aliases while preserving the
--- durable group-job audit trail.
-local function persistentGroupValue(source)
-  local value = {}
-  if type(source) ~= "table" then return value end
-  for key, item in pairs(source) do value[common.copy(key)] = common.copy(item) end
-  return value
-end
-
-local function loadControllerDb()
-  local loaded, err = common.loadTable(DB_PATH, dbDefaults())
-  db = common.merge(dbDefaults(), loaded or {})
-  -- `leases` is authoritative for V4.  Fall back to the old draft alias only
-  -- when a legacy file has no leases table at all.
-  if type(loaded) == "table" and type(loaded.leases) ~= "table" and type(loaded.activeLeases) == "table" then
-    db.leases = common.copy(loaded.activeLeases)
-  end
-  db.leases = type(db.leases) == "table" and db.leases or {}
-  db.pendingStarts = type(db.pendingStarts) == "table" and db.pendingStarts or {}
-  db.activeLeases = common.copy(db.leases)
-  db.presets, db.queue, db.history = db.presets or {}, db.queue or {}, db.history or {}
-  db.groups = type(db.groups) == "table" and db.groups or {}
-  db.docks = type(db.docks) == "table" and db.docks or {}
-  db.bays = type(db.bays) == "table" and db.bays or {}
-  db.groupJobs = type(db.groupJobs) == "table" and db.groupJobs or {}
-  db.groupLeases = type(db.groupLeases) == "table" and db.groupLeases or {}
-  if #db.groupLeases == 0 then
-    for _, lease in ipairs(db.leases) do if type(lease) == "table" and lease.groupJobId then db.groupLeases[#db.groupLeases + 1] = common.copy(lease) end end
-  end

@@ -1,3 +1,184 @@
+  if peripheralIsType(side, "inventory") then return true end
+  if peripheral and peripheral.wrap then
+    local ok, wrapped = pcall(peripheral.wrap, side)
+    if ok and wrapped and (type(wrapped.list) == "function" or type(wrapped.size) == "function") then return true end
+  end
+  return false
+end
+
+local function inventorySlots(side)
+  if not side or not peripheral or not peripheral.wrap then return nil end
+  local ok, wrapped = pcall(peripheral.wrap, side)
+  if not ok or not wrapped then return nil end
+  if type(wrapped.size) == "function" then
+    local sizeOk, result = pcall(wrapped.size)
+    if sizeOk then return tonumber(result) end
+  end
+  return nil
+end
+
+local function fuelStatus()
+  if not turtle or type(turtle.getFuelLevel) ~= "function" then return nil, nil end
+  local ok, level = pcall(turtle.getFuelLevel)
+  local limitOk, limit = false, nil
+  if type(turtle.getFuelLimit) == "function" then limitOk, limit = pcall(turtle.getFuelLimit) end
+  if not ok then return nil, nil end
+  if limitOk ~= true then limit = nil end
+  return level, limit
+end
+
+local function countInventorySlots()
+  if not turtle or type(turtle.getItemCount) ~= "function" then return nil, nil end
+  local used, empty = 0, 0
+  for slot = 1, 16 do
+    local ok, count = pcall(turtle.getItemCount, slot)
+    count = ok and tonumber(count) or 0
+    if count > 0 then used = used + 1 else empty = empty + 1 end
+  end
+  return used, empty
+end
+
+local function configuredReservedSlots(config)
+  local result, seen = {}, {}
+  local function add(value)
+    if type(value) ~= "table" then return end
+    for key, item in pairs(value) do
+      local candidate
+      if type(key) == "number" and type(item) == "boolean" then candidate = key
+      elseif type(key) == "number" and tonumber(item) then candidate = tonumber(item)
+      elseif type(key) == "number" then candidate = key
+      elseif tonumber(item) then candidate = tonumber(item) end
+      if candidate and candidate >= 1 and candidate <= 16 then
+        candidate = math.floor(candidate)
+        if not seen[candidate] then seen[candidate] = true; result[#result + 1] = candidate end
+      end
+    end
+  end
+  local materials = type(config.materials) == "table" and config.materials or {}
+  local recycle = type(config.recycle) == "table" and config.recycle or {}
+  local lighting = type(config.lighting) == "table" and config.lighting or {}
+  add(config.reservedSlots); add(materials.reservedSlots); add(materials.sealSlots)
+  add(materials.torchSlots); add(materials.fuelReserveSlots); add(recycle.reservedSlots)
+  add(lighting.preferredSlots); add(config.sealSlots); add(config.torchSlots)
+  table.sort(result)
+  return result
+end
+
+local function coordinateTable(value)
+  if type(value) ~= "table" then return false end
+  return tonumber(value.x) ~= nil and tonumber(value.y) ~= nil and tonumber(value.z) ~= nil
+end
+
+local function coordinateText(value)
+  if not coordinateTable(value) then return valueString(value) end
+  return ("%s,%s,%s"):format(tostring(value.x), tostring(value.y), tostring(value.z))
+end
+
+local function doctorJournal(config, state, finding)
+  local journalConfig = type(config.journal) == "table" and config.journal or {}
+  local journalState = type(state) == "table" and type(state.journal) == "table" and state.journal or {}
+  if journalConfig.enabled == false or journalState.enabled == false then
+    finding("PASS", "journal", "disabled")
+    return
+  end
+  local path = journalConfig.path or journalState.path or journalState.journalPath or "/ccminer/data/state.journal"
+  local text, readError = readTextNoWrite(path)
+  local seqValue, sequenceValue = tonumber(journalState.seq), tonumber(journalState.sequence)
+  local expectedSeq = seqValue or sequenceValue
+  local writes = tonumber(journalState.writes)
+  local entries = tonumber(journalState.entries)
+  if seqValue and sequenceValue and seqValue ~= sequenceValue then
+    finding("FAIL", "journal", "state seq/sequence counters disagree")
+  elseif writes and entries and (writes < 0 or entries < 0 or entries > writes) then
+    finding("FAIL", "journal", "state writes/entries counters are inconsistent")
+  end
+  if not text then
+    if readError == "missing" and (not writes or writes == 0) then
+      finding("WARN", "journal", "enabled but no entries yet (" .. tostring(path) .. ")")
+    elseif readError == "missing" then
+      finding("FAIL", "journal", "missing after " .. tostring(writes) .. " writes: " .. tostring(path))
+    else
+      finding("FAIL", "journal", tostring(path) .. ": " .. tostring(readError))
+    end
+  else
+    local count, malformed, previousSeq, lastSeq = 0, 0, nil, nil
+    for line in (text .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+      if line ~= "" then
+        count = count + 1
+        local decoded
+        if type(textutils) == "table" and type(textutils.unserialize) == "function" then
+          local ok, value = pcall(textutils.unserialize, line)
+          if ok and type(value) == "table" then decoded = value end
+        end
+        local sequence = decoded and tonumber(decoded.seq or decoded.sequence) or nil
+        if not decoded or sequence == nil then
+          malformed = malformed + 1
+        elseif previousSeq and sequence <= previousSeq then
+          malformed = malformed + 1
+        else
+          previousSeq, lastSeq = sequence, sequence
+        end
+      end
+    end
+    if malformed > 0 then
+      finding("FAIL", "journal", ("%s malformed/non-monotonic entries=%d"):format(path, malformed))
+    elseif expectedSeq and lastSeq and lastSeq > expectedSeq then
+      finding("FAIL", "journal", ("latest seq %s exceeds state seq %s"):format(tostring(lastSeq), tostring(expectedSeq)))
+    elseif expectedSeq and lastSeq and lastSeq < expectedSeq then
+      finding("WARN", "journal", ("latest seq %s behind state seq %s (rotation/checkpoint may be pending)"):format(tostring(lastSeq), tostring(expectedSeq)))
+    elseif entries and entries ~= count then
+      finding("WARN", "journal", ("file entries=%d state entries=%d"):format(count, entries))
+    else
+      finding("PASS", "journal", ("%s entries=%d seq=%s"):format(path, count, tostring(lastSeq or expectedSeq or 0)))
+    end
+  end
+
+  local checkpointPath = journalConfig.checkpointPath or journalState.checkpointPath or "/ccminer/data/state.checkpoint.db"
+  if fs and fs.exists and fs.exists(checkpointPath) then
+    local checkpoint, checkpointError = readTableNoWrite(checkpointPath)
+    if not checkpoint then finding("FAIL", "journal.checkpoint", tostring(checkpointPath) .. ": " .. tostring(checkpointError or "invalid"))
+    else
+      local checkpointSeq = tonumber(checkpoint.seq or checkpoint.sequence or tableValue(checkpoint.journal, "seq") or tableValue(checkpoint.journal, "sequence"))
+      if expectedSeq and checkpointSeq and checkpointSeq > expectedSeq then
+        finding("FAIL", "journal.checkpoint", "checkpoint sequence is ahead of state")
+      else finding("PASS", "journal.checkpoint", tostring(checkpointSeq or "unsequenced")) end
+    end
+  elseif expectedSeq and expectedSeq > 0 then
+    local every = math.max(1, tonumber(journalConfig.checkpointEvery) or 32)
+    local checkpoints = tonumber(journalState.checkpoints) or 0
+    if checkpoints > 0 or expectedSeq >= every then
+      finding("WARN", "journal.checkpoint", "checkpoint file is missing")
+    else
+      finding("PASS", "journal.checkpoint", "not due yet")
+    end
+  end
+end
+
+local function doctorDiscardAllowlist(config, finding)
+  local discard = type(config.discard) == "table" and config.discard or nil
+  local recycle = type(config.recycle) == "table" and config.recycle or nil
+  local allowlist = config.discardAllowlist or (discard and (discard.allowlist or discard.allowed or discard.items))
+    or (discard and type(discard.items) == "table" and discard.items.allowlist)
+    or (recycle and (recycle.discardAllowlist or recycle.allowlist or recycle.discardItems))
+    or (recycle and type(recycle.discard) == "table" and (recycle.discard.allowlist or recycle.discard.allowed))
+  local mode = tostring((discard and (discard.mode or discard.policy)) or config.discardMode or "KEEP_ALL"):upper()
+  local enabled = discard and discard.enabled
+  if enabled == nil then enabled = config.discardEnabled end
+  if allowlist == nil then
+    if enabled == true then finding("FAIL", "discard.allowlist", "discard is enabled but allowlist is missing")
+    else finding("PASS", "discard.allowlist", "not configured") end
+    return
+  end
+  if type(allowlist) ~= "table" then
+    finding("FAIL", "discard.allowlist", "allowlist must be a table")
+    return
+  end
+  local protected = type(config.protectedBlocks) == "table" and config.protectedBlocks or {}
+  local count, unsafe = 0, 0
+  for key, value in pairs(allowlist) do
+    local name
+    if type(key) == "number" then name = value else name = key end
+    if type(name) ~= "string" or name == "" or name:find("[%c%s]") or name:find("%*")
       or (type(key) ~= "number" and value ~= true) then
       unsafe = unsafe + 1
     elseif protected[name] == true then
@@ -63,146 +244,3 @@ local function runDoctor()
       else finding("FAIL", check[1], "must be a number >= " .. tostring(check[3])) end
     end
     finding("PASS", "config.profile", tostring(config.profile or "balanced"))
-    finding("PASS", "config.water", valueString(config.water or config.waterMode or "seal"))
-    finding("PASS", "config.lighting", valueString(config.lighting or config.lightMode or "off"))
-    finding("PASS", "config.materials", valueString(config.materials or {}))
-  elseif role == "controller" then
-    local controllerNumbers = {
-      { "config.historyLimit", config.historyLimit, 1 },
-      { "config.workerTimeoutSeconds", config.workerTimeoutSeconds, 1 },
-      { "config.discoverySeconds", config.discoverySeconds, 1 },
-    }
-    for _, check in ipairs(controllerNumbers) do
-      if tonumber(check[2]) and tonumber(check[2]) >= check[3] then finding("PASS", check[1], tostring(check[2]))
-      else finding("FAIL", check[1], "must be a number >= " .. tostring(check[3])) end
-    end
-    finding("PASS", "config.queueEnabled", valueString(config.queueEnabled))
-    finding("PASS", "config.overlapProtection", valueString(config.overlapProtection))
-    finding("PASS", "config.adaptiveRefresh", valueString(config.adaptiveRefresh))
-    finding("PASS", "config.presets", valueString(config.presets or {}))
-  elseif role == "gps" then
-    finding("PASS", "config.coordinates", ("%s, %s, %s"):format(tostring(config.x), tostring(config.y), tostring(config.z)))
-  end
-
-  if role == "worker" then doctorDiscardAllowlist(config, finding) end
-
-  local labelApi = os and type(os.getComputerLabel) == "function"
-  local label = labelApi and os.getComputerLabel() or nil
-  if not labelApi then finding("WARN", "label.api", "getComputerLabel unavailable")
-  elseif label and label ~= "" then finding("PASS", "label", tostring(label))
-  else finding("WARN", "label", "computer label is not set") end
-
-  local modems = wirelessModems()
-  if #modems > 0 then finding("PASS", "modem", table.concat(modems, ", "))
-  elseif role == "worker" or role == "controller" or role == "gps" then finding("FAIL", "modem", "no wireless modem detected")
-  else finding("WARN", "modem", "role is not configured") end
-
-  local gpsApi = gps and type(gps.locate) == "function"
-  local gpsConfig = type(config.gps) == "table" and config.gps or {}
-  if role == "worker" and gpsConfig.enabled == false then finding("WARN", "gps.api", "disabled in config")
-  elseif gpsApi then finding("PASS", "gps.api", "gps.locate available")
-  elseif role == "worker" and gpsConfig.required == true then finding("FAIL", "gps.api", "required GPS API unavailable")
-  else finding("WARN", "gps.api", "gps.locate unavailable") end
-
-  if role == "worker" then
-    if not turtle then
-      finding("FAIL", "turtle", "worker role is running without a turtle API")
-    else
-      local sides = {
-        { "inventory.output", config.outputSide or "back", true },
-        { "inventory.fuel", config.fuelSide or "top", true },
-      }
-      if (config.lavaMode or "seal") == "seal" then sides[#sides + 1] = { "inventory.seal", config.sealSide or "right", true } end
-      local usedSides = {}
-      for _, item in ipairs(sides) do
-        local side = tostring(item[2])
-        if usedSides[side] then finding("WARN", item[1], "same side as another inventory: " .. side) end
-        usedSides[side] = true
-        if inventoryAvailable(side) then
-          local slots = inventorySlots(side)
-          finding("PASS", item[1], side .. (slots and (" (" .. slots .. " slots)") or ""))
-        else finding("FAIL", item[1], "inventory missing on " .. side) end
-      end
-      local fuel, fuelLimit = fuelStatus()
-      if fuel == nil then finding("FAIL", "fuel.api", "turtle fuel API unavailable")
-      elseif fuel == "unlimited" then finding("PASS", "fuel", "unlimited")
-      else
-        local target = tonumber(config.fuelTarget) or 0
-        local buffer = tonumber(config.fuelBuffer) or 0
-        if tonumber(fuel) and target > 0 and fuel < math.min(target, buffer > 0 and buffer or target) then
-          finding("WARN", "fuel", ("%s / %s (below configured reserve)"):format(tostring(fuel), tostring(fuelLimit or "-")))
-        else finding("PASS", "fuel", ("%s / %s"):format(tostring(fuel), tostring(fuelLimit or "-"))) end
-      end
-      local used, empty = countInventorySlots()
-      if used == nil then finding("FAIL", "inventory.slots", "turtle inventory API unavailable")
-      else
-        local reserve = tonumber(config.reserveEmptySlots) or 0
-        if empty < reserve then finding("WARN", "inventory.reserve", ("%d empty (target %d)"):format(empty, reserve))
-        else finding("PASS", "inventory.reserve", ("%d empty (target %d)"):format(empty, reserve)) end
-        local reserved = configuredReservedSlots(config)
-        if #reserved == 0 then finding("WARN", "inventory.reservedSlots", "no explicit material slots")
-        else
-          local present = {}
-          for _, slot in ipairs(reserved) do
-            local ok, count = pcall(turtle.getItemCount, slot)
-            present[#present + 1] = tostring(slot) .. "=" .. tostring(ok and count or 0)
-          end
-          finding("PASS", "inventory.reservedSlots", table.concat(present, ", "))
-        end
-      end
-    end
-  end
-
-  local rawState, stateError = readTableNoWrite(common.STATE_PATH)
-  if role == "worker" then
-    if not rawState then
-      finding(stateError == "missing" and "WARN" or "FAIL", "state.file", "state is " .. tostring(stateError or "missing"))
-    else
-      finding("PASS", "state.file", "readable")
-      local state = rawState
-      if tonumber(state.schema) ~= tonumber(common.SCHEMA) then finding("FAIL", "state.schema", "schema mismatch")
-      else finding("PASS", "state.schema", tostring(state.schema)) end
-      local statuses = { idle = true, working = true, paused = true, blocked = true, complete = true, aborted = true,
-        waiting_fuel = true, waiting_output = true, waiting_seal = true, waiting_torch = true, waiting_water = true,
-        recovering = true, dormant = true, calibrating = true }
-      if statuses[state.status] then finding("PASS", "state.status", tostring(state.status))
-      else finding("WARN", "state.status", "unknown status: " .. tostring(state.status)) end
-      if state.pendingAction ~= nil then
-        if type(state.pendingAction) ~= "table" or not state.pendingAction.kind then finding("FAIL", "state.pending", "malformed pendingAction")
-        elseif state.status ~= "blocked" and state.phase ~= "recovery_required" then finding("WARN", "state.pending", "pending action exists while state is not blocked")
-        else finding("PASS", "state.pending", tostring(state.pendingAction.kind)) end
-      else finding("PASS", "state.pending", "none") end
-      local active = state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output"
-        or state.status == "waiting_seal" or state.status == "waiting_torch"
-      if active and type(state.job) ~= "table" and type(state.service) ~= "table" then
-        finding("FAIL", "state.job", "active state has no job or service")
-      elseif type(state.job) == "table" then
-        local cursor, total = tonumber(state.job.cursor), tonumber(state.job.total)
-        if not cursor or not total or cursor < 0 or total <= 0 or cursor > total then
-          finding("FAIL", "state.job", "cursor/total is inconsistent")
-        else finding("PASS", "state.job", ("%d/%d"):format(cursor, total)) end
-      else finding("PASS", "state.job", "none") end
-      if state.request ~= nil and type(state.request) ~= "string" then finding("WARN", "state.request", "request is not a string") end
-      if state.stagedStop ~= nil and type(state.stagedStop) ~= "table" and type(state.stagedStop) ~= "boolean" then
-        finding("FAIL", "state.stagedStop", "malformed staged stop")
-      elseif type(state.stagedStop) == "table" then
-        finding("PASS", "state.stagedStop", valueString(state.stagedStop))
-      else
-        finding("PASS", "state.stagedStop", "none")
-      end
-
-      local calibration = tableValue(config, "gps", "calibration") or tableValue(state, "gps", "calibration")
-      local dockMetadata = state.dock or config.dock
-      local dock = dockMetadata
-      if type(dockMetadata) == "table" and not coordinateTable(dockMetadata) then
-        dock = dockMetadata.homeWorld or dockMetadata.world or dockMetadata.position or dockMetadata.home
-      end
-      if dock == nil and type(calibration) == "table" then dock = calibration.home end
-      if dock == nil and type(dockMetadata) == "table" then finding("PASS", "dock", "metadata=" .. valueString(dockMetadata))
-      elseif dock == nil then finding("PASS", "dock", "not configured/calibrated")
-      elseif coordinateTable(dock) then finding("PASS", "dock", coordinateText(dock))
-      elseif type(dockMetadata) == "table" then finding("PASS", "dock", "metadata=" .. valueString(dockMetadata))
-      else finding("FAIL", "dock", "dock coordinates are malformed") end
-
-      local bay = state.bay or config.bay
-      if bay == nil then finding("PASS", "bay", "not configured")

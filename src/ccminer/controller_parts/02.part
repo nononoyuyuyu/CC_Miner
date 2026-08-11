@@ -191,6 +191,7 @@ local function renderDashboard(target, key)
   buttonRow(key, bottom, width, {
     { "DISCOVER", dashboardAction("discover") }, { "NEW JOB", dashboardAction("new") },
     { "PROGRESS", dashboardAction("progress") }, { "INFO", dashboardAction("info") },
+    { "REMOTE", dashboardAction("remote") },
   })
   buttonRow(key, bottom + 1, width, {
     { "STOP", dashboardAction("stop") }, { "RECOVERY", dashboardAction("recovery") },

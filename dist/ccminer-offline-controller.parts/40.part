@@ -1,203 +1,209 @@
-      for key, value in pairs(registry or {}) do print(("%s world=%s,%s,%s facing=%s maxDepth=%s"):format(tostring(key), tostring(value.world and value.world.x or "-"), tostring(value.world and value.world.y or "-"), tostring(value.world and value.world.z or "-"), tostring(value.facing or "-"), tostring(value.maxDepth or "-"))) end
-    elseif sub == "register" and id then
-      local value = { world = { x = tonumber(args[4]), y = tonumber(args[5]), z = tonumber(args[6]) }, facing = args[7], maxDepth = tonumber(args[8]) }
-      local ok, err = command == "dock" and registerDock(id, value) or registerBay(id, value)
-      print(ok and ((command == "dock" and "Dock" or "Bay") .. " saved.") or ("Register error: " .. tostring(err)))
-    else print("Usage: " .. command .. " list|register <id> <x> <y> <z> [facing=south|east|north|west|0..3] [maxDepth]") end
-    return true
+      ("GPS: %s / %s"):format(data.gps and data.gps.calibrated and "calibrated" or "uncalibrated", data.gps and data.gps.available and "available" or "unavailable"),
+      ("Fuel: %s / %s"):format(tostring(data.fuel or "-"), tostring(data.fuelLimit or "-")),
+      ("Inventory: %s used, %s empty, %s items"):format(tostring(data.inventoryUsed or "-"), tostring(data.inventoryEmpty or "-"), tostring(data.inventoryItems or "-")),
+      ("Materials: seal=%s water=%s"):format(tostring(data.materials and data.materials.seal or data.seal and data.seal.count or "-"), tostring(data.materials and data.materials.water or "-")),
+    }
+      if data.job then lines[#lines + 1] = ("Job: %s (%dx%dx%d) [%s]"):format(tostring(data.job.name), data.job.width, data.job.length, data.job.depth, tostring(data.job.strategy or "-")); lines[#lines + 1] = "Progress: " .. progressText(data) end
+      if data.lastError then lines[#lines + 1] = "Error: " .. tostring(data.lastError) end
+      if data.completionReason then lines[#lines + 1] = "Completion: " .. tostring(data.completionReason) end
+      if data.report or data.stats then
+        local report = data.report or data.stats
+        local discard = report.discard or report.discardCount or "-"
+        if type(discard) == "table" then discard = tostring(discard.count or discard.total or common.tableCount(discard)) end
+        lines[#lines + 1] = ("Metrics: blocks=%s fuel=%s discard=%s"):format(tostring(report.blocks or report.totalBlocks or "-"), tostring(report.fuel or "-"), tostring(discard))
+      end
+    for index, line in ipairs(lines) do if index + 2 >= height - 1 then break end; common.writeAt(1, index + 2, common.fit(line, width), colors and colors.white or nil) end
   end
-  if command == "discover" or command == "status" then
-    discover(); pumpFor(3)
-    local ids = orderedIds()
-    if #ids == 0 then print("No workers found."); return true end
-    for _, id in ipairs(ids) do
-      local data = workers[id].data or {}
-      print(("#%s %-16s %-14s %s GPS=%s seal=%s"):format(id, workerLabel(workers[id], id), statusOf(workers[id]), progressText(data), data.gps and data.gps.calibrated and "ready" or "no", data.seal and data.seal.count or "-"))
-    end
-    return true
-  elseif command == "start" then
-    local id, width, length, depth = tonumber(args[2]), tonumber(args[3]), tonumber(args[4]), tonumber(args[5])
-    if not id or not width or not length or not depth then print("Usage: controller.lua start <id> <width> <length> <depth>"); return true end
-    discover(); pumpFor(1)
-    draft = makeCliDraft(id, width, length, depth)
-    local result = computePreflight()
-    if result and not result.fatal then startDraft() else print("Preflight blocked: " .. tostring(result and result.planError or "unavailable")) end
-    pumpFor(2); print(notice); draft = nil; mode = "dashboard"; return true
-  elseif command == "stop" then
-    local id, stopMode = tonumber(args[2]), string.lower(args[3] or "pause_now")
-    local validModes = { pause_now = true, finish_row = true, finish_layer = true, return_home = true, abort = true }
-    if not id or not validModes[stopMode] then print("Usage: controller.lua stop <id> pause_now|finish_row|finish_layer|return_home|abort"); return true end
-    stageStop(id, stopMode); pumpFor(2); print(notice); return true
-  elseif command == "pause" or command == "resume" or command == "recall" or command == "service" or command == "abort" or command == "clear" then
-    local id = tonumber(args[2]); if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
-    sendCommand(id, command); pumpFor(2); print(notice); return true
-  elseif command == "gps" or command == "calibrate" then
-    local id = tonumber(args[2]); if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
-    sendCommand(id, command == "gps" and "gps_fix" or "calibrate_gps"); pumpFor(3); print(notice); return true
-  elseif command == "rehome" then
-    local id = tonumber(args[2]); if not id or args[3] ~= "RESET" then print("Usage: controller.lua rehome <id> RESET"); return true end
-    sendCommand(id, "rehome", { confirm = "RESET" }); pumpFor(2); print(notice); return true
-  elseif command == "queue" then
-    local sub = string.lower(args[2] or "list")
-    if sub == "list" then printQueue()
-    elseif config.queueEnabled == false then print("Queue is disabled by controller configuration.")
-    elseif sub == "clear" then db.queue = {}; saveControllerDb(); print("Queue cleared.")
-    elseif sub == "remove" or sub == "delete" then local index = tonumber(args[3]); if index and db.queue[index] then table.remove(db.queue, index); saveControllerDb(); print("Queue item removed.") else print("Usage: queue remove <index>") end
-    elseif sub == "add" then
-      local id, width, length, depth = tonumber(args[3]), tonumber(args[4]), tonumber(args[5]), tonumber(args[6])
-      if not id or not width or not length or not depth then print("Usage: queue add <id> <width> <length> <depth>") else discover(); pumpFor(1); local item = makeCliDraft(id, width, length, depth); item.queuedAt = common.nowSeconds(); draft = item; local ok = queueDraft(); draft = nil; print(ok and "Queued." or notice) end
-    elseif sub == "run" then
-      local index = tonumber(args[3]) or 1; local item = db.queue[index]
-      if not item then print("Queue item not found.") else item.retryAt = common.nowSeconds(); item.awaiting = nil; saveControllerDb(); lastQueueDispatch = 0; dispatchQueue(); print(notice) end
-    else print("Usage: queue list|add|run|remove|clear") end
-    return true
-  elseif command == "preset" or command == "presets" then
-    local sub = string.lower(args[2] or "list")
-    if sub == "list" then for _, preset in ipairs(db.presets) do print(tostring(preset.name)) end
-    elseif sub == "save" then local ok, err = savePreset(args[3], db.lastDraft or draft); print(ok and "Preset saved." or ("Preset error: " .. tostring(err)))
-    elseif sub == "use" or sub == "load" then print(applyPreset(args[3]) and "Preset selected." or "Preset not found.")
-    elseif sub == "delete" or sub == "remove" then local keep = {}; for _, preset in ipairs(db.presets) do if tostring(preset.name) ~= tostring(args[3]) then keep[#keep + 1] = preset end end; db.presets = keep; saveControllerDb(); print("Preset removed.")
-    else print("Usage: preset list|save|use|delete <name>") end
-    return true
-  elseif command == "report" or command == "history" then printHistory(); return true
-  elseif command == "doctor" then
-    print("CC Miner controller doctor")
-    print("network=" .. tostring(networkReady) .. " modems=" .. tostring(#(modemNames or {})))
-    print("db=" .. tostring(dbError and ("WARN " .. dbError) or "ok") .. " path=" .. DB_PATH)
-    print("workers=" .. tostring(#orderedIds()) .. " leases=" .. tostring(#(db.leases or {})) .. " queue=" .. tostring(#db.queue))
-    print("sorting=" .. tostring(config.sorting and config.sorting.enabled == true and "enabled" or "off"))
-    return true
+  drawButton(key, 1, math.max(1, height - 1), width, "BACK", function() mode = "dashboard" end, true)
+end
+
+local function renderReport(target, key)
+  local width, height = target.getSize()
+  writeHeader("COMPLETION REPORT / HISTORY", target)
+  local maxRows = math.max(1, height - 5)
+  local count = #db.history
+  if count == 0 then common.writeAt(1, 3, common.fit("No completed jobs.", width), colors and colors.lightGray or nil) end
+  for row = 1, maxRows do
+    local index = count - row + 1
+    local item = db.history[index]
+    if not item then break end
+    local line = ("%s %s #%s %s %s"):format(tostring(item.finishedAt or "-"), tostring(item.status or "-"), tostring(item.workerId or "-"), tostring(item.name or item.jobId or "-"), item.reason and tostring(item.reason) or "")
+    common.writeAt(1, 2 + row, common.fit(line, width), item.status == "aborted" and (colors and colors.red or nil) or (colors and colors.lime or nil))
+  end
+  drawButton(key, 1, math.max(1, height - 1), width, "BACK", function() mode = "dashboard" end, true)
+end
+
+local function renderConfirm(target, key)
+  local width, height = target.getSize()
+  writeHeader("CONFIRM COMMAND", target, colors and colors.orange or nil)
+  local message = confirmState and confirmState.message or "Continue?"
+  local lineWidth = math.max(10, width - 4)
+  local words, lines, current = {}, {}, ""
+  for word in tostring(message):gmatch("%S+") do words[#words + 1] = word end
+  for _, word in ipairs(words) do
+    if #current == 0 then current = word elseif #current + 1 + #word <= lineWidth then current = current .. " " .. word else lines[#lines + 1] = current; current = word end
+  end
+  if current ~= "" then lines[#lines + 1] = current end
+  for index, line in ipairs(lines) do common.writeAt(2, math.max(3, math.floor((height - #lines) / 2) + index), common.fit(line, lineWidth), colors and colors.white or nil) end
+  buttonRow(key, math.max(1, height - 2), width, {
+    { "YES", function()
+      if confirmState and confirmState.twoStep and not confirmState.armed then
+        confirmState.armed = true; confirmState.message = "FINAL confirmation: press YES again to send REHOME RESET."; invalidate(); return
+      end
+      local id = selectedWorker()
+      if confirmState and id then
+        if confirmState.command == "stop" then stageStop(id, (confirmState.payload or {}).mode or "abort") else sendCommand(id, confirmState.command, confirmState.payload) end
+      end
+      confirmState, mode = nil, "dashboard"
+    end },
+    { "NO", function() confirmState, mode = nil, "dashboard"; setNotice("Cancelled.", false) end },
+  })
+end
+
+local function screenSignature(target, key)
+  local width, height = target.getSize()
+  local id, worker = selectedWorker()
+  local data = worker and worker.data or {}
+  local gid, group = selectedGroupRecord()
+  local groupJob = gid and activeGroupJob(gid) or nil
+  return table.concat({ tostring(mode), tostring(key), tostring(width), tostring(height), tostring(id or ""), tostring(data.updatedAt or data.status or ""), tostring(gid or ""), tostring(group and group.updatedAt or ""), tostring(groupJob and groupJob.updatedAt or ""), tostring(groupDraft and groupDraft.updatedAt or ""), tostring(groupDraft and groupDraft.preflight and groupDraft.preflight.computedAt or ""), tostring(draft and draft.gridPageX or ""), tostring(draft and draft.gridPageZ or ""), tostring(dirty) }, "|")
+end
+
+local function renderOne(target, key)
+  resetHitboxes(key)
+  local signature = screenSignature(target, key)
+  if renderCache[key] == signature and not dirty then return end
+  common.withTerm(target, function()
+    common.clear(colors and colors.black or nil, colors and colors.white or nil)
+    if mode == "dashboard" then renderDashboard(target, key)
+    elseif mode == "groups" then renderGroups(target, key)
+    elseif mode == "group_info" then renderGroupInfo(target, key)
+    elseif mode == "group_dimensions" or mode == "group_job" then renderGroupDimensions(target, key)
+    elseif mode == "job_dimensions" then renderDimensions(target, key)
+    elseif mode == "job_grid" or mode == "job_chunks" then renderGrid(target, key)
+    elseif mode == "preflight" then renderPreflight(target, key)
+    elseif mode == "progress" then renderProgress(target, key)
+    elseif mode == "stop_menu" then renderStopMenu(target, key)
+    elseif mode == "recovery" then renderRecovery(target, key)
+    elseif mode == "info" then renderInfo(target, key)
+    elseif mode == "report" then renderReport(target, key)
+    elseif mode == "confirm" then renderConfirm(target, key)
+    elseif mode == "error_detail" then renderErrorDetail(target, key)
+    else mode = "dashboard"; renderDashboard(target, key) end
+  end)
+  renderCache[key] = signature
+end
+
+local function render()
+  if not dirty then return end
+  renderOne(term.current(), "term")
+  for _, entry in ipairs(monitors) do renderOne(entry.device, entry.name) end
+  dirty = false
+end
+
+local function handlePointer(key, x, y)
+  local boxes = hitboxes[key] or {}
+  for index = #boxes, 1, -1 do
+    local box = boxes[index]
+    if x >= box.x1 and x <= box.x2 and y >= box.y1 and y <= box.y2 then box.action(); invalidate(); return true end
   end
   return false
 end
-
-if #args > 0 and commandLineMode() then return end
-
-(function()
-  discover()
-  local refreshTimer = os.startTimer(1)
-  while running do
-    render()
-    local event, a, b, c = os.pullEvent()
-    if event == "rednet_message" and c == common.PROTOCOL then
-      handleMessage(a, b)
-    elseif event == "char" then
-      processChar(a)
-    elseif event == "key" then
-      processKey(a)
-    elseif event == "mouse_click" then
-      handlePointer("term", b, c)
-    elseif event == "monitor_touch" then
-      if config.touchEnabled ~= false then handlePointer(a, b, c) end
-    elseif event == "timer" then
-      if alertTimers[a] then
-        local alertOutput = alertTimers[a]; alertTimers[a] = nil
-        if alertOutput.global and redstone and redstone.setOutput then pcall(redstone.setOutput, alertOutput.side or "back", false) end
-        if alertOutput.relay and alertOutput.relay.setOutput then pcall(alertOutput.relay.setOutput, alertOutput.side or "back", false) end
-        for _, relay in ipairs(alertOutput.relays or {}) do if relay and relay.setOutput then pcall(relay.setOutput, alertOutput.side or "back", false) end end
-      elseif a == refreshTimer then
-        dispatchQueue()
-        groupSchedulerTick()
-        sortingTick()
-        if common.nowSeconds() - lastDiscovery >= (config.discoverySeconds or 5) then discover() end
-        dirty = true
-        refreshTimer = os.startTimer(1)
-      end
-    elseif event == "term_resize" or event == "monitor_resize" or event == "peripheral" or event == "peripheral_detach" then
-      monitors = common.findPeripherals("monitor")
-      speakers = common.findPeripherals("speaker")
-      redstoneDevices = common.findPeripherals("redstoneIntegrator")
-      for _, entry in ipairs(monitors) do if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end end
-      renderCache = {}; dirty = true
-    end
-  end
-
-  common.clear(colors and colors.black or nil, colors and colors.white or nil)
-  print("CC Miner controller stopped. Run 'ccm dashboard' to reopen it.")
-end)()
 ]] },
-}
-local FILE_COUNT = 10
-local WORKER_PARTS = {}
-local CONTROLLER_PARTS = {[[controller_parts/01.part]], [[controller_parts/02.part]], [[controller_parts/03.part]]}
-local ENTRYPOINT = [[controller.lua]]
-local UPDATE_SENTINEL = [[-- CC Miner V4 update-incomplete sentinel for controller
-error("CC Miner runtime update is incomplete. Re-transfer the offline bundle and run update-low-space.", 0)
-]]
-local LOW_SPACE_STEPS = {
-  { kind = "runtime", index = 1 },
-  { kind = "runtime", index = 2 },
-  { kind = "runtime", index = 3 },
-  { kind = "runtime", index = 4 },
-  { kind = "runtime", index = 5 },
-  { kind = "runtime", index = 6 },
-  { kind = "runtime", index = 8 },
-  { kind = "runtime", index = 9 },
-  { kind = "runtime", index = 10 },
-  { kind = "obsolete", target = [[lib/geo.lua]] },
-  { kind = "obsolete", target = [[worker.lua]] },
-  { kind = "obsolete", target = [[worker_parts/01.part]] },
-  { kind = "obsolete", target = [[worker_parts/02.part]] },
-  { kind = "obsolete", target = [[worker_parts/03.part]] },
-  { kind = "obsolete", target = [[worker_parts/04.part]] },
-  { kind = "obsolete", target = [[worker_parts/05.part]] },
-  { kind = "obsolete", target = [[gps_host.lua]] },
-}
+  { source = [[src/ccminer/controller_parts/03.part]], target = [[controller_parts/03.part]], digest = [[ed58e408499ddb24b3c076ccdca6b3e0e0c0f384ca10bd9a43ddbba0971e561c]], content = [[-- CC Miner V4 - keyboard/CLI compatibility and event loop.
 
-local function fail(message)
-  error(tostring(message), 0)
-end
-local function ensureDir(path)
-  if not path or path == "" or fs.exists(path) then return end
-  local parent = fs.getDir(path)
-  if parent and parent ~= "" and parent ~= path then ensureDir(parent) end
-  fs.makeDir(path)
-end
-local function readFile(path)
-  if not fs.exists(path) or fs.isDir(path) then return nil end
-  local handle = fs.open(path, "rb")
-  if not handle then return nil end
-  local text = handle.readAll(); handle.close(); return text
-end
-local function writeFile(path, text)
-  ensureDir(fs.getDir(path))
-  local handle = fs.open(path, "wb")
-  if not handle then return false, "Cannot write " .. path end
-  local ok, writeError = pcall(handle.write, text or "")
-  handle.close()
-  if not ok then return false, tostring(writeError) end
-  return true
-end
-local function digest(text)
-  if not textutils or type(textutils.sha256) ~= "function" then
-    return nil, "textutils.sha256 is required for strict offline bundle verification."
+local function processChar(character)
+  character = string.lower(character or "")
+  if mode == "job_dimensions" then
+    if character:match("%d") or character == "-" then draftDigit(character) end
+    return
+  elseif mode == "group_dimensions" or mode == "group_job" then
+    if character:match("%d") or character == "-" then groupDraftDigit(character)
+    elseif character == "p" then
+      local gid = selectedGroupRecord()
+      if gid and groupDraft then commitGroupDraftField(); groupDraft.preflight = computeGroupPreflight(gid, groupDraft); invalidate() end
+    elseif character == "s" then
+      local gid = selectedGroupRecord()
+      if gid and groupDraft then commitGroupDraftField(); local result = groupDraft.preflight or computeGroupPreflight(gid, groupDraft); groupDraft.preflight = result; if result and not result.fatal then startGroup(gid, groupDraft) end; invalidate() end
+    elseif character == "b" or character == "q" then mode = "groups"; invalidate() end
+    return
+  elseif mode == "confirm" then
+    if character == "y" then
+      if confirmState and confirmState.twoStep and not confirmState.armed then
+        confirmState.armed = true; confirmState.message = "FINAL confirmation: press Y again to send REHOME RESET."; invalidate(); return
+      end
+      local id = selectedWorker()
+      if confirmState and id then
+        if confirmState.command == "stop" then stageStop(id, (confirmState.payload or {}).mode or "abort") else sendCommand(id, confirmState.command, confirmState.payload) end
+      end
+      confirmState, mode = nil, "dashboard"
+    elseif character == "n" then confirmState, mode = nil, "dashboard"; setNotice("Cancelled.", false) end
+    return
+  elseif mode == "error_detail" then
+    if character == "o" or character == "b" or character == "q" then noticeState.dismiss() end
+    return
+  elseif mode == "job_grid" then
+    if character == "a" then allGrid(true) elseif character == "c" then allGrid(false) elseif character == "i" then invertGrid() elseif character == "r" then draft.rectMode = not draft.rectMode; draft.rectStart = nil; invalidate() end
+    return
+  elseif mode == "groups" then
+    local ids = orderedGroupIds()
+    if character == "s" then groupAction("start")()
+    elseif character == "p" then groupAction("pause")()
+    elseif character == "r" then groupAction("resume")()
+    elseif character == "h" then groupAction("return")()
+    elseif character == "v" then mode = "group_info"; invalidate()
+    end
+    return
+  elseif mode == "group_info" then
+    if character == "b" or character == "q" then mode = "groups"; invalidate() end
+    return
   end
-  local ok, value = pcall(textutils.sha256, text or "")
-  if not ok or type(value) ~= "string" then return nil, tostring(value or "sha256 failed") end
-  return string.lower(value)
+  if mode ~= "dashboard" then return end
+  local id = selectedWorker()
+  if character == "d" then discover()
+  elseif character == "n" then dashboardAction("new")()
+  elseif character == "p" then sendCommand(id, "pause")
+  elseif character == "r" then sendCommand(id, "resume")
+  elseif character == "h" then sendCommand(id, "recall")
+  elseif character == "s" then dashboardAction("stop")()
+  elseif character == "x" then dashboardAction("abort")()
+  elseif character == "c" then dashboardAction("clear")()
+  elseif character == "i" then dashboardAction("info")()
+  elseif character == "g" then dashboardAction("progress")()
+  elseif character == "o" then dashboardAction("remote")()
+  elseif character == "e" then dashboardAction("recovery")()
+  elseif character == "t" then dashboardAction("report")()
+  elseif character == "l" then dashboardAction("gps")()
+  elseif character == "v" then dashboardAction("groups")()
+  elseif character == "q" then running = false end
 end
-local function compileText(label, text)
-  local loader = loadstring or load
-  local compiled, compileError = loader(text, "@" .. label)
-  if not compiled then return false, tostring(compileError) end
-  return true
-end
-local function validateEmbedded()
-  if #files ~= FILE_COUNT then fail("Embedded runtime file count is invalid for role " .. ROLE) end
-  local seen = {}
-  local aggregate = {
-    "ccminer-offline-role", "\0", VERSION, "\0", tostring(SCHEMA), "\0", ROLE, "\0", tostring(#files), "\0",
-  }
-  for index, file in ipairs(files) do
-    if type(file.target) ~= "string" or type(file.content) ~= "string" or seen[file.target] then
-      fail("Embedded runtime order/target is invalid at index " .. tostring(index))
+
+local function processKey(keyCode)
+  if keys and keyCode == keys.escape then
+    if mode == "dashboard" then
+      running = false
+    else
+      mode, draft, confirmState = "dashboard", nil, nil
+      invalidate()
     end
-    seen[file.target] = true
-    local actual, digestError = digest(file.content)
-    if not actual then fail(digestError) end
-    if actual ~= string.lower(file.digest or "") then
-      fail("Embedded runtime digest mismatch: " .. tostring(file.target))
+    return
+  end
+  if mode == "dashboard" then
+    local ids = orderedIds()
+    if keys and keyCode == keys.up then
+      selected = math.max(1, selected - 1)
+      invalidate()
+    elseif keys and keyCode == keys.down then
+      selected = math.min(math.max(1, #ids), selected + 1)
+      invalidate()
+    elseif keys and keyCode == keys.enter then
+      mode = "info"
+      invalidate()
     end
-    aggregate[#aggregate + 1] = file.source; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.target; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.digest; aggregate[#aggregate + 1] = "\0"
+  elseif mode == "error_detail" then
+    if keys and (keyCode == keys.enter or keyCode == keys.backspace or keyCode == keys.escape) then noticeState.dismiss() end
+  elseif mode == "groups" then
+    local ids = orderedGroupIds()
+    if keys and keyCode == keys.up then selectedGroup = math.max(1, selectedGroup - 1); invalidate()
+    elseif keys and keyCode == keys.down then selectedGroup = math.min(math.max(1, #ids), selectedGroup + 1); invalidate()
+    elseif keys and keyCode == keys.enter then mode = "group_info"; invalidate()

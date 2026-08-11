@@ -90,6 +90,32 @@ function M.statusColor(status)
   return map[status] or colors.white
 end
 
+-- Remote-console defaults are kept in one constructor so each config gets a
+-- fresh allowlist table.  Keeping this as an ordered array (not a shared map)
+-- also avoids ComputerCraft serializer aliasing and matches the worker's
+-- exact command-head authorization contract.
+function M.defaultRemoteConsoleConfig()
+  return {
+    enabled = false,
+    allowShell = false,
+    sessionSeconds = 120,
+    maxOutputBytes = 8192,
+    auditLimit = 50,
+    allowlist = {
+      "ccm status",
+      "ccm report",
+      "ccm doctor",
+      "id",
+      "label get",
+      "ls",
+      "dir",
+      "df",
+      "free",
+      "version",
+    },
+  }
+end
+
 function M.defaultWorkerConfig()
   return {
     schema = M.SCHEMA,
@@ -98,6 +124,11 @@ function M.defaultWorkerConfig()
     networkKey = "CHANGE_ME",
     workerName = M.safeComputerLabel("Miner"),
     controllerId = 0,
+    -- Remote console is deliberately disabled until a setup user opts in.
+    -- The allowlist is an ordered string array (rather than a map) so the
+    -- controller/worker wire contract and ComputerCraft serializer remain
+    -- straightforward and deterministic.
+    remoteConsole = M.defaultRemoteConsoleConfig(),
     reserveEmptySlots = 3,
     fuelBuffer = 256,
     fuelTarget = 12000,
@@ -371,42 +402,3 @@ function M.defaultState()
       consumedAt = nil,
     },
     -- Disposal is audited independently of the general recycle counters.
-    -- Items that are not selected by the active policy are counted as held or
-    -- skipped rather than silently dropped.
-    discardStats = {
-      enabled = false,
-      mode = "KEEP_ALL",
-      passes = 0,
-      attempts = 0,
-      stacks = 0,
-      discarded = 0,
-      items = 0,
-      skipped = 0,
-      held = 0,
-      unknown = 0,
-      overflow = 0,
-      byName = {},
-      lastAt = nil,
-      lastError = nil,
-      triggerEmptySlots = 3,
-      maxStacksPerPass = 8,
-    },
-    -- Short alias used by worker reports; both tables start with identical
-    -- counters and are normalized together when an older state is loaded by
-    -- the worker runtime.
-    discard = {
-      enabled = false,
-      mode = "KEEP_ALL",
-      passes = 0,
-      attempts = 0,
-      stacks = 0,
-      discarded = 0,
-      items = 0,
-      skipped = 0,
-      held = 0,
-      unknown = 0,
-      overflow = 0,
-      byName = {},
-      lastAt = nil,
-      lastError = nil,
-      triggerEmptySlots = 3,

@@ -422,6 +422,32 @@ function M.statusColor(status)
   return map[status] or colors.white
 end
 
+-- Remote-console defaults are kept in one constructor so each config gets a
+-- fresh allowlist table.  Keeping this as an ordered array (not a shared map)
+-- also avoids ComputerCraft serializer aliasing and matches the worker's
+-- exact command-head authorization contract.
+function M.defaultRemoteConsoleConfig()
+  return {
+    enabled = false,
+    allowShell = false,
+    sessionSeconds = 120,
+    maxOutputBytes = 8192,
+    auditLimit = 50,
+    allowlist = {
+      "ccm status",
+      "ccm report",
+      "ccm doctor",
+      "id",
+      "label get",
+      "ls",
+      "dir",
+      "df",
+      "free",
+      "version",
+    },
+  }
+end
+
 function M.defaultWorkerConfig()
   return {
     schema = M.SCHEMA,
@@ -430,6 +456,11 @@ function M.defaultWorkerConfig()
     networkKey = "CHANGE_ME",
     workerName = M.safeComputerLabel("Miner"),
     controllerId = 0,
+    -- Remote console is deliberately disabled until a setup user opts in.
+    -- The allowlist is an ordered string array (rather than a map) so the
+    -- controller/worker wire contract and ComputerCraft serializer remain
+    -- straightforward and deterministic.
+    remoteConsole = M.defaultRemoteConsoleConfig(),
     reserveEmptySlots = 3,
     fuelBuffer = 256,
     fuelTarget = 12000,
@@ -1097,6 +1128,95 @@ local function normalizeIdentifier(value, fallback, maximum)
   return value
 end
 
+-- Remote console commands are deliberately represented as an array of exact
+-- command strings.  A command may contain one space-separated subcommand (for
+-- example `ccm status` or `label get`), but shell syntax and arguments are
+-- never accepted here.  The worker performs the final command-head check;
+-- this normalizer only keeps persisted configuration portable and safe.
+local function normalizeRemoteAllowlist(value, fallback)
+  fallback = type(fallback) == "table" and fallback or M.defaultRemoteConsoleConfig().allowlist
+  local function command(value)
+    if type(value) ~= "string" then return nil end
+    if #value < 1 or #value > 128 or value:find("[%c]") then return nil end
+    local trimmed = M.trim(value)
+    if trimmed ~= value then return nil end
+    local normalized = string.lower(trimmed):gsub("%s+", " ")
+    if normalized == "" or normalized:find("[^a-z0-9_%.%- ]") then return nil end
+    -- Do not let a command silently change when a hand-edited value has
+    -- leading/trailing whitespace; this is easier to audit than accepting a
+    -- visually ambiguous entry.
+    if normalized:gsub("%s+", " ") ~= string.lower(value) then return nil end
+    return normalized
+  end
+
+  local out, seen = {}, {}
+  local invalid = false
+  local function add(item)
+    local normalized = command(item)
+    if not normalized then invalid = true; return end
+    if not seen[normalized] then
+      seen[normalized] = true
+      out[#out + 1] = normalized
+    end
+  end
+
+  if type(value) == "string" then
+    -- Early V4 drafts used a comma-separated text field.  Read it once and
+    -- write the canonical array on the next save.
+    if value == "" then return {} end
+    for item in value:gmatch("[^,;]+") do add(item) end
+    if value:match("^[,;]") or value:match("[,;]$") or value:find("[,;][,;]") then invalid = true end
+  elseif type(value) == "table" then
+    local isArray = #value > 0
+    if isArray then
+      for index = 1, #value do add(value[index]) end
+      for key in pairs(value) do
+        if type(key) ~= "number" or key < 1 or key > #value or key ~= math.floor(key) then invalid = true end
+      end
+    else
+      -- Accept a legacy `{ ["ccm status"] = true }` map, but never persist
+      -- that shape.  False entries are ignored; non-boolean values fail safe.
+      local names = {}
+      for key, enabled in pairs(value) do
+        if type(key) ~= "string" or type(enabled) ~= "boolean" then
+          invalid = true
+        elseif enabled then
+          names[#names + 1] = key
+        end
+      end
+      table.sort(names)
+      for _, key in ipairs(names) do add(key) end
+    end
+  elseif value == nil then
+    return M.copy(fallback)
+  else
+    return M.copy(fallback)
+  end
+
+  -- An explicitly supplied malformed allowlist must not widen access.  Keep
+  -- valid entries when possible; if every entry was rejected, persist an
+  -- empty list (deny by default) rather than restoring a surprising grant.
+  if invalid and #out == 0 then return {} end
+  return out
+end
+
+function M.normalizeRemoteConsoleConfig(value)
+  local defaults = M.defaultRemoteConsoleConfig()
+  local source = type(value) == "table" and value or {}
+  local out = {
+    enabled = normalizeBoolean(source.enabled, defaults.enabled),
+    allowShell = normalizeBoolean(source.allowShell, defaults.allowShell),
+    sessionSeconds = normalizeInteger(source.sessionSeconds, 1, 3600, defaults.sessionSeconds),
+    maxOutputBytes = normalizeInteger(source.maxOutputBytes, 256, 65536, defaults.maxOutputBytes),
+    auditLimit = normalizeInteger(source.auditLimit, 1, 1000, defaults.auditLimit),
+    allowlist = normalizeRemoteAllowlist(source.allowlist, defaults.allowlist),
+  }
+  -- `allowShell` is a separate privilege and must never be inferred from the
+  -- command list.  Keep a boolean false for malformed/non-boolean values.
+  if out.allowShell ~= true then out.allowShell = false end
+  return out
+end
+
 local function firstNonNil(...)
   for index = 1, select("#", ...) do
     local value = select(index, ...)
@@ -1129,6 +1249,30 @@ local function normalizeWorkerConfig(raw)
 
   config.networkKey = normalizeString(config.networkKey, defaults.networkKey, 8, 40)
   config.workerName = normalizeString(config.workerName, defaults.workerName, 1, 20)
+  config.controllerId = normalizeInteger(config.controllerId, 0, 65535, defaults.controllerId)
+  -- Remote-console settings were introduced additively.  Read the canonical
+  -- nested record first, then the short aliases used by early V4 drafts, and
+  -- always emit a fresh canonical table for serializer safety.
+  local loadedRemote = type(loaded.remoteConsole) == "table" and loaded.remoteConsole
+    or (type(loaded.remote_console) == "table" and loaded.remote_console)
+    or (type(loaded.remote) == "table" and loaded.remote) or {}
+  local remoteScalar = type(loaded.remoteConsole) == "boolean" and loaded.remoteConsole or nil
+  local remoteSource = {
+    enabled = firstNonNil(loadedRemote.enabled, remoteScalar, loaded.remoteConsoleEnabled,
+      loaded.remote_console_enabled, loaded.remoteEnabled),
+    allowShell = firstNonNil(loadedRemote.allowShell, loadedRemote.shell,
+      loaded.remoteConsoleAllowShell, loaded.remote_allow_shell, loaded.remoteShell),
+    sessionSeconds = firstNonNil(loadedRemote.sessionSeconds, loadedRemote.session,
+      loadedRemote.timeoutSeconds, loaded.remoteSessionSeconds, loaded.remoteConsoleSessionSeconds),
+    maxOutputBytes = firstNonNil(loadedRemote.maxOutputBytes, loadedRemote.maxOutput,
+      loaded.remoteMaxOutputBytes, loaded.remoteConsoleMaxOutputBytes),
+    auditLimit = firstNonNil(loadedRemote.auditLimit, loadedRemote.auditEntries,
+      loaded.remoteAuditLimit, loaded.remoteConsoleAuditLimit),
+    allowlist = firstNonNil(loadedRemote.allowlist, loadedRemote.allowList, loadedRemote.commands,
+      loadedRemote.allowedCommands, loaded.remoteAllowlist, loaded.remote_allowlist,
+      loaded.remoteConsoleAllowlist),
+  }
+  config.remoteConsole = M.normalizeRemoteConsoleConfig(remoteSource)
   config.profile = normalizeEnum(config.profile, { safe = true, balanced = true, turbo = true }, defaults.profile)
   config.waterMode = normalizeEnum(config.waterMode, { ignore = true, stop = true, seal = true }, defaults.waterMode)
   config.maxContinuousSeal = normalizeInteger(config.maxContinuousSeal, 1, 4096, defaults.maxContinuousSeal)
@@ -1485,6 +1629,10 @@ function M.saveConfig(config)
     if type(toSave.materials) == "table" and type(toSave.discard) == "table" then
       toSave.materials.discard = M.copy(toSave.discard)
     end
+    -- Rebuild the remote-console record from scalar fields and a fresh array
+    -- so hand-edited/shared aliases (or recursive tables) can never make the
+    -- ComputerCraft serializer reject an otherwise valid worker config.
+    toSave.remoteConsole = M.normalizeRemoteConsoleConfig(config.remoteConsole)
   end
   return M.saveTable(M.CONFIG_PATH, toSave)
 end

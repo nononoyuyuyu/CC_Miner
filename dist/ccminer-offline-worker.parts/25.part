@@ -1,3 +1,225 @@
+      currentKey = state.job.route.currentKey,
+    } or nil,
+  }
+  local ok, serialized = pcall(textutils.serialize, entry)
+  if ok then handle.writeLine(serialized) end
+  handle.close()
+  if not ok then return false end
+  -- Keep the audit file bounded without making it authoritative.  This is a
+  -- best-effort rotation; failure is intentionally non-fatal.
+  if fs.getSize and fs.getSize(path) > 131072 then
+    local old = path .. ".1"
+    pcall(function()
+      if fs.exists(old) then fs.delete(old) end
+      fs.move(path, old)
+      state.journal.entries = 0
+    end)
+  end
+  if state.stats then state.stats.journalWrites = (state.stats.journalWrites or 0) + 1 end
+  state.journal.lightweight = state.journal.lightweight or {}
+  state.journal.lightweight.seq = (tonumber(state.journal.lightweight.seq) or 0) + 1
+  state.journal.lightweight.writes = (tonumber(state.journal.lightweight.writes) or 0) + 1
+  state.journal.lightweight.lastAt = entry.at
+  return true
+end
+
+local function saveLightweightCheckpoint(reason)
+  local journalConfig = config.journal or {}
+  if journalConfig.enabled == false then return true end
+  local path = journalConfig.pendingPath or "/ccminer/data/state.pending"
+  if not fs or not fs.open then return false end
+  if common.ensureDir then common.ensureDir(fs.getDir(path)) end
+  local compact = {
+    schema = common.SCHEMA,
+    at = common.nowSeconds(),
+    reason = tostring(reason or "state"),
+    pose = {
+      x = tonumber(state.pose and state.pose.x) or 0,
+      y = tonumber(state.pose and state.pose.y) or 0,
+      z = tonumber(state.pose and state.pose.z) or 0,
+      dir = (tonumber(state.pose and state.pose.dir) or 0) % 4,
+    },
+    pendingAction = state.pendingAction and common.copy(state.pendingAction) or nil,
+    status = state.status, phase = state.phase,
+    jobId = state.job and state.job.id or nil,
+    cursor = state.job and state.job.cursor or nil,
+    route = state.job and state.job.route and common.copy(state.job.route) or nil,
+    request = state.request,
+    service = state.service and common.copy(state.service) or nil,
+    checkpoint = state.checkpoint and common.copy(state.checkpoint) or nil,
+    resumeToken = state.resumeToken and common.copy(state.resumeToken) or nil,
+    assignmentResumeToken = state.assignmentResumeToken and common.copy(state.assignmentResumeToken) or nil,
+    stagedStop = state.stagedStop and common.copy(state.stagedStop) or state.stagedStop,
+  }
+  -- Use the same writeAllAtomic path as state.db.  A direct fs.open("w")
+  -- leaves a truncated pending file if the turtle loses power mid-write.
+  local ok = common.saveTable(path, compact)
+  if not ok then return false end
+  state.journal.lightweight = state.journal.lightweight or {}
+  state.journal.lightweight.checkpoints = (tonumber(state.journal.lightweight.checkpoints) or 0) + 1
+  state.journal.lightweight.lastMove = tonumber(state.stats and state.stats.moves) or 0
+  state.journal.lightweight.lastReason = tostring(reason or "state")
+  return true
+end
+
+local function lightweightWriteDue(reason)
+  local journalConfig = config.journal or {}
+  if journalConfig.enabled == false then return true end
+  local light = state.journal and state.journal.lightweight or {}
+  if light.force == true or state.pendingAction ~= nil then return true end
+  local status = tostring(state.status or "")
+  if status == "idle" or status == "paused" or status == "blocked" or status == "complete"
+    or status == "aborted" or state.request ~= nil or state.service ~= nil then
+    return true
+  end
+  local every = math.max(1, tonumber(config.performance and config.performance.lightweightCheckpointEveryMoves) or 16)
+  local moves = tonumber(state.stats and state.stats.moves) or 0
+  local lastMove = tonumber(light.lastMove) or 0
+  if moves - lastMove >= every then return true end
+  local text = tostring(reason or "")
+  return text == "field_compress" or text == "field_discard" or text == "field_discard_inventory"
+    or text == "discard_inventory_error" or text == "unload_start" or text == "unload_done"
+end
+
+local function saveJournalCheckpoint()
+  local journalConfig = config.journal or {}
+  if journalConfig.enabled == false then return true end
+  local every = math.max(1, tonumber(config.performance and config.performance.checkpointEveryMoves) or tonumber(journalConfig.checkpointEvery) or 32)
+  state.journal = state.journal or {}
+  local writes = tonumber(state.journal.writes) or 0
+  if writes == 0 or writes % every ~= 0 then return true end
+  local path = journalConfig.checkpointPath or "/ccminer/data/state.checkpoint.db"
+  local ok, err = common.saveTable(path, state)
+  if ok then
+    state.journal.checkpoints = (tonumber(state.journal.checkpoints) or 0) + 1
+    state.journal.lastCheckpointAt = common.nowSeconds()
+    state.journal.lastCheckpointMove = tonumber(state.stats and state.stats.moves) or 0
+  end
+  return ok, err
+end
+
+local function stateSaveNeedsFull(reason, explicit)
+  local journalConfig = config.journal or {}
+  if journalConfig.enabled == false then return true end
+  if explicit == true then return true end
+  local status = tostring(state.status or "")
+  if not state.job or status == "idle" or status == "paused" or status == "blocked"
+    or status == "complete" or status == "aborted" or status == "calibrating"
+    or status == "waiting_output" or status == "waiting_fuel" or status == "waiting_seal" or status == "waiting_torch"
+    or state.request ~= nil then
+    return true
+  end
+  if state.service then
+    local phase = tostring(state.phase or "")
+    if phase == "service_requested" or phase == "unloading" or phase == "refueling"
+      or phase == "refilling_seal" or phase == "refilling_torch"
+      or phase == "waiting_output" or phase == "waiting_fuel" or phase == "waiting_seal" or phase == "waiting_torch" then
+      return true
+    end
+  end
+  local moveEvery = math.max(1, tonumber(config.performance and config.performance.checkpointEveryMoves) or 32)
+  local lastMove = tonumber(state.journal and state.journal.lastCheckpointMove) or 0
+  if (tonumber(state.stats and state.stats.moves) or 0) - lastMove >= moveEvery then return true end
+  local text = tostring(reason or "")
+  return text:find("start", 1, true) ~= nil or text:find("complete", 1, true) ~= nil
+    or text:find("blocked", 1, true) ~= nil or text:find("recovery", 1, true) ~= nil
+    or text:find("stop", 1, true) ~= nil or text:find("pause", 1, true) ~= nil
+    or text:find("rehome", 1, true) ~= nil or text:find("clear", 1, true) ~= nil
+end
+
+local function saveState(reason, explicitFull)
+  if state.estimate and state.job then
+    state.estimate.actual = tonumber(state.job.cursor) or 0
+    state.estimate.variance = state.estimate.actual - (tonumber(state.estimate.estimated) or state.estimate.actual)
+  end
+  state.schema = common.SCHEMA
+  state.version = common.VERSION
+  state.updatedAt = common.nowSeconds()
+  local full = stateSaveNeedsFull(reason, explicitFull)
+  local ok, err = true, nil
+  if full then
+    ok, err = common.saveTable(common.STATE_PATH, state)
+    if ok then
+      state.journal = state.journal or {}
+      state.journal.lastCheckpointMove = tonumber(state.stats and state.stats.moves) or 0
+      state.journal.lastCheckpointAt = state.updatedAt
+      local pendingPath = (config.journal or {}).pendingPath or "/ccminer/data/state.pending"
+      if fs and fs.exists and fs.exists(pendingPath) then pcall(fs.delete, pendingPath) end
+    end
+  end
+  if not ok then
+    common.log("ERROR", "State save failed: " .. tostring(err))
+    error("State save failed: " .. tostring(err), 0)
+  end
+  local writeLightweight = full or lightweightWriteDue(reason)
+  if writeLightweight then
+    if not appendJournal(reason) then
+      common.log("WARN", "State journal append failed; atomic state remains authoritative.")
+    end
+    if (not full) and not saveLightweightCheckpoint(reason) then
+      state.journal.lightweight = state.journal.lightweight or {}
+      state.journal.lightweight.lastError = "pending journal write failed"
+      state.status, state.phase = "blocked", "journal_error"
+      state.lastError = "Atomic pending journal write failed; physical work is stopped."
+      error(state.lastError, 0)
+    end
+    if state.journal and state.journal.lightweight then state.journal.lightweight.force = false end
+  end
+  if full then saveJournalCheckpoint() end
+end
+
+local function poseCopy(pose)
+  pose = pose or state.pose or {}
+  return {
+    x = tonumber(pose.x) or 0,
+    y = tonumber(pose.y) or 0,
+    z = tonumber(pose.z) or 0,
+    dir = (tonumber(pose.dir) or 0) % 4,
+  }
+end
+
+local function samePosePosition(a, b)
+  return tonumber(a and a.x) == tonumber(b and b.x)
+    and tonumber(a and a.y) == tonumber(b and b.y)
+    and tonumber(a and a.z) == tonumber(b and b.z)
+end
+
+-- A resume token is a durable route cursor, not merely a coordinate.  The
+-- service path may revisit a chunk anchor, so preserving layer/cursor/phase
+-- prevents mining the same cell twice after a return or a power loss.
+local function checkpointToken()
+  local token = {
+    pose = poseCopy(),
+    x = tonumber(state.pose and state.pose.x) or 0,
+    y = tonumber(state.pose and state.pose.y) or 0,
+    z = tonumber(state.pose and state.pose.z) or 0,
+    dir = (tonumber(state.pose and state.pose.dir) or 0) % 4,
+  }
+  local job = state.job
+  local route = job and job.route
+  if route then
+    token.layer = tonumber(route.layer) or 0
+    token.walkIndex = tonumber(route.walkIndex) or 1
+    token.localCursor = tonumber(route.localCursor) or 0
+    token.phase = route.phase or "travel"
+    token.currentKey = route.currentKey
+  end
+  token.cursor = job and tonumber(job.cursor) or nil
+  token.jobId = job and job.id or nil
+  return token
+end
+
+local function installCheckpointToken(token)
+  if type(token) ~= "table" then return end
+  state.resumeToken = common.copy(token)
+  state.checkpoint = common.copy(token)
+end
+
+local function beginPhysicalAction(kind, details, poseAfter)
+  if state.pendingAction then
+    return false, "An unresolved physical action is already recorded. Rehome the turtle before continuing."
+  end
+  state.pendingAction = {
     kind = tostring(kind or "unknown"),
     poseBefore = poseCopy(),
     poseAfter = poseAfter and poseCopy(poseAfter) or nil,
@@ -66,283 +288,3 @@ end
 local function isSealItemName(name)
   return name and config.sealBlocks and config.sealBlocks[name] == true
 end
-
-local function materialsConfig()
-  local materials = config.materials or {}
-  local recycle = config.recycle or {}
-  return materials, recycle
-end
-
--- Profiles adjust operating margins and cadence only.  Job-level settings for
--- safety modes (lighting/water) remain authoritative elsewhere in the worker.
--- Keep an invalid legacy config from silently selecting a more aggressive
--- profile; balanced is the neutral, backward-compatible fallback.
-local function effectiveProfile()
-  local profile = state.job and state.job.profile or config.profile or "balanced"
-  profile = tostring(profile)
-  if profile ~= "safe" and profile ~= "balanced" and profile ~= "turbo" then
-    profile = "balanced"
-  end
-  return profile
-end
-
-local function profileReserveEmptySlots()
-  local materials = config.materials or {}
-  local base = math.max(0, math.floor(tonumber(materials.reserveEmptySlots or config.reserveEmptySlots) or 3))
-  local profile = effectiveProfile()
-  if profile == "safe" then return math.min(8, base + 2) end
-  if profile == "turbo" then return math.max(1, base - 1) end
-  return base
-end
-
-local function profileFuelBuffer()
-  local base = math.max(0, tonumber(config.fuelBuffer) or 256)
-  if effectiveProfile() == "safe" then return math.ceil(base * 1.5) end
-  -- Turbo may not reduce the configured fuel safety margin.  There is no
-  -- speed-up worth weakening the return-home guarantee, so retain base.
-  return base
-end
-
-local function profileCompactEvery()
-  local materials = config.materials or {}
-  local base = math.max(0, math.floor(tonumber(materials.compactEveryMoves or config.compactEveryMoves) or 32))
-  local profile = effectiveProfile()
-  if profile == "safe" then return math.min(base, 16) end
-  if profile == "turbo" then return math.max(base, 64) end
-  return base
-end
-
-local function profileMaxContinuousSeal()
-  local base = math.max(1, math.floor(tonumber(
-    config.maxContinuousSeal or config.fluidSealLimit or config.waterSealLimit
-  ) or 8))
-  local profile = effectiveProfile()
-  -- maxContinuousSeal is a user-configured absolute ceiling.  A profile can
-  -- only tighten it (safe) or use a larger documented cap when configured
-  -- (turbo); it must never raise a default 32 to 64 implicitly.
-  if profile == "safe" then return math.min(base, 8) end
-  if profile == "turbo" then return math.min(base, 64) end
-  return math.min(base, 32)
-end
-
-local function profileLightingInterval(requested)
-  requested = math.max(1, math.floor(tonumber(requested) or 32))
-  local profile = effectiveProfile()
-  if profile == "safe" then return math.min(requested, 8) end
-  if profile == "turbo" then return math.min(12, math.max(requested, 12)) end
-  return requested
-end
-
--- Shared by status reporting and the movement implementation so the
--- controller sees the same explicit mode and profile-adjusted cadence that
--- physical placement will use.
-local function effectiveLightingValues()
-  local lighting = config.lighting or {}
-  local mode = state.job and state.job.lighting and state.job.lighting.mode or nil
-  mode = mode or state.lighting.mode or lighting.mode or config.lightMode or "off"
-  if mode ~= "off" and mode ~= "safe" and mode ~= "custom" then mode = "off" end
-  local requested = state.job and state.job.lighting and state.job.lighting.interval or nil
-  requested = tonumber(requested or state.lighting.interval or lighting.interval or config.torchInterval) or 32
-  return mode, profileLightingInterval(requested)
-end
-
-local function lightingConfig()
-  local lighting = config.lighting or {}
-  local mode = lighting.mode or config.lightMode or "off"
-  if mode ~= "off" and mode ~= "safe" and mode ~= "custom" then mode = "off" end
-  local interval = tonumber(lighting.interval or config.torchInterval) or 32
-  return lighting, mode, math.max(1, math.floor(interval))
-end
-
-local function torchBlocks()
-  local lighting = config.lighting or {}
-  local blocks = lighting.torchBlocks or config.torchBlocks or {
-    ["minecraft:torch"] = true,
-    ["minecraft:soul_torch"] = true,
-  }
-  return blocks
-end
-
-local function isTorchItemName(name)
-  return name and torchBlocks()[name] == true
-end
-
-local function slotSet(value)
-  local result = {}
-  if type(value) ~= "table" then return result end
-  -- Lists such as {13,14} store slots in values; maps such as {[13]=true}
-  -- store them in keys.  Accept both forms for old and new configurations.
-  for key, item in pairs(value) do
-    local numberItem, numberKey = tonumber(item), tonumber(key)
-    if type(item) == "boolean" then
-      if item and numberKey then result[math.floor(numberKey)] = true end
-    elseif numberItem then
-      result[math.floor(numberItem)] = true
-    elseif numberKey then
-      result[math.floor(numberKey)] = true
-    end
-  end
-  return result
-end
-
-local function materialSlotSets()
-  local materials, recycle = materialsConfig()
-  local sets = {
-    generic = slotSet(materials.reservedSlots or recycle.reservedSlots or config.reservedSlots),
-    seal = slotSet(materials.sealSlots or config.sealSlots),
-    torch = slotSet(materials.torchSlots or config.torchSlots),
-    fuel = slotSet(materials.fuelReserveSlots or config.fuelReserveSlots),
-  }
-  return sets
-end
-
-local function isReservedSlot(slot, role)
-  local sets = materialSlotSets()
-  local number = tonumber(slot) or 0
-  if sets.generic[number] then return true end
-  if role == "seal" then return sets.torch[number] or sets.fuel[number] end
-  if role == "torch" then return sets.seal[number] or sets.fuel[number] end
-  if role == "fuel" then return sets.seal[number] or sets.torch[number] end
-  if role == "generic" or role == nil then
-    return sets.seal[number] or sets.torch[number] or sets.fuel[number]
-  end
-  return false
-end
-
-local function slotRoleContains(slot, role)
-  local sets = materialSlotSets()
-  return sets[role] and sets[role][tonumber(slot) or 0] == true
-end
-
-local function isFuelItem(slot)
-  if not slot or turtle.getItemCount(slot) <= 0 or type(turtle.refuel) ~= "function" then return false end
-  local original = turtle.getSelectedSlot()
-  turtle.select(slot)
-  local ok, result = pcall(turtle.refuel, 0)
-  turtle.select(original)
-  return ok and result == true
-end
-
-local function sealMaterialCount()
-  local count = 0
-  for slot = 1, 16 do
-    if isSealItemName(itemName(slot)) then count = count + turtle.getItemCount(slot) end
-  end
-  return count
-end
-
-local function selectSealMaterial()
-  local materials = materialsConfig()
-  local preferred = materials.sealSlots or (config.recycle and config.recycle.sealSlots) or config.sealSlots
-  if type(preferred) == "table" then
-    for _, candidate in ipairs(preferred) do
-      local slot = tonumber(candidate)
-      if slot and not isReservedSlot(slot, "seal") and turtle.getItemCount(slot) > 0 and isSealItemName(itemName(slot)) then
-        turtle.select(slot)
-        return slot
-      end
-    end
-  end
-  for slot = 1, 16 do
-    if not isReservedSlot(slot, "seal") and isSealItemName(itemName(slot)) and turtle.getItemCount(slot) > 0 then
-      turtle.select(slot)
-      return slot
-    end
-  end
-  return nil
-end
-
-local function torchMaterialCount()
-  local count = 0
-  for slot = 1, 16 do
-    if isTorchItemName(itemName(slot)) then count = count + turtle.getItemCount(slot) end
-  end
-  return count
-end
-
-local function preferredTorchSlots()
-  local materials = materialsConfig()
-  local lighting = config.lighting or {}
-  local configured = lighting.preferredSlots or materials.torchSlots or config.torchSlots
-  local result, seen = {}, {}
-  if lighting.slot and tonumber(lighting.slot) then
-    local slot = math.floor(tonumber(lighting.slot))
-    result[#result + 1], seen[slot] = slot, true
-  end
-  if type(configured) == "table" then
-    for _, candidate in ipairs(configured) do
-      local slot = tonumber(candidate)
-      if slot and not seen[math.floor(slot)] then
-        slot = math.floor(slot)
-        result[#result + 1], seen[slot] = slot, true
-      end
-    end
-  end
-  return result
-end
-
-local function selectTorchMaterial()
-  local preferred = preferredTorchSlots()
-  if type(preferred) == "table" then
-    for _, candidate in ipairs(preferred) do
-      local slot = tonumber(candidate)
-      if slot and not isReservedSlot(slot, "torch") and turtle.getItemCount(slot) > 0 and isTorchItemName(itemName(slot)) then
-        turtle.select(slot)
-        return slot
-      end
-    end
-  end
-  for slot = 1, 16 do
-    if not isReservedSlot(slot, "torch") and turtle.getItemCount(slot) > 0 and isTorchItemName(itemName(slot)) then
-      turtle.select(slot)
-      return slot
-    end
-  end
-  return nil
-end
-
-local function gpsConfig()
-  config.gps = config.gps or {}
-  return config.gps
-end
-
-local function gpsCalibration()
-  local gpsSettings = gpsConfig()
-  if geo.validCalibration(gpsSettings.calibration) then return gpsSettings.calibration end
-  return nil
-end
-
-local function gpsSummary()
-  local calibration = gpsCalibration()
-  return {
-    enabled = gpsConfig().enabled ~= false,
-    required = gpsConfig().required == true,
-    available = state.gps and state.gps.available == true,
-    calibrated = calibration ~= nil,
-    calibration = calibration and common.copy(calibration) or nil,
-    lastFix = state.gps and common.copy(state.gps.lastFix) or nil,
-    lastFixAt = state.gps and state.gps.lastFixAt or nil,
-    lastError = state.gps and state.gps.lastError or nil,
-    corrections = state.gps and state.gps.corrections or 0,
-  }
-end
-
-local function jobSnapshot()
-  if not state.job then return nil end
-  local route = state.job.route
-  local layer, row, currentChunk
-  if state.job.strategy == "chunk_plan" and route then
-    layer = (tonumber(route.layer) or 0) + 1
-    currentChunk = route.currentKey
-  else
-    local cursor = tonumber(state.job.cursor) or 0
-    local rowWidth = math.max(1, tonumber(state.job.length) or 1)
-    local rowVolume = rowWidth * math.max(1, tonumber(state.job.width) or 1)
-    layer = math.floor(cursor / rowVolume) + 1
-    row = math.floor((cursor % rowVolume) / rowWidth) + 1
-  end
-  return {
-    id = state.job.id,
-    assignmentId = state.job.assignmentId,
-    groupJobId = state.job.groupJobId,
-    groupId = state.job.groupId,

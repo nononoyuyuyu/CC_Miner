@@ -37,6 +37,7 @@ local function printHelp()
   print("ccm gps <id>                    Request GPS fix")
   print("ccm calibrate <id>              Calibrate worker GPS")
   print("ccm rehome <id> RESET")
+  print("ccm remote <workerId> [-- <command...>]  Remote console (CLI only)")
 end
 
 local function forwardController(forwarded)
@@ -1116,7 +1117,7 @@ elseif command == "rehome" then
 elseif command == "start" or command == "pause" or command == "resume" or command == "recall"
   or command == "service" or command == "abort" or command == "clear" or command == "gps" or command == "calibrate"
   or command == "queue" or command == "preset" or command == "presets" or command == "stop"
-  or command == "group" or command == "dock" or command == "bay" then
+  or command == "group" or command == "dock" or command == "bay" or command == "remote" then
   local config = loadConfigForCommand()
   if config and config.role ~= "controller" then reportError("Run this command on the controller computer.")
   elseif config then

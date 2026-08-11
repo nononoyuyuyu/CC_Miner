@@ -1,242 +1,199 @@
-    elseif name == "report" then mode = "report"
-    elseif name == "last_error" then noticeState.showLast()
-    elseif name == "stop" then if id then mode = "stop_menu" else setNotice("No worker selected.", true) end
-    elseif name == "pause" or name == "resume" or name == "recall" or name == "service" then sendCommand(id, name)
-    elseif name == "abort" then
-      if id then confirmState = { command = "stop", payload = { mode = "abort" }, message = "Abort the active job and return home?" }; mode = "confirm" end
-    elseif name == "clear" then
-      if id then confirmState = { command = "clear", message = "Clear the completed or aborted job record?" }; mode = "confirm" end
-    elseif name == "rehome" then
-      if id then confirmState = { command = "rehome", payload = { confirm = "RESET" }, twoStep = true, message = "REHOME RESET clears the active job. Press YES twice only when the turtle is physically in its dock." }; mode = "confirm" end
-    elseif name == "gps" then
-      if id then confirmState = { command = "calibrate_gps", message = "GPS calibration moves forward one block and back. Is the dock front clear?" }; mode = "confirm" end
-    elseif name == "quit" then running = false end
-    invalidate()
-  end
-end
-
-local function sortingTick()
-  local settings = config.sorting
-  if not settings or settings.enabled ~= true or common.nowSeconds() - lastSorting < (tonumber(settings.interval) or 30) then return end
-  lastSorting = common.nowSeconds()
-  if not peripheral or not peripheral.wrap then return end
-  local source = peripheral.wrap(settings.source or "")
-  local valuable = peripheral.wrap(settings.valuableTarget or "")
-  local bulk = peripheral.wrap(settings.bulkTarget or "")
-  local seal = peripheral.wrap(settings.sealTarget or "")
-  if not source or type(source.list) ~= "function" or type(source.pushItems) ~= "function" then
-    if not sortingWarned then sortingWarned = true; setNotice("Sorting WARN: source inventory is not configured.", false) end
-    return
-  end
-  if not valuable or not bulk or not seal then
-    if not sortingWarned then sortingWarned = true; setNotice("Sorting WARN: one or more target inventories are missing.", false) end
-    return
-  end
-  local valuableItems, sealItems = settings.valuableItems or {}, settings.sealBlocks or {}
-  for slot, item in pairs(source.list() or {}) do
-    local destination = bulk
-    if valuableItems[item.name] == true then destination = valuable
-    elseif sealItems[item.name] == true then destination = seal end
-    local targetName = destination == valuable and (settings.valuableTarget or "") or destination == seal and (settings.sealTarget or "") or (settings.bulkTarget or "")
-    pcall(source.pushItems, targetName, slot, item.count)
-  end
-end
-]] },
-  { source = [[src/ccminer/controller_parts/02.part]], target = [[controller_parts/02.part]], digest = [[9f523a5b9993393fd52fb1e53944ba5bd5628b58bd05ef0adfe93ffa02b8162c]], content = [[-- CC Miner V4 - adaptive touch views.  Every view has a keyboard fallback and
--- uses bounded hitboxes, so a 20x8 monitor remains operable.
-
-local fieldOrder = { "width", "length", "depth", "targetY" }
-local fieldLabels = { width = "WIDTH", length = "LENGTH", depth = "DEPTH", targetY = "BOTTOM Y" }
-local fieldLimits = { width = 128, length = 512, depth = 128, targetY = 32000 }
-
-local function currentFieldOrder()
-  if draft and draftCalibration() then return { "width", "length", "targetY" } end
-  return { "width", "length", "depth" }
-end
-
--- Group dimensions intentionally use a separate draft.  The single-worker
--- `draft` remains untouched so an operator can leave GROUPS and resume a
--- queued/legacy job without losing its inputs.
-local function groupDraftWorldMode()
-  return groupDraft and tostring(groupDraft.mode or "world") == "world"
-end
-
-local function groupFieldOrder()
-  return groupDraftWorldMode() and { "width", "length", "targetY" } or { "width", "length", "depth" }
-end
-
-local function commitGroupDraftField()
-  if not groupDraft then return end
-  local field = groupDraft.selectedField or "width"
-  local value = tonumber(groupDraft.buffer)
-  if not value then value = groupDraft[field] or 1 end
-  value = common.clamp(math.floor(value), fieldLimits[field] and -fieldLimits[field] or 1, fieldLimits[field] or 512)
-  if field ~= "targetY" then value = math.max(1, value) end
-  groupDraft[field], groupDraft.buffer = value, tostring(value)
-end
-
-local function chooseGroupDraftField(field)
-  commitGroupDraftField()
-  if not groupDraft then return end
-  groupDraft.selectedField = field
-  groupDraft.buffer = tostring(groupDraft[field] or 0)
-end
-
-local function groupDraftDigit(digit)
-  if not groupDraft then return end
-  local buffer = tostring(groupDraft.buffer or "")
-  if tostring(digit) == "-" then
-    if groupDraft.selectedField == "targetY" and buffer:sub(1, 1) ~= "-" then groupDraft.buffer = "-" .. (buffer == "0" and "" or buffer); groupDraft.preflight = nil end
-    return
-  end
-  if buffer == "0" then buffer = "" end
-  if #buffer < 6 then groupDraft.buffer = buffer .. tostring(digit); groupDraft.preflight = nil end
-end
-
-local function groupDraftBackspace()
-  if not groupDraft then return end
-  local buffer = tostring(groupDraft.buffer or "")
-  groupDraft.buffer = buffer:sub(1, math.max(0, #buffer - 1))
-  if groupDraft.buffer == "" or groupDraft.buffer == "-" then groupDraft.buffer = "0" end
-  groupDraft.preflight = nil
-end
-
-local function adjustGroupDraft(field, delta)
-  chooseGroupDraftField(field)
-  if not groupDraft then return end
-  local value = tonumber(groupDraft[field]) or 1
-  local minimum = field == "targetY" and -fieldLimits.targetY or 1
-  local maximum = fieldLimits[field] or 512
-  groupDraft[field], groupDraft.buffer = common.clamp(value + delta, minimum, maximum), nil
-  groupDraft.buffer = tostring(groupDraft[field])
-  groupDraft.preflight = nil
-end
-
-local function commitDraftField()
-  if not draft then return end
-  local field = draft.selectedField or "width"
-  local value = tonumber(draft.buffer)
-  if not value then value = draft[field] or 1 end
-  value = common.clamp(math.floor(value), fieldLimits[field] and -fieldLimits[field] or 1, fieldLimits[field] or 512)
-  if field ~= "targetY" then value = math.max(1, value) end
-  draft[field], draft.buffer = value, tostring(value)
-end
-
-local function chooseDraftField(field)
-  commitDraftField()
-  draft.selectedField = field
-  draft.buffer = tostring(draft[field] or 0)
-end
-
-local function draftDigit(digit)
-  if not draft then return end
-  local buffer = tostring(draft.buffer or "")
-  if tostring(digit) == "-" then
-    if draft.selectedField == "targetY" and buffer:sub(1, 1) ~= "-" then draft.buffer = "-" .. (buffer == "0" and "" or buffer) end
-    return
-  end
-  if buffer == "0" then buffer = "" end
-  if #buffer < 6 then draft.buffer = buffer .. tostring(digit) end
-end
-
-local function draftBackspace()
-  if not draft then return end
-  local buffer = tostring(draft.buffer or "")
-  draft.buffer = buffer:sub(1, math.max(0, #buffer - 1))
-  if draft.buffer == "" or draft.buffer == "-" then draft.buffer = "0" end
-end
-
-local function adjustDraft(field, delta)
-  chooseDraftField(field)
-  local value = tonumber(draft[field]) or 1
-  local minimum = field == "targetY" and -fieldLimits.targetY or 1
-  local maximum = fieldLimits[field] or 512
-  draft[field], draft.buffer = common.clamp(value + delta, minimum, maximum), nil
-  draft.buffer = tostring(draft[field])
-end
-
-local function writeHeader(title, target, background)
-  local width = target.getSize()
-  common.writeAt(1, 1, common.center(title, width), colors and colors.black or nil, background or (colors and colors.cyan or nil))
-end
-
-local function noticeLine(target, y)
-  local width, height = target.getSize()
-  y = y or height
-  if y < 1 then return end
-  local noticeColor = noticeIsError and (colors and colors.red or nil) or (colors and colors.lime or nil)
-  local prefix = noticeIsError and "ERROR - open LAST ERR: " or ""
-  common.writeAt(1, y, common.fit(prefix .. notice, width), noticeColor)
-end
-
-local function wrapNotice(text, width)
-  local lines, remaining = {}, tostring(text or "")
-  width = math.max(8, width)
-  while #remaining > width do
-    local cut = width
-    while cut > 1 and remaining:sub(cut, cut) ~= " " do cut = cut - 1 end
-    if cut <= 1 then cut = width end
-    lines[#lines + 1] = remaining:sub(1, cut):gsub("%s+$", "")
-    remaining = remaining:sub(cut + 1):gsub("^%s+", "")
-  end
-  if remaining ~= "" then lines[#lines + 1] = remaining end
-  return lines
-end
-
-local function renderErrorDetail(target, key)
-  local width, height = target.getSize()
-  writeHeader("COMMAND REJECTED - DETAILS", target, colors and colors.red or nil)
-  common.writeAt(1, 2, common.fit("The worker refused the command. Read the reason below.", width), colors and colors.yellow or nil)
-  local lines = wrapNotice(noticeState.detail or notice or "Unknown error", math.max(8, width - 2))
-  local maxLines = math.max(1, height - 5)
-  for index = 1, math.min(#lines, maxLines) do
-    common.writeAt(2, 2 + index, common.fit(lines[index], math.max(1, width - 2)), colors and colors.white or nil)
-  end
-  if #lines > maxLines then common.writeAt(2, height - 2, common.fit("The message continues; use ccm report if needed.", math.max(1, width - 2)), colors and colors.yellow or nil) end
-  buttonRow(key, height, width, { { "OK - RETURN", noticeState.dismiss, true } })
-end
-
-local function statusGlyph(state)
-  return ({ ok = "OK", warn = "!!", bad = "XX" })[state] or "??"
-end
-
-local function renderDashboard(target, key)
-  local width, height = target.getSize()
-  writeHeader("CC MINER V4 TOUCH CONTROL", target)
-  local ids = orderedIds()
-  local online = 0
-  for _, id in ipairs(ids) do if statusOf(workers[id]) ~= "offline" then online = online + 1 end end
-  common.writeAt(1, 2, common.fit(("Controller #%d | Workers %d/%d | Q%d H%d"):format(os.getComputerID(), online, #ids, #db.queue, #db.history), width), colors and colors.lightGray or nil)
-  local headerY = 4
-  common.writeAt(1, headerY, common.fit(width >= 48 and " ID    NAME           STATUS       PROGRESS       FUEL" or " ID NAME      STATUS   PROGRESS", width), colors and colors.yellow or nil)
-  local maxRows = math.max(1, height - 10)
-  if #ids == 0 then
-    common.writeAt(2, headerY + 2, common.fit("No workers. DISCOVER (D).", math.max(1, width - 2)), colors and colors.lightGray or nil)
-  else
-    local first = selected > maxRows and selected - maxRows + 1 or 1
-    for row = 1, maxRows do
-      local index = first + row - 1
-      local id = ids[index]
-      if not id then break end
-      local worker, data = workers[id], workers[id].data or {}
-      local status = statusOf(worker)
-      local line
-      if width >= 48 then
-        line = ("%s%-5s %-14s %-12s %-16s %-7s"):format(index == selected and ">" or " ", tostring(id), common.fit(workerLabel(worker, id), 14), common.fit(status, 12), common.fit(progressText(data), 16), tostring(data.fuel or "-"))
-      else
-        line = ("%s%-3s %-10s %-8s %s"):format(index == selected and ">" or " ", tostring(id), common.fit(workerLabel(worker, id), 10), common.fit(status, 8), progressText(data))
-      end
-      local y = headerY + row
-      common.writeAt(1, y, common.fit(line, width), index == selected and (colors and colors.black or nil) or common.statusColor(status), index == selected and (colors and colors.white or nil) or (colors and colors.black or nil))
-      addHitbox(key, 1, y, width, y, function() selected = index; invalidate() end)
     end
   end
-  local bottom = math.max(1, height - 4)
-  buttonRow(key, bottom, width, {
-    { "DISCOVER", dashboardAction("discover") }, { "NEW JOB", dashboardAction("new") },
-    { "PROGRESS", dashboardAction("progress") }, { "INFO", dashboardAction("info") },
-  })
-  buttonRow(key, bottom + 1, width, {
-    { "STOP", dashboardAction("stop") }, { "RECOVERY", dashboardAction("recovery") },
-    { "REPORT", dashboardAction("report") }, { "GPS", dashboardAction("gps") },
-  })
+  target.homeY = target.homeY or source.homeY
+  target.bottomY = target.bottomY or source.bottomY
+  target.layers = target.layers or source.layers
+  local outboundToken = sourceToken and common.copy(sourceToken) or nil
+  if outboundToken then
+    outboundToken.sourceAssignmentId = source.assignmentId
+    outboundToken.reassignedFromAssignmentId = source.assignmentId
+    outboundToken.assignmentId = target.assignmentId
+    outboundToken.groupJobId = job.groupJobId
+    outboundToken.jobId = target.jobId
+    outboundToken.sourceWorkerId = tonumber(stoppedWorkerId) or stoppedWorkerId
+    outboundToken.workerId = target.workerId
+    target.assignmentResumeToken = common.copy(outboundToken)
+  else
+    target.assignmentResumeToken = nil
+  end
+  local pending = {
+    sourceWorkerId = tonumber(stoppedWorkerId) or stoppedWorkerId, targetWorkerId = tonumber(targetWorkerId) or targetWorkerId, assignmentId = target.assignmentId, sourceAssignmentId = source.assignmentId,
+    jobId = target.jobId, chunkKeys = common.copy(source.chunkKeys), transitKeys = common.copy(source.transitKeys or {}), bay = bayId, bayId = bayId, dock = common.copy(dock or {}), dockId = dockId,
+    homeWorld = common.copy(target.homeWorld), maxDepth = target.maxDepth, facing = target.facing, homeY = target.homeY, bottomY = target.bottomY, layers = target.layers, assignmentResumeToken = common.copy(outboundToken), sentAt = common.nowSeconds(), status = "awaiting_ack",
+  }
+  local payload = {
+    scope = "group", group = true, groupId = job.groupId, groupJobId = job.groupJobId, parentGroupJobId = job.groupJobId, groupCommand = "START", requestedCommand = "start", command = "start", assignmentCatalog = common.copy(job.catalog),
+    assignmentId = target.assignmentId, sourceAssignmentId = source.assignmentId, reassignedFromAssignmentId = source.assignmentId, assignmentResumeToken = common.copy(outboundToken), assignmentChunks = common.copy(pending.chunkKeys), chunkKeys = common.copy(pending.chunkKeys), transitKeys = common.copy(pending.transitKeys), seedKey = target.seedKey,
+    homeY = target.homeY, bottomY = target.bottomY, targetY = target.bottomY, layers = target.layers, width = job.width, length = job.length, depth = target.layers or job.depth, chunkMode = job.chunkMode,
+    name = job.name, profile = job.profile, waterMode = job.waterMode, lighting = common.copy(job.lighting or {}), workerId = target.workerId, targetWorkerId = target.workerId,
+    bay = target.bay, bayId = target.bayId, dock = common.copy(target.dock or {}), dockId = target.dockId, homeWorld = common.copy(target.homeWorld), maxDepth = target.maxDepth, facing = target.facing,
+    lease = { groupJobId = job.groupJobId, assignmentId = target.assignmentId, workerId = target.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(pending.chunkKeys) }, assignment = common.copy(target),
+    leases = { transit = { groupJobId = job.groupJobId, assignmentId = target.assignmentId, workerId = target.workerId, mode = job.chunkMode, kind = "transit", chunks = common.copy(pending.transitKeys) }, mine = { groupJobId = job.groupJobId, assignmentId = target.assignmentId, workerId = target.workerId, mode = job.chunkMode, kind = "mine", chunks = common.copy(pending.chunkKeys) } },
+  }
+  job.pendingReassignment = pending
+  saveControllerDb()
+  local ok = sendCommand(target.workerId, "start", payload)
+  if ok then
+    pending.sentAt = common.nowSeconds()
+    pending.status = "awaiting_ack"
+    saveControllerDb()
+    setNotice("Residual reassignment sent; awaiting worker ACK.", false)
+  else
+    job.pendingReassignment = nil
+    saveControllerDb()
+    setNotice("Residual reassignment send failed; original lease retained.", true)
+  end
+  return ok
+end
+
+local function groupSchedulerTick()
+  local now = common.nowSeconds()
+  if now == groupSchedulerLast then return end
+  groupSchedulerLast = now
+  -- Emergency fuel/service requests take precedence over ordinary staggered
+  -- starts.  The cap is persisted per group so restarts cannot overfill a bay.
+  for _, job in pairs(db.groupJobs or {}) do
+    if type(job) == "table" and (job.status == "starting" or job.status == "queued" or job.status == "working" or job.status == "PARTIAL_START") then
+      local group = groupRecord(job.groupId)
+      job.awaitingAck = job.awaitingAck or {}
+      job.pending = job.pending or {}
+      job.attempts = job.attempts or {}
+      if job.pendingReassignment and now - tonumber(job.pendingReassignment.sentAt or now) >= 10 then
+        local pending = job.pendingReassignment
+        job.pendingReassignment = nil
+        job.alerts = job.alerts or {}
+        job.alerts[#job.alerts + 1] = "REASSIGN_TIMEOUT:#" .. tostring(pending.targetWorkerId)
+        updateGroupAggregate(job)
+        saveControllerDb()
+      end
+      for waitingKey, waiting in pairs(job.awaitingAck) do
+        if now - tonumber(waiting.sentAt or now) >= 10 then
+          local attempts = tonumber(job.attempts[waitingKey] or waiting.attempts or 1)
+          job.awaitingAck[waitingKey] = nil
+          if attempts >= 2 then
+            rejectGroupStart(job, waitingKey, "start ACK timeout")
+          else
+            job.pending[waitingKey] = true
+            local assignment = job.assignments and (job.assignments[waitingKey] or job.assignments[tonumber(waitingKey)])
+            if assignment then assignment.status = "queued" end
+            job.nextDispatchAt = now
+          end
+        end
+      end
+      local limit = math.max(1, tonumber(group and group.replenishConcurrency or db.groupScheduler.replenishConcurrency) or 1)
+      local activeService = 0
+      job.serviceSentAt = job.serviceSentAt or {}
+      for _, id in ipairs(groupWorkerIds(group)) do
+        local data = workerData(id) or {}
+        if data.status == "waiting_fuel" or tonumber(data.fuel) and tonumber(data.fuel) <= tonumber(data.fuelLowWatermark or 0) then
+          activeService = activeService + 1
+          if activeService <= limit and now - tonumber(job.serviceSentAt[tostring(id)] or 0) >= 5 then
+            sendCommand(id, "service", { scope = "group", group = true, groupCommand = "SERVICE", groupId = job.groupId, groupJobId = job.groupJobId, priority = "EMERGENCY_FUEL", targetWorkerId = id, workerId = id })
+            job.serviceSentAt[tostring(id)] = now
+          end
+        end
+      end
+      if job.status == "starting" and now >= tonumber(job.nextDispatchAt or 0) then dispatchGroupJob(job, false) end
+    end
+  end
+end
+
+local function buildAssignments(result)
+  local id, worker = draftWorker()
+  if not id or not worker then return nil, "No worker selected." end
+  -- A worker's calibrated home is the authoritative entrance for its plan.
+  -- Until a future protocol can describe independent entrances, never split a
+  -- single footprint at runtime; queue dispatch below handles parallel jobs.
+  local assignments = {}
+  local base = "q-" .. tostring(os.getComputerID()) .. "-" .. tostring(common.nowMillis())
+  local selectedKeys = {}
+  for _, chunk in ipairs(result.catalog or {}) do
+    local excluded = false
+    for _, item in ipairs(result.excludedChunks or {}) do if item.key == chunk.key then excluded = true; break end end
+    if not excluded then selectedKeys[#selectedKeys + 1] = chunk.key end
+  end
+  assignments[1] = { workerId = id, assignmentId = base .. ":1", jobId = base, chunks = selectedKeys }
+  return assignments
+end
+
+local function startDraft()
+  if not draft then return false end
+  -- Worker position, GPS visibility and active-job state may change while the
+  -- preflight page is open. START must use a fresh result, not yesterday's
+  -- green snapshot.
+  local result = computePreflight()
+  if not result then setNotice("Preflight failed.", true); return false end
+  if result.fatal then setNotice("Start blocked by a fatal preflight item.", true); return false end
+  local assignments, assignmentError = buildAssignments(result)
+  if not assignments then setNotice(assignmentError, true); return false end
+  local leases = {}
+  for _, assignment in ipairs(assignments) do
+    local lease, err = reserveLease(assignment.jobId, assignment.workerId, result.chunkMode, assignment.chunks, assignment.assignmentId)
+    if not lease then
+      for _, prior in ipairs(leases) do releaseLeasesForWorker(prior.workerId, prior.jobId) end
+      setNotice(err, true)
+      return false
+    end
+    leases[#leases + 1] = lease
+  end
+  local sent, sentAssignments = true, {}
+  for _, assignment in ipairs(assignments) do
+    local payloadDepth = result.jobDepth or draft.depth
+    local payloadLighting = common.copy(draft.lighting)
+    if type(payloadLighting) ~= "table" then payloadLighting = { mode = "safe" } end
+    if result.effectiveInterval == 0 then payloadLighting.interval = nil else payloadLighting.interval = result.effectiveInterval end
+    local payload = {
+      width = draft.width, length = draft.length, depth = payloadDepth,
+      chunkMode = result.chunkMode, excludedChunks = result.excludedChunks,
+      lighting = payloadLighting, waterMode = draft.waterMode, profile = draft.profile,
+      name = draft.name or ("Quarry %dx%dx%d"):format(draft.width, draft.length, payloadDepth),
+      -- assignmentId is group-only wire metadata. Sending it for an ordinary
+      -- one-worker quarry makes the worker correctly demand assignmentChunks
+      -- and reject the otherwise valid full-footprint job.
+      jobId = assignment.jobId,
+    }
+    if result.chunkMode == "world" then payload.targetY = result.targetY end
+    local sentOK, _, messageId = sendCommand(assignment.workerId, "start", payload)
+    if not sentOK then sent = false; break end
+    db.pendingStarts[tostring(assignment.workerId)] = {
+      workerId = assignment.workerId, jobId = assignment.jobId,
+      assignmentId = assignment.assignmentId, messageId = messageId,
+      sentAt = common.nowSeconds(),
+    }
+    sentAssignments[#sentAssignments + 1] = assignment
+  end
+  if not sent then
+    for _, assignment in ipairs(assignments) do db.pendingStarts[tostring(assignment.workerId)] = nil end
+    for _, assignment in ipairs(sentAssignments) do sendCommand(assignment.workerId, "stop", { mode = "abort", assignmentId = assignment.assignmentId }) end
+    for _, assignment in ipairs(assignments) do releaseLeasesForWorker(assignment.workerId, assignment.jobId) end
+    setNotice("One or more workers rejected the job; all assignments were stopped.", true)
+    return false
+  end
+  db.lastDraft = persistentDraft(draft)
+  db.lastPreset = draft.profile or db.lastPreset
+  if draft.queueIndex and db.queue[draft.queueIndex] then
+    db.queue[draft.queueIndex].awaiting = { workerId = assignments[1].workerId, jobId = assignments[1].jobId, sentAt = common.nowSeconds() }
+    db.queue[draft.queueIndex].retryAt = common.nowSeconds() + 10
+  end
+  saveControllerDb()
+  mode, draft = "dashboard", nil
+  setNotice(("Job sent to %d worker%s."):format(#assignments, #assignments == 1 and "" or "s"), false)
+  return true
+end
+
+local function queueDraft()
+  if not draft then return false end
+  if config.queueEnabled == false then setNotice("Queue is disabled by controller configuration.", true); return false end
+  local previousQueueing = draft.queueing
+  draft.queueing = true
+  local result = computePreflight()
+  draft.queueing = previousQueueing
+  if not result or result.fatal then setNotice("Cannot queue: preflight has a fatal item.", true); return false end
+  local queuedKeys = {}
+  for _, chunk in ipairs(result.catalog or {}) do
+    local excluded = false
+    for _, item in ipairs(result.excludedChunks or {}) do if item.key == chunk.key then excluded = true; break end end
+    if not excluded then queuedKeys[#queuedKeys + 1] = chunk.key end
+  end
+  if result.chunkMode == "world" then
+    local conflict = activeLeaseOverlap(result.chunkMode, draft.workerId, queuedKeys)

@@ -66,8 +66,352 @@
   return true, "GPS calibrated."
 end
 
-local function applyControlCommand(command, payload)
+-- -------------------------------------------------------------------------
+-- Remote console
+-- -------------------------------------------------------------------------
+-- The console is intentionally implemented in the worker rather than by
+-- writing a temporary command file.  Session material and command input stay
+-- in memory; only bounded audit counters are exposed through status.
+
+local function remoteToken(prefix, sender)
+  remoteTokenCounter = (tonumber(remoteTokenCounter) or 0) + 1
+  return ("remote-%s-%d-%d-%d"):format(
+    tostring(prefix or "token"), tonumber(sender) or 0, common.nowMillis(), remoteTokenCounter
+  )
+end
+
+local function remoteIsTerminated(value)
+  local text = tostring(value or "")
+  return text == "Terminated" or text:find("Terminated", 1, true) ~= nil
+end
+
+local function remoteAuditHead(command)
+  -- Keep only the command prefix.  Arguments (which may contain a path or a
+  -- secret supplied to an explicitly enabled shell) are never retained.
+  command = common.trim(command or "")
+  local first, second = command:match("^(%S+)%s+(%S+)")
+  local head = first and second and string.lower(first) == "ccm"
+    and (first .. " " .. second) or (command:match("^(%S+)") or "")
+  return head:sub(1, 64)
+end
+
+local function remoteAuditRecord(command, ok)
+  local limit = math.max(1, math.floor(tonumber(config.remoteConsole.auditLimit) or 50))
+  remoteAudit[#remoteAudit + 1] = {
+    command = remoteAuditHead(command),
+    ok = ok == true,
+    at = common.nowSeconds(),
+  }
+  while #remoteAudit > limit do table.remove(remoteAudit, 1) end
+end
+
+local function remoteSessionExpired()
+  if remoteSession and common.nowSeconds() >= tonumber(remoteSession.expiresAt or 0) then
+    remoteSession = nil
+    return true
+  end
+  return false
+end
+
+local function remoteConsoleReady()
+  local allowed = {
+    idle = true, complete = true, aborted = true, paused = true,
+  }
+  if not allowed[tostring(state.status or "")] then
+    return false, "Remote console requires an idle, complete, aborted, or paused worker."
+  end
+  if not isHome() then return false, "Remote console requires the worker to be at home." end
+  if state.pendingAction then return false, "Remote console is unavailable while recovery is pending." end
+  if state.request ~= nil or state.service ~= nil then
+    return false, "Remote console is unavailable while a worker request is pending."
+  end
+  return true
+end
+
+local function remotePayloadSession(payload)
+  local nested = type(payload.session) == "table" and payload.session or {}
+  local sessionId = payload.sessionId or nested.sessionId or nested.id
+  local nonce = payload.nonce or nested.nonce
+  local sequence = payload.seq or payload.sequence or payload.requestSeq
+    or nested.seq or nested.sequence or nested.requestSeq
+  return sessionId, nonce, sequence
+end
+
+local function remoteConsumeSession(sender, payload)
+  remoteSessionExpired()
+  if not remoteSession then return false, "Remote console session is not open." end
+  if tonumber(sender) ~= tonumber(remoteSession.sender) then
+    return false, "Remote console session is bound to another sender."
+  end
+  local sessionId, nonce, sequence = remotePayloadSession(payload)
+  if tostring(sessionId or "") ~= tostring(remoteSession.sessionId) then
+    return false, "Remote console sessionId is invalid."
+  end
+  if tostring(nonce or "") ~= tostring(remoteSession.nonce) then
+    return false, "Remote console nonce is invalid."
+  end
+  local seq = tonumber(sequence)
+  if not seq or seq ~= math.floor(seq) or seq < 1 then
+    return false, "Remote console sequence is required."
+  end
+  local expected = (tonumber(remoteSession.lastSeq) or 0) + 1
+  if seq ~= expected then
+    return false, ("Remote console sequence replay/out of order (expected %d)."):format(expected)
+  end
+  -- Consume the sequence before running the command.  A failed/denied command
+  -- is still a used request and cannot be replayed with the same sequence.
+  remoteSession.lastSeq = seq
+  return true, nil, seq
+end
+
+local function remoteCommandHead(command)
+  local first, second = tostring(command or ""):match("^%s*(%S+)%s*(%S*)")
+  return string.lower(first or ""), string.lower(second or "")
+end
+
+local function remoteHasForbiddenSyntax(command)
+  command = tostring(command or "")
+  -- Shell metacharacters, substitutions, and backslash escapes are denied in
+  -- safe mode even when a matching configured entry exists.
+  if command:find("[\r\n;|&><`\\]", 1) then return true end
+  if command:find("%$%(", 1) or command:find("%${", 1) then return true end
+  local first, second = remoteCommandHead(command)
+  local base = first:match("([^/]+)$") or first
+  local destructive = {
+    reboot = true, shutdown = true, update = true, delete = true,
+    edit = true, copy = true, move = true, mv = true, rm = true,
+    mkdir = true, rmdir = true, wget = true, pastebin = true,
+    lua = true, shell = true, exit = true, install = true,
+    touch = true, write = true, append = true, format = true,
+    mount = true, unmount = true, attach = true, detach = true,
+    monitor = true, craft = true, tunnel = true, excavate = true,
+    dig = true, drop = true, place = true,
+  }
+  if destructive[base] then return true end
+  if base == "ccm" and second ~= "status" and second ~= "report" and second ~= "doctor" then return true end
+  -- `label set` mutates the computer label; only the read-only getter is
+  -- permitted in safe mode, even when an operator supplied an exact entry.
+  if base == "label" and second ~= "get" then return true end
+  return false
+end
+
+local function remoteConfiguredCommand(command)
+  local allowlist = config.remoteConsole.allowlist
+  if type(allowlist) ~= "table" then return false end
+  for _, entry in ipairs(allowlist) do
+    -- Configured entries are deliberately exact (after trimming the request,
+    -- not the configured value); no wildcard or prefix semantics are allowed.
+    if type(entry) == "string" and command == entry then return true end
+  end
+  return false
+end
+
+local function remoteSafeCommand(command)
+  command = common.trim(command or "")
+  if command == "" or remoteHasForbiddenSyntax(command) then return false end
+  if remoteConfiguredCommand(command) then return true end
+  -- Built-ins are exact command strings too.  This intentionally does not
+  -- grant a command head with arbitrary arguments (for example `ls /`): an
+  -- operator must opt into that complete string in remoteConsole.allowlist.
+  local builtin = {
+    ["ccm status"] = true, ["ccm report"] = true, ["ccm doctor"] = true,
+    ["id"] = true, ["label get"] = true, ["ls"] = true, ["dir"] = true,
+    ["df"] = true, ["free"] = true, ["version"] = true,
+  }
+  return builtin[command] == true
+end
+
+local function remoteMemoryTerminal(limit)
+  local chunks, size, overflow = {}, 0, false
+  local cursorX, cursorY = 1, 1
+  local textColor, backgroundColor = 1, 32768
+  local palettes = {}
+  local function append(value)
+    value = tostring(value or "")
+    if value == "" then return end
+    local remaining = math.max(0, limit - size)
+    if #value > remaining then
+      if remaining > 0 then chunks[#chunks + 1] = value:sub(1, remaining); size = size + remaining end
+      overflow = true
+    else
+      chunks[#chunks + 1] = value
+      size = size + #value
+    end
+  end
+  local terminal = {
+    write = function(value) append(value); cursorX = cursorX + #tostring(value or "") end,
+    blit = function(value) append(value); cursorX = cursorX + #tostring(value or "") end,
+    clear = function() chunks, size, overflow = {}, 0, false; cursorX, cursorY = 1, 1 end,
+    clearLine = function() cursorX = 1 end,
+    getCursorPos = function() return cursorX, cursorY end,
+    setCursorPos = function(x, y)
+      x, y = math.max(1, math.floor(tonumber(x) or 1)), math.max(1, math.floor(tonumber(y) or 1))
+      if y > cursorY then append(string.rep("\n", y - cursorY)) end
+      cursorX, cursorY = x, y
+    end,
+    setCursorBlink = function() end,
+    getCursorBlink = function() return false end,
+    isColor = function() return false end,
+    getSize = function() return 51, 19 end,
+    scroll = function(lines) append(string.rep("\n", math.max(0, tonumber(lines) or 0))) end,
+    setTextColor = function(value) textColor = value end,
+    getTextColor = function() return textColor end,
+    setBackgroundColor = function(value) backgroundColor = value end,
+    getBackgroundColor = function() return backgroundColor end,
+    setPaletteColor = function(index, ...) palettes[index] = { ... } end,
+    setPaletteColour = function(index, ...) palettes[index] = { ... } end,
+    getPaletteColor = function(index) local p = palettes[index]; return p and table.unpack(p) or 0, 0, 0 end,
+    getPaletteColour = function(index) local p = palettes[index]; return p and table.unpack(p) or 0, 0, 0 end,
+  }
+  return terminal, function() return table.concat(chunks), overflow end
+end
+
+local function runRemoteShell(command)
+  local maxBytes = math.max(1, math.floor(tonumber(config.remoteConsole.maxOutputBytes) or 8192))
+  if not shell or type(shell.run) ~= "function" then
+    return false, "Shell API is unavailable.", { output = "", truncated = false }
+  end
+  if not term or type(term.redirect) ~= "function" then
+    return false, "Terminal redirect is unavailable.", { output = "", truncated = false }
+  end
+  local memory, readOutput = remoteMemoryTerminal(maxBytes)
+  local previous = type(term.current) == "function" and term.current() or nil
+  local redirected, oldTerm = pcall(term.redirect, memory)
+  if not redirected then return false, tostring(oldTerm), { output = "", truncated = false } end
+  oldTerm = oldTerm or previous
+  local ran, exitCode = pcall(shell.run, command)
+  local restored, restoreError = pcall(term.redirect, oldTerm)
+  local output, truncated = readOutput()
+  if not restored then return false, tostring(restoreError), {
+    output = output, truncated = truncated,
+  } end
+  if not ran then
+    -- Ctrl+T is a local operator stop and must propagate through the remote
+    -- path exactly as it does through GPS/rednet receive.
+    if remoteIsTerminated(exitCode) then error(exitCode, 0) end
+    return false, tostring(exitCode), { output = output, truncated = truncated }
+  end
+  local success = exitCode == true or (type(exitCode) == "number" and exitCode == 0)
+  return success, success and "Remote command completed." or "Remote command failed.", {
+    output = output,
+    exitCode = exitCode,
+    truncated = truncated,
+  }
+end
+
+local function remoteConsoleAction(sender, payload)
   payload = payload or {}
+  if config.remoteConsole.enabled ~= true then
+    return false, "Remote console is disabled.", nil, nil
+  end
+  local action = string.lower(common.trim(payload.action or payload.remoteAction or ""))
+  remoteSessionExpired()
+  if action == "open" then
+    if tonumber(config.controllerId or 0) <= 0 then
+      return false, "Remote console requires a pinned controllerId.", nil, nil
+    end
+    if tonumber(sender) ~= tonumber(config.controllerId) then
+      return false, "Remote console sender is not the pinned controller.", nil, nil
+    end
+    if remoteSession then
+      if tonumber(remoteSession.sender) ~= tonumber(sender) then
+        return false, "Remote console session is already open for another controller.", nil, nil
+      end
+      -- Re-opening from the pinned controller is idempotent.  This recovers
+      -- when the OPEN ACK was lost without making the operator wait for the
+      -- whole session timeout or issuing a second shell session.
+      local existing = {
+        action = "open",
+        sessionId = remoteSession.sessionId,
+        nonce = remoteSession.nonce,
+        expiresAt = remoteSession.expiresAt,
+        seq = tonumber(remoteSession.lastSeq) or 0,
+        nextSeq = (tonumber(remoteSession.lastSeq) or 0) + 1,
+        resumed = true,
+      }
+      return true, "Remote console session resumed.", existing, existing
+    end
+    local ready, readyError = remoteConsoleReady()
+    if not ready then return false, readyError, nil, nil end
+    local now = common.nowSeconds()
+    remoteSession = {
+      sessionId = remoteToken("session", sender),
+      nonce = remoteToken("nonce", sender),
+      sender = tonumber(sender),
+      openedAt = now,
+      expiresAt = now + math.max(1, math.floor(tonumber(config.remoteConsole.sessionSeconds) or 120)),
+      lastSeq = 0,
+    }
+    remoteAuditRecord("remote_console open", true)
+    local result = {
+      action = "open",
+      sessionId = remoteSession.sessionId,
+      nonce = remoteSession.nonce,
+      expiresAt = remoteSession.expiresAt,
+      seq = 0,
+      nextSeq = 1,
+    }
+    return true, "Remote console session opened.", result, result
+  elseif action == "exec" or action == "close" then
+    if action == "exec" then
+      local ready, readyError = remoteConsoleReady()
+      if not ready then return false, readyError, nil, nil end
+    end
+    local consumed, consumeError, consumedSeq = remoteConsumeSession(sender, payload)
+    if not consumed then return false, consumeError, nil, nil end
+    local sessionId = remoteSession and remoteSession.sessionId
+    if action == "close" then
+      remoteAuditRecord("remote_console close", true)
+      remoteSession = nil
+      return true, "Remote console session closed.", {
+        action = "close", closed = true, sessionId = sessionId, seq = consumedSeq,
+      }, nil
+    end
+    local commandText = payload.commandText or payload.commandLine or payload.execCommand
+      or payload.cmd or payload.input or payload.text
+    if type(commandText) ~= "string" then
+      remoteAuditRecord("remote_console exec", false)
+      return false, "Remote console command text is required.", {
+        action = "exec", seq = consumedSeq,
+        output = "", truncated = false,
+        nextSeq = (tonumber(remoteSession.lastSeq) or 0) + 1,
+      }, nil
+    end
+    commandText = common.trim(commandText)
+    if not config.remoteConsole.allowShell and not remoteSafeCommand(commandText) then
+      remoteAuditRecord(commandText, false)
+      return false, "Remote console command is not on the safe allowlist.", {
+        action = "exec", seq = consumedSeq,
+        output = "", truncated = false,
+        nextSeq = (tonumber(remoteSession.lastSeq) or 0) + 1,
+      }, nil
+    end
+    local ok, text, result = runRemoteShell(commandText)
+    remoteAuditRecord(commandText, ok)
+    result = result or { output = "", truncated = false }
+    result.action, result.seq = "exec", consumedSeq
+    result.nextSeq = (tonumber(remoteSession.lastSeq) or 0) + 1
+    return ok, text, result, nil
+  end
+  return false, "Unknown remote console action: " .. tostring(action), nil, nil
+end
+
+local function applyControlCommand(command, payload, sender)
+  payload = payload or {}
+  if command == "remote_console" then
+    return remoteConsoleAction(sender, payload)
+  end
+  -- Movement/job commands take priority over maintenance.  Close the
+  -- in-memory console before accepting any command which may leave the dock,
+  -- so a forgotten terminal can never remain attached during mining.
+  if remoteSession and ({
+    start = true, resume = true, recall = true, service = true, abort = true,
+    stop = true, pause = true, pause_now = true, finish_row = true,
+    finish_layer = true, return_home = true, calibrate_gps = true, rehome = true,
+  })[tostring(command)] then
+    remoteAuditRecord("remote_console auto_close", true)
+    remoteSession = nil
+  end
   if command == "pause_now" or command == "finish_row" or command == "finish_layer" or command == "return_home" then
     payload.mode = command
     command = "stop"
@@ -238,8 +582,8 @@ local function handleMessage(sender, message)
   end
   local payload = message.payload
   local command = tostring(payload.command or "")
-  local ok, text = applyControlCommand(command, payload)
-  sendAck(sender, message, ok, text)
+  local ok, text, result, session = applyControlCommand(command, payload, sender)
+  sendAck(sender, message, ok, text, result, session)
   if command == "status" or command == "ping" or command == "gps_fix" then sendStatus(sender, message) end
 end
 

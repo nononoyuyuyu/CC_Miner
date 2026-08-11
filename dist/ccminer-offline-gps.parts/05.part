@@ -1,3 +1,96 @@
+  config.lighting.torchTarget = normalizeInteger(config.lighting.torchTarget, 1, 512, defaults.lighting.torchTarget)
+  config.lighting.torchReserve = normalizeInteger(config.lighting.torchReserve, 0, math.max(0, config.lighting.torchTarget - 1), defaults.lighting.torchReserve)
+  config.lighting.reserve = normalizeInteger(config.lighting.reserve, 0, 512, defaults.lighting.reserve)
+  config.lighting.preferredSlots = normalizeSlotList(config.lighting.preferredSlots, defaults.lighting.preferredSlots)
+  config.lighting.torchBlocks = normalizeBlockMap(config.lighting.torchBlocks, defaults.lighting.torchBlocks)
+  config.lighting.slot = normalizeInteger(config.lighting.slot, 1, 16, defaults.lighting.slot)
+  local loadedLighting = type(raw) == "table" and raw.lighting or nil
+  local requestedTorchSide = type(loadedLighting) == "table" and loadedLighting.side or nil
+  if requestedTorchSide == nil and type(raw) == "table" then requestedTorchSide = raw.torchSide end
+  config.lighting.side = normalizeEnum(requestedTorchSide or config.lighting.side,
+    { left = true, right = true }, defaults.lighting.side)
+  if config.lavaMode == "seal" and config.lighting.side == config.sealSide then
+    config.lighting.side = config.sealSide == "left" and "right" or "left"
+  end
+  -- V4 uses lighting.side; retain the flat alias for older draft configs.
+  config.torchSide = config.lighting.side
+
+  config.materials = normalizeTable(defaults.materials, config.materials)
+  for _, key in ipairs({ "sealSlots", "torchSlots", "fuelReserveSlots" }) do
+    config.materials[key] = normalizeSlotList(config.materials[key], defaults.materials[key])
+  end
+  config.materials.compactEveryMoves = normalizeInteger(config.materials.compactEveryMoves, 1, 100000, defaults.materials.compactEveryMoves)
+  config.materials.recycleMinedBlocks = normalizeBoolean(config.materials.recycleMinedBlocks, defaults.materials.recycleMinedBlocks)
+  config.materials.retainSealTarget = normalizeInteger(config.discard.retainSealTarget, 1, 512, defaults.materials.retainSealTarget)
+  config.discard.retainSealTarget = config.materials.retainSealTarget
+  config.retainSealTarget = config.discard.retainSealTarget
+  -- Keep legacy material compatibility as an independent copy.  Some
+  -- ComputerCraft serializers reject shared table references.
+  config.materials.discard = M.copy(config.discard)
+
+  config.performance = normalizeTable(defaults.performance, config.performance)
+  local requestedGpsVerify = loadedPerformance.gpsVerifyEveryMoves
+    or loadedPerformance.gpsVerifyMoves
+    or loadedPerformance.gpsVerifyCadence
+    or config.performance.gpsVerifyEveryMoves
+  config.performance.gpsVerifyEveryMoves = normalizeInteger(requestedGpsVerify, 32, 64,
+    defaults.performance.gpsVerifyEveryMoves)
+  config.performance.gpsVerifyMoves = config.performance.gpsVerifyEveryMoves
+  config.performance.gpsVerifyCadence = config.performance.gpsVerifyEveryMoves
+  local requestedLightweight = loadedPerformance.lightweightCheckpointEveryMoves
+    or loadedPerformance.lightweightCheckpointCadence
+    or loadedPerformance.journalEveryMoves
+    or loadedJournal.lightweightCheckpointEveryMoves
+    or loadedJournal.checkpointEvery
+    or config.performance.lightweightCheckpointEveryMoves
+  config.performance.lightweightCheckpointEveryMoves = normalizeInteger(requestedLightweight, 1, 100000,
+    defaults.performance.lightweightCheckpointEveryMoves)
+  config.performance.lightweightCheckpointCadence = config.performance.lightweightCheckpointEveryMoves
+  config.performance.journalEveryMoves = config.performance.lightweightCheckpointEveryMoves
+  local requestedCheckpoint = loadedPerformance.checkpointEveryMoves
+    or loadedPerformance.checkpointCadence
+    or config.performance.checkpointEveryMoves
+  config.performance.checkpointEveryMoves = normalizeInteger(requestedCheckpoint, 1, 100000,
+    defaults.performance.checkpointEveryMoves)
+  config.performance.checkpointCadence = config.performance.checkpointEveryMoves
+
+  -- Journal settings predate `performance`; preserve their values but expose
+  -- the lightweight cadence as the canonical checkpoint hint.
+  config.journal = normalizeTable(defaults.journal, config.journal)
+  config.journal.enabled = normalizeBoolean(config.journal.enabled, defaults.journal.enabled)
+  config.journal.checkpointEvery = normalizeInteger(config.journal.checkpointEvery, 1, 100000, defaults.journal.checkpointEvery)
+  config.journal.lightweightCheckpointEveryMoves = normalizeInteger(
+    config.journal.lightweightCheckpointEveryMoves,
+    1,
+    100000,
+    defaults.journal.lightweightCheckpointEveryMoves
+  )
+  config.journal.maxEntries = normalizeInteger(config.journal.maxEntries, 1, 10000, defaults.journal.maxEntries)
+  if type(config.journal.path) ~= "string" or M.trim(config.journal.path) == "" then config.journal.path = defaults.journal.path end
+  if type(config.journal.pendingPath) ~= "string" or M.trim(config.journal.pendingPath) == "" then config.journal.pendingPath = defaults.journal.pendingPath end
+  config.journal.lightweightCheckpointEveryMoves = config.performance.lightweightCheckpointEveryMoves
+
+  config.dock = normalizeTable(defaults.dock, config.dock)
+  local legacyAssignment = loaded.groupId or loaded.group or loaded.groupAssignment or loaded.assignment
+  if type(legacyAssignment) == "table" then
+    legacyAssignment = legacyAssignment.groupId or legacyAssignment.id or legacyAssignment.name
+  end
+  local legacyDockId = type(loaded.dock) == "string" and loaded.dock or nil
+  local dockId = loadedDock.id or loaded.dockId or loaded.homeDockId or legacyDockId or config.dock.id
+  local groupId = loadedDock.groupId or legacyAssignment or config.dock.groupId
+  local bayId = loadedDock.bayId or loaded.bayId or loaded.bay or config.dock.bayId
+  if type(dockId) == "table" then dockId = dockId.id or dockId.name end
+  if type(groupId) == "table" then groupId = groupId.id or groupId.name or groupId.groupId end
+  if type(bayId) == "table" then bayId = bayId.id or bayId.name or bayId.bayId end
+  config.dock.id = normalizeIdentifier(dockId, defaults.dock.id, 64)
+  config.dock.groupId = normalizeIdentifier(groupId, defaults.dock.groupId, 64)
+  config.dock.bayId = normalizeIdentifier(bayId, defaults.dock.bayId, 64)
+  local homeWorld = loadedDock.homeWorld or loadedDock.world or loadedDock.position or loadedDock.home
+    or loaded.homeWorld or loaded.gpsHome
+  if not homeWorld and type(config.gps) == "table" and type(config.gps.calibration) == "table" then
+    homeWorld = config.gps.calibration.home
+  end
+  config.dock.homeWorld = normalizeHomeWorld(homeWorld, defaults.dock.homeWorld)
   config.dock.facing = normalizeFacing(
     firstNonNil(loadedDock.facing, loadedDock.direction, loaded.facing, loaded.direction, config.dock.facing),
     defaults.dock.facing
@@ -80,109 +173,3 @@ local function normalizeControllerConfig(raw)
   config.workerTimeoutSeconds = normalizeInteger(config.workerTimeoutSeconds, 1, 3600, defaults.workerTimeoutSeconds)
   config.discoverySeconds = normalizeInteger(config.discoverySeconds, 1, 3600, defaults.discoverySeconds)
   config.monitorTextScale = normalizeNumber(config.monitorTextScale, 0.5, 5, defaults.monitorTextScale)
-  if config.monitorTextScale * 2 ~= math.floor(config.monitorTextScale * 2) then config.monitorTextScale = defaults.monitorTextScale end
-  config.touchEnabled = normalizeBoolean(config.touchEnabled, defaults.touchEnabled)
-  config.historyLimit = normalizeInteger(config.historyLimit, 1, 1000, defaults.historyLimit)
-  config.queueEnabled = normalizeBoolean(config.queueEnabled, defaults.queueEnabled)
-  config.overlapProtection = normalizeBoolean(config.overlapProtection, defaults.overlapProtection)
-  config.adaptiveRefresh = normalizeBoolean(config.adaptiveRefresh, defaults.adaptiveRefresh)
-
-  -- Controller group/bay settings are intentionally singular in config;
-  -- per-group records belong to the controller DB.  Older draft configs used
-  -- top-level `partition`, `service`, and `bay` tables, so migrate their
-  -- scalar values into the canonical group/dock tables while retaining any
-  -- unknown DB-owned data untouched.
-  local loaded = type(raw) == "table" and raw or {}
-  local loadedGroup = type(loaded.group) == "table" and loaded.group or {}
-  local loadedPartition = type(loaded.partition) == "table" and loaded.partition or {}
-  local loadedService = type(loaded.service) == "table" and loaded.service or {}
-  local loadedBay = type(loaded.bay) == "table" and loaded.bay or {}
-  local loadedDock = type(loaded.dock) == "table" and loaded.dock or {}
-  config.group = normalizeTable(defaults.group, config.group)
-  config.group.maxWorkers = normalizeInteger(
-    loadedGroup.maxWorkers or loaded.maxWorkers or config.group.maxWorkers,
-    1, 256, defaults.group.maxWorkers
-  )
-  config.group.maxConcurrentService = normalizeInteger(
-    loadedGroup.maxConcurrentService or loadedService.maxConcurrentService
-      or loadedService.maxConcurrent or loadedService.concurrency or loaded.maxConcurrentService
-      or loaded.serviceConcurrency or config.group.maxConcurrentService,
-    1, 64, defaults.group.maxConcurrentService
-  )
-  config.group.partitionMode = normalizeEnum(
-    loadedGroup.partitionMode or loadedPartition.mode or loadedPartition.strategy
-      or loaded.partitionMode or loaded.partitionStrategy or config.group.partitionMode,
-    { stripe = true, round_robin = true, roundrobin = true, ["round-robin"] = true },
-    defaults.group.partitionMode
-  )
-  if config.group.partitionMode == "roundrobin" then config.group.partitionMode = "round_robin" end
-  if config.group.partitionMode == "round-robin" then config.group.partitionMode = "round_robin" end
-  config.group.requireGpsForPartition = normalizeBoolean(
-    firstNonNil(loadedGroup.requireGpsForPartition, loadedPartition.requireGpsForPartition,
-      loadedPartition.requireGps, loadedPartition.gpsRequired, loaded.requireGpsForPartition,
-      loaded.gpsRequiredForPartition, config.group.requireGpsForPartition),
-    defaults.group.requireGpsForPartition
-  )
-  config.dock = normalizeTable(defaults.dock, config.dock)
-  config.dock.baySpacing = normalizeInteger(
-    firstNonNil(loadedDock.baySpacing, loadedBay.spacing, loadedBay.baySpacing, loaded.baySpacing, config.dock.baySpacing),
-    1, 256, defaults.dock.baySpacing
-  )
-  config.dock.requireSameFloor = normalizeBoolean(
-    firstNonNil(loadedDock.requireSameFloor, loadedDock.sameFloor,
-      loadedBay.requireSameFloor, loadedBay.sameFloor, loaded.requireSameFloor, config.dock.requireSameFloor),
-    defaults.dock.requireSameFloor
-  )
-  config.alerts = normalizeTable(defaults.alerts, config.alerts)
-  config.alerts.enabled = normalizeBoolean(config.alerts.enabled, defaults.alerts.enabled)
-  config.alerts.speaker = normalizeBoolean(config.alerts.speaker, defaults.alerts.speaker)
-  config.alerts.redstone = normalizeBoolean(config.alerts.redstone, defaults.alerts.redstone)
-  config.alerts.redstoneSide = normalizeEnum(config.alerts.redstoneSide,
-    { front = true, back = true, left = true, right = true, top = true, bottom = true }, defaults.alerts.redstoneSide)
-  config.alerts.cooldownSeconds = normalizeInteger(config.alerts.cooldownSeconds, 0, 3600, defaults.alerts.cooldownSeconds)
-  config.presets = normalizeTable(defaults.presets, config.presets)
-  for _, name in ipairs({ "safe", "balanced", "turbo" }) do
-    config.presets[name] = normalizeTable(defaults.presets[name], config.presets[name])
-    config.presets[name].profile = normalizeEnum(config.presets[name].profile,
-      { safe = true, balanced = true, turbo = true }, defaults.presets[name].profile)
-    config.presets[name].waterMode = normalizeEnum(config.presets[name].waterMode,
-      { ignore = true, stop = true, seal = true }, defaults.presets[name].waterMode)
-    config.presets[name].maxContinuousSeal = normalizeInteger(config.presets[name].maxContinuousSeal, 1, 4096,
-      defaults.presets[name].maxContinuousSeal)
-  end
-  config.sorting = normalizeTable(defaults.sorting, config.sorting)
-  config.sorting.enabled = normalizeBoolean(config.sorting.enabled, defaults.sorting.enabled)
-  config.sorting.interval = normalizeInteger(config.sorting.interval, 1, 86400, defaults.sorting.interval)
-  config.sorting.source = normalizePeripheralName(config.sorting.source, defaults.sorting.source)
-  config.sorting.valuableTarget = normalizePeripheralName(config.sorting.valuableTarget, defaults.sorting.valuableTarget)
-  config.sorting.bulkTarget = normalizePeripheralName(config.sorting.bulkTarget, defaults.sorting.bulkTarget)
-  config.sorting.sealTarget = normalizePeripheralName(config.sorting.sealTarget, defaults.sorting.sealTarget)
-  config.sorting.valuableItems = normalizeBlockMap(config.sorting.valuableItems, defaults.sorting.valuableItems)
-  config.sorting.sealBlocks = normalizeBlockMap(config.sorting.sealBlocks, defaults.sorting.sealBlocks)
-  return config
-end
-
-function M.loadConfig()
-  local raw, err = M.loadTable(M.CONFIG_PATH, {})
-  if err then return nil, err end
-  local role = raw and raw.role or nil
-  if role == "worker" then return normalizeWorkerConfig(raw), nil end
-  if role == "controller" then return normalizeControllerConfig(raw), nil end
-  if role == "gps" then
-    local config = M.merge(M.defaultGPSConfig(), raw)
-    config.schema, config.version = M.SCHEMA, M.VERSION
-    return config, nil
-  end
-  return raw, nil
-end
-
-function M.saveConfig(config)
-  config.schema = M.SCHEMA
-  config.version = M.VERSION
-  -- Some worker modules keep the legacy `materials.discard` name as a live
-  -- alias of `discard` while running.  Detach that alias before serializing so
-  -- a GPS calibration save cannot fail on ComputerCraft builds that reject
-  -- shared table references.
-  local toSave = config
-  if type(config) == "table" and config.role == "worker" then
-    toSave = M.copy(config)

@@ -1,3 +1,166 @@
+        else finding("WARN", "controller.db", tostring(path) .. " has no history table") end
+
+        local docks = type(db.docks) == "table" and db.docks or {}
+        local bays = type(db.bays) == "table" and db.bays or {}
+        local groups = db.groups
+        local groupJobs = db.groupJobs or db.group_jobs
+        if groups == nil then
+          finding("PASS", "group", "no groups configured")
+        elseif type(groups) ~= "table" then
+          finding("FAIL", "group", "groups table is malformed")
+        else
+          local groupCount = 0; local groupErrors = 0
+          for key, group in pairs(groups) do
+            groupCount = groupCount + 1
+            if type(group) ~= "table" then
+              groupErrors = groupErrors + 1
+            else
+              local workers = group.workerIds or group.workers
+              if workers ~= nil and type(workers) ~= "table" then groupErrors = groupErrors + 1 end
+              local dockId = group.dockId or (type(group.dock) == "string" and group.dock or nil)
+              local bayId = group.bayId or (type(group.bay) == "string" and group.bay or nil)
+              if dockId and docks[dockId] == nil and docks[tostring(dockId)] == nil then groupErrors = groupErrors + 1 end
+              if bayId and bays[bayId] == nil and bays[tostring(bayId)] == nil then groupErrors = groupErrors + 1 end
+              if group.bottomY ~= nil and not tonumber(group.bottomY) then groupErrors = groupErrors + 1 end
+            end
+          end
+          if groupErrors > 0 then finding("FAIL", "group", ("%d malformed of %d"):format(groupErrors, groupCount))
+          else finding("PASS", "group", tostring(groupCount) .. " configured") end
+        end
+        if db.docks == nil then finding("PASS", "dock", "no dock registry")
+        elseif type(db.docks) ~= "table" then finding("FAIL", "dock", "dock registry is malformed")
+        else
+          local errors, count = 0, 0
+          for _, dock in pairs(db.docks) do
+            count = count + 1
+            if type(dock) ~= "table" then errors = errors + 1
+            elseif dock.world and not coordinateTable(dock.world) then errors = errors + 1
+            elseif dock.x ~= nil and (not tonumber(dock.x) or not tonumber(dock.y) or not tonumber(dock.z)) then errors = errors + 1 end
+          end
+          if errors > 0 then finding("FAIL", "dock", ("%d malformed of %d"):format(errors, count))
+          else finding("PASS", "dock", tostring(count) .. " registered") end
+        end
+        if db.bays == nil then finding("PASS", "bay", "no bay registry")
+        elseif type(db.bays) ~= "table" then finding("FAIL", "bay", "bay registry is malformed")
+        else
+          local errors, count = 0, 0
+          for _, bay in pairs(db.bays) do
+            count = count + 1
+            if type(bay) ~= "table" then errors = errors + 1
+            elseif bay.world and not coordinateTable(bay.world) then errors = errors + 1
+            elseif bay.capacity ~= nil and (not tonumber(bay.capacity) or tonumber(bay.capacity) < 1) then errors = errors + 1 end
+          end
+          if errors > 0 then finding("FAIL", "bay", ("%d malformed of %d"):format(errors, count))
+          else finding("PASS", "bay", tostring(count) .. " registered") end
+        end
+        if groupJobs ~= nil and type(groupJobs) ~= "table" then
+          finding("FAIL", "group.ack", "groupJobs table is malformed")
+        elseif type(groupJobs) == "table" then
+          local ackWarnings = 0
+          for _, job in pairs(groupJobs) do
+            if type(job) == "table" then
+              local assignments = job.assignments or job.assignmentCount
+              local acks = job.acks or job.ackSummary or job.ackCount
+              local aggregate = type(job.aggregate) == "table" and job.aggregate or nil
+              local aggregateAcks = aggregate and tonumber(aggregate.acks) or nil
+              local aggregateTotal = aggregate and tonumber(aggregate.ackTotal or aggregate.total) or nil
+              if type(assignments) == "table" then assignments = #assignments end
+              if type(acks) == "table" then
+                local count = 0
+                for _ in pairs(acks) do count = count + 1 end
+                acks = count
+              end
+              if assignments and acks and tonumber(acks) and tonumber(assignments) and tonumber(acks) > tonumber(assignments) then ackWarnings = ackWarnings + 1 end
+              if aggregateAcks and aggregateTotal and (aggregateAcks < 0 or aggregateAcks > aggregateTotal) then ackWarnings = ackWarnings + 1 end
+            end
+          end
+          if ackWarnings > 0 then finding("FAIL", "group.ack", "ACK count exceeds assignments")
+          else finding("PASS", "group.ack", "group ACK summaries are consistent") end
+        else finding("PASS", "group.ack", "no group jobs") end
+        break
+      elseif dbError and dbError ~= "missing" then finding("WARN", "controller.db", tostring(path) .. ": " .. tostring(dbError)) end
+    end
+    if not found then finding("WARN", "controller.db", "history database not found") end
+  end
+
+  print("")
+  print(("Doctor summary: PASS=%d WARN=%d FAIL=%d"):format(counts.PASS, counts.WARN, counts.FAIL))
+  if counts.FAIL > 0 then print("Doctor result: FAIL")
+  elseif counts.WARN > 0 then print("Doctor result: WARN")
+  else print("Doctor result: PASS") end
+end
+
+if command == "help" or command == "?" then
+  printHelp()
+elseif command == "version" then
+  print("CC Miner " .. tostring(common.VERSION or ""))
+elseif command == "setup" then
+  shell.run("/ccminer/setup.lua", args[2])
+elseif command == "dashboard" then
+  shell.run("/ccminer/controller.lua")
+elseif command == "discover" then
+  shell.run("/ccminer/controller.lua", "discover")
+elseif command == "doctor" then
+  runDoctor()
+elseif command == "report" then
+  runReport()
+elseif command == "rehome" then
+  local config, configError = common.loadConfig()
+  if not config then
+    reportError(configError or "Not configured.")
+  elseif config.role == "worker" then
+    if args[2] ~= "RESET" then
+      reportError("Place the turtle in its dock facing the quarry, then run: ccm rehome RESET")
+    else
+      local calibration = config.gps and config.gps.calibration or nil
+      if calibration and gps and gps.locate then
+        local x, y, z = gps.locate(2, false)
+        if not x then
+          reportError("A GPS fix is required to verify the calibrated dock. Rehome was cancelled.")
+          return
+        end
+        if common.round(x) ~= calibration.home.x or common.round(y) ~= calibration.home.y or common.round(z) ~= calibration.home.z then
+          reportError("GPS position does not match the calibrated dock. Rehome was cancelled.")
+          return
+        end
+      elseif calibration then
+        reportError("GPS is unavailable, so the calibrated dock cannot be verified. Rehome was cancelled.")
+        return
+      end
+      local previous = common.loadTable(common.STATE_PATH, common.defaultState())
+      local reset = common.defaultState()
+      if previous and previous.stats then reset.stats = previous.stats end
+      local ok, err = common.saveTable(common.STATE_PATH, reset)
+      if not ok then reportError("Cannot reset worker state: " .. tostring(err))
+      else print("Worker coordinates and job were reset to home. Run: reboot") end
+    end
+  elseif config.role == "controller" then
+    if not tonumber(args[2]) or args[3] ~= "RESET" then reportError("Usage: ccm rehome <id> RESET") else forwardController() end
+  else
+    reportError("Rehome is not available for role " .. tostring(config.role))
+  end
+elseif command == "start" or command == "pause" or command == "resume" or command == "recall"
+  or command == "service" or command == "abort" or command == "clear" or command == "gps" or command == "calibrate"
+  or command == "queue" or command == "preset" or command == "presets" or command == "stop"
+  or command == "group" or command == "dock" or command == "bay" or command == "remote" then
+  local config = loadConfigForCommand()
+  if config and config.role ~= "controller" then reportError("Run this command on the controller computer.")
+  elseif config then
+    if command == "group" then
+      local sub = string.lower(tostring(args[2] or "list"))
+      local groupCommands = {
+        list = true, show = true, register = true, start = true, pause = true, resume = true,
+        ["return"] = true, service = true, abort = true, clear = true, reassign = true,
+      }
+      if not groupCommands[sub] then
+        reportError("Usage: ccm group list|show <id>|register <id> <workerIds comma> [name dock bay mode partition workerBayMap workerDockMap]|start|pause|resume|return|service|abort|clear|reassign <id> <stopped> [target]")
+      else
+        -- Keep the complete argument vector intact.  The controller owns
+        -- group validation, worker selection, partial-start policy and ACK
+        -- aggregation; command.lua only preserves the legacy forwarding
+        -- boundary and role check.
+        forwardController()
+      end
     elseif command == "dock" or command == "bay" then
       local sub = string.lower(tostring(args[2] or "list"))
       if sub ~= "list" and sub ~= "register" then
@@ -52,210 +215,3 @@ elseif command == "status" then
     printStatusFeature("Lighting", state.lighting, config.lighting or config.lightMode)
     printStatusFeature("Water", state.water, config.water or config.waterMode)
     printStatusFeature("Profile", state.profile, config.profile)
-    printStatusFeature("Materials", state.materials, config.materials)
-    printStatusFeature("Staged stop", state.stagedStop, config.stagedStop)
-    if state.job then print(("Job: %s %s/%s [%s]"):format(tostring(state.job.name), tostring(state.job.cursor), tostring(state.job.total), tostring(state.job.strategy))) end
-    printOperationalFields(state, config)
-    if state.lastError then print("Error: " .. tostring(state.lastError)) end
-  elseif config.role == "gps" then
-    print(("Coordinates: %s, %s, %s"):format(config.x, config.y, config.z))
-  end
-elseif command == "logs" then
-  if not fs.exists(common.LOG_PATH) then print("No log file yet."); return end
-  local handle = fs.open(common.LOG_PATH, "r")
-  local lines = {}
-  while true do
-    local line = handle.readLine()
-    if not line then break end
-    lines[#lines + 1] = line
-    if #lines > 30 then table.remove(lines, 1) end
-  end
-  handle.close()
-  for _, line in ipairs(lines) do print(line) end
-elseif command == "update" then
-  if not http then reportError("HTTP API is disabled."); return end
-  shell.run("wget", "run", "https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua", "update")
-else
-  reportError("Unknown command: " .. command)
-  printHelp()
-end
-]] },
-  { source = [[src/ccminer/gps_host.lua]], target = [[gps_host.lua]], digest = [[326f3a7b66868af6f3d2825af6ad96483c0d062cf6ac442ba00db363b2e52939]], content = [[-- CC Miner V4 - managed GPS host launcher.
-
-local common = dofile("/ccminer/lib/common.lua")
-local config, err = common.loadConfig()
-if not config or config.role ~= "gps" then error(err or "GPS host is not configured. Run: ccm setup gps", 0) end
-
-if os.setComputerLabel then os.setComputerLabel(config.gpsName or common.safeComputerLabel("GPS")) end
-local opened = common.openWirelessModems()
-if #opened == 0 then error("No wireless modem found. Attach a wireless modem to this GPS host.", 0) end
-
-common.clear(colors and colors.black or nil, colors and colors.white or nil)
-print("CC Miner V4 GPS Host " .. common.VERSION)
-print("Name: " .. tostring(config.gpsName))
-print(("Coordinates: %d, %d, %d"):format(config.x, config.y, config.z))
-print("Modem: " .. table.concat(opened, ", "))
-print("")
-print("Hosting GPS. Keep this chunk loaded.")
-common.log("INFO", ("GPS host started at %d,%d,%d"):format(config.x, config.y, config.z))
-
-local ok = shell.run("gps", "host", tostring(config.x), tostring(config.y), tostring(config.z))
-if not ok then error("The built-in GPS host program exited unexpectedly.", 0) end
-]] },
-}
-local FILE_COUNT = 6
-local WORKER_PARTS = {}
-local CONTROLLER_PARTS = {}
-local ENTRYPOINT = [[gps_host.lua]]
-local UPDATE_SENTINEL = [[-- CC Miner V4 update-incomplete sentinel for gps
-error("CC Miner runtime update is incomplete. Re-transfer the offline bundle and run update-low-space.", 0)
-]]
-local LOW_SPACE_STEPS = {
-  { kind = "runtime", index = 1 },
-  { kind = "runtime", index = 2 },
-  { kind = "runtime", index = 3 },
-  { kind = "runtime", index = 4 },
-  { kind = "runtime", index = 5 },
-  { kind = "obsolete", target = [[lib/geo.lua]] },
-  { kind = "obsolete", target = [[lib/quarry.lua]] },
-  { kind = "obsolete", target = [[worker.lua]] },
-  { kind = "obsolete", target = [[worker_parts/01.part]] },
-  { kind = "obsolete", target = [[worker_parts/02.part]] },
-  { kind = "obsolete", target = [[worker_parts/03.part]] },
-  { kind = "obsolete", target = [[worker_parts/04.part]] },
-  { kind = "obsolete", target = [[worker_parts/05.part]] },
-  { kind = "obsolete", target = [[controller.lua]] },
-  { kind = "obsolete", target = [[controller_parts/01.part]] },
-  { kind = "obsolete", target = [[controller_parts/02.part]] },
-  { kind = "obsolete", target = [[controller_parts/03.part]] },
-}
-
-local function fail(message)
-  error(tostring(message), 0)
-end
-local function ensureDir(path)
-  if not path or path == "" or fs.exists(path) then return end
-  local parent = fs.getDir(path)
-  if parent and parent ~= "" and parent ~= path then ensureDir(parent) end
-  fs.makeDir(path)
-end
-local function readFile(path)
-  if not fs.exists(path) or fs.isDir(path) then return nil end
-  local handle = fs.open(path, "rb")
-  if not handle then return nil end
-  local text = handle.readAll(); handle.close(); return text
-end
-local function writeFile(path, text)
-  ensureDir(fs.getDir(path))
-  local handle = fs.open(path, "wb")
-  if not handle then return false, "Cannot write " .. path end
-  local ok, writeError = pcall(handle.write, text or "")
-  handle.close()
-  if not ok then return false, tostring(writeError) end
-  return true
-end
-local function digest(text)
-  if not textutils or type(textutils.sha256) ~= "function" then
-    return nil, "textutils.sha256 is required for strict offline bundle verification."
-  end
-  local ok, value = pcall(textutils.sha256, text or "")
-  if not ok or type(value) ~= "string" then return nil, tostring(value or "sha256 failed") end
-  return string.lower(value)
-end
-local function compileText(label, text)
-  local loader = loadstring or load
-  local compiled, compileError = loader(text, "@" .. label)
-  if not compiled then return false, tostring(compileError) end
-  return true
-end
-local function validateEmbedded()
-  if #files ~= FILE_COUNT then fail("Embedded runtime file count is invalid for role " .. ROLE) end
-  local seen = {}
-  local aggregate = {
-    "ccminer-offline-role", "\0", VERSION, "\0", tostring(SCHEMA), "\0", ROLE, "\0", tostring(#files), "\0",
-  }
-  for index, file in ipairs(files) do
-    if type(file.target) ~= "string" or type(file.content) ~= "string" or seen[file.target] then
-      fail("Embedded runtime order/target is invalid at index " .. tostring(index))
-    end
-    seen[file.target] = true
-    local actual, digestError = digest(file.content)
-    if not actual then fail(digestError) end
-    if actual ~= string.lower(file.digest or "") then
-      fail("Embedded runtime digest mismatch: " .. tostring(file.target))
-    end
-    aggregate[#aggregate + 1] = file.source; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.target; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.digest; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.content; aggregate[#aggregate + 1] = "\0"
-  end
-  local aggregateDigest, aggregateError = digest(table.concat(aggregate))
-  if not aggregateDigest then fail(aggregateError) end
-  if aggregateDigest ~= string.lower(SOURCE_DIGEST) then
-    fail("Embedded role source digest mismatch for " .. ROLE)
-  end
-  return true
-end
-local function validateParts(label, targets)
-  if #targets == 0 then return true end
-  local source = {}
-  for index, target in ipairs(targets) do
-    local found
-    for _, file in ipairs(files) do if file.target == target then found = file.content; break end end
-    if not found then fail("Embedded runtime part is missing: " .. target) end
-    source[index] = found
-  end
-  local ok, compileError = compileText(label .. ".assembled.lua", table.concat(source))
-  if not ok then fail("Assembled source failed syntax validation: " .. label .. ": " .. compileError) end
-end
-local function validateAll()
-  validateEmbedded()
-  for _, file in ipairs(files) do
-    if not file.target:match("%.part$") then
-      local ok, compileError = compileText(file.target, file.content)
-      if not ok then fail("Embedded file failed syntax validation: " .. file.target .. ": " .. compileError) end
-    end
-  end
-  validateParts("worker", WORKER_PARTS)
-  validateParts("controller", CONTROLLER_PARTS)
-end
--- Kept as a named boundary for source-contract checks and recovery logs.  The
--- role bundle validates from memory, so no /ccminer.update staging tree is
--- needed before a low-space commit.
-local function validateLowSpaceStage()
-  validateAll()
-end
-local function copyIfPresent(source, target)
-  local text = readFile(source)
-  if text then return writeFile(target, text) end
-  return true
-end
-local function moveChecked(source, target)
-  local ok, moveError = pcall(fs.move, source, target)
-  if not ok or not fs.exists(target) then
-    return false, tostring(moveError or ("Move destination is missing: " .. target))
-  end
-  return true
-end
-local function atomicWrite(path, text)
-  local temp, backup = path .. ".tmp", path .. ".bak"
-  ensureDir(fs.getDir(path))
-  if fs.exists(temp) then fs.delete(temp) end
-  local wrote, writeError = writeFile(temp, text)
-  if not wrote then return false, writeError end
-  local hadCurrent = fs.exists(path)
-  if hadCurrent then
-    if fs.exists(backup) then fs.delete(backup) end
-    local moved, moveError = moveChecked(path, backup)
-    if not moved then fs.delete(temp); return false, "Cannot rotate previous file: " .. moveError end
-  end
-  local moved, moveError = moveChecked(temp, path)
-  if not moved then
-    if fs.exists(path) then fs.delete(path) end
-    local restored = true
-    local restoreError
-    if hadCurrent and fs.exists(backup) then
-      restored, restoreError = moveChecked(backup, path)
-    elseif hadCurrent then
-      restored, restoreError = false, "backup is missing"
-    end

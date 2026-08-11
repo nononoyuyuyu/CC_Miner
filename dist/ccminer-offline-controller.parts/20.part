@@ -1,3 +1,207 @@
+    assigned = assigned + 1
+  end
+  return owner, owned, loads, strategyLabel or "graph", seeds
+end
+
+local function cloneStringArray(values)
+  local copy = {}
+  for index, value in ipairs(values or {}) do copy[index] = tostring(value) end
+  return copy
+end
+
+local function groupAssignmentCopy(source)
+  local copy = {}
+  for key, value in pairs(source or {}) do
+    if key == "chunkKeys" or key == "transitKeys" or key == "leaseKeys" or key == "transitLeaseKeys" then
+      copy[key] = cloneStringArray(value)
+    elseif key == "layersInfo" and type(value) == "table" then
+      local info = {}; for infoKey, infoValue in pairs(value) do info[infoKey] = infoValue end; copy[key] = info
+    else
+      copy[key] = value
+    end
+  end
+  return copy
+end
+
+local function groupLeaseKey(groupJobId, workerId, chunkKeyValue)
+  return tostring(groupJobId) .. ":" .. tostring(workerId) .. ":" .. tostring(chunkKeyValue)
+end
+
+function M.partitionGroup(catalog, workersInput, options)
+  options = type(options) == "table" and options or {}
+  local chunks, keys, catalogError = groupCatalogInput(catalog, options)
+  if not chunks then return nil, catalogError end
+  if #keys > MAX_CHUNKS then return nil, "too_many_chunks" end
+  local catalogCells = 0
+  for _, key in ipairs(keys) do
+    catalogCells = catalogCells + chunks[key].cells
+    if catalogCells > MAX_BLOCKS then return nil, "group_too_large" end
+  end
+  local workers, workerError = groupWorkerList(workersInput)
+  if not workers then return nil, workerError end
+  if #workers > #keys then return nil, "more_workers_than_chunks" end
+  for _, worker in ipairs(workers) do
+    if worker.seedKey and not chunks[worker.seedKey] then return nil, "unknown_seed_chunk:" .. worker.seedKey end
+    if worker.bayInvalid then return nil, "invalid_worker_bay" end
+  end
+  local bayMap = options.workerBays or options.bays
+  if type(bayMap) == "table" then
+    for _, worker in ipairs(workers) do
+      if not worker.bay then
+        local bay = bayMap[worker.id] or bayMap[worker.key]
+        if type(bay) == "table" then
+          local point = bay.position or bay.world or bay.bay or bay.homeWorld or bay
+          if type(point) == "table" and (not numberValue(point.x) or not numberValue(point.z)) then
+            point = point.world or point.position or point.bay or point
+          end
+          local x, z = numberValue(point.x), numberValue(point.z)
+          if (not x or not z) and point.cx ~= nil and point.cz ~= nil then
+            local cx, cz = integerValue(point.cx), integerValue(point.cz)
+            if cx and cz then x, z = cx * 16 + 8, cz * 16 + 8 end
+          end
+          if x and z then worker.bay = { x = x, z = z } end
+        end
+        if bay ~= nil and not worker.bay then return nil, "invalid_worker_bay" end
+      end
+    end
+  end
+  -- When bay metadata is supplied, every worker must have one distinct bay
+  -- chunk inside the authoritative world catalog.  Never silently snap an
+  -- out-of-catalog bay to its nearest chunk: that would let a worker start
+  -- from another worker's region and defeats the transit lease boundary.
+  local bayAware, bayChunks = false, {}
+  for _, worker in ipairs(workers) do
+    if worker.bay then
+      bayAware = true
+      local cx, cz = math.floor(worker.bay.x / 16), math.floor(worker.bay.z / 16)
+      local bayKey
+      for _, key in ipairs(keys) do
+        local chunk = chunks[key]
+        if chunk.cx == cx and chunk.cz == cz then bayKey = key; break end
+      end
+      if not bayKey then return nil, "worker_bay_outside_catalog:" .. worker.key end
+      if bayChunks[bayKey] then return nil, "duplicate_worker_bay_chunk:" .. bayKey end
+      bayChunks[bayKey] = worker.key
+      worker.bayChunkKey = bayKey
+    end
+  end
+  if bayAware then
+    for _, worker in ipairs(workers) do
+      if not worker.bayChunkKey then return nil, "worker_bay_required:" .. worker.key end
+    end
+  end
+  if not graphConnected(chunks, keys) then return nil, "chunk_catalog_disconnected" end
+
+  local bottomY = options.bottomY
+  if bottomY == nil then bottomY = options.commonBottomY end
+  if bottomY == nil then bottomY = options.targetY end
+  if bottomY == nil then bottomY = options.bottom end
+  if bottomY ~= nil then
+    bottomY = integerValue(bottomY)
+    if not bottomY then return nil, "invalid_bottom_y" end
+  end
+  local homeYMap = options.workerHomeY or options.homeYs
+  if type(homeYMap) == "table" then
+    for _, worker in ipairs(workers) do
+      if worker.homeY == nil then
+        local candidate = homeYMap[worker.id] or homeYMap[worker.key]
+        if candidate ~= nil then
+          worker.homeY = integerValue(candidate)
+          if worker.homeY == nil then return nil, "invalid_home_y" end
+        end
+      end
+    end
+  end
+  local defaultLayers = options.layers
+  if defaultLayers ~= nil then
+    defaultLayers = integerValue(defaultLayers, 1, MAX_DIMENSION)
+    if not defaultLayers then return nil, "invalid_layers" end
+  end
+  local groupJobId = options.groupJobId or options.jobId or "group"
+  if (type(groupJobId) ~= "string" and type(groupJobId) ~= "number") or tostring(groupJobId) == "" then
+    return nil, "invalid_group_job_id"
+  end
+  local strategy = options.strategy
+  -- Older controller settings called graph growth "round_robin".  Keep that
+  -- spelling accepted while retaining connected ownership guarantees.
+  if strategy == "round_robin" then strategy = "graph" end
+  if strategy ~= nil and strategy ~= "stripe" and strategy ~= "graph" and strategy ~= "growth" then
+    return nil, "invalid_partition_strategy"
+  end
+  if options.stripeAxis ~= nil and options.stripeAxis ~= "x" and options.stripeAxis ~= "z" then
+    return nil, "invalid_stripe_axis"
+  end
+  local distanceWeight = options.distanceWeight
+  if distanceWeight == nil then distanceWeight = 0.25 end
+  distanceWeight = numberValue(distanceWeight)
+  if not distanceWeight or distanceWeight < 0 or distanceWeight > MAX_DIMENSION then return nil, "invalid_distance_weight" end
+
+  local owner, owned, loads, strategyUsed, seeds, stripeAxisUsed
+  if strategy ~= "graph" and strategy ~= "growth" and options.stripeFirst ~= false then
+    owner, owned, loads, strategyUsed, stripeAxisUsed = stripeOwner(chunks, keys, workers, options)
+  end
+  if strategy == "stripe" and not owner then return nil, owned or "stripe_partition_unavailable" end
+  if not owner then
+    owner, owned, loads, strategyUsed, seeds = graphOwner(chunks, keys, workers,
+      strategy == "growth" and "growth" or "graph", distanceWeight)
+  end
+  if not owner then return nil, owned or "partition_failed" end
+
+  -- Rectangular stripes are expected to be connected, but a hand-authored
+  -- catalog may have irregular bounding boxes.  Fail closed (or use graph
+  -- growth for the automatic strategy) instead of handing a worker a split
+  -- region.
+  local function ownedConnected(list)
+    if #list < 2 then return true end
+    local allowed, seen, queue = {}, {}, { list[1] }
+    for _, key in ipairs(list) do allowed[key] = true end
+    seen[list[1]] = true
+    local head = 1
+    while queue[head] do
+      local key = queue[head]; head = head + 1
+      for _, neighbor in ipairs(chunks[key].neighbors or {}) do
+        if allowed[neighbor] and not seen[neighbor] then seen[neighbor] = true; queue[#queue + 1] = neighbor end
+      end
+    end
+    for _, key in ipairs(list) do if not seen[key] then return false end end
+    return true
+  end
+  local allConnected = true
+  for index = 1, #workers do if not ownedConnected(owned[index]) then allConnected = false; break end end
+  if not allConnected then
+    if strategy == "stripe" then return nil, "partition_disconnected" end
+    owner, owned, loads, strategyUsed, seeds = graphOwner(chunks, keys, workers, "graph", distanceWeight)
+    stripeAxisUsed = nil
+    if not owner then return nil, owned or "partition_disconnected" end
+  end
+
+  -- Stripe assignment has no growth seeds, but each worker still needs a
+  -- deterministic checkpoint near its bay.  Prefer the bay's chunk when it is
+  -- inside the stripe; otherwise choose the closest owned chunk.
+  if strategyUsed == "stripe" then
+    seeds = {}
+    for index, worker in ipairs(workers) do
+      local candidate = workerBayChunk(worker, chunks, keys)
+      if not candidate or owner[candidate] ~= index then
+        local best, bestDistance
+        for _, key in ipairs(owned[index] or {}) do
+          local chunk = chunks[key]
+          local distance = worker.bay
+            and (math.abs(worker.bay.x - (chunk.cx * 16 + 8)) + math.abs(worker.bay.z - (chunk.cz * 16 + 8)))
+            or 0
+          if not best or distance < bestDistance or (distance == bestDistance and chunkComparator(chunk, chunks[best])) then
+            best, bestDistance = key, distance
+          end
+        end
+        candidate = best
+      end
+      seeds[index] = candidate
+    end
+  end
+
+  -- Prefer the canonical entrance chunk in the shared reference-local
+  -- catalog.  Falling back to lexicographic order is only for hand-authored
+  -- catalogs that do not expose the (0,1) entrance cell.
   local rootKey = options.rootKey and tostring(options.rootKey) or nil
   if not rootKey then
     for _, key in ipairs(keys) do
@@ -53,229 +257,3 @@
     -- disjoint to the controller.  The assignment-scoped identity lives in
     -- leaseId separately, while each array gets its own copy for CC's
     -- serializer.
-    local leaseKeys = cloneStringArray(chunkKeys)
-    local transitLeaseKeys = cloneStringArray(transitKeys)
-    local assignment = {
-      workerId = worker.id,
-      groupJobId = groupJobId,
-      leaseId = tostring(groupJobId) .. ":" .. tostring(worker.id),
-      chunkKeys = chunkKeys,
-      transitKeys = transitKeys,
-      transitLeaseKeys = transitLeaseKeys,
-      leaseKeys = leaseKeys,
-      seedKey = seedKey,
-      estimatedCost = estimatedCost,
-      estimatedVolume = volume,
-      volume = volume,
-      estimatedDistance = distance,
-      distance = distance,
-      distanceWeight = distanceWeight,
-      homeY = worker.homeY,
-      bottomY = bottomY,
-      layers = layers,
-      layersInfo = { homeY = worker.homeY, bottomY = bottomY, count = layers },
-      strategy = strategyUsed,
-      stripeAxis = stripeAxisUsed,
-    }
-    assignments[#assignments + 1] = assignment
-    totalCost = totalCost + estimatedCost
-  end
-
-  local unassigned = {}
-  for _, key in ipairs(keys) do if not assignedSet[key] then unassigned[#unassigned + 1] = key end end
-  local result = {
-    assignments = {},
-    unassigned = cloneStringArray(unassigned),
-    totalCost = totalCost,
-    groupJobId = groupJobId,
-    strategy = strategyUsed,
-    stripeAxis = stripeAxisUsed,
-    distanceWeight = distanceWeight,
-    bottomY = bottomY,
-    catalogCount = #keys,
-  }
-  for index, assignment in ipairs(assignments) do result.assignments[index] = groupAssignmentCopy(assignment) end
-  -- Mapping is useful to controller callers, but must be a deep independent
-  -- copy: CC's serializer treats even equal table references as recursive.
-  result.byWorker = {}
-  for _, assignment in ipairs(assignments) do result.byWorker[assignment.workerId] = groupAssignmentCopy(assignment) end
-  return result
-end
-
-M.groupPartition = M.partitionGroup
-M.splitGroupWorkers = M.partitionGroup
-M.assignGroupWorkers = M.partitionGroup
-M.partitionWorkersGroup = M.partitionGroup
-
--- Build a worker-local plan from a shared world catalog.  The catalog may be
--- an array/map, or an existing plan.  `assignedKeys` are the only mineable
--- chunks; `transitKeys` are optional, explicit lease keys that may be crossed
--- while travelling from a dock/entrance to the assigned seed.
-local function cloneValue(value, depth)
-  if type(value) ~= "table" then return value end
-  depth = (depth or 0) + 1
-  if depth > 16 then return nil end
-  local copy = {}
-  for key, item in pairs(value) do
-    local copiedKey = type(key) == "table" and nil or key
-    if copiedKey ~= nil then copy[copiedKey] = cloneValue(item, depth) end
-  end
-  return copy
-end
-
-local function assignedCatalogEntries(catalog)
-  if type(catalog) ~= "table" then return nil, nil, "invalid_chunk_catalog" end
-  local source = catalog
-  if type(catalog.catalog) == "table" then source = catalog.catalog end
-  if type(catalog.chunks) == "table" then source = catalog.chunks end
-  local entries, byKey = {}, {}
-  if #source > 0 then
-    for index = 1, #source do
-      local entry = source[index]
-      if type(entry) ~= "table" then return nil, nil, "invalid_chunk_catalog" end
-      local key = entry.key and tostring(entry.key) or nil
-      if not key or byKey[key] then return nil, nil, "duplicate_chunk_key" end
-      byKey[key] = entry; entries[#entries + 1] = entry
-    end
-  else
-    for key, entry in pairs(source) do
-      if type(entry) ~= "table" then return nil, nil, "invalid_chunk_catalog" end
-      local normalized = entry.key and tostring(entry.key) or tostring(key)
-      if normalized == "" or byKey[normalized] then return nil, nil, "duplicate_chunk_key" end
-      if entry.key == nil or tostring(entry.key) == "" then
-        -- Keep map-key catalogs immutable while giving catalogGraph the
-        -- explicit key required by its world-key validation.
-        local copy = {}
-        for field, value in pairs(entry) do copy[field] = value end
-        copy.key = normalized
-        entry = copy
-      end
-      byKey[normalized] = entry; entries[#entries + 1] = entry
-    end
-  end
-  return entries, byKey
-end
-
-local function assignedKeyList(value, field)
-  if type(value) == "table" and field and type(value[field]) == "table" then value = value[field] end
-  if type(value) ~= "table" then return nil, "invalid_assigned_keys" end
-  local list, seen = {}, {}
-  if #value > 0 then
-    for index = 1, #value do
-      local key = value[index]
-      if type(key) == "table" then key = key.key or key.chunkKey end
-      if key == nil or tostring(key) == "" then return nil, "invalid_assigned_key" end
-      key = tostring(key)
-      if seen[key] then return nil, "duplicate_assigned_key:" .. key end
-      seen[key] = true; list[#list + 1] = key
-    end
-  else
-    for key, enabled in pairs(value) do
-      if enabled then
-        key = tostring(key)
-        if key == "" or seen[key] then return nil, "duplicate_assigned_key:" .. key end
-        seen[key] = true; list[#list + 1] = key
-      end
-    end
-  end
-  table.sort(list)
-  if #list == 0 then return nil, "no_assigned_chunks" end
-  return list
-end
-
-local function assignedConnected(chunks, keys)
-  if #keys == 0 then return false end
-  local allowed, seen, queue = {}, {}, { keys[1] }
-  for _, key in ipairs(keys) do allowed[key] = true end
-  seen[keys[1]] = true
-  local head = 1
-  while queue[head] do
-    local key = queue[head]; head = head + 1
-    for _, neighbor in ipairs(chunks[key].neighbors or {}) do
-      if allowed[neighbor] and not seen[neighbor] then seen[neighbor] = true; queue[#queue + 1] = neighbor end
-    end
-  end
-  for _, key in ipairs(keys) do if not seen[key] then return false end end
-  return true
-end
-
-local function assignedWalk(chunks, keys, rootKey, assignedSet)
-  local visited, walk = {}, {}
-  visited[rootKey] = true
-  chunks[rootKey].parent = nil
-  walk[1] = {
-    key = rootKey,
-    first = true,
-    anchor = { x = chunks[rootKey].anchor.x, z = chunks[rootKey].anchor.z },
-  }
-  local stack = { { key = rootKey, next = 1 } }
-  while #stack > 0 do
-    local frame = stack[#stack]
-    local chunk = chunks[frame.key]
-    local nextKey
-    while frame.next <= #chunk.neighbors do
-      local candidate = chunk.neighbors[frame.next]
-      frame.next = frame.next + 1
-      if assignedSet[candidate] and not visited[candidate] then nextKey = candidate; break end
-    end
-    if nextKey then
-      visited[nextKey] = true
-      chunks[nextKey].parent = frame.key
-      local boundary = M.chunkAnchor(chunks[nextKey], chunks[frame.key]) or chunks[nextKey].anchor
-      chunks[nextKey].anchor = { x = boundary.x, z = boundary.z }
-      walk[#walk + 1] = {
-        key = nextKey,
-        first = true,
-        anchor = { x = boundary.x, z = boundary.z },
-      }
-      stack[#stack + 1] = { key = nextKey, next = 1 }
-    else
-      stack[#stack] = nil
-      if #stack > 0 then
-        local parentKey = stack[#stack].key
-        walk[#walk + 1] = {
-          key = parentKey,
-          first = false,
-          anchor = { x = chunks[parentKey].anchor.x, z = chunks[parentKey].anchor.z },
-        }
-      end
-    end
-  end
-  return walk, visited
-end
-
-function M.buildAssignedChunkPlan(catalog, assignedKeys, options)
-  options = type(options) == "table" and options or {}
-  local sourceEntries, sourceByKey, sourceError = assignedCatalogEntries(catalog)
-  if not sourceEntries then return nil, sourceError end
-  local graphInput = {}
-  for _, source in ipairs(sourceEntries) do graphInput[#graphInput + 1] = source end
-  local sourceChunks, sourceKeys = catalogGraph(graphInput)
-  if not sourceChunks then return nil, sourceKeys end
-  for _, key in ipairs(sourceKeys) do
-    if sourceChunks[key].mode ~= "world" then return nil, "gps_required_world_catalog" end
-  end
-  if not graphConnected(sourceChunks, sourceKeys) then return nil, "chunk_catalog_disconnected" end
-
-  local assignment = type(assignedKeys) == "table" and assignedKeys or nil
-  if assignedKeys == nil and type(catalog) == "table" then
-    assignedKeys = catalog.assignedKeys or catalog.mineChunkKeys or catalog.chunkKeys
-    if not assignedKeys and type(catalog.catalog) == "table" then
-      assignedKeys = catalog.catalog.assignedKeys or catalog.catalog.mineChunkKeys or catalog.catalog.chunkKeys
-    end
-    assignment = type(assignedKeys) == "table" and catalog or nil
-  end
-  local mineKeys, mineError = assignedKeyList(assignment and (assignment.chunkKeys or assignment.assignedKeys or assignment.chunks) or assignedKeys)
-  if not mineKeys then return nil, mineError end
-  local transitInput = options.transitKeys or (assignment and (assignment.transitKeys or assignment.transit))
-  local transitKeys = {}
-  if transitInput ~= nil then
-    local transitError
-    local transitEmpty = type(transitInput) == "table" and next(transitInput) == nil
-    if transitEmpty then transitKeys = {} else
-      transitKeys, transitError = assignedKeyList(transitInput)
-      if not transitKeys then return nil, transitError end
-    end
-  end
-  local mineSet, transitSet = {}, {}
-  for _, key in ipairs(mineKeys) do

@@ -1,188 +1,176 @@
-  buttonRow(key, 5, width, { { "FINISH LAYER", action("finish_layer", "Finish current layer then stop.") }, { "RETURN HOME", action("return_home", "Return-home stop requested.") } })
-  buttonRow(key, math.max(6, height - 3), width, { { "ABORT", action("abort", "Abort requested.") }, { "BACK", function() mode = "dashboard" end } })
-  noticeLine(target, height)
-end
-
-local function renderRecovery(target, key)
-  local width, height = target.getSize()
-  local id, worker = selectedWorker()
-  local data = worker and worker.data or {}
-  writeHeader("RECOVERY WIZARD", target, colors and colors.red or nil)
-  local explanation = data.lastError or (data.pendingAction and ("Pending action: " .. tostring(data.pendingAction.kind)) or "Worker needs recovery.")
-  common.writeAt(1, 2, common.fit("State: " .. tostring(data.status or "unknown") .. " / " .. tostring(data.phase or "-"), width), colors and colors.yellow or nil)
-  common.writeAt(1, 3, common.fit(explanation, width), colors and colors.white or nil)
-  buttonRow(key, 5, width, { { "GPS FIX", function() recoveryAction("gps_fix") end }, { "RETRY", function() recoveryAction("retry") end }, { "RESUME", function() recoveryAction("resume") end } })
-  buttonRow(key, 6, width, { { "RETURN", function() recoveryAction("return") end }, { "REHOME RESET", function() recoveryAction("rehome") end }, { "BACK", function() mode = "dashboard" end } })
-  noticeLine(target, height)
-end
-
-local function renderInfo(target, key)
-  local width, height = target.getSize()
-  local id, worker = selectedWorker()
-  local data = worker and worker.data or {}
-  writeHeader("WORKER DETAILS", target)
-  if not id or not worker then common.writeAt(1, 3, common.fit("No worker selected.", width), colors and colors.red or nil)
-  else
-    local lines = {
-      ("ID: %s  Name: %s"):format(tostring(id), workerLabel(worker, id)),
-      ("Status: %s / %s"):format(statusOf(worker), tostring(data.phase or "-")),
-      data.pose and ("Local pose: x=%s y=%s z=%s dir=%s"):format(data.pose.x, data.pose.y, data.pose.z, data.pose.dir) or "Local pose: -",
-      data.world and ("GPS world: %s, %s, %s"):format(data.world.x, data.world.y, data.world.z) or "GPS world: no fix",
-      ("GPS: %s / %s"):format(data.gps and data.gps.calibrated and "calibrated" or "uncalibrated", data.gps and data.gps.available and "available" or "unavailable"),
-      ("Fuel: %s / %s"):format(tostring(data.fuel or "-"), tostring(data.fuelLimit or "-")),
-      ("Inventory: %s used, %s empty, %s items"):format(tostring(data.inventoryUsed or "-"), tostring(data.inventoryEmpty or "-"), tostring(data.inventoryItems or "-")),
-      ("Materials: seal=%s water=%s"):format(tostring(data.materials and data.materials.seal or data.seal and data.seal.count or "-"), tostring(data.materials and data.materials.water or "-")),
-    }
-      if data.job then lines[#lines + 1] = ("Job: %s (%dx%dx%d) [%s]"):format(tostring(data.job.name), data.job.width, data.job.length, data.job.depth, tostring(data.job.strategy or "-")); lines[#lines + 1] = "Progress: " .. progressText(data) end
-      if data.lastError then lines[#lines + 1] = "Error: " .. tostring(data.lastError) end
-      if data.completionReason then lines[#lines + 1] = "Completion: " .. tostring(data.completionReason) end
-      if data.report or data.stats then
-        local report = data.report or data.stats
-        local discard = report.discard or report.discardCount or "-"
-        if type(discard) == "table" then discard = tostring(discard.count or discard.total or common.tableCount(discard)) end
-        lines[#lines + 1] = ("Metrics: blocks=%s fuel=%s discard=%s"):format(tostring(report.blocks or report.totalBlocks or "-"), tostring(report.fuel or "-"), tostring(discard))
+        common.writeAt(3, row, common.fit("REMAIN " .. tostring(#(assignment.chunkKeys or {})) .. " chunks; use REASSIGN", math.max(1, width - 3)), colors and colors.yellow or nil)
+        addHitbox(key, 1, row, width, row, function() if job then reassignGroupAssignment(job.groupJobId, workerId) end end)
+        row = row + 1
       end
-    for index, line in ipairs(lines) do if index + 2 >= height - 1 then break end; common.writeAt(1, index + 2, common.fit(line, width), colors and colors.white or nil) end
-  end
-  drawButton(key, 1, math.max(1, height - 1), width, "BACK", function() mode = "dashboard" end, true)
-end
-
-local function renderReport(target, key)
-  local width, height = target.getSize()
-  writeHeader("COMPLETION REPORT / HISTORY", target)
-  local maxRows = math.max(1, height - 5)
-  local count = #db.history
-  if count == 0 then common.writeAt(1, 3, common.fit("No completed jobs.", width), colors and colors.lightGray or nil) end
-  for row = 1, maxRows do
-    local index = count - row + 1
-    local item = db.history[index]
-    if not item then break end
-    local line = ("%s %s #%s %s %s"):format(tostring(item.finishedAt or "-"), tostring(item.status or "-"), tostring(item.workerId or "-"), tostring(item.name or item.jobId or "-"), item.reason and tostring(item.reason) or "")
-    common.writeAt(1, 2 + row, common.fit(line, width), item.status == "aborted" and (colors and colors.red or nil) or (colors and colors.lime or nil))
-  end
-  drawButton(key, 1, math.max(1, height - 1), width, "BACK", function() mode = "dashboard" end, true)
-end
-
-local function renderConfirm(target, key)
-  local width, height = target.getSize()
-  writeHeader("CONFIRM COMMAND", target, colors and colors.orange or nil)
-  local message = confirmState and confirmState.message or "Continue?"
-  local lineWidth = math.max(10, width - 4)
-  local words, lines, current = {}, {}, ""
-  for word in tostring(message):gmatch("%S+") do words[#words + 1] = word end
-  for _, word in ipairs(words) do
-    if #current == 0 then current = word elseif #current + 1 + #word <= lineWidth then current = current .. " " .. word else lines[#lines + 1] = current; current = word end
-  end
-  if current ~= "" then lines[#lines + 1] = current end
-  for index, line in ipairs(lines) do common.writeAt(2, math.max(3, math.floor((height - #lines) / 2) + index), common.fit(line, lineWidth), colors and colors.white or nil) end
-  buttonRow(key, math.max(1, height - 2), width, {
-    { "YES", function()
-      if confirmState and confirmState.twoStep and not confirmState.armed then
-        confirmState.armed = true; confirmState.message = "FINAL confirmation: press YES again to send REHOME RESET."; invalidate(); return
-      end
-      local id = selectedWorker()
-      if confirmState and id then
-        if confirmState.command == "stop" then stageStop(id, (confirmState.payload or {}).mode or "abort") else sendCommand(id, confirmState.command, confirmState.payload) end
-      end
-      confirmState, mode = nil, "dashboard"
-    end },
-    { "NO", function() confirmState, mode = nil, "dashboard"; setNotice("Cancelled.", false) end },
-  })
-end
-
-local function screenSignature(target, key)
-  local width, height = target.getSize()
-  local id, worker = selectedWorker()
-  local data = worker and worker.data or {}
-  local gid, group = selectedGroupRecord()
-  local groupJob = gid and activeGroupJob(gid) or nil
-  return table.concat({ tostring(mode), tostring(key), tostring(width), tostring(height), tostring(id or ""), tostring(data.updatedAt or data.status or ""), tostring(gid or ""), tostring(group and group.updatedAt or ""), tostring(groupJob and groupJob.updatedAt or ""), tostring(groupDraft and groupDraft.updatedAt or ""), tostring(groupDraft and groupDraft.preflight and groupDraft.preflight.computedAt or ""), tostring(draft and draft.gridPageX or ""), tostring(draft and draft.gridPageZ or ""), tostring(dirty) }, "|")
-end
-
-local function renderOne(target, key)
-  resetHitboxes(key)
-  local signature = screenSignature(target, key)
-  if renderCache[key] == signature and not dirty then return end
-  common.withTerm(target, function()
-    common.clear(colors and colors.black or nil, colors and colors.white or nil)
-    if mode == "dashboard" then renderDashboard(target, key)
-    elseif mode == "groups" then renderGroups(target, key)
-    elseif mode == "group_info" then renderGroupInfo(target, key)
-    elseif mode == "group_dimensions" or mode == "group_job" then renderGroupDimensions(target, key)
-    elseif mode == "job_dimensions" then renderDimensions(target, key)
-    elseif mode == "job_grid" or mode == "job_chunks" then renderGrid(target, key)
-    elseif mode == "preflight" then renderPreflight(target, key)
-    elseif mode == "progress" then renderProgress(target, key)
-    elseif mode == "stop_menu" then renderStopMenu(target, key)
-    elseif mode == "recovery" then renderRecovery(target, key)
-    elseif mode == "info" then renderInfo(target, key)
-    elseif mode == "report" then renderReport(target, key)
-    elseif mode == "confirm" then renderConfirm(target, key)
-    elseif mode == "error_detail" then renderErrorDetail(target, key)
-    else mode = "dashboard"; renderDashboard(target, key) end
-  end)
-  renderCache[key] = signature
-end
-
-local function render()
-  if not dirty then return end
-  renderOne(term.current(), "term")
-  for _, entry in ipairs(monitors) do renderOne(entry.device, entry.name) end
-  dirty = false
-end
-
-local function handlePointer(key, x, y)
-  local boxes = hitboxes[key] or {}
-  for index = #boxes, 1, -1 do
-    local box = boxes[index]
-    if x >= box.x1 and x <= box.x2 and y >= box.y1 and y <= box.y2 then box.action(); invalidate(); return true end
-  end
-  return false
-end
-]] },
-  { source = [[src/ccminer/controller_parts/03.part]], target = [[controller_parts/03.part]], digest = [[8a3d20c1cd8060203171bbaac8696271f04a47956709b5dd99e7df4a976ec861]], content = [[-- CC Miner V4 - keyboard/CLI compatibility and event loop.
-
-local function processChar(character)
-  character = string.lower(character or "")
-  if mode == "job_dimensions" then
-    if character:match("%d") or character == "-" then draftDigit(character) end
-    return
-  elseif mode == "group_dimensions" or mode == "group_job" then
-    if character:match("%d") or character == "-" then groupDraftDigit(character)
-    elseif character == "p" then
-      local gid = selectedGroupRecord()
-      if gid and groupDraft then commitGroupDraftField(); groupDraft.preflight = computeGroupPreflight(gid, groupDraft); invalidate() end
-    elseif character == "s" then
-      local gid = selectedGroupRecord()
-      if gid and groupDraft then commitGroupDraftField(); local result = groupDraft.preflight or computeGroupPreflight(gid, groupDraft); groupDraft.preflight = result; if result and not result.fatal then startGroup(gid, groupDraft) end; invalidate() end
-    elseif character == "b" or character == "q" then mode = "groups"; invalidate() end
-    return
-  elseif mode == "confirm" then
-    if character == "y" then
-      if confirmState and confirmState.twoStep and not confirmState.armed then
-        confirmState.armed = true; confirmState.message = "FINAL confirmation: press Y again to send REHOME RESET."; invalidate(); return
-      end
-      local id = selectedWorker()
-      if confirmState and id then
-        if confirmState.command == "stop" then stageStop(id, (confirmState.payload or {}).mode or "abort") else sendCommand(id, confirmState.command, confirmState.payload) end
-      end
-      confirmState, mode = nil, "dashboard"
-    elseif character == "n" then confirmState, mode = nil, "dashboard"; setNotice("Cancelled.", false) end
-    return
-  elseif mode == "error_detail" then
-    if character == "o" or character == "b" or character == "q" then noticeState.dismiss() end
-    return
-  elseif mode == "job_grid" then
-    if character == "a" then allGrid(true) elseif character == "c" then allGrid(false) elseif character == "i" then invertGrid() elseif character == "r" then draft.rectMode = not draft.rectMode; draft.rectStart = nil; invalidate() end
-    return
-  elseif mode == "groups" then
-    local ids = orderedGroupIds()
-    if character == "s" then groupAction("start")()
-    elseif character == "p" then groupAction("pause")()
-    elseif character == "r" then groupAction("resume")()
-    elseif character == "h" then groupAction("return")()
-    elseif character == "v" then mode = "group_info"; invalidate()
     end
-    return
-  elseif mode == "group_info" then
-    if character == "b" or character == "q" then mode = "groups"; invalidate() end
+    local reason = job and (job.returnReason or job.completionReason) or nil
+    local report = job and (job.report or job.metrics) or nil
+    if reason then common.writeAt(1, math.max(4, height - 5), common.fit("RETURN: " .. tostring(reason), width), colors and colors.yellow or nil) end
+    if report then
+      local discard = report.discard or report.discardCount or "-"
+      if type(discard) == "table" then discard = tostring(discard.count or discard.total or common.tableCount(discard)) end
+      common.writeAt(1, math.max(4, height - 4), common.fit(("METRICS blocks=%s fuel=%s discard=%s"):format(tostring(report.blocks or report.totalBlocks or "-"), tostring(report.fuel or "-"), tostring(discard)), width), colors and colors.lightGray or nil)
+    end
+    if aggregate.warnings and #aggregate.warnings > 0 then common.writeAt(1, math.max(4, height - 3), common.fit("WARN: " .. table.concat(aggregate.warnings, "; "), width), colors and colors.orange or nil) end
+  end
+  buttonRow(key, math.max(1, height - 1), width, { { "BACK", function() mode = "groups" end }, { "REFRESH", function() local id = selectedGroupRecord(); local job = id and activeGroupJob(id); if job then updateGroupAggregate(job) end; invalidate() end } })
+  noticeLine(target, height)
+end
+
+local function renderDimensions(target, key)
+  local width, height = target.getSize()
+  local id, worker = draftWorker()
+  local worldMode = draftCalibration() ~= nil
+  local visibleFields = currentFieldOrder()
+  writeHeader("NEW JOB - SETTINGS", target)
+  common.writeAt(1, 2, common.fit(("Worker #%s %s | %s mode"):format(tostring(id or "-"), worker and workerLabel(worker, id) or "offline", worldMode and "WORLD" or "LOCAL"), width), colors and colors.lightGray or nil)
+  common.writeAt(1, 3, common.fit(worldMode and "Fields + keypad. BOTTOM Y derives LAYERS from each worker HOME Y." or "Fields + keypad. GRID tiles are chunks; local jobs omit BOTTOM Y.", width), colors and colors.lightGray or nil)
+  local fieldWidth = math.min(32, math.max(14, math.floor(width * 0.52)))
+  local rows = math.min(#visibleFields, math.max(1, math.floor((height - 8) / 2)))
+  for index = 1, rows do
+    local field = visibleFields[index]
+    local y = 4 + (index - 1) * 2
+    local active = draft.selectedField == field
+    local shown = active and draft.buffer or tostring(draft[field])
+    common.writeAt(1, y, common.fit(fieldLabels[field], fieldWidth - 2), active and (colors and colors.black or nil) or (colors and colors.white or nil), active and (colors and colors.yellow or nil) or (colors and colors.black or nil))
+    drawButton(key, 1, y + 1, 3, "-", function() adjustDraft(field, -1) end, true)
+    drawButton(key, 5, y + 1, math.max(5, fieldWidth - 11), shown, function() chooseDraftField(field) end, true, active)
+    drawButton(key, fieldWidth - 5, y + 1, 3, "+", function() adjustDraft(field, 1) end, true)
+  end
+  local keypadX = math.min(width - 12, fieldWidth + 2)
+  local keypadWidth = math.max(12, width - keypadX + 1)
+  local cellWidth = math.max(4, math.floor(keypadWidth / 3))
+  local labels = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "CLR", "0", "<" }
+  for index, label in ipairs(labels) do
+    local row = math.floor((index - 1) / 3)
+    local column = (index - 1) % 3
+    local x, y = keypadX + column * cellWidth, 4 + row * 2
+    if y <= height - 3 then
+      local action
+      if label == "CLR" then action = function() draft.buffer = "0" end
+      elseif label == "<" then action = draftBackspace
+      else local digit = label; action = function() draftDigit(digit) end end
+      drawButton(key, x, y, math.max(3, cellWidth - 1), label, action, true)
+      addHitbox(key, x, y, x + math.max(2, cellWidth - 2), math.min(height - 3, y + 1), action)
+    end
+  end
+  local summaryY = math.max(4, height - 5)
+  local shownDepth = draft.depth
+  if worldMode then local derived = effectiveJobDepth("world", draftCalibration()); shownDepth = derived or shownDepth end
+  local volume = (tonumber(draft.width) or 1) * (tonumber(draft.length) or 1) * (tonumber(shownDepth) or 1)
+  local profileInfo = profileParameters(draft.profile, draft.lighting)
+  local intervalText = profileInfo and ("torch=" .. tostring(profileInfo.effectiveInterval) .. "(" .. tostring(profileInfo.requestedInterval) .. ")") or "profile invalid"
+  local homeText = "HOME Y=-"
+  if worldMode then
+    local calibration = draftCalibration()
+    homeText = "HOME Y=" .. tostring(calibration and calibration.home and calibration.home.y or "-") .. " LAYERS=" .. tostring(shownDepth)
+  end
+  common.writeAt(1, summaryY, common.fit(("%dx%dx%d=%s blocks | %s | %s profile=%s %s"):format(draft.width, draft.length, shownDepth, common.humanNumber(volume), worldMode and ("BOTTOM Y=" .. tostring(draft.targetY)) or "LOCAL DEPTH=" .. tostring(shownDepth), homeText, tostring(draft.profile), intervalText), width), colors and colors.lightGray or nil)
+  local optionY = math.max(4, summaryY + 1)
+  buttonRow(key, optionY, width, {
+    { "LIGHT " .. tostring(draft.lighting and draft.lighting.mode or "safe"), function() local modes = { "off", "safe", "custom" }; local now = draft.lighting and draft.lighting.mode or "safe"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; draft.lighting.mode = modes[n % #modes + 1]; invalidate() end },
+    { "WATER " .. tostring(draft.waterMode or "seal"), function() local modes = { "ignore", "stop", "seal" }; local now = draft.waterMode or "seal"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; draft.waterMode = modes[n % #modes + 1]; invalidate() end },
+    { "PROFILE " .. tostring(draft.profile or "balanced"), function() local modes = { "safe", "balanced", "turbo" }; local now = draft.profile or "balanced"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; draft.profile = modes[n % #modes + 1]; invalidate() end },
+    { "AUTO: QUEUE", function() draft.autoAssign = false; setNotice("Single footprint is sent to the selected worker; queue dispatch handles parallel jobs.", false) end },
+  })
+  buttonRow(key, math.max(1, height - 2), width, {
+    { "GRID", function() commitDraftField(); mode = "job_grid"; draft.gridPageX, draft.gridPageZ = 1, 1; invalidate() end },
+    { "PREFLIGHT", function() commitDraftField(); local result = computePreflight(); if result then mode = "preflight" end; invalidate() end },
+    { "QUEUE", function() commitDraftField(); queueDraft() end, config.queueEnabled ~= false },
+    { "CANCEL", function() mode, draft = "dashboard", nil; invalidate() end },
+  })
+  noticeLine(target, height)
+end
+
+local function gridCatalog()
+  local catalog, err, chunkMode, calibration, rootKey = buildDraftCatalog()
+  if not catalog then return nil, err end
+  return catalog, nil, chunkMode, calibration, rootKey
+end
+
+local function chunkGrid(catalog)
+  local byCoordinate, xSeen, zSeen, xValues, zValues = {}, {}, {}, {}, {}
+  for _, chunk in ipairs(catalog or {}) do
+    local cx, cz = tonumber(chunk.cx), tonumber(chunk.cz)
+    if cx and cz then
+      byCoordinate[tostring(cx) .. ":" .. tostring(cz)] = chunk
+      if not xSeen[cx] then xSeen[cx] = true; xValues[#xValues + 1] = cx end
+      if not zSeen[cz] then zSeen[cz] = true; zValues[#zValues + 1] = cz end
+    end
+  end
+  table.sort(xValues); table.sort(zValues)
+  local xIndex, zIndex = {}, {}
+  for index, value in ipairs(xValues) do xIndex[value] = index end
+  for index, value in ipairs(zValues) do zIndex[value] = index end
+  return byCoordinate, xValues, zValues, xIndex, zIndex
+end
+
+local function toggleChunk(chunk, catalog, rootKey)
+  if not draft then return end
+  if not chunk or chunk.key == rootKey then setNotice("Entrance chunk is locked.", true); return end
+  draft.excluded = draft.excluded or {}
+  if draft.rectMode and draft.rectStart then
+    local sx, sz = draft.rectStart.cx, draft.rectStart.cz
+    local minX, maxX = math.min(sx, chunk.cx), math.max(sx, chunk.cx)
+    local minZ, maxZ = math.min(sz, chunk.cz), math.max(sz, chunk.cz)
+    for _, candidate in ipairs(catalog or {}) do
+      if candidate.key ~= rootKey then
+        local inside = candidate.cx >= minX and candidate.cx <= maxX and candidate.cz >= minZ and candidate.cz <= maxZ
+        draft.excluded[candidate.key] = not inside
+      end
+    end
+    draft.rectStart = nil; draft.rectMode = false
+    setNotice("RECT mining selection applied to whole chunks.", false)
+  elseif draft.rectMode then
+    draft.rectStart = { cx = tonumber(chunk.cx), cz = tonumber(chunk.cz), key = chunk.key }
+    setNotice("RECT first point stored; touch a second chunk.", false)
+  else
+    draft.excluded[chunk.key] = not draft.excluded[chunk.key]
+  end
+  invalidate()
+end
+
+local function allGrid(value)
+  local catalog, err, _, _, rootKey = gridCatalog()
+  if not catalog then setNotice(err, true); return end
+  normalizeChunkMask(catalog, rootKey)
+  draft.excluded = draft.excluded or {}
+  for _, chunk in ipairs(catalog) do if chunk.key ~= rootKey then draft.excluded[chunk.key] = not (value == true) end end
+  draft.partialMask = false
+  setNotice(value == true and "ALL: all chunks selected for mining." or "CLEAR: all non-entry chunks deselected.", false)
+  invalidate()
+end
+
+local function invertGrid()
+  local catalog, err, _, _, rootKey = gridCatalog()
+  if not catalog then setNotice(err, true); return end
+  normalizeChunkMask(catalog, rootKey)
+  draft.excluded = draft.excluded or {}
+  for _, chunk in ipairs(catalog) do if chunk.key ~= rootKey then draft.excluded[chunk.key] = not draft.excluded[chunk.key] end end
+  setNotice("INVERT: chunk mining selection inverted; entrance remains selected.", false)
+  invalidate()
+end
+
+local function renderGrid(target, key)
+  local width, height = target.getSize()
+  local catalog, err, chunkMode, _, rootKey = gridCatalog()
+  writeHeader("NEW JOB - TOUCH GRID", target)
+  if not catalog then common.writeAt(1, 3, common.fit(tostring(err), width), colors and colors.red or nil); drawButton(key, 1, height - 1, width, "BACK", function() mode = "job_dimensions" end, true); return end
+  local partialMask = normalizeChunkMask(catalog, rootKey)
+  local byCoordinate, xValues, zValues, xIndex, zIndex = chunkGrid(catalog)
+  local cellWidth = width >= 48 and 2 or 1
+  local cols = common.clamp(math.floor((width - 3) / cellWidth), 1, math.max(1, #xValues))
+  local rows = common.clamp(height - 8, 1, math.max(1, #zValues))
+  draft.gridPageX = common.clamp(draft.gridPageX or 1, 1, math.max(1, #xValues - cols + 1))
+  draft.gridPageZ = common.clamp(draft.gridPageZ or 1, 1, math.max(1, #zValues - rows + 1))
+  local pageX, pageZ = draft.gridPageX, draft.gridPageZ
+  common.writeAt(1, 2, common.fit(("%s chunks cx=%s..%s cz=%s..%s | %s"):format(chunkMode, tostring(xValues[pageX] or "-"), tostring(xValues[math.min(#xValues, pageX + cols - 1)] or "-"), tostring(zValues[pageZ] or "-"), tostring(zValues[math.min(#zValues, pageZ + rows - 1)] or "-"), draft.rectMode and (draft.rectStart and "RECT: second point" or "RECT: first point") or "tap toggles mining"), width), colors and colors.lightGray or nil)
+  for row = 0, rows - 1 do
+    local cz = zValues[pageZ + row]
+    for col = 0, cols - 1 do
+      local cx = xValues[pageX + col]
+      local chunk = cx and cz and byCoordinate[tostring(cx) .. ":" .. tostring(cz)] or nil
+      if chunk then
+      local locked = chunk.key == rootKey
+      local excluded = draft.excluded and draft.excluded[chunk.key] == true
+      local glyph = locked and "E" or excluded and "X" or "."

@@ -1,100 +1,3 @@
-    printStatusFeature("Materials", state.materials, config.materials)
-    printStatusFeature("Staged stop", state.stagedStop, config.stagedStop)
-    if state.job then print(("Job: %s %s/%s [%s]"):format(tostring(state.job.name), tostring(state.job.cursor), tostring(state.job.total), tostring(state.job.strategy))) end
-    printOperationalFields(state, config)
-    if state.lastError then print("Error: " .. tostring(state.lastError)) end
-  elseif config.role == "gps" then
-    print(("Coordinates: %s, %s, %s"):format(config.x, config.y, config.z))
-  end
-elseif command == "logs" then
-  if not fs.exists(common.LOG_PATH) then print("No log file yet."); return end
-  local handle = fs.open(common.LOG_PATH, "r")
-  local lines = {}
-  while true do
-    local line = handle.readLine()
-    if not line then break end
-    lines[#lines + 1] = line
-    if #lines > 30 then table.remove(lines, 1) end
-  end
-  handle.close()
-  for _, line in ipairs(lines) do print(line) end
-elseif command == "update" then
-  if not http then reportError("HTTP API is disabled."); return end
-  shell.run("wget", "run", "https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua", "update")
-else
-  reportError("Unknown command: " .. command)
-  printHelp()
-end
-]] },
-  { source = [[src/ccminer/gps_host.lua]], target = [[gps_host.lua]], digest = [[326f3a7b66868af6f3d2825af6ad96483c0d062cf6ac442ba00db363b2e52939]], content = [[-- CC Miner V4 - managed GPS host launcher.
-
-local common = dofile("/ccminer/lib/common.lua")
-local config, err = common.loadConfig()
-if not config or config.role ~= "gps" then error(err or "GPS host is not configured. Run: ccm setup gps", 0) end
-
-if os.setComputerLabel then os.setComputerLabel(config.gpsName or common.safeComputerLabel("GPS")) end
-local opened = common.openWirelessModems()
-if #opened == 0 then error("No wireless modem found. Attach a wireless modem to this GPS host.", 0) end
-
-common.clear(colors and colors.black or nil, colors and colors.white or nil)
-print("CC Miner V4 GPS Host " .. common.VERSION)
-print("Name: " .. tostring(config.gpsName))
-print(("Coordinates: %d, %d, %d"):format(config.x, config.y, config.z))
-print("Modem: " .. table.concat(opened, ", "))
-print("")
-print("Hosting GPS. Keep this chunk loaded.")
-common.log("INFO", ("GPS host started at %d,%d,%d"):format(config.x, config.y, config.z))
-
-local ok = shell.run("gps", "host", tostring(config.x), tostring(config.y), tostring(config.z))
-if not ok then error("The built-in GPS host program exited unexpectedly.", 0) end
-]] },
-}
-local FILE_COUNT = 6
-local WORKER_PARTS = {}
-local CONTROLLER_PARTS = {}
-local ENTRYPOINT = [[gps_host.lua]]
-local UPDATE_SENTINEL = [[-- CC Miner V4 update-incomplete sentinel for gps
-error("CC Miner runtime update is incomplete. Re-transfer the offline bundle and run update-low-space.", 0)
-]]
-local LOW_SPACE_STEPS = {
-  { kind = "runtime", index = 1 },
-  { kind = "runtime", index = 2 },
-  { kind = "runtime", index = 3 },
-  { kind = "runtime", index = 4 },
-  { kind = "runtime", index = 5 },
-  { kind = "obsolete", target = [[lib/geo.lua]] },
-  { kind = "obsolete", target = [[lib/quarry.lua]] },
-  { kind = "obsolete", target = [[worker.lua]] },
-  { kind = "obsolete", target = [[worker_parts/01.part]] },
-  { kind = "obsolete", target = [[worker_parts/02.part]] },
-  { kind = "obsolete", target = [[worker_parts/03.part]] },
-  { kind = "obsolete", target = [[worker_parts/04.part]] },
-  { kind = "obsolete", target = [[worker_parts/05.part]] },
-  { kind = "obsolete", target = [[controller.lua]] },
-  { kind = "obsolete", target = [[controller_parts/01.part]] },
-  { kind = "obsolete", target = [[controller_parts/02.part]] },
-  { kind = "obsolete", target = [[controller_parts/03.part]] },
-}
-
-local function fail(message)
-  error(tostring(message), 0)
-end
-local function ensureDir(path)
-  if not path or path == "" or fs.exists(path) then return end
-  local parent = fs.getDir(path)
-  if parent and parent ~= "" and parent ~= path then ensureDir(parent) end
-  fs.makeDir(path)
-end
-local function readFile(path)
-  if not fs.exists(path) or fs.isDir(path) then return nil end
-  local handle = fs.open(path, "rb")
-  if not handle then return nil end
-  local text = handle.readAll(); handle.close(); return text
-end
-local function writeFile(path, text)
-  ensureDir(fs.getDir(path))
-  local handle = fs.open(path, "wb")
-  if not handle then return false, "Cannot write " .. path end
   local ok, writeError = pcall(handle.write, text or "")
   handle.close()
   if not ok then return false, tostring(writeError) end
@@ -270,3 +173,100 @@ local preserved = {
   { ROOT .. "/data/state.db", TEMP .. "/data/state.db" },
   { ROOT .. "/data/state.db.bak", TEMP .. "/data/state.db.bak" },
   { ROOT .. "/data/state.pending", TEMP .. "/data/state.pending" },
+  { ROOT .. "/data/state.journal", TEMP .. "/data/state.journal" },
+  { ROOT .. "/data/state.checkpoint.db", TEMP .. "/data/state.checkpoint.db" },
+  { ROOT .. "/data/controller.db", TEMP .. "/data/controller.db" },
+  { ROOT .. "/controller.db", TEMP .. "/controller.db" },
+  { ROOT .. "/data/ccminer.log", TEMP .. "/data/ccminer.log" },
+  { ROOT .. "/data/ccminer.log.1", TEMP .. "/data/ccminer.log.1" },
+}
+if action ~= "update-low-space" then
+  for _, pair in ipairs(preserved) do
+    local ok, copyError = copyIfPresent(pair[1], pair[2])
+    if not ok then fs.delete(TEMP); fail("Cannot preserve existing data: " .. tostring(copyError)) end
+  end
+end
+
+local function parseMarker(text)
+  if not text then return nil end
+  local version = text:match("version=([^\r\n]+)")
+  local schema = tonumber(text:match("schema=(%d+)"))
+  local role = text:match("role=([^\r\n]+)")
+  local state = text:match("state=([^\r\n]+)")
+  local nextIndex = tonumber(text:match("next=(%d+)"))
+  if not version or not schema or not role or not state or not nextIndex then return nil end
+  return { version = version, schema = schema, role = role, state = state, next = nextIndex }
+end
+local function markerRead()
+  local markerText = readFile(LOW_SPACE_MARKER)
+  local marker = parseMarker(markerText)
+  if marker then return marker, nil end
+  local backupPath, tempPath = LOW_SPACE_MARKER .. ".bak", LOW_SPACE_MARKER .. ".tmp"
+  local tempText = readFile(tempPath)
+  local temp = parseMarker(tempText)
+  if tempText and not temp then
+    return nil, "Recovery marker temporary file is corrupt; refusing to guess update progress."
+  end
+  local backupText = readFile(backupPath)
+  local backup = parseMarker(backupText)
+  if backup then
+    local restored, restoreError = atomicWrite(LOW_SPACE_MARKER, backupText)
+    if not restored then return nil, "Recovery marker backup is valid but could not be restored: " .. tostring(restoreError) end
+    local recovered = parseMarker(readFile(LOW_SPACE_MARKER))
+    if not recovered then return nil, "Recovery marker backup restore could not be verified." end
+    return recovered, nil
+  end
+  if temp then
+    local restored, restoreError = atomicWrite(LOW_SPACE_MARKER, tempText)
+    if not restored then return nil, "Recovery marker temporary file is valid but could not be restored: " .. tostring(restoreError) end
+    local recovered = parseMarker(readFile(LOW_SPACE_MARKER))
+    if not recovered then return nil, "Recovery marker temporary restore could not be verified." end
+    return recovered, nil
+  end
+  if markerText then return nil, "Recovery marker is corrupt and no valid atomic backup remains." end
+  if backupText then return nil, "Recovery marker backup is corrupt and cannot be trusted." end
+  return nil, nil
+end
+local function markerWrite(state, nextIndex)
+  local text = table.concat({
+    "version=" .. VERSION,
+    "schema=" .. tostring(SCHEMA),
+    "role=" .. ROLE,
+    "state=" .. tostring(state),
+    "next=" .. tostring(nextIndex or 1),
+    "",
+  }, "\n")
+  return atomicWrite(LOW_SPACE_MARKER, text)
+end
+local function clearMarker()
+  for _, suffix in ipairs({ "", ".tmp", ".bak" }) do
+    local path = LOW_SPACE_MARKER .. suffix
+    if fs.exists(path) then pcall(fs.delete, path) end
+    if fs.exists(path) then return false, "Cannot clear recovery marker artifact: " .. path end
+  end
+  return true
+end
+local function lowSpaceFailure(message)
+  printError("LOW-SPACE UPDATE PAUSED")
+  fail(tostring(message) .. "\nRecovery marker: " .. LOW_SPACE_MARKER
+    .. "\nRe-transfer ccminer-offline-" .. ROLE .. ".lua and its parts, then rerun update-low-space.")
+end
+local function embeddedEntrypoint()
+  for _, file in ipairs(files) do
+    if file.target == ENTRYPOINT then return file.content end
+  end
+  lowSpaceFailure("Embedded role loader is missing: " .. ENTRYPOINT)
+end
+local function ensureUpdateSentinel()
+  local path = ROOT .. "/" .. ENTRYPOINT
+  if readFile(path) ~= UPDATE_SENTINEL then
+    local wrote, writeError = atomicWrite(path, UPDATE_SENTINEL)
+    if not wrote then lowSpaceFailure("Cannot install the update-incomplete sentinel: " .. tostring(writeError)) end
+  end
+  if readFile(path) ~= UPDATE_SENTINEL then
+    lowSpaceFailure("Update-incomplete sentinel could not be verified; runtime was not started.")
+  end
+end
+local function applyLowSpaceStep(step)
+  if step.kind == "runtime" then
+    local file = files[step.index]

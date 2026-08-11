@@ -1,171 +1,228 @@
-            check("bay cell:#" .. tostring(id), "bad", "cannot rebase worker forward entrance to common catalog", true)
-          else
-            local forwardCell = false
-            for _, chunk in ipairs(catalog or {}) do
-              if tonumber(localForward.x) >= tonumber(chunk.minX) and tonumber(localForward.x) <= tonumber(chunk.maxX)
-                and tonumber(localForward.z) >= tonumber(chunk.minZ) and tonumber(localForward.z) <= tonumber(chunk.maxZ) then
-                forwardCell = tostring(chunk.key) == tostring(homeKey) or forwardCell
-              end
-            end
-            if not forwardCell then check("bay cell:#" .. tostring(id), "bad", "worker forward entrance is outside its bay chunk cells", true)
-            else check("bay cell:#" .. tostring(id), "ok", "forward entrance is inside its bay chunk", false) end
-          end
-        end
-      end
-      if not workerBay then
-        check("bay:#" .. tostring(id), "bad", "registered bay metadata unavailable", true)
-      elseif not workerBay.world then
-        check("bay pose:#" .. tostring(id), "bad", "bay world pose unavailable", true)
-      elseif workerBay.world then
-        local pos = data.world or data.position
-        local match = pos and tonumber(pos.x) == tonumber(workerBay.world.x) and tonumber(pos.y) == tonumber(workerBay.world.y) and tonumber(pos.z) == tonumber(workerBay.world.z)
-        if match then check("bay pose:#" .. tostring(id), "ok", "world pose verified", false) else check("bay pose:#" .. tostring(id), "bad", "worker is not at bay world pose", true) end
-        local facing = data.facing or data.pose and data.pose.dir
-        if facing == nil then check("bay facing:#" .. tostring(id), "bad", "worker facing unavailable", true)
-        elseif workerBay.facing ~= nil and tostring(facing) ~= tostring(workerBay.facing) then check("bay facing:#" .. tostring(id), "bad", "facing mismatch", true)
-        else check("bay facing:#" .. tostring(id), "ok", tostring(facing), false) end
-      end
-    end
-    if worldMode and not workerDock then check("dock:#" .. tostring(id), "bad", "registered dock metadata unavailable", true) end
-    if workerDock and workerDock.maxDepth and tonumber(spec.maxDepth) and tonumber(workerDock.maxDepth) < tonumber(spec.maxDepth) then spec.maxDepth = tonumber(workerDock.maxDepth) end
-    local homeY = tonumber(spec.homeY)
-    local bottom = commonBottom
-    if worldMode and (not homeY or not bottom) then check("Y:#" .. tostring(id), "bad", "HOME Y/BOTTOM Y unavailable", true) end
-    if worldMode and homeY and bottom then
-      local layers = math.floor(homeY - bottom + 1)
-      local maxDepth = tonumber(spec.maxDepth or config.maxDepth)
-      if layers < 1 then check("maxDepth:#" .. tostring(id), "bad", "BOTTOM Y is above HOME Y", true) elseif layers > maxDepth then check("maxDepth:#" .. tostring(id), "bad", tostring(layers) .. " > " .. tostring(maxDepth), true) else check("maxDepth:#" .. tostring(id), "ok", tostring(layers), false) end
-      minDepth = minDepth and math.min(minDepth, layers) or layers
-    end
-    local availableFuel = tonumber(data.fuel or data.materials and data.materials.fuel)
-    if availableFuel and (minFuel == nil or availableFuel < minFuel) then minFuel = availableFuel end
-    local workerDepth = (worldMode and homeY and commonBottom and math.max(1, math.floor(homeY - commonBottom + 1))) or tonumber(value.depth) or 1
-    maxRequiredFuel = math.max(maxRequiredFuel, estimateFuel(#catalog * workerDepth, value.width, value.length, workerDepth))
-    if chunkMode == "local" and #ids > 1 then check("local group partition", "bad", "local jobs cannot be auto-split", true) end
+  local caps = data.capabilities or {}
+  if draft.waterMode ~= "ignore" then
+    if caps.waterHandling == false then check("water capability", "bad", "worker lacks waterHandling", true)
+    elseif caps.waterHandling == nil then check("water capability", "warn", "worker capability unknown", false)
+    else check("water capability", "ok", "ready", false) end
+  else check("water capability", "ok", "ignore", false) end
+  if draft.lighting and draft.lighting.mode ~= "off" then
+    if caps.lighting == false then check("lighting capability", "bad", "worker lacks lighting", true)
+    elseif caps.lighting == nil then check("lighting capability", "warn", "worker capability unknown", false)
+    else check("lighting capability", "ok", "ready", false) end
+  else check("lighting capability", "ok", "off", false) end
+  local selectedChunkKeys = {}
+  for _, chunk in ipairs(catalog) do
+    local excluded = false
+    for _, item in ipairs(excludedChunks) do if item.key == chunk.key then excluded = true; break end end
+    if not excluded then selectedChunkKeys[#selectedChunkKeys + 1] = chunk.key end
   end
-  -- Bay metadata is controller-owned and may differ from GPS calibration
-  -- coordinates.  Validate all registered positions as a set before asking
-  -- quarry to partition; otherwise two workers can share one entrance or be
-  -- placed on different floors/orientations while each individual check
-  -- still appears valid.
-  if worldMode and #specs > 1 then
-    local bayPoints = {}
-    for _, spec in ipairs(specs) do
-      local bayId, workerBay = groupWorkerResource(group, spec.workerId, "bay")
-      local point = workerBay and (workerBay.world or workerBay.position or workerBay)
-      if point and tonumber(point.x) and tonumber(point.y) and tonumber(point.z) then
-        bayPoints[#bayPoints + 1] = {
-          workerId = spec.workerId, bayId = bayId, x = tonumber(point.x), y = tonumber(point.y), z = tonumber(point.z),
-          facing = workerBay.facing or workerBay.direction or spec.facing,
-        }
-      end
-    end
-    local requireSameFloor = not (config.dock and config.dock.requireSameFloor == false)
-    local spacing = math.max(0, tonumber(config.dock and config.dock.baySpacing) or 0)
-    for i = 1, #bayPoints do
-      for j = i + 1, #bayPoints do
-        local a, b = bayPoints[i], bayPoints[j]
-        if requireSameFloor and a.y ~= b.y then check("bay floor:#" .. tostring(a.workerId) .. "/#" .. tostring(b.workerId), "bad", "registered bay HOME Y differs", true) end
-        if a.facing ~= nil and b.facing ~= nil and tostring(a.facing) ~= tostring(b.facing) then
-          check("bay facing:#" .. tostring(a.workerId) .. "/#" .. tostring(b.workerId), "bad", "registered bay orientation differs", true)
-        end
-        local dx, dz = a.x - b.x, a.z - b.z
-        local distance = math.sqrt(dx * dx + dz * dz)
-        if distance <= 0 or (spacing > 0 and distance < spacing) then
-          check("bay spacing:#" .. tostring(a.workerId) .. "/#" .. tostring(b.workerId), "bad", "registered bay positions overlap or are closer than " .. tostring(spacing), true)
-        end
-      end
-    end
-  end
-  local partition, partitionError = partitionGroupCatalog(catalog, group, { chunkMode = chunkMode, strategy = partitionStrategy, bottomY = commonBottom, layers = chunkMode == "local" and tonumber(value.depth) or nil }, specs)
-  if not partition then check("connected partition", "bad", tostring(partitionError), true) else check("connected partition", "ok", value.partition or group.partition or "stripe", false) end
-  local assignments = partition
-  local selectedKeys = {}
-  if assignments then
-    for _, spec in ipairs(specs) do
-      local assignment = assignments[tostring(spec.workerId)] or assignments[spec.workerId]
-      local ownsBay = false
-      local mineSet = {}
-      if not assignment then check("assignment:#" .. tostring(spec.workerId), "bad", "partition missing worker assignment", true) end
-      for _, key in ipairs(assignment and assignment.chunkKeys or {}) do mineSet[tostring(key)] = true; selectedKeys[#selectedKeys + 1] = key end
-      if worldMode and spec.bayChunkKey and mineSet[tostring(spec.bayChunkKey)] then ownsBay = true end
-      if worldMode and not ownsBay then check("assignment bay chunk:#" .. tostring(spec.workerId), "bad", "assignment does not own worker bay chunk", true) end
-      for _, key in ipairs(assignment and assignment.transitKeys or {}) do
-        if not mineSet[tostring(key)] then check("transit ownership:#" .. tostring(spec.workerId), "bad", "transit chunk leaves worker assignment", true) end
-      end
-      if worldMode and spec.bayChunkKey and assignment and tostring(assignment.seedKey or "") ~= tostring(spec.bayChunkKey) then
-        check("assignment bay seed:#" .. tostring(spec.workerId), "bad", "assignment seed is not worker bay chunk", true)
-      end
-    end
-  end
-  local mineConflict = groupLeaseConflict(chunkMode, nil, selectedKeys, "mine", groupId)
-  if mineConflict then check("mine lease", "bad", "overlaps " .. tostring(mineConflict.groupJobId or mineConflict.jobId or "active"), true) else check("mine lease", "ok", "available", false) end
-  local transitKeys = {}
-  if assignments then for _, assignment in pairs(assignments) do for _, key in ipairs(assignment.transitKeys or {}) do transitKeys[#transitKeys + 1] = key end end end
-  local transitConflict = groupLeaseConflict(chunkMode, nil, transitKeys, "transit", groupId)
-  if transitConflict then check("transit lease", "bad", "overlaps " .. tostring(transitConflict.groupJobId or transitConflict.jobId or "active"), true) else check("transit lease", "ok", "available", false) end
-  if not minFuel then check("minimum fuel", "warn", "unknown / estimate " .. tostring(maxRequiredFuel) .. " (refill scheduler)", false) elseif minFuel < maxRequiredFuel then check("minimum fuel", "warn", tostring(minFuel) .. " < estimate " .. tostring(maxRequiredFuel) .. " (refill scheduler)", false) else check("minimum fuel", "ok", tostring(minFuel) .. " / estimate " .. tostring(maxRequiredFuel), false) end
+  local leaseConflict = (not draft.queueing) and id and activeLeaseOverlap and activeLeaseOverlap(chunkMode, id, selectedChunkKeys)
+  if leaseConflict then check("lease", "bad", "overlaps active job " .. tostring(leaseConflict.jobId or "unknown"), true) end
+  local fatal = false
+  for _, item in ipairs(checks) do if item.fatal or item.state == "bad" and item.fatal then fatal = true end end
   local result = {
-    groupId = tostring(groupId), group = common.copy(group), value = common.copy(value), checks = checks, fatal = fatal,
-    catalog = catalog, catalogDescriptor = groupCatalogDescriptor(catalog, chunkMode, rootKey, specs), chunkMode = chunkMode, rootKey = rootKey, assignments = assignments,
-    workers = specs, bottomY = commonBottom, minLayers = minDepth, minFuel = minFuel, requiredFuel = maxRequiredFuel, partition = partitionStrategy,
-    totalChunks = #catalog, selectedChunks = #selectedKeys, warnings = {}, minimumFuel = minFuel, requiredFuel = maxRequiredFuel, computedAt = common.nowSeconds(),
+    checks = checks, fatal = fatal, catalog = catalog, plan = plan, planError = planError,
+    chunkMode = chunkMode, calibration = calibration, rootKey = rootKey,
+    excludedChunks = excludedChunks, cells = estimate and (estimate.surfaceCells or estimate.columns) or (cells - cellExcluded), blocks = estimate and (estimate.blocks or estimate.totalBlocks) or blocks,
+    chunks = plan and plan.catalogCount or #catalog, selectedChunks = (plan and plan.selectedChunks) or (#catalog - #excludedChunks), totalChunks = #catalog, exclusions = #excludedChunks,
+    torches = torchNeed, fuel = requiredFuel, baseFuel = baseFuelEstimate, estimate = estimate, jobDepth = jobDepth, targetY = targetY,
+    profile = profileInfo.profile, requestedInterval = profileInfo.requestedInterval, effectiveInterval = profileInfo.effectiveInterval,
+    fuelMultiplier = profileInfo.fuelMultiplier,
   }
-  for _, item in ipairs(checks) do if item.state == "warn" then result.warnings[#result.warnings + 1] = item.name .. ": " .. tostring(item.detail) end end
+  draft.preflight = result
   return result
 end
 
-local function groupLeaseEntries(job, assignment)
-  local entries = {}
-  for _, kind in ipairs({ "transit", "mine" }) do
-    local keys = kind == "transit" and (assignment.transitKeys or {}) or (assignment.chunkKeys or {})
-    entries[#entries + 1] = {
-      jobId = tostring(assignment.jobId), groupJobId = tostring(job.groupJobId), assignmentId = tostring(assignment.assignmentId), workerId = assignment.workerId,
-      kind = kind, mode = job.chunkMode, chunks = common.copy(keys), createdAt = common.nowSeconds(),
-    }
+activeLeaseOverlap = function(mode, workerId, chunks)
+  for _, lease in ipairs(db.leases or {}) do
+    local leaseMode = lease.mode == "world" and "world" or "local"
+    if mode == "world" and leaseMode == "world" then
+      local set = {}
+      for _, key in ipairs(lease.chunks or {}) do set[tostring(key)] = true end
+      for _, key in ipairs(chunks or {}) do if set[tostring(key)] then return lease end end
+    elseif mode == "local" and leaseMode == "local" and tonumber(lease.workerId) == tonumber(workerId) then
+      return lease
+    end
   end
-  return entries
+  return nil
 end
 
-releaseGroupLeases = function(job, onlyPending)
-  if type(job) ~= "table" then return end
-  local removed = {}
-  local function keep(lease)
-    if tostring(lease.groupJobId or "") ~= tostring(job.groupJobId or "") then return true end
-    if onlyPending and job.started and job.started[tostring(lease.workerId)] then return true end
-    removed[#removed + 1] = lease
-    return false
-  end
-  local kept, keptGroup = {}, {}
-  for _, lease in ipairs(db.leases or {}) do if keep(lease) then kept[#kept + 1] = lease end end
-  for _, lease in ipairs(db.groupLeases or {}) do
-    if tostring(lease.groupJobId or "") ~= tostring(job.groupJobId or "") or (onlyPending and job.started and job.started[tostring(lease.workerId)]) then keptGroup[#keptGroup + 1] = lease end
-  end
-  db.leases, db.groupLeases = kept, keptGroup
-  db.activeLeases = common.copy(kept)
-  saveControllerDb()
-  return #removed
+local function reserveLease(jobId, workerId, mode, chunks, assignmentId)
+  local conflict = activeLeaseOverlap(mode, workerId, chunks)
+  if conflict then return nil, "Active lease overlap with " .. tostring(conflict.jobId or conflict.assignmentId) end
+  local lease = {
+    jobId = tostring(jobId), assignmentId = assignmentId, workerId = tonumber(workerId) or workerId,
+    mode = mode, chunks = common.copy(chunks or {}), createdAt = common.nowSeconds(),
+  }
+  db.leases[#db.leases + 1] = lease
+  db.activeLeases = common.copy(db.leases)
+  local ok, err = saveControllerDb()
+  if not ok then table.remove(db.leases); return nil, err or "Could not persist active lease" end
+  return lease
 end
 
-groupSafeStop = function(job, workerId, reason)
-  local payload = { scope = "group", group = true, groupId = job.groupId, groupJobId = job.groupJobId, groupCommand = "RETURN", mode = "return_home", safeStop = true, reason = reason or "partial_start" }
-  payload.targetWorkerId, payload.workerId = tonumber(workerId) or workerId, tonumber(workerId) or workerId
-  sendCommand(workerId, "stop", payload)
+local function chunkKeySet(catalog)
+  local set = {}
+  for _, chunk in ipairs(catalog or {}) do set[chunk.key] = true end
+  return set
 end
 
-sortedJobAssignments = function(job)
+local function deterministicPartition(chunks, count)
   local out = {}
-  for key, value in pairs(job and job.assignments or {}) do if type(value) == "table" then out[#out + 1] = value end end
-  table.sort(out, function(a, b) return tostring(a.workerId) < tostring(b.workerId) end)
+  count = math.max(1, tonumber(count) or 1)
+  for index = 1, count do out[index] = {} end
+  for index, chunk in ipairs(chunks or {}) do out[((index - 1) % count) + 1][#out[((index - 1) % count) + 1] + 1] = chunk end
   return out
 end
 
-local function dispatchGroupJob(job, force)
-  if type(job) ~= "table" or (job.status ~= "starting" and job.status ~= "queued") then return false end
-  job.pending = job.pending or {}
-  job.started = job.started or {}
-  job.failed = job.failed or {}
-  job.awaitingAck = job.awaitingAck or {}
-  job.acks = job.acks or {}
-  for _ in pairs(job.awaitingAck) do return true end
-  local now = common.nowSeconds()
+-- Group planning ---------------------------------------------------------
+-- The quarry module may expose the richer partitionGroup API in newer
+-- runtimes.  Controllers assembled with an older quarry.lua still work for
+-- world plans through partitionChunks; local plans intentionally never get an
+-- automatic split because their coordinates are dock-relative.
+local function groupWorkerSpecs(group)
+  local specs = {}
+  for _, id in ipairs(groupWorkerIds(group)) do
+    local data = workerData(id) or {}
+    local calibration = data.gps and data.gps.calibration or data.calibration
+    local home = calibration and calibration.home or data.home
+    local world = data.world or data.position
+    local bayId, bay = groupWorkerResource(group, id, "bay")
+    local dockId, dock = groupWorkerResource(group, id, "dock")
+    local bayPoint = bay and (bay.world or bay.position or bay) or nil
+    local bayChunkKey = bayPoint and tonumber(bayPoint.x) and tonumber(bayPoint.z)
+      and quarry.chunkKey("world", math.floor(tonumber(bayPoint.x) / 16), math.floor(tonumber(bayPoint.z) / 16)) or nil
+    specs[#specs + 1] = {
+      workerId = tonumber(id) or id,
+      id = tonumber(id) or id,
+      version = data.version or data.workerVersion,
+      home = common.copy(home),
+      calibration = common.copy(calibration),
+      world = common.copy(world),
+      facing = data.facing or data.pose and data.pose.dir,
+      homeY = tonumber(home and home.y or data.homeY),
+      maxDepth = tonumber(data.maxDepth or data.capabilities and data.capabilities.maxDepth),
+      capability = common.copy(data.capabilities or {}),
+      bayId = bayId, bay = common.copy(bayPoint), bayChunkKey = bayChunkKey, bayMeta = common.copy(bay), dockId = dockId, dock = common.copy(dock),
+    }
+  end
+  return specs
+end
+
+local function normalizeGroupAssignments(raw, workerSpecs)
+  local source = type(raw) == "table" and (raw.byWorker or raw.assignments or raw) or nil
+  if type(source) ~= "table" then return nil, "invalid_group_assignments" end
+  local out, count = {}, 0
+  for index, spec in ipairs(workerSpecs or {}) do
+    local id, key = spec.workerId, tostring(spec.workerId)
+    -- Never pair assignments by array index: quarry is allowed to sort worker
+    -- IDs.  Match the explicit workerId (or byWorker map key) only.
+    local value = source[key] or source[id]
+    if type(value) ~= "table" then
+      for candidateKey, candidate in pairs(source) do
+        if type(candidate) == "table" and tostring(candidate.workerId or candidate.id) == key then value = candidate; break end
+        if tostring(candidateKey) == key and type(candidate) == "table" then value = candidate; break end
+      end
+    end
+    if type(value) ~= "table" then return nil, "group_assignment_missing_worker_" .. key end
+    local chunks = value.chunkKeys or value.chunks or value.assignmentChunks or {}
+    if type(chunks) ~= "table" then return nil, "group_assignment_invalid_chunks_" .. key end
+    local assignment = {
+      workerId = tonumber(value.workerId or id) or value.workerId or id,
+      chunkKeys = common.copy(chunks),
+      transitKeys = common.copy(value.transitKeys or value.transit or {}),
+      seedKey = value.seedKey,
+      estimatedCost = tonumber(value.estimatedCost or value.cost or value.cells) or 0,
+      homeY = tonumber(value.homeY or spec.homeY),
+      bottomY = tonumber(value.bottomY),
+      layers = tonumber(value.layers),
+    }
+    if #assignment.chunkKeys == 0 then return nil, "group_assignment_empty_" .. key end
+    out[key] = assignment
+    count = count + 1
+  end
+  return out, count
+end
+
+local function partitionGroupCatalog(catalog, group, options, workerSpecs)
+  local specs = workerSpecs or groupWorkerSpecs(group)
+  if #specs == 0 then return nil, "group_workers_required" end
+  options = type(options) == "table" and options or {}
+  options.strategy = options.strategy or (group and group.partition) or "stripe"
+  options.stripeFirst = options.stripeFirst ~= false
+  options.connected = true
+  options.balanced = true
+  options.requireConnected = true
+  if type(quarry.partitionGroup) == "function" then
+    local ok, raw, err = pcall(quarry.partitionGroup, catalog, specs, options)
+    if ok and raw then
+      local normalized, count = normalizeGroupAssignments(raw, specs)
+      local unassigned = raw and raw.unassigned
+      local hasUnassigned = type(unassigned) == "table" and ((#unassigned > 0) or next(unassigned) ~= nil)
+      if normalized and count == #specs and not hasUnassigned then return normalized, nil, raw end
+      if not err then err = count end
+    end
+  end
+  local mode = options.chunkMode == "world" and "world" or "local"
+  if mode ~= "world" and #specs > 1 then return nil, "local_group_partition_disabled" end
+  if #specs > 1 then return nil, "partitionGroup_required_for_multi_worker" end
+  if type(quarry.partitionChunks) ~= "function" then return nil, "group_partition_api_unavailable" end
+  local ids = {}
+  for _, spec in ipairs(specs) do ids[#ids + 1] = spec.workerId end
+  local ok, legacy = pcall(quarry.partitionChunks, catalog, ids)
+  if not ok or not legacy then return nil, tostring(legacy or "group_partition_api_unavailable") end
+  local normalized = {}
+  for _, spec in ipairs(specs) do
+    local value = legacy[spec.workerId] or legacy[tostring(spec.workerId)]
+    if type(value) ~= "table" then return nil, "legacy_partition_missing_worker_" .. tostring(spec.workerId) end
+    normalized[tostring(spec.workerId)] = {
+      workerId = spec.workerId,
+      chunkKeys = common.copy(value.chunkKeys or value.chunks or {}),
+      transitKeys = common.copy(value.transitKeys or {}),
+      seedKey = value.seedKey,
+      estimatedCost = tonumber(value.estimatedCost or value.cost or value.cells) or 0,
+      homeY = spec.homeY,
+    }
+  end
+  return normalized, nil, legacy
+end
+
+local function groupDraftDefaults(group)
+  local previous = db.lastDraft or {}
+  local workerIds = groupWorkerIds(group)
+  local firstData = workerIds[1] and workerData(workerIds[1]) or nil
+  local calibration = firstData and firstData.gps and firstData.gps.calibration
+  local homeY = calibration and calibration.home and tonumber(calibration.home.y) or tonumber(firstData and firstData.homeY)
+  local depth = tonumber(previous.depth) or 16
+  local bottomY = tonumber(previous.bottomY or previous.targetY)
+  if not bottomY and homeY then bottomY = homeY - depth + 1 end
+  return {
+    groupId = group and group.id,
+    width = tonumber(previous.width) or 8,
+    length = tonumber(previous.length) or 32,
+    depth = depth,
+    bottomY = bottomY,
+    targetY = bottomY,
+    mode = group and group.mode or "world",
+    partition = group and group.partition or (config.group and config.group.partitionMode) or "stripe",
+    lighting = normalizedLighting and normalizedLighting(previous.lighting) or common.copy(previous.lighting or { mode = "safe", interval = 10 }),
+    waterMode = normalizedWaterMode and normalizedWaterMode(previous.waterMode) or tostring(previous.waterMode or "seal"),
+    profile = normalizedProfile and normalizedProfile(previous.profile) or tostring(previous.profile or "balanced"),
+    name = previous.name or (group and group.name and ("Group " .. tostring(group.name)) or "Group Quarry"),
+  }
+end
+
+local function groupCatalogAndShape(group, value)
+  local mode = value.mode == "world" and "world" or "local"
+  local specs = groupWorkerSpecs(group)
+  local calibration
+  for _, spec in ipairs(specs) do
+    if spec.calibration then calibration = spec.calibration; break end
+  end
+  local catalog, err
+  if type(value.catalog) == "table" and #value.catalog > 0 then
+    catalog = common.copy(value.catalog)
+  else
+    catalog, err = quarry.buildCatalog(value.width, value.length, mode, calibration)
+  end
+  if not catalog then return nil, err end
+  local rootKey

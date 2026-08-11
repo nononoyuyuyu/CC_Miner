@@ -1,3 +1,182 @@
+    for _, key in ipairs(keys) do
+      if not owner[key] then
+        local candidates, candidateSeen = {}, {}
+        for _, neighbor in ipairs(chunks[key].neighbors or {}) do
+          local index = owner[neighbor]
+          if index and not candidateSeen[index] then candidateSeen[index] = true; candidates[#candidates + 1] = index end
+        end
+        for _, index in ipairs(candidates) do
+          local deficit = target - loads[index]
+          local projected = math.abs((loads[index] + chunks[key].cells) - target)
+          if not bestKey or deficit > bestDeficit or (deficit == bestDeficit and projected < bestProjected) or (deficit == bestDeficit and projected == bestProjected and (chunkComparator(chunks[key], chunks[bestKey]) or (key == bestKey and index < bestOwner))) then
+            bestKey, bestOwner, bestDeficit, bestProjected = key, index, deficit, projected
+          end
+        end
+      end
+    end
+    if not bestKey then return nil, "chunk_catalog_disconnected" end
+    owner[bestKey] = bestOwner
+    owned[bestOwner][#owned[bestOwner] + 1] = bestKey
+    loads[bestOwner] = loads[bestOwner] + chunks[bestKey].cells
+    assigned = assigned + 1
+  end
+
+  local result = {}
+  for index, worker in ipairs(workers) do
+    table.sort(owned[index], function(left, right) return chunkComparator(chunks[left], chunks[right]) end)
+    result[worker.id] = { chunkKeys = owned[index], cells = loads[index] }
+  end
+  return result
+end
+
+M.partitionChunks = partitionChunks
+M.assignWorkers = partitionChunks
+M.splitWorkers = partitionChunks
+M.splitWorkerChunks = partitionChunks
+M.partitionWorkers = partitionChunks
+M.assignChunkWorkers = partitionChunks
+M.splitWorkerAssignments = partitionChunks
+
+-- -------------------------------------------------------------------------
+-- Group dispatch helpers
+-- -------------------------------------------------------------------------
+-- Group dispatch accepts either an already-built GPS catalog or a compact
+-- descriptor ({ width, length, worldSeed/calibration }).  Keeping catalog
+-- construction here lets a controller send only a worker bay and a GPS world
+-- seed while preserving the world-coordinate safety checks in buildCatalog.
+local function worldSeedCalibration(seed, options)
+  options = type(options) == "table" and options or {}
+  if type(seed) ~= "table" then return nil, "gps_not_calibrated" end
+  local nested = seed.home and seed or (seed.calibration and seed.calibration) or seed
+  if validCalibration(nested) then
+    return {
+      home = { x = nested.home.x, y = nested.home.y, z = nested.home.z },
+      forward = { x = nested.forward.x, z = nested.forward.z },
+    }
+  end
+  local point = seed.position or seed.world or seed.bay or seed.worldSeed or seed
+  local x, z = numberValue(point.x), numberValue(point.z)
+  if (not x or not z) and point.cx ~= nil and point.cz ~= nil then
+    local cx, cz = integerValue(point.cx), integerValue(point.cz)
+    if cx and cz then x, z = cx * 16 + 8, cz * 16 + 8 end
+  end
+  local y = numberValue(point.y)
+  if not x or not z then return nil, "gps_not_calibrated" end
+  y = y or numberValue(options.homeY) or 0
+  local forward = seed.forward or options.forward or { x = 0, z = 1 }
+  local fx, fz = numberValue(forward.x), numberValue(forward.z)
+  if not fx or not fz or math.abs(fx) + math.abs(fz) ~= 1 then return nil, "gps_not_calibrated" end
+  return { home = { x = x, y = y, z = z }, forward = { x = fx, z = fz } }
+end
+
+function M.buildWorldCatalog(width, length, worldSeed, options)
+  options = type(options) == "table" and options or {}
+  if type(width) == "table" then
+    local descriptor = width
+    if descriptor.width == nil and descriptor.length == nil and integerValue(length, 1, MAX_DIMENSION)
+        and integerValue(worldSeed, 1, MAX_DIMENSION) then
+      -- Flexible seed-first form: buildWorldCatalog(worldSeed, width, length).
+      local seed = descriptor
+      width, length, worldSeed = length, worldSeed, seed
+      descriptor = nil
+    end
+    if descriptor == nil then
+      local calibration = options.calibration or worldSeedCalibration(worldSeed, options)
+      if not calibration then return nil, "gps_not_calibrated" end
+      local catalog, catalogError = M.buildCatalog(width, length, "world", calibration)
+      if not catalog then return nil, catalogError end
+      catalog.referenceCalibration = {
+        home = { x = calibration.home.x, y = calibration.home.y, z = calibration.home.z },
+        forward = { x = calibration.forward.x, z = calibration.forward.z },
+      }
+      catalog.calibrationSeed = {
+        home = { x = calibration.home.x, y = calibration.home.y, z = calibration.home.z },
+        forward = { x = calibration.forward.x, z = calibration.forward.z },
+      }
+      local bounds
+      for _, chunk in ipairs(catalog) do
+        if contains(chunk, 0, 1) then catalog.rootKey = chunk.key; break end
+      end
+      for _, chunk in ipairs(catalog) do
+        bounds = bounds or { minX = chunk.minX, maxX = chunk.maxX, minZ = chunk.minZ, maxZ = chunk.maxZ }
+        bounds.minX, bounds.maxX = math.min(bounds.minX, chunk.minX), math.max(bounds.maxX, chunk.maxX)
+        bounds.minZ, bounds.maxZ = math.min(bounds.minZ, chunk.minZ), math.max(bounds.maxZ, chunk.maxZ)
+      end
+      catalog.bounds = bounds
+      return catalog
+    end
+    options = type(length) == "table" and length or options
+    width, length = descriptor.width, descriptor.length
+    worldSeed = descriptor.worldSeed or descriptor.seed or descriptor.calibration or options.worldSeed or worldSeed
+    if descriptor.options and type(descriptor.options) == "table" then
+      local merged = {}
+      for key, value in pairs(descriptor.options) do merged[key] = value end
+      for key, value in pairs(options) do merged[key] = value end
+      options = merged
+      if worldSeed == nil then worldSeed = options.worldSeed end
+    end
+  end
+  local calibration = options.calibration
+  if not calibration then calibration = worldSeedCalibration(worldSeed, options) end
+  if not calibration then return nil, "gps_not_calibrated" end
+  local catalog, catalogError = M.buildCatalog(width, length, "world", calibration)
+  if not catalog then return nil, catalogError end
+  -- Arrays may carry metadata fields in Lua.  Keep the reference GPS seed and
+  -- bounds available to assigned-plan builders without sharing calibration
+  -- tables with the caller or with persisted worker state.
+  catalog.referenceCalibration = {
+    home = { x = calibration.home.x, y = calibration.home.y, z = calibration.home.z },
+    forward = { x = calibration.forward.x, z = calibration.forward.z },
+  }
+  catalog.calibrationSeed = {
+    home = { x = calibration.home.x, y = calibration.home.y, z = calibration.home.z },
+    forward = { x = calibration.forward.x, z = calibration.forward.z },
+  }
+  local referenceRoot
+  for _, chunk in ipairs(catalog) do
+    if contains(chunk, 0, 1) then referenceRoot = chunk.key; break end
+  end
+  catalog.rootKey = referenceRoot
+  local bounds
+  for _, chunk in ipairs(catalog) do
+    bounds = bounds or { minX = chunk.minX, maxX = chunk.maxX, minZ = chunk.minZ, maxZ = chunk.maxZ }
+    bounds.minX, bounds.maxX = math.min(bounds.minX, chunk.minX), math.max(bounds.maxX, chunk.maxX)
+    bounds.minZ, bounds.maxZ = math.min(bounds.minZ, chunk.minZ), math.max(bounds.maxZ, chunk.maxZ)
+  end
+  catalog.bounds = bounds
+  return catalog
+end
+
+M.catalogFromWorldSeed = M.buildWorldCatalog
+M.worldCatalog = M.buildWorldCatalog
+M.buildGpsCatalog = M.buildWorldCatalog
+M.buildCatalogFromWorldSeed = M.buildWorldCatalog
+M.worldCatalogFromSeed = M.buildWorldCatalog
+
+local function groupCatalogInput(catalog, options)
+  options = type(options) == "table" and options or {}
+  if catalog == nil and options.width ~= nil and options.length ~= nil then
+    local generated, generatedError = M.buildWorldCatalog(options.width, options.length, options.worldSeed, options)
+    if not generated then return nil, nil, generatedError end
+    local chunks, keys = catalogGraph(generated)
+    if not chunks then return nil, nil, keys end
+    return chunks, keys
+  end
+  if type(catalog) ~= "table" then return nil, nil, "invalid_chunk_catalog" end
+  local descriptor = catalog
+  local hasChunks = type(descriptor.chunks) == "table" or #descriptor > 0
+  if not hasChunks and descriptor.width ~= nil and descriptor.length ~= nil then
+    local generated, generatedError = M.buildWorldCatalog(descriptor, options)
+    if not generated then return nil, nil, generatedError end
+    local chunks, keys = catalogGraph(generated)
+    if not chunks then return nil, nil, keys end
+    return chunks, keys
+  end
+  -- A caller may pass { worldSeed = ..., width = ..., length = ... } with no
+  -- explicit calibration.  Treat this as the same descriptor form above.
+  if not hasChunks and options.width ~= nil and options.length ~= nil then
+    local generated, generatedError = M.buildWorldCatalog(options.width, options.length,
+      descriptor.worldSeed or descriptor.seed or options.worldSeed, options)
     if not generated then return nil, nil, generatedError end
     local chunks, keys = catalogGraph(generated)
     if not chunks then return nil, nil, keys end
@@ -67,226 +246,3 @@ local function groupWorkerList(values)
     else
       id = value
     end
-    if id == nil or tostring(id) == "" then return nil, "invalid_worker_id" end
-    key = tostring(id)
-    if seen[key] then return nil, "duplicate_worker_id" end
-    seen[key] = true
-    homeY = homeY == nil and nil or integerValue(homeY)
-    if homeY == nil and homeYProvided then return nil, "invalid_home_y" end
-    workers[#workers + 1] = {
-      id = id,
-      key = key,
-      homeY = homeY,
-      bay = bay,
-      bayInvalid = bayInvalid,
-      seedKey = seedKey and tostring(seedKey) or nil,
-      order = item.order,
-    }
-  end
-  table.sort(workers, function(a, b) return a.key < b.key end)
-  return workers
-end
-
-local function uniqueSortedKeys(keys, chunks)
-  local result, seen = {}, {}
-  for _, key in ipairs(keys or {}) do
-    key = tostring(key)
-    if chunks[key] and not seen[key] then seen[key] = true; result[#result + 1] = key end
-  end
-  table.sort(result, function(a, b) return chunkComparator(chunks[a], chunks[b]) end)
-  return result
-end
-
-local function catalogGridShape(chunks, keys)
-  local xs, zs, seenX, seenZ, byCoord = {}, {}, {}, {}, {}
-  for _, key in ipairs(keys) do
-    local chunk = chunks[key]
-    local coordKey = tostring(chunk.cx) .. ":" .. tostring(chunk.cz)
-    if byCoord[coordKey] then return nil end
-    byCoord[coordKey] = key
-    if not seenX[chunk.cx] then seenX[chunk.cx] = true; xs[#xs + 1] = chunk.cx end
-    if not seenZ[chunk.cz] then seenZ[chunk.cz] = true; zs[#zs + 1] = chunk.cz end
-  end
-  table.sort(xs); table.sort(zs)
-  if #xs * #zs ~= #keys then return nil end
-  for _, cx in ipairs(xs) do
-    for _, cz in ipairs(zs) do
-      if not byCoord[tostring(cx) .. ":" .. tostring(cz)] then return nil end
-    end
-  end
-  return xs, zs, byCoord
-end
-
-local function workerBayChunk(worker, chunks, keys)
-  -- In world group mode the bay entrance is the authoritative seed.  An
-  -- optional seedKey is only a legacy hint and must not move a worker away
-  -- from its own bay chunk.
-  if worker.bayChunkKey and chunks[worker.bayChunkKey] then return worker.bayChunkKey end
-  if worker.seedKey and chunks[worker.seedKey] then return worker.seedKey end
-  if worker.bay then
-    local cx, cz = math.floor(worker.bay.x / 16), math.floor(worker.bay.z / 16)
-    local exact
-    for _, key in ipairs(keys) do
-      local chunk = chunks[key]
-      if chunk.cx == cx and chunk.cz == cz then exact = key; break end
-    end
-    if exact then return exact end
-    local best, bestDistance
-    for _, key in ipairs(keys) do
-      local chunk = chunks[key]
-      local centerX, centerZ = chunk.cx * 16 + 8, chunk.cz * 16 + 8
-      local distance = math.abs(worker.bay.x - centerX) + math.abs(worker.bay.z - centerZ)
-      if not best or distance < bestDistance or (distance == bestDistance and chunkComparator(chunk, chunks[best])) then
-        best, bestDistance = key, distance
-      end
-    end
-    return best
-  end
-  return nil
-end
-
-local function stripeOwner(chunks, keys, workers, options)
-  local xs, zs, byCoord = catalogGridShape(chunks, keys)
-  if not xs or not zs then return nil, "stripe_partition_unavailable" end
-  local explicitAxis = options.stripeAxis == "x" or options.stripeAxis == "z"
-  local axis = explicitAxis and options.stripeAxis or (#xs >= #zs and "x" or "z")
-
-  -- A bay-aware stripe can only satisfy the ownership contract when each bay
-  -- occupies a distinct stripe level.  If the automatically selected axis
-  -- collides, try the other axis before falling back to graph growth.
-  local function levelData(candidateAxis)
-    local candidateLevels = candidateAxis == "x" and xs or zs
-    if #workers > #candidateLevels then return nil end
-    local positions, used = {}, {}
-    local anyBay = false
-    for index, worker in ipairs(workers) do
-      if worker.bayChunkKey then
-        anyBay = true
-        local chunk = chunks[worker.bayChunkKey]
-        if not chunk then return nil end
-        local level = candidateAxis == "x" and chunk.cx or chunk.cz
-        local position
-        for levelIndex, value in ipairs(candidateLevels) do
-          if value == level then position = levelIndex; break end
-        end
-        if not position or used[position] then return nil end
-        used[position] = true
-        positions[index] = position
-      end
-    end
-    if anyBay then
-      for index = 1, #workers do if not positions[index] then return nil end end
-    end
-    return candidateLevels, positions, anyBay
-  end
-
-  local levels, bayPositions, bayAware = levelData(axis)
-  if not levels and not explicitAxis then
-    axis = axis == "x" and "z" or "x"
-    levels, bayPositions, bayAware = levelData(axis)
-  end
-  if not levels then return nil, "stripe_partition_unavailable" end
-
-  local weights, levelPositions = {}, {}
-  for index, level in ipairs(levels) do
-    levelPositions[level] = index
-    local weight = 0
-    for _, key in ipairs(keys) do
-      local chunk = chunks[key]
-      if (axis == "x" and chunk.cx == level) or (axis == "z" and chunk.cz == level) then weight = weight + chunk.cells end
-    end
-    weights[index] = weight
-  end
-  local workerOrder = {}
-  for index = 1, #workers do workerOrder[index] = index end
-  if bayAware then
-    table.sort(workerOrder, function(left, right)
-      if bayPositions[left] ~= bayPositions[right] then return bayPositions[left] < bayPositions[right] end
-      return workers[left].key < workers[right].key
-    end)
-  end
-
-  local owner, owned, loads = {}, {}, {}
-  for index = 1, #workers do owned[index], loads[index] = {}, 0 end
-  local cuts = {}
-  if bayAware then
-    -- Choose each cut at the nearest weighted midpoint while constraining it
-    -- between adjacent bay levels.  This keeps every stripe contiguous and
-    -- guarantees the worker whose bay is on a level owns that level.
-    local prefix, total = { [0] = 0 }, 0
-    for index, weight in ipairs(weights) do total = total + weight; prefix[index] = total end
-    local previousCut = 0
-    for rank = 1, #workers - 1 do
-      local workerIndex = workerOrder[rank]
-      local nextWorkerIndex = workerOrder[rank + 1]
-      local minimum = math.max(previousCut + 1, bayPositions[workerIndex])
-      local maximum = math.min(bayPositions[nextWorkerIndex] - 1, #levels - (#workers - rank))
-      if minimum > maximum then return nil, "stripe_bay_alignment_unavailable" end
-      local target = total * rank / #workers
-      local bestCut, bestError
-      for candidate = minimum, maximum do
-        local error = math.abs(prefix[candidate] - target)
-        if not bestCut or error < bestError or (error == bestError and candidate < bestCut) then
-          bestCut, bestError = candidate, error
-        end
-      end
-      cuts[rank], previousCut = bestCut, bestCut
-    end
-    cuts[#workers] = #levels
-  else
-    local levelIndex, remainingWeight = 1, 0
-    for _, weight in ipairs(weights) do remainingWeight = remainingWeight + weight end
-    for rank = 1, #workers do
-      local remainingWorkers = #workers - rank
-      local target = remainingWeight / (remainingWorkers + 1)
-      local selected = 0
-      while levelIndex <= #levels do
-        local canStop = selected > 0 and (#levels - levelIndex + 1) >= remainingWorkers
-        local weight = weights[levelIndex]
-        if canStop and selected + weight > target and selected > 0 then break end
-        selected = selected + weight
-        levelIndex = levelIndex + 1
-        if levelIndex > #levels or (#levels - levelIndex + 1) == remainingWorkers then break end
-      end
-      if rank == #workers then selected = remainingWeight end
-      cuts[rank] = levelIndex - 1
-      remainingWeight = remainingWeight - selected
-    end
-  end
-
-  local startLevel = 1
-  for rank = 1, #workers do
-    local workerIndex = workerOrder[rank]
-    local endLevel = cuts[rank]
-    for _, key in ipairs(keys) do
-      local chunk = chunks[key]
-      local level = axis == "x" and chunk.cx or chunk.cz
-      local levelPos = levelPositions[level]
-      if levelPos and levelPos >= startLevel and levelPos <= endLevel then
-        owner[key] = workerIndex
-        owned[workerIndex][#owned[workerIndex] + 1] = key
-        loads[workerIndex] = loads[workerIndex] + chunk.cells
-      end
-    end
-    startLevel = endLevel + 1
-  end
-  return owner, owned, loads, "stripe", axis
-end
-
-local function graphOwner(chunks, keys, workers, strategyLabel, distanceWeight)
-  if #workers > #keys then return nil, "more_workers_than_chunks" end
-  local owner, owned, loads = {}, {}, {}
-  for index = 1, #workers do owned[index], loads[index] = {}, 0 end
-  local seeds, seedSet = {}, {}
-  local seedDistanceCache = {}
-  -- First honour explicit/bay seeds.  Bay chunks are validated as unique by
-  -- partitionGroup; a duplicate can still only arise from a legacy caller,
-  -- in which case choose the next deterministic frontier rather than aliasing
-  -- ownership.
-  for index, worker in ipairs(workers) do
-    local selected = workerBayChunk(worker, chunks, keys)
-    if selected and seedSet[selected] then selected = nil end
-    if not selected then
-      local best, bestDistance
-      for _, key in ipairs(keys) do
-        if not seedSet[key] then

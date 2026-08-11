@@ -1,270 +1,252 @@
-      local expected = pending.details and pending.details.block
-      if not expected or blockName(data) == expected then
-        return false, "Pending dig target is still present; refusing a blind retry."
-      end
-      return false, "Pending dig target changed to " .. blockName(data) .. "."
-    end
-    return true
-  end
-  if common.startsWith(kind, "seal_") then
-    local present, data = inspectPendingSide(kind)
-    if present and (isLava(data) or isWater(data)) then
-      return false, "Pending fluid seal target remains present; refusing a blind retry."
-    end
-    local direction = kind:match("_(forward|up|down)$")
-    if direction then
-      state.fluidSealRun = (tonumber(state.fluidSealRun) or 0) + 1
-      state.water.continuousSeals = state.fluidSealRun
-      state.fluidSealMarker = {
-        kind = (pending.details and pending.details.fluidKind) or (common.startsWith(kind, "seal_water") and "water" or "lava"),
-        direction = direction,
-        material = pending.details and pending.details.material or nil,
-        pose = poseCopy(),
-        at = common.nowSeconds(),
-      }
-    end
-    return true
-  end
-  if common.startsWith(kind, "torch_") then
-    if common.startsWith(kind, "torch_wall") and tonumber(pending.details and pending.details.side or 0) ~= 0 then
-      return false, "Pending wall torch requires orientation recovery before re-inspection."
-    end
-    local present, data = inspectPendingSide(kind)
-    if present and isTorchItemName(blockName(data)) then return true end
-    if not present then return true end
-    return false, "Pending torch target is occupied by " .. blockName(data) .. "."
-  end
-  return nil
-end
-
-local function tryResolvePendingAction()
-  local pending = state.pendingAction
-  if not pending then return true end
-  local kind = tostring(pending.kind or "")
-  if common.startsWith(kind, "turn_") or kind == "gps_calibration" then return false, "GPS cannot determine the result of " .. kind end
-  local nonMovement, nonMovementError = resolveNonMovementPending(pending)
-  if nonMovement ~= nil then
-    if not nonMovement then return false, nonMovementError end
-    state.pendingAction = nil
-    state.stats.journalRecoveries = (state.stats.journalRecoveries or 0) + 1
-    if common.startsWith(kind, "torch_") then
-      state.stats.torchesRecovered = (state.stats.torchesRecovered or 0) + 1
-      state.lighting.torchesRecovered = (state.lighting.torchesRecovered or 0) + 1
-    end
-    state.stats.powerRecoveries = (state.stats.powerRecoveries or 0) + 1
-    common.log("WARN", "Re-inspected pending action " .. kind .. " as resolved")
-    saveState("pending_recovered_" .. kind)
-    return true
-  end
-  if gpsConfig().autoResolvePending == false or not gpsCalibration() then return false, "GPS pending-action recovery is unavailable." end
-  local fix, fixError = locateGPS()
-  if not fix then return false, fixError end
-  local resolved, resolveError = geo.resolvePending(pending, fix, gpsCalibration())
-  if not resolved then return false, resolveError end
-  state.pose = poseCopy(resolved.pose)
-  state.pendingAction = nil
-  if resolved.outcome == "after" and common.startsWith(kind, "move_") then
-    state.stats.moves = (state.stats.moves or 0) + 1
-  end
-  state.stats.gpsRecoveries = (state.stats.gpsRecoveries or 0) + 1
-  state.stats.powerRecoveries = (state.stats.powerRecoveries or 0) + 1
-  state.gps.corrections = (state.gps.corrections or 0) + 1
-  common.log("WARN", "GPS resolved pending action " .. kind .. " as " .. resolved.outcome)
-  saveState()
-  return true
-end
-
-local function preflight()
-  if not os.getComputerLabel or not os.getComputerLabel() then
-    if os.setComputerLabel then os.setComputerLabel(config.workerName) end
-  end
-  local opened, names = protocol.open()
-  networkReady = opened
-  if not opened then
-    common.log("ERROR", "No wireless modem found.")
-    printError("No wireless modem found. Equip one on the turtle.")
+    state.stats.jobsAborted = (state.stats.jobsAborted or 0) + 1
+    state.checkpoint = nil
+    state.status, state.phase = "aborted", "home"
+    state.estimate = state.estimate or {}
+    state.estimate.actual = state.job and state.job.cursor or 0
+    state.estimate.variance = (state.estimate.actual or 0) - (tonumber(state.estimate.estimated) or (state.estimate.actual or 0))
+    state.report = {
+      jobId = state.job and state.job.id or nil,
+      assignmentId = state.job and state.job.assignmentId or nil,
+      groupJobId = state.job and state.job.groupJobId or nil,
+      group = state.group and common.copy(state.group) or nil,
+      reason = state.completionReason or service.reason or "aborted",
+      returnReason = state.lastReturnReason or state.returnReason,
+      ["return"] = state.serviceReturn and common.copy(state.serviceReturn) or nil,
+      aborted = true,
+      completedAt = common.nowSeconds(),
+      elapsed = state.job and math.max(0, common.nowSeconds() - (state.job.startedAt or common.nowSeconds())) or 0,
+      progress = state.job and { cursor = state.job.cursor or 0, total = state.job.total or 0 } or nil,
+      stats = common.copy(state.stats),
+      estimated = state.estimate and state.estimate.estimated or nil,
+      actual = state.job and state.job.cursor or nil,
+      materials = { torchCount = torchMaterialCount(), sealCount = sealMaterialCount() },
+      discard = common.copy(state.discardStats or state.discard or {}),
+      throughput = throughputSnapshot(),
+      assignmentResumeToken = state.assignmentResumeToken and common.copy(state.assignmentResumeToken)
+        or assignmentResumeSnapshot(state.resumeToken or state.checkpoint),
+    }
+    state.stats.jobReports = (state.stats.jobReports or 0) + 1
+    if state.job then state.job.report = common.copy(state.report) end
+    state.lastReport = common.copy(state.report)
+    state.jobReport = common.copy(state.report)
+  elseif finalStatus == "paused" then
+    if not preserveCheckpoint then state.checkpoint = nil end
+    state.status, state.phase = "paused", "home_paused"
   else
-    common.log("INFO", "Wireless modem opened: " .. table.concat(names, ","))
+    state.checkpoint = nil
+    state.status, state.phase = "working", "mining"
   end
-
-  state.pose = poseCopy(state.pose)
-  ensureV3State()
-  state.stats = common.merge(common.defaultState().stats, state.stats)
-  state.gps = common.merge(common.defaultState().gps, state.gps)
-  if state.job and not state.job.strategy then state.job.strategy = "serpentine" end
-  if state.job and state.job.strategy == "chunk_plan" and not state.job.chunkPlan then
-    local plan, planError = quarry.buildChunkPlan(state.job, gpsCalibration())
-    if plan then state.job.chunkPlan = plan else state.lastError = planError end
-  end
-
-  if state.pendingAction then
-    local resolved, resolveError = tryResolvePendingAction()
-    if not resolved then
-      local pending = state.pendingAction
-      state.status, state.phase, state.request, state.service = "blocked", "recovery_required", nil, nil
-      state.lastError = ("Power loss occurred during '%s' from x=%s y=%s z=%s dir=%s. GPS recovery failed: %s. Return the turtle to its dock, face the quarry, then use REHOME."):format(
-        tostring(pending.kind or "unknown"), tostring(pending.poseBefore and pending.poseBefore.x or "?"),
-        tostring(pending.poseBefore and pending.poseBefore.y or "?"), tostring(pending.poseBefore and pending.poseBefore.z or "?"),
-        tostring(pending.poseBefore and pending.poseBefore.dir or "?"), tostring(resolveError)
-      )
-      common.log("ERROR", state.lastError)
-    end
-  elseif stateError then
-    state.status, state.phase = "blocked", "state_corrupt"
-    state.lastError = tostring(stateError)
-  elseif gpsCalibration() then
-    local fix, fixError = locateGPS()
-    if fix then
-      local expected = geo.localToWorld(gpsCalibration(), state.pose)
-      if not geo.samePosition(fix, expected) then
-        if not state.job and state.status ~= "working" then
-          local corrected = geo.worldToLocal(gpsCalibration(), fix, state.pose.dir)
-          state.pose = poseCopy(corrected)
-          state.gps.corrections = (state.gps.corrections or 0) + 1
-          common.log("WARN", "GPS corrected idle local coordinates at boot.")
-        else
-          state.status, state.phase = "blocked", "gps_drift"
-          state.lastError = ("Boot GPS mismatch: expected %d,%d,%d, located %d,%d,%d."):format(
-            expected.x, expected.y, expected.z, fix.x, fix.y, fix.z
-          )
-        end
-      end
-    elseif gpsConfig().required then
-      state.status, state.phase = "blocked", "gps_error"
-      state.lastError = "Required GPS fix failed at boot: " .. tostring(fixError)
-    end
-  elseif gpsConfig().required then
-    state.status, state.phase = "blocked", "gps_error"
-    state.lastError = "GPS is required but no calibration is stored."
-  end
-
-  saveState()
-  displayLocalStatus()
+  saveState("service_finished", true)
   heartbeat(true)
 end
 
-preflight()
-
-while true do
-  drainNetwork(12)
-  if state.request and state.status ~= "working" then state.status = "working" end
-  if state.status == "working" then
-    if state.request then handlePendingRequest() end
-    if state.service then continueService() else runMiningStep() end
-  elseif state.status == "waiting_output" or state.status == "waiting_fuel" or state.status == "waiting_seal" or state.status == "waiting_torch" then
-    if state.service then
-      continueService()
-      if state.status == "waiting_output" or state.status == "waiting_fuel" or state.status == "waiting_seal" or state.status == "waiting_torch" then sleep(3) end
+local function continueService()
+  if not state.service then return true end
+  state.status = "working"
+  state.service.returnStartedAt = state.service.returnStartedAt or common.nowSeconds()
+  state.service.returnDistance = state.service.returnDistance or 0
+  state.serviceReturn = state.serviceReturn or {}
+  state.serviceReturn.startedAt = state.serviceReturn.startedAt or common.nowSeconds()
+  state.returnReason = state.service.reason or state.returnReason or "service"
+  if not isHome() then
+    state.phase = "returning"
+    local returnDistance = estimatedReturnDistance(state.pose)
+    if returnDistance then state.service.returnDistance = returnDistance end
+    saveState("service_return_start", true)
+    local preReturnGPS, preReturnError = verifyGPS(true)
+    if not preReturnGPS then markBlocked("GPS verification before return failed: " .. tostring(preReturnError)); return false end
+    local ok, err
+    if state.job and state.job.strategy == "chunk_plan" then
+      ok, err = navigateChunkPlanHome("service")
     else
-      markBlocked("Service state is missing while waiting.")
+      ok, err = navigateTo({ x = 0, y = 0, z = 0 }, "home", "service")
     end
-  else
-    pollNetwork(0.5)
+    if not ok then
+      if err == "control_request" then return false end
+      markBlocked("Return to home failed: " .. tostring(err))
+      return false
+    end
   end
-  heartbeat(false)
-  if state.status ~= "working" then displayLocalStatus() end
-end
-]] },
-}
-local FILE_COUNT = 13
-local WORKER_PARTS = {[[worker_parts/01.part]], [[worker_parts/02.part]], [[worker_parts/03.part]], [[worker_parts/04.part]], [[worker_parts/05.part]]}
-local CONTROLLER_PARTS = {}
-local ENTRYPOINT = [[worker.lua]]
-local UPDATE_SENTINEL = [[-- CC Miner V4 update-incomplete sentinel for worker
-error("CC Miner runtime update is incomplete. Re-transfer the offline bundle and run update-low-space.", 0)
-]]
-local LOW_SPACE_STEPS = {
-  { kind = "runtime", index = 1 },
-  { kind = "runtime", index = 2 },
-  { kind = "runtime", index = 3 },
-  { kind = "runtime", index = 4 },
-  { kind = "runtime", index = 5 },
-  { kind = "runtime", index = 6 },
-  { kind = "runtime", index = 7 },
-  { kind = "runtime", index = 9 },
-  { kind = "runtime", index = 10 },
-  { kind = "runtime", index = 11 },
-  { kind = "runtime", index = 12 },
-  { kind = "runtime", index = 13 },
-  { kind = "obsolete", target = [[controller.lua]] },
-  { kind = "obsolete", target = [[controller_parts/01.part]] },
-  { kind = "obsolete", target = [[controller_parts/02.part]] },
-  { kind = "obsolete", target = [[controller_parts/03.part]] },
-  { kind = "obsolete", target = [[gps_host.lua]] },
-}
 
-local function fail(message)
-  error(tostring(message), 0)
-end
-local function ensureDir(path)
-  if not path or path == "" or fs.exists(path) then return end
-  local parent = fs.getDir(path)
-  if parent and parent ~= "" and parent ~= path then ensureDir(parent) end
-  fs.makeDir(path)
-end
-local function readFile(path)
-  if not fs.exists(path) or fs.isDir(path) then return nil end
-  local handle = fs.open(path, "rb")
-  if not handle then return nil end
-  local text = handle.readAll(); handle.close(); return text
-end
-local function writeFile(path, text)
-  ensureDir(fs.getDir(path))
-  local handle = fs.open(path, "wb")
-  if not handle then return false, "Cannot write " .. path end
-  local ok, writeError = pcall(handle.write, text or "")
-  handle.close()
-  if not ok then return false, tostring(writeError) end
-  return true
-end
-local function digest(text)
-  if not textutils or type(textutils.sha256) ~= "function" then
-    return nil, "textutils.sha256 is required for strict offline bundle verification."
+  local ok, err = turnTo(0)
+  if not ok then markBlocked("Cannot face quarry at home: " .. tostring(err)); return false end
+  if movementInterrupted("service") then return false end
+  local dockGPS, dockGPSError = verifyGPS(true)
+  if not dockGPS then markBlocked("GPS verification at dock failed: " .. tostring(dockGPSError)); return false end
+
+  ok, err = unloadAtHome()
+  if not ok then
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_output", "waiting_output", err
+    saveState(); heartbeat(true); return false
   end
-  local ok, value = pcall(textutils.sha256, text or "")
-  if not ok or type(value) ~= "string" then return nil, tostring(value or "sha256 failed") end
-  return string.lower(value)
-end
-local function compileText(label, text)
-  local loader = loadstring or load
-  local compiled, compileError = loader(text, "@" .. label)
-  if not compiled then return false, tostring(compileError) end
-  return true
-end
-local function validateEmbedded()
-  if #files ~= FILE_COUNT then fail("Embedded runtime file count is invalid for role " .. ROLE) end
-  local seen = {}
-  local aggregate = {
-    "ccminer-offline-role", "\0", VERSION, "\0", tostring(SCHEMA), "\0", ROLE, "\0", tostring(#files), "\0",
-  }
-  for index, file in ipairs(files) do
-    if type(file.target) ~= "string" or type(file.content) ~= "string" or seen[file.target] then
-      fail("Embedded runtime order/target is invalid at index " .. tostring(index))
+  if movementInterrupted("service") then return false end
+
+  ok, err = refuelAtHome()
+  if not ok then
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_fuel", "waiting_fuel", err
+    saveState(); heartbeat(true); return false
+  end
+  if movementInterrupted("service") then return false end
+
+  ok, err = refillSealAtHome()
+  if not ok then
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_seal", "waiting_seal", err
+    saveState(); heartbeat(true); return false
+  end
+  if movementInterrupted("service") then return false end
+
+  ok, err = refillTorchAtHome()
+  if not ok then
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_torch", "waiting_torch", err
+    saveState("waiting_torch"); heartbeat(true); return false
+  end
+  if movementInterrupted("service") then return false end
+
+  if state.service.resumeAfter and (state.resumeToken or state.checkpoint) then
+    local token = state.resumeToken or state.checkpoint
+    local checkpoint = poseCopy(token)
+    checkpoint.dir = tonumber(token.dir) or checkpoint.dir
+    state.phase, state.status, state.lastError = "going_back", "working", nil
+    saveState("service_resume_start", true)
+    local preResumeGPS, preResumeError = verifyGPS(true)
+    if not preResumeGPS then markBlocked("GPS verification before resume failed: " .. tostring(preResumeError)); return false end
+    if state.job and state.job.strategy == "chunk_plan" then
+      ok, err = navigateChunkPlanWork(checkpoint, "service")
+    else
+      ok, err = navigateTo(checkpoint, "work", "service")
     end
-    seen[file.target] = true
-    local actual, digestError = digest(file.content)
-    if not actual then fail(digestError) end
-    if actual ~= string.lower(file.digest or "") then
-      fail("Embedded runtime digest mismatch: " .. tostring(file.target))
+    if not ok then
+      if err == "control_request" then return false end
+      markBlocked("Return to work point failed: " .. tostring(err))
+      return false
     end
-    aggregate[#aggregate + 1] = file.source; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.target; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.digest; aggregate[#aggregate + 1] = "\0"
-    aggregate[#aggregate + 1] = file.content; aggregate[#aggregate + 1] = "\0"
+    ok, err = turnTo(checkpoint.dir)
+    if not ok then markBlocked("Cannot restore work direction: " .. tostring(err)); return false end
+    if movementInterrupted("service") then return false end
+    local arrivedGPS, arrivedGPSError = verifyGPS(true)
+    if not arrivedGPS then markBlocked("GPS verification after resume failed: " .. tostring(arrivedGPSError)); return false end
+    if state.job and state.job.route then
+      for _, key in ipairs({ "layer", "walkIndex", "localCursor", "phase", "currentKey" }) do
+        if token[key] ~= nil then state.job.route[key] = token[key] end
+      end
+    end
+    state.checkpoint = nil
+    state.resumeToken = nil
   end
-  local aggregateDigest, aggregateError = digest(table.concat(aggregate))
-  if not aggregateDigest then fail(aggregateError) end
-  if aggregateDigest ~= string.lower(SOURCE_DIGEST) then
-    fail("Embedded role source digest mismatch for " .. ROLE)
-  end
+  state.service.returnEndedAt = common.nowSeconds()
+  state.service.returnSeconds = math.max(0, state.service.returnEndedAt - (state.service.returnStartedAt or state.service.returnEndedAt))
+  state.serviceReturn.endedAt = state.service.returnEndedAt
+  state.serviceReturn.seconds = state.service.returnSeconds
+  state.serviceReturn.distance = state.service.returnDistance or 0
+  state.timeMetrics = state.timeMetrics or {}
+  state.timeMetrics.returnSeconds = (state.timeMetrics.returnSeconds or 0) + state.service.returnSeconds
+  finishService()
   return true
 end
-local function validateParts(label, targets)
-  if #targets == 0 then return true end
-  local source = {}
-  for index, target in ipairs(targets) do
-    local found
-    for _, file in ipairs(files) do if file.target == target then found = file.content; break end end
-    if not found then fail("Embedded runtime part is missing: " .. target) end
-    source[index] = found
+
+local function requiredDirectionTo(target)
+  local dx, dy, dz = target.x - state.pose.x, target.y - state.pose.y, target.z - state.pose.z
+  local manhattan = math.abs(dx) + math.abs(dy) + math.abs(dz)
+  if manhattan ~= 1 then return nil, "path_desync:" .. tostring(manhattan) end
+  if dy == 1 then return "up", nil, dy end
+  if dy == -1 then return "down", nil, dy end
+  if dx == 1 then return "forward", 1, 0 end
+  if dx == -1 then return "forward", 3, 0 end
+  if dz == 1 then return "forward", 0, 0 end
+  if dz == -1 then return "forward", 2, 0 end
+  return nil, "invalid_delta"
+end
+
+local function shouldService()
+  local _, empty = inventoryStats()
+  local materials, recycle = materialsConfig()
+  local reserveEmpty = profileReserveEmptySlots()
+  if empty <= reserveEmpty then return true, "inventory" end
+  local level = fuelLevel()
+  if level ~= "unlimited" then
+    local returnDistance, returnError = estimatedReturnDistance(state.pose)
+    if not returnDistance then
+      return true, "fuel_route:" .. tostring(returnError)
+    end
+    local nextCost = math.max(1, tonumber(config.nextSectionCost or config.serviceNextSectionCost) or 16)
+    if state.job then
+      local remaining = math.max(0, (state.job.total or 0) - (state.job.cursor or 0))
+      nextCost = math.min(nextCost + math.floor(remaining > 0 and math.sqrt(remaining) or 0), math.max(nextCost, remaining))
+    end
+    local needed = returnDistance + nextCost + profileFuelBuffer()
+    if tonumber(level or 0) <= needed then return true, "fuel" end
   end
+  if (config.lavaMode or "seal") == "seal" and sealMaterialCount() <= (tonumber(config.sealReserve) or 8) then
+    return true, "seal"
+  end
+  local lightingMode = effectiveLighting()
+  if lightingMode ~= "off" and torchMaterialCount() <= (tonumber((config.lighting or {}).reserve) or tonumber((config.lighting or {}).torchReserve) or tonumber(config.torchReserve) or 4) then
+    return true, "torch"
+  end
+  local _, lightInterval = effectiveLighting()
+  if lightingMode ~= "off" and lightInterval > 0 then
+    local moves = tonumber(state.stats.moves) or 0
+    if moves > 0 and moves % lightInterval == 0 and torchMaterialCount() <= 0 then return true, "torch" end
+  end
+  -- compactEvery is intentionally handled by compressInventoryAtField()
+  -- from runMiningStep.  Returning home solely to merge stacks wastes fuel
+  -- and violates the local-compression contract.
+  return false
+end
+
+local function handlePendingRequest()
+  if state.request == "recall" or state.request == "return_home" then beginService(false, "paused", "recall", true); return true end
+  if state.request == "service" then beginService(false, "paused", "manual_service", true); return true end
+  if state.request == "abort" then beginService(false, "aborted", "abort", false); return true end
+  if state.request == "pause_now" then
+    state.request = nil
+    if state.stagedStop and type(state.stagedStop) == "table" then
+      state.stagedStop.reachedAt = common.nowSeconds()
+      state.stagedStop.boundary = "physical_safe"
+    end
+    state.status, state.phase = "paused", "paused"
+    saveState("pause_now_reached")
+    return true
+  end
+  return false
+end
+
+local function beginAutomaticService(reason)
+  beginService(true, "working", "automatic_" .. tostring(reason), false)
+  continueService()
+end
+
+local function handleMoveFailure(prefix, err, allowBedrock)
+  if err == "control_request" then return true end
+  if err == "seal_material" then beginAutomaticService("seal"); return true end
+  if err == "torch_material" then beginAutomaticService("torch"); return true end
+  if err == "torch_surface_unavailable" then
+    markBlocked(prefix .. ": no safe torch wall/floor surface was available.")
+    return true
+  end
+  if err == "inventory_full" then beginAutomaticService("inventory"); return true end
+  if err == "water_seal_limit" then
+    state.status, state.phase, state.lastError = "blocked", "water_seal_limit", prefix .. ": continuous water sealing limit reached."
+    state.stats.waterBlocked = (state.stats.waterBlocked or 0) + 1
+    saveState("water_seal_limit")
+    return true
+  end
+  if err == "lava_seal_limit" then
+    markBlocked(prefix .. ": continuous lava sealing limit reached.")
+    return true
+  end
+  if common.startsWith(err or "", "water:") then
+    state.status, state.phase, state.lastError = "blocked", "water_detected", prefix .. ": water detected (mode=" .. waterMode() .. ")."
+    saveState("water_stop")
+    return true
+  end
+  if err == "out_of_fuel" then
+    markBlocked(prefix .. ": fuel was exhausted before the safety return threshold.")
+    return true
+  end
+  if allowBedrock and common.startsWith(err or "", "protected:minecraft:bedrock") then
+    state.completionReason = "bedrock_reached"

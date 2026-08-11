@@ -1,3 +1,208 @@
+      dockPose.x, dockPose.z = dockAnchor.x, dockAnchor.z
+    end
+  end
+  local serviceRoute = M.shortestServiceRoute(servicePlan,
+    dockPose, { chunkKey = seedKey }, { y = options.y or options.bottomY or 0 })
+  if not serviceRoute then return nil, "service_route_disconnected" end
+  return {
+    mode = "world",
+    rootKey = seedKey,
+    dockKey = dockKey,
+    entranceKey = dockKey,
+    seedKey = seedKey,
+    chunks = chunks,
+    assignedKeys = cloneStringArray(mineKeys),
+    mineChunkKeys = cloneStringArray(mineKeys),
+    transitKeys = cloneStringArray(transitKeys),
+    serviceRoute = {
+      chunkKeys = cloneStringArray(serviceRoute.chunkKeys),
+      keys = cloneStringArray(serviceRoute.keys or serviceRoute.chunkKeys),
+      path = cloneStringArray(serviceRoute.path or serviceRoute.chunkKeys),
+      transitKeys = cloneStringArray(serviceRoute.transitKeys or serviceRoute.chunkKeys),
+      waypoints = cloneValue(serviceRoute.waypoints),
+      distance = serviceRoute.distance,
+      fallback = serviceRoute.fallback,
+    },
+    transitRouteKeys = cloneStringArray(servicePath),
+    walk = walk,
+    optimizedWalk = optimized,
+    optimizedRoute = optimizedOrder,
+    route = routeCopy,
+    columns = assignedColumns,
+    selectedChunks = #mineKeys,
+    catalogCount = #sourceKeys,
+    bounds = assignedBounds,
+    referenceCalibration = cloneValue(referenceCalibration),
+    workerCalibration = cloneValue(workerCalibration),
+    workerId = assignment and assignment.workerId or options.workerId,
+    groupJobId = assignment and assignment.groupJobId or options.groupJobId,
+    homeY = assignment and assignment.homeY or options.homeY,
+    bottomY = assignment and assignment.bottomY or options.bottomY,
+    depth = assignment and assignment.layers or options.layers,
+  }
+end
+
+M.assignedChunkPlan = M.buildAssignedChunkPlan
+M.buildWorkerChunkPlan = M.buildAssignedChunkPlan
+M.planAssignedChunks = M.buildAssignedChunkPlan
+M.planAssignment = M.buildAssignedChunkPlan
+M.buildAssignmentPlan = M.buildAssignedChunkPlan
+
+local function boundsFrom(value, length, options)
+  options = type(options) == "table" and options or {}
+  local minX, maxX, minZ, maxZ
+  if type(value) == "table" then
+    if value.minX ~= nil and value.maxX ~= nil and value.minZ ~= nil and value.maxZ ~= nil then
+      minX, maxX = integerValue(value.minX), integerValue(value.maxX)
+      minZ, maxZ = integerValue(value.minZ), integerValue(value.maxZ)
+    elseif value.width ~= nil and value.length ~= nil then
+      local width, validLength = integerValue(value.width, 1, MAX_DIMENSION), integerValue(value.length, 1, MAX_DIMENSION)
+      if not width or not validLength or width * validLength > MAX_COLUMNS then return nil, "invalid_bounds" end
+      local originX = integerValue(value.originX ~= nil and value.originX or options.originX or 0)
+      local originZ = integerValue(value.originZ ~= nil and value.originZ or options.originZ or 1)
+      if not originX or not originZ then return nil, "invalid_bounds" end
+      minX, maxX = originX, originX + width - 1
+      minZ, maxZ = originZ, originZ + validLength - 1
+    elseif value.plan then
+      return boundsFrom(value.plan, nil, options)
+    elseif value.chunks then
+      for _, chunk in pairs(value.chunks) do
+        if not minX or chunk.minX < minX then minX = chunk.minX end
+        if not maxX or chunk.maxX > maxX then maxX = chunk.maxX end
+        if not minZ or chunk.minZ < minZ then minZ = chunk.minZ end
+        if not maxZ or chunk.maxZ > maxZ then maxZ = chunk.maxZ end
+      end
+    end
+  else
+    local width = integerValue(value, 1, MAX_DIMENSION)
+    local validLength = integerValue(length, 1, MAX_DIMENSION)
+    if width and validLength and width * validLength <= MAX_COLUMNS then
+      local originX = integerValue(options.originX ~= nil and options.originX or 0)
+      local originZ = integerValue(options.originZ ~= nil and options.originZ or 1)
+      if originX and originZ then
+        minX, maxX = originX, originX + width - 1
+        minZ, maxZ = originZ, originZ + validLength - 1
+      end
+    end
+  end
+  if not minX or not maxX or not minZ or not maxZ or maxX < minX or maxZ < minZ then return nil, "invalid_bounds" end
+  if (maxX - minX + 1) * (maxZ - minZ + 1) > MAX_COLUMNS then return nil, "bounds_too_large" end
+  return {
+    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
+    width = maxX - minX + 1, length = maxZ - minZ + 1,
+    cells = (maxX - minX + 1) * (maxZ - minZ + 1),
+  }
+end
+
+function M.gridBounds(value, length, options)
+  return boundsFrom(value, length, options)
+end
+
+M.getGridBounds = M.gridBounds
+M.bounds = M.gridBounds
+
+function M.gridPage(bounds, page, pageWidth, pageHeight)
+  local normalized, boundsError = boundsFrom(bounds)
+  if not normalized then return nil, boundsError end
+  if type(pageWidth) == "table" then pageHeight, pageWidth = pageWidth.pageHeight, pageWidth.pageWidth end
+  pageWidth = integerValue(pageWidth, 1, MAX_DIMENSION) or 16
+  pageHeight = integerValue(pageHeight, 1, MAX_DIMENSION) or pageWidth
+  local pagesX = math.ceil(normalized.width / pageWidth)
+  local pagesZ = math.ceil(normalized.length / pageHeight)
+  local pageCount = pagesX * pagesZ
+  page = integerValue(page, 1, pageCount) or 1
+  local pageIndex = page - 1
+  local pageX, pageZ = pageIndex % pagesX, math.floor(pageIndex / pagesX)
+  local minX = normalized.minX + pageX * pageWidth
+  local minZ = normalized.minZ + pageZ * pageHeight
+  local maxX = math.min(normalized.maxX, minX + pageWidth - 1)
+  local maxZ = math.min(normalized.maxZ, minZ + pageHeight - 1)
+  return {
+    page = page, pageIndex = pageIndex, pageCount = pageCount,
+    pagesX = pagesX, pagesZ = pagesZ, pageX = pageX, pageZ = pageZ,
+    pageWidth = pageWidth, pageHeight = pageHeight,
+    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
+    width = maxX - minX + 1, length = maxZ - minZ + 1,
+    cells = (maxX - minX + 1) * (maxZ - minZ + 1),
+  }
+end
+
+M.getGridPage = M.gridPage
+M.page = M.gridPage
+M.gridPageInfo = M.gridPage
+M.pageInfo = M.gridPage
+
+function M.gridCell(bounds, index)
+  local normalized, boundsError = boundsFrom(bounds)
+  if not normalized then return nil, boundsError end
+  index = integerValue(index, 0)
+  if not index or index >= normalized.cells then return nil, "index_out_of_range" end
+  local row = math.floor(index / normalized.length)
+  local column = index % normalized.length
+  local z = row % 2 == 0 and (normalized.minZ + column) or (normalized.maxZ - column)
+  return { x = normalized.minX + row, z = z, index = index, row = row, column = column }
+end
+
+M.getGridCell = M.gridCell
+
+function M.gridCellInfo(bounds, x, z)
+  local normalized, boundsError = boundsFrom(bounds)
+  if not normalized then return nil, boundsError end
+  x, z = integerValue(x), integerValue(z)
+  if not x or not z then return nil, "invalid_position" end
+  local inside = contains(normalized, x, z)
+  local info = { x = x, z = z, inside = inside }
+  if inside then
+    local row, column = x - normalized.minX, z - normalized.minZ
+    info.row, info.column = row, column
+    info.index = row * normalized.length + (row % 2 == 0 and column or normalized.length - 1 - column)
+  end
+  return info
+end
+
+M.getCellInfo = M.gridCellInfo
+M.cellInfo = M.gridCellInfo
+
+function M.selectRectangle(bounds, x1, z1, x2, z2, options)
+  local normalized, boundsError = boundsFrom(bounds)
+  if not normalized then return nil, boundsError end
+  if type(x1) == "table" then
+    options = z1
+    local selection = x1
+    x1, z1, x2, z2 = selection.x1 or selection.minX, selection.z1 or selection.minZ, selection.x2 or selection.maxX, selection.z2 or selection.maxZ
+  end
+  x1, z1, x2, z2 = integerValue(x1), integerValue(z1), integerValue(x2), integerValue(z2)
+  if not x1 or not z1 or not x2 or not z2 then return nil, "invalid_rectangle" end
+  if x1 > x2 then x1, x2 = x2, x1 end
+  if z1 > z2 then z1, z2 = z2, z1 end
+  local minX, maxX = math.max(x1, normalized.minX), math.min(x2, normalized.maxX)
+  local minZ, maxZ = math.max(z1, normalized.minZ), math.min(z2, normalized.maxZ)
+  if minX > maxX or minZ > maxZ then return nil, "rectangle_out_of_bounds" end
+  local count = (maxX - minX + 1) * (maxZ - minZ + 1)
+  local result = {
+    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
+    width = maxX - minX + 1, length = maxZ - minZ + 1,
+    count = count, cellsCount = count,
+    clipped = minX ~= x1 or maxX ~= x2 or minZ ~= z1 or maxZ ~= z2,
+  }
+  local includeCells = true
+  if type(options) == "table" and options.includeCells == false then includeCells = false end
+  if type(options) == "boolean" then includeCells = options end
+  if includeCells and count <= MAX_SELECTION_CELLS then
+    result.cells = {}
+    for x = minX, maxX do
+      for z = minZ, maxZ do result.cells[#result.cells + 1] = { x = x, z = z } end
+    end
+    result.selectedCells = result.cells
+  elseif includeCells then
+    result.cellsTruncated = true
+  end
+  return result
+end
+
+M.rectangleSelection = M.selectRectangle
+M.selectRect = M.selectRectangle
+M.rectangle = M.selectRectangle
 M.selectRectangleCells = M.selectRectangle
 
 return M
@@ -22,7 +227,7 @@ local program, compileError = loader(table.concat(source), "@/ccminer/worker.ass
 if not program then error("Cannot assemble worker: " .. tostring(compileError), 0) end
 return program(...)
 ]] },
-  { source = [[src/ccminer/worker_parts/01.part]], target = [[worker_parts/01.part]], digest = [[52cb73f7bf7ea3d503dac7dcb52049521a8fafa749f864dcd8cb93ea59ff1ca5]], content = [[-- CC Miner V4 - autonomous quarry worker
+  { source = [[src/ccminer/worker_parts/01.part]], target = [[worker_parts/01.part]], digest = [[adfdcc73c12b346fbe31dcca56b8c0d4b9a5bde1ed05be0a98579b1c3cf24c25]], content = [[-- CC Miner V4 - autonomous quarry worker
 -- Home=(0,0,0), forward=+Z, right=+X, down=-Y.
 
 local common = dofile("/ccminer/lib/common.lua")
@@ -52,179 +257,15 @@ config.gps = config.gps or {}
 config.discard = config.discard or config.materials.discard or {}
 config.dock = config.dock or {}
 config.group = config.group or {}
-if config.lighting.mode == nil then config.lighting.mode = config.lightMode or "off" end
-if config.lighting.interval == nil then config.lighting.interval = config.torchInterval or 32 end
-if config.lighting.preferredSlots == nil then config.lighting.preferredSlots = config.torchSlots end
-if config.lighting.torchBlocks == nil then config.lighting.torchBlocks = config.torchBlocks end
-if type(config.lighting.torchBlocks) == "table" and #config.lighting.torchBlocks > 0 then
-  local allowed = {}
-  for _, name in ipairs(config.lighting.torchBlocks) do allowed[tostring(name)] = true end
-  config.lighting.torchBlocks = allowed
-end
-if config.materials.sealSlots == nil then config.materials.sealSlots = config.sealSlots end
-if config.materials.torchSlots == nil then config.materials.torchSlots = config.torchSlots end
-if config.materials.recycleMinedBlocks == nil then config.materials.recycleMinedBlocks = true end
-if config.materials.retainSealTarget == nil then config.materials.retainSealTarget = config.retainSealTarget or config.sealTarget end
-if tonumber(config.sealTarget) == nil or tonumber(config.sealTarget) < 1 then config.sealTarget = 64 end
-config.sealTarget = math.max(1, math.floor(tonumber(config.sealTarget) or 64))
--- Disposal is deliberately opt-in.  Legacy V2 configurations used a
--- recycle flag but had no authority to throw arbitrary items away; map those
--- settings to the safe KEEP_ALL policy until an explicit mode is present.
-local discardMode = config.discard.mode or config.discard.policy or config.discardPolicy
-discardMode = tostring(discardMode or "KEEP_ALL"):upper()
-if discardMode ~= "KEEP_ALL" and discardMode ~= "DISCARD_EXCESS_STONE" and discardMode ~= "CUSTOM_ALLOWLIST" then
-  discardMode = "KEEP_ALL"
-end
-config.discard.mode = discardMode
-local configuredSealTarget = tonumber(
-  config.discard.retainSealTarget or config.materials.retainSealTarget or config.sealTarget
-)
-if not configuredSealTarget or configuredSealTarget < 1 then configuredSealTarget = 64 end
-config.discard.retainSealTarget = math.floor(configuredSealTarget)
-config.discard.triggerEmptySlots = math.max(0, math.floor(tonumber(
-  config.discard.triggerEmptySlots or config.reserveEmptySlots
-) or 3))
-config.discard.maxStacksPerPass = math.max(1, math.floor(tonumber(config.discard.maxStacksPerPass) or 8))
-if type(config.discard.allowlist) ~= "table" then config.discard.allowlist = {} end
-if type(config.discard.stoneAllowlist) ~= "table" then
-  config.discard.stoneAllowlist = {
-    ["minecraft:stone"] = true,
-    ["minecraft:cobblestone"] = true,
-    ["minecraft:cobbled_deepslate"] = true,
-  }
-end
--- Keep a canonical alias for callers that still read materials.discard, but
--- never share the table itself: CC's serializer rejects recursive aliases.
-config.materials.discard = common.copy(config.discard)
-config.materials.retainSealTarget = config.discard.retainSealTarget
-config.gps.verifyEveryMoves = math.max(1, math.floor(tonumber(
-  config.performance.gpsVerifyEveryMoves or config.gps.verifyEveryMoves
-) or 32))
-config.performance.gpsVerifyEveryMoves = config.gps.verifyEveryMoves
-config.performance.lightweightCheckpointEveryMoves = math.max(1, math.floor(tonumber(
-  config.performance.lightweightCheckpointEveryMoves or config.journal.checkpointEvery
-) or 16))
-config.performance.checkpointEveryMoves = math.max(1, math.floor(tonumber(
-  config.performance.checkpointEveryMoves or config.journal.checkpointEvery
-) or 32))
--- Seal stock is a hard safety invariant.  An absent/invalid legacy target is
--- migrated to 64 rather than allowing a zero-target refill to run dry.
-if tonumber(config.discard.retainSealTarget) < 1 then config.discard.retainSealTarget = 64 end
-if config.water.mode == nil then config.water.mode = config.waterMode or "ignore" end
-if config.journal.enabled == nil then config.journal.enabled = true end
-
-local rawState, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
-local state = common.merge(common.defaultState(), rawState)
--- The atomic state file is authoritative.  A malformed state must never be
--- treated as an empty job (which could cause an unsafe duplicate dig).
-if stateError then
-  state.status = "blocked"
-  state.phase = "state_corrupt"
-  state.lastError = tostring(stateError)
-  common.log("ERROR", stateError)
-end
-
-local function ensureV3State()
-  state.stats = state.stats or {}
-  local counters = {
-    torchesPlaced = 0, torchRefills = 0, torchShortages = 0,
-    waterDetected = 0, waterSealed = 0, waterBlocked = 0,
-    recycled = 0, sealOverflow = 0, compressions = 0,
-    serviceReturns = 0, journalWrites = 0,
-    discardPasses = 0, discardedBlocks = 0, discardSkipped = 0,
-    discardUnknown = 0, routeMoves = 0, routeDistance = 0,
-  }
-  for key, value in pairs(counters) do
-    if state.stats[key] == nil then state.stats[key] = value end
-  end
-  state.lighting = state.lighting or {
-    mode = "off", interval = 32, lastAt = nil, lastPose = nil,
-    placed = 0, shortages = 0,
-  }
-  state.water = state.water or {
-    mode = "ignore", detected = 0, sealed = 0, blocked = 0,
-    last = nil,
-  }
-  state.recycle = state.recycle or {
-    enabled = true, held = 0, cap = 64, overflow = 0,
-    compressed = 0, byName = {},
-  }
-  -- State migrations intentionally copy, rather than alias, legacy tables.
-  -- CC's serializer rejects recursive aliases and a power-loss recovery must
-  -- be able to distinguish discardStats from its report shorthand.
-  local discardDefaults = {
-    enabled = config.discard.mode ~= "KEEP_ALL", mode = config.discard.mode,
-    passes = 0, attempts = 0, stacks = 0, discarded = 0, items = 0,
-    skipped = 0, held = 0, unknown = 0, overflow = 0, byName = {},
-    lastAt = nil, lastError = nil, triggerEmptySlots = config.discard.triggerEmptySlots,
-  }
-  local legacyDiscard = state.discardStats or state.discard
-  state.discardStats = common.merge(discardDefaults, legacyDiscard)
-  state.discard = common.merge(discardDefaults, state.discardStats)
-  state.discard.mode = config.discard.mode
-  state.discard.triggerEmptySlots = config.discard.triggerEmptySlots
-  state.discard.maxStacksPerPass = config.discard.maxStacksPerPass
-  state.routeMetrics = state.routeMetrics or { moves = 0, turns = 0, distance = 0, routeLength = 0, detours = 0, services = 0 }
-  state.timeMetrics = state.timeMetrics or { startedAt = nil, updatedAt = nil, elapsedSeconds = 0, activeSeconds = 0, serviceSeconds = 0, returnSeconds = 0 }
-  state.metrics = state.metrics or { route = common.copy(state.routeMetrics), time = common.copy(state.timeMetrics) }
-  state.returnReason = state.returnReason or nil
-  state.lastReturnReason = state.lastReturnReason or nil
-  state.resumeToken = state.resumeToken or nil
-  state.assignmentResumeToken = state.assignmentResumeToken or nil
-  state.group = state.group or nil
-  state.dock = state.dock or nil
-  state.fluidSealRun = tonumber(state.fluidSealRun) or 0
-  state.fluidSealMarker = state.fluidSealMarker or nil
-  if state.stagedStop == nil then state.stagedStop = false end
-  state.report = state.report or nil
-  state.estimate = state.estimate or { estimated = 0, actual = 0, variance = 0 }
-  state.journal = state.journal or { seq = 0, writes = 0, checkpoints = 0 }
-  state.journal.lightweight = state.journal.lightweight or {
-    enabled = true, seq = 0, writes = 0, checkpoints = 0, lastAt = nil, lastError = nil,
-  }
-end
-ensureV3State()
-
-local function recoverPendingSnapshot()
-  local journalConfig = config.journal or {}
-  if journalConfig.enabled == false or not common.loadTable then return end
-  local path = journalConfig.pendingPath or "/ccminer/data/state.pending"
-  local pending, pendingError = common.loadTable(path, nil)
-  if pendingError or type(pending) ~= "table" then return end
-  local pendingJobId = pending.jobId
-  local currentJobId = state.job and state.job.id or nil
-  if pendingJobId and currentJobId and tostring(pendingJobId) == tostring(currentJobId) then
-    if pending.pose then state.pose = common.copy(pending.pose) end
-    for _, key in ipairs({ "status", "phase", "request", "service", "checkpoint", "resumeToken", "assignmentResumeToken", "stagedStop", "pendingAction" }) do
-      if pending[key] ~= nil then state[key] = common.copy(pending[key]) end
-    end
-    if state.job then
-      if pending.cursor ~= nil then state.job.cursor = tonumber(pending.cursor) or state.job.cursor end
-      if pending.route then state.job.route = common.merge(state.job.route or {}, pending.route) end
-    end
-    state.journal = state.journal or {}
-    state.journal.lightweight = state.journal.lightweight or {}
-    state.journal.lightweight.recovered = true
-    state.journal.recovered = true
-  elseif pending.pendingAction and not currentJobId then
-    -- A pending physical action without a matching full job is ambiguous;
-    -- retain it and force the normal recovery wizard at preflight.
-    state.pendingAction = common.copy(pending.pendingAction)
-    state.status, state.phase = "blocked", "recovery_required"
-    state.lastError = "Pending physical action has no matching full checkpoint."
-  end
-end
-
-recoverPendingSnapshot()
-
-local lastHeartbeat = 0
-local networkReady = false
-local pollNetwork
-
-local function appendJournal(event)
-  -- Journal is deliberately auxiliary: the atomic state remains the source
-  -- of truth.  If a filesystem implementation cannot append, continue with
-  -- the state save and expose the warning through the normal log.
-  local journalConfig = config.journal or {}
-  if journalConfig.enabled == false then return true end
-  local path = journalConfig.path or "/ccminer/data/state.journal"
+-- Remote console is deliberately fail-closed.  Keep its policy in one nested
+-- table so older V2 configs (which have no remoteConsole key) remain disabled
+-- until an operator opts in explicitly.
+config.remoteConsole = config.remoteConsole or {}
+config.remoteConsole.enabled = config.remoteConsole.enabled == true
+config.remoteConsole.allowShell = config.remoteConsole.allowShell == true
+config.remoteConsole.sessionSeconds = math.max(1, math.floor(
+  tonumber(config.remoteConsole.sessionSeconds) or 120
+))
+config.remoteConsole.maxOutputBytes = math.max(1, math.floor(
+  tonumber(config.remoteConsole.maxOutputBytes) or 8192
+))

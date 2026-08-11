@@ -1,279 +1,270 @@
-  local mode = state.job and state.job.waterMode
-  if not mode then mode = config.waterMode or (config.water and config.water.mode) or state.water.mode end
-  mode = tostring(mode or "ignore")
-  if mode ~= "ignore" and mode ~= "stop" and mode ~= "seal" then mode = "ignore" end
-  return mode
+
+local function remoteToken(prefix, sender)
+  remoteTokenCounter = (tonumber(remoteTokenCounter) or 0) + 1
+  return ("remote-%s-%d-%d-%d"):format(
+    tostring(prefix or "token"), tonumber(sender) or 0, common.nowMillis(), remoteTokenCounter
+  )
 end
 
-local function maxContinuousSeal()
-  return profileMaxContinuousSeal()
+local function remoteIsTerminated(value)
+  local text = tostring(value or "")
+  return text == "Terminated" or text:find("Terminated", 1, true) ~= nil
 end
 
-local function isInventoryBlock(side, data)
-  if peripheral and peripheral.hasType then
-    local ok, result = pcall(peripheral.hasType, side, "inventory")
-    if ok and result == true then return true end
-  end
-  local wrapped = peripheral and peripheral.wrap(side) or nil
-  if wrapped and (type(wrapped.list) == "function" or type(wrapped.size) == "function") then return true end
-  local name = string.lower(blockName(data))
-  for _, marker in ipairs({ "chest", "barrel", "shulker_box", "drawer", "crate", "vault" }) do
-    if name:find(marker, 1, true) then return true end
-  end
-  return false
+local function remoteAuditHead(command)
+  -- Keep only the command prefix.  Arguments (which may contain a path or a
+  -- secret supplied to an explicitly enabled shell) are never retained.
+  command = common.trim(command or "")
+  local first, second = command:match("^(%S+)%s+(%S+)")
+  local head = first and second and string.lower(first) == "ccm"
+    and (first .. " " .. second) or (command:match("^(%S+)") or "")
+  return head:sub(1, 64)
 end
 
-local function movementInterrupted(context)
-  if context ~= "mining" and context ~= "service" then return false end
-  if state.status ~= "working" then return true end
-  -- Only an immediate pause/return/abort interrupts an in-flight move.  A
-  -- finish_row/finish_layer request is evaluated by the route boundary logic.
-  if state.request == "pause_now" or state.request == "return_home" or state.request == "abort" or state.request == "recall" or state.request == "service" then
-    return true
-  end
-  return false
-end
-
-local function updatePoseAfterMove(direction)
-  state.pose = geo.poseAfterMove(state.pose, direction)
-  state.stats.moves = (state.stats.moves or 0) + 1
-  state.routeMetrics = state.routeMetrics or { moves = 0, turns = 0, distance = 0 }
-  state.routeMetrics.moves = (state.routeMetrics.moves or 0) + 1
-  state.routeMetrics.distance = (state.routeMetrics.distance or 0) + 1
-  state.stats.routeMoves = (state.stats.routeMoves or 0) + 1
-  state.stats.routeDistance = (state.stats.routeDistance or 0) + 1
-  state.timeMetrics = state.timeMetrics or {}
-  state.timeMetrics.lastMoveAt = common.nowSeconds()
-end
-
-local function sealFluid(action, direction, data, fluidKind)
-  fluidKind = fluidKind or (isWater(data) and "water" or "lava")
-  local mode = fluidKind == "water" and waterMode() or (config.lavaMode or "seal")
-  if mode ~= "seal" then
-    if fluidKind == "water" and mode == "stop" then
-      state.stats.waterBlocked = (state.stats.waterBlocked or 0) + 1
-      state.stats.waterStopped = (state.stats.waterStopped or 0) + 1
-      state.water.blocked = (state.water.blocked or 0) + 1
-      state.water.stopped = (state.water.stopped or 0) + 1
-      state.water.last = { kind = "water", name = blockName(data), pose = poseCopy() }
-    end
-    return false, fluidKind .. ":" .. blockName(data)
-  end
-  local continuous = tonumber(state.fluidSealRun) or 0
-  if continuous >= maxContinuousSeal() then
-    if fluidKind == "water" then state.stats.waterBlocked = (state.stats.waterBlocked or 0) + 1 end
-    return false, fluidKind == "water" and "water_seal_limit" or "lava_seal_limit"
-  end
-  local originalSlot = turtle.getSelectedSlot()
-  local slot = selectSealMaterial()
-  if not slot then
-    turtle.select(originalSlot)
-    return false, "seal_material"
-  end
-  local material = itemName(slot)
-  local prepared, prepareError = beginPhysicalAction("seal_" .. fluidKind .. "_" .. direction, {
-    fluid = blockName(data), material = material, fluidKind = fluidKind,
-  }, poseCopy())
-  if not prepared then turtle.select(originalSlot); return false, prepareError end
-  local placed, placeReason = action.place()
-  turtle.select(originalSlot)
-  if not placed then
-    cancelPhysicalAction()
-    return false, "lava_seal_failed:" .. tostring(placeReason or blockName(data))
-  end
-  if fluidKind == "water" then
-    state.stats.waterSealed = (state.stats.waterSealed or 0) + 1
-    state.water.sealed = (state.water.sealed or 0) + 1
-    state.water.lastRun = continuous + 1
-  else
-    state.stats.lavaSealed = (state.stats.lavaSealed or 0) + 1
-  end
-  state.fluidSealRun = continuous + 1
-  state.water.continuousSeals = state.fluidSealRun
-  state.fluidSealMarker = {
-    kind = fluidKind,
-    direction = direction,
-    material = material,
-    pose = poseCopy(),
+local function remoteAuditRecord(command, ok)
+  local limit = math.max(1, math.floor(tonumber(config.remoteConsole.auditLimit) or 50))
+  remoteAudit[#remoteAudit + 1] = {
+    command = remoteAuditHead(command),
+    ok = ok == true,
     at = common.nowSeconds(),
   }
-  commitPhysicalAction()
-  sleep(0.15)
-  return true
+  while #remoteAudit > limit do table.remove(remoteAudit, 1) end
 end
 
-local function sealLava(action, direction, data)
-  return sealFluid(action, direction, data, "lava")
-end
-
-local function effectiveLighting()
-  -- lighting.mode is an explicit safety choice and is never changed by a
-  -- profile.  Profiles only adjust the requested placement cadence.
-  return effectiveLightingValues()
-end
-
-local function noteMinedMaterial(name)
-  if not isSealItemName(name) then return end
-  local materials, recycle = materialsConfig()
-  local enabled = materials.recycleMinedBlocks
-  if enabled == nil then enabled = recycle.enabled end
-  if enabled == false then return end
-  state.recycle = state.recycle or { byName = {}, held = 0, cap = 64, overflow = 0 }
-  state.recycle.byName = state.recycle.byName or {}
-  state.recycle.byName[name] = (state.recycle.byName[name] or 0) + 1
-  state.recycle.held = (state.recycle.held or 0) + 1
-  state.recycle.cap = math.max(0, math.floor(tonumber(materials.retainSealTarget or recycle.maxHeld or config.retainSealTarget or config.sealTarget or state.recycle.cap or 64) or 64))
-  if state.recycle.held > state.recycle.cap then
-    state.recycle.overflow = state.recycle.held - state.recycle.cap
-  end
-  state.stats.recycledBlocks = (state.stats.recycledBlocks or 0) + 1
-  state.stats.recycled = (state.stats.recycled or 0) + 1
-end
-
-local function isGravityBlock(data)
-  local name = string.lower(blockName(data))
-  for _, marker in ipairs({ "sand", "gravel", "concrete_powder", "anvil", "dragon_egg", "scaffolding" }) do
-    if name:find(marker, 1, true) then return true end
+local function remoteSessionExpired()
+  if remoteSession and common.nowSeconds() >= tonumber(remoteSession.expiresAt or 0) then
+    remoteSession = nil
+    return true
   end
   return false
 end
 
-local function tryPlaceTorchWall(relativeDir)
-  local originalDir = state.pose.dir
-  local originalSlot = turtle.getSelectedSlot()
-  local targetDir = (originalDir + relativeDir) % 4
-  local turned, turnError = turnTo(targetDir)
-  if not turned then return false, turnError end
-
-  local function restoreContext(reason)
-    turtle.select(originalSlot)
-    local restored, restoreError = turnTo(originalDir)
-    if not restored then return false, restoreError end
-    return false, reason
+local function remoteConsoleReady()
+  local allowed = {
+    idle = true, complete = true, aborted = true, paused = true,
+  }
+  if not allowed[tostring(state.status or "")] then
+    return false, "Remote console requires an idle, complete, aborted, or paused worker."
   end
-
-  local present, data = turtle.inspect()
-  if present then
-    if relativeDir ~= 1 and relativeDir ~= 3 then return restoreContext("occupied") end
-    local protected, name = isProtected(data)
-    if protected or isInventoryBlock("front", data) or isLava(data) or isWater(data) or isGravityBlock(data) then
-      return restoreContext("occupied")
-    end
-    local _, emptySlots = inventoryStats()
-    if emptySlots <= 0 then return restoreContext("inventory_full") end
-    -- In a normal 1x1 tunnel, carve a one-block niche only from an ordinary
-    -- solid side block.  The dig and subsequent place are separately journaled
-    -- so a power loss can be re-inspected idempotently.
-    turtle.select(originalSlot)
-    local prepared, prepareError = beginPhysicalAction("dig_torch_niche_forward", {
-      block = name, side = relativeDir,
-    }, poseCopy())
-    if not prepared then return restoreContext(prepareError) end
-    local dug, digError = turtle.dig()
-    if not dug then
-      cancelPhysicalAction()
-      return restoreContext(digError or "torch_niche_dig_failed")
-    end
-    state.stats.blocksDug = (state.stats.blocksDug or 0) + 1
-    noteMinedMaterial(name)
-    state.fluidSealRun = 0
-    state.fluidSealMarker = nil
-    commitPhysicalAction()
-    local slot = selectTorchMaterial()
-    if not slot then return restoreContext("torch_material") end
-    local placedPrepared, placedPrepareError = beginPhysicalAction("torch_niche_forward", {
-      side = relativeDir, material = itemName(slot),
-    }, poseCopy())
-    if not placedPrepared then return restoreContext(placedPrepareError) end
-    local placed, placeError = turtle.place()
-    if not placed then
-      cancelPhysicalAction()
-      return restoreContext(placeError or "torch_niche_place_failed")
-    end
-    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
-    state.lighting.placed = (state.lighting.placed or 0) + 1
-    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
-    commitPhysicalAction()
-    turtle.select(originalSlot)
-    local restored, restoreError = turnTo(originalDir)
-    if not restored then return false, restoreError end
-    state.lighting.lastAt = common.nowSeconds()
-    state.lighting.lastPose = poseCopy()
-    return true
+  if not isHome() then return false, "Remote console requires the worker to be at home." end
+  if state.pendingAction then return false, "Remote console is unavailable while recovery is pending." end
+  if state.request ~= nil or state.service ~= nil then
+    return false, "Remote console is unavailable while a worker request is pending."
   end
-
-  local slot = selectTorchMaterial()
-  if not slot then return restoreContext("torch_material") end
-  local prepared, prepareError = beginPhysicalAction("torch_wall", {
-    side = relativeDir, material = itemName(slot), pose = poseCopy(),
-  }, poseCopy())
-  if not prepared then return restoreContext(prepareError) end
-  local placed, placeError = turtle.place()
-  if placed then
-    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
-    state.lighting.placed = (state.lighting.placed or 0) + 1
-    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
-    commitPhysicalAction()
-  else
-    cancelPhysicalAction()
-  end
-  turtle.select(originalSlot)
-  local restored, restoreError = turnTo(originalDir)
-  if not restored then return false, restoreError end
-  if not placed then return false, placeError or "torch_wall_failed" end
-  state.lighting.lastAt = common.nowSeconds()
-  state.lighting.lastPose = poseCopy()
   return true
 end
 
-local function tryPlaceTorchFloor()
-  local originalSlot = turtle.getSelectedSlot()
-  local slot = selectTorchMaterial()
-  if not slot then turtle.select(originalSlot); return false, "torch_material" end
-  -- placeDown is used only when the adjacent block is empty; this avoids
-  -- replacing a floor block and makes the fallback deterministic.
-  local hasBlock = turtle.inspectDown()
-  if hasBlock then turtle.select(originalSlot); return false, "occupied" end
-  local prepared, prepareError = beginPhysicalAction("torch_floor", {
-    side = "bottom", material = itemName(slot), pose = poseCopy(),
-  }, poseCopy())
-  if not prepared then turtle.select(originalSlot); return false, prepareError end
-  local placed, placeError = turtle.placeDown()
-  if placed then
-    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
-    state.lighting.placed = (state.lighting.placed or 0) + 1
-    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
-    commitPhysicalAction()
-  else
-    cancelPhysicalAction()
-  end
-  turtle.select(originalSlot)
-  if not placed then return false, placeError or "torch_floor_failed" end
-  state.lighting.lastAt = common.nowSeconds()
-  state.lighting.lastPose = poseCopy()
-  return true
+local function remotePayloadSession(payload)
+  local nested = type(payload.session) == "table" and payload.session or {}
+  local sessionId = payload.sessionId or nested.sessionId or nested.id
+  local nonce = payload.nonce or nested.nonce
+  local sequence = payload.seq or payload.sequence or payload.requestSeq
+    or nested.seq or nested.sequence or nested.requestSeq
+  return sessionId, nonce, sequence
 end
 
-local function maybePlaceTorch(context)
-  if context ~= "mining" then return true end
-  if isHome() then return true end
-  local mode, interval = effectiveLighting()
-  if mode == "off" then return true end
-  local moves = tonumber(state.stats.moves) or 0
-  if moves <= 0 or moves % interval ~= 0 then return true end
-  if torchMaterialCount() <= 0 then
-    state.stats.torchShortages = (state.stats.torchShortages or 0) + 1
-    state.lighting.shortages = (state.lighting.shortages or 0) + 1
-    return false, "torch_material"
+local function remoteConsumeSession(sender, payload)
+  remoteSessionExpired()
+  if not remoteSession then return false, "Remote console session is not open." end
+  if tonumber(sender) ~= tonumber(remoteSession.sender) then
+    return false, "Remote console session is bound to another sender."
   end
-  -- Deterministic wall order: right, left, front, then floor.  Safe mode
-  -- omits the floor fallback; custom mode permits it when walls are absent.
-  local failureReason = nil
-  for _, relativeDir in ipairs({ 1, 3, 0 }) do
-    local placed, reason = tryPlaceTorchWall(relativeDir)
-    if placed then return true end
-    failureReason = reason or failureReason
-    if reason ~= "occupied" and reason ~= "torch_wall_failed" then
-      if reason == "torch_material" or reason == "inventory_full" then return false, reason end
+  local sessionId, nonce, sequence = remotePayloadSession(payload)
+  if tostring(sessionId or "") ~= tostring(remoteSession.sessionId) then
+    return false, "Remote console sessionId is invalid."
+  end
+  if tostring(nonce or "") ~= tostring(remoteSession.nonce) then
+    return false, "Remote console nonce is invalid."
+  end
+  local seq = tonumber(sequence)
+  if not seq or seq ~= math.floor(seq) or seq < 1 then
+    return false, "Remote console sequence is required."
+  end
+  local expected = (tonumber(remoteSession.lastSeq) or 0) + 1
+  if seq ~= expected then
+    return false, ("Remote console sequence replay/out of order (expected %d)."):format(expected)
+  end
+  -- Consume the sequence before running the command.  A failed/denied command
+  -- is still a used request and cannot be replayed with the same sequence.
+  remoteSession.lastSeq = seq
+  return true, nil, seq
+end
+
+local function remoteCommandHead(command)
+  local first, second = tostring(command or ""):match("^%s*(%S+)%s*(%S*)")
+  return string.lower(first or ""), string.lower(second or "")
+end
+
+local function remoteHasForbiddenSyntax(command)
+  command = tostring(command or "")
+  -- Shell metacharacters, substitutions, and backslash escapes are denied in
+  -- safe mode even when a matching configured entry exists.
+  if command:find("[\r\n;|&><`\\]", 1) then return true end
+  if command:find("%$%(", 1) or command:find("%${", 1) then return true end
+  local first, second = remoteCommandHead(command)
+  local base = first:match("([^/]+)$") or first
+  local destructive = {
+    reboot = true, shutdown = true, update = true, delete = true,
+    edit = true, copy = true, move = true, mv = true, rm = true,
+    mkdir = true, rmdir = true, wget = true, pastebin = true,
+    lua = true, shell = true, exit = true, install = true,
+    touch = true, write = true, append = true, format = true,
+    mount = true, unmount = true, attach = true, detach = true,
+    monitor = true, craft = true, tunnel = true, excavate = true,
+    dig = true, drop = true, place = true,
+  }
+  if destructive[base] then return true end
+  if base == "ccm" and second ~= "status" and second ~= "report" and second ~= "doctor" then return true end
+  -- `label set` mutates the computer label; only the read-only getter is
+  -- permitted in safe mode, even when an operator supplied an exact entry.
+  if base == "label" and second ~= "get" then return true end
+  return false
+end
+
+local function remoteConfiguredCommand(command)
+  local allowlist = config.remoteConsole.allowlist
+  if type(allowlist) ~= "table" then return false end
+  for _, entry in ipairs(allowlist) do
+    -- Configured entries are deliberately exact (after trimming the request,
+    -- not the configured value); no wildcard or prefix semantics are allowed.
+    if type(entry) == "string" and command == entry then return true end
+  end
+  return false
+end
+
+local function remoteSafeCommand(command)
+  command = common.trim(command or "")
+  if command == "" or remoteHasForbiddenSyntax(command) then return false end
+  if remoteConfiguredCommand(command) then return true end
+  -- Built-ins are exact command strings too.  This intentionally does not
+  -- grant a command head with arbitrary arguments (for example `ls /`): an
+  -- operator must opt into that complete string in remoteConsole.allowlist.
+  local builtin = {
+    ["ccm status"] = true, ["ccm report"] = true, ["ccm doctor"] = true,
+    ["id"] = true, ["label get"] = true, ["ls"] = true, ["dir"] = true,
+    ["df"] = true, ["free"] = true, ["version"] = true,
+  }
+  return builtin[command] == true
+end
+
+local function remoteMemoryTerminal(limit)
+  local chunks, size, overflow = {}, 0, false
+  local cursorX, cursorY = 1, 1
+  local textColor, backgroundColor = 1, 32768
+  local palettes = {}
+  local function append(value)
+    value = tostring(value or "")
+    if value == "" then return end
+    local remaining = math.max(0, limit - size)
+    if #value > remaining then
+      if remaining > 0 then chunks[#chunks + 1] = value:sub(1, remaining); size = size + remaining end
+      overflow = true
+    else
+      chunks[#chunks + 1] = value
+      size = size + #value
     end
   end
+  local terminal = {
+    write = function(value) append(value); cursorX = cursorX + #tostring(value or "") end,
+    blit = function(value) append(value); cursorX = cursorX + #tostring(value or "") end,
+    clear = function() chunks, size, overflow = {}, 0, false; cursorX, cursorY = 1, 1 end,
+    clearLine = function() cursorX = 1 end,
+    getCursorPos = function() return cursorX, cursorY end,
+    setCursorPos = function(x, y)
+      x, y = math.max(1, math.floor(tonumber(x) or 1)), math.max(1, math.floor(tonumber(y) or 1))
+      if y > cursorY then append(string.rep("\n", y - cursorY)) end
+      cursorX, cursorY = x, y
+    end,
+    setCursorBlink = function() end,
+    getCursorBlink = function() return false end,
+    isColor = function() return false end,
+    getSize = function() return 51, 19 end,
+    scroll = function(lines) append(string.rep("\n", math.max(0, tonumber(lines) or 0))) end,
+    setTextColor = function(value) textColor = value end,
+    getTextColor = function() return textColor end,
+    setBackgroundColor = function(value) backgroundColor = value end,
+    getBackgroundColor = function() return backgroundColor end,
+    setPaletteColor = function(index, ...) palettes[index] = { ... } end,
+    setPaletteColour = function(index, ...) palettes[index] = { ... } end,
+    getPaletteColor = function(index) local p = palettes[index]; return p and table.unpack(p) or 0, 0, 0 end,
+    getPaletteColour = function(index) local p = palettes[index]; return p and table.unpack(p) or 0, 0, 0 end,
+  }
+  return terminal, function() return table.concat(chunks), overflow end
+end
+
+local function runRemoteShell(command)
+  local maxBytes = math.max(1, math.floor(tonumber(config.remoteConsole.maxOutputBytes) or 8192))
+  if not shell or type(shell.run) ~= "function" then
+    return false, "Shell API is unavailable.", { output = "", truncated = false }
+  end
+  if not term or type(term.redirect) ~= "function" then
+    return false, "Terminal redirect is unavailable.", { output = "", truncated = false }
+  end
+  local memory, readOutput = remoteMemoryTerminal(maxBytes)
+  local previous = type(term.current) == "function" and term.current() or nil
+  local redirected, oldTerm = pcall(term.redirect, memory)
+  if not redirected then return false, tostring(oldTerm), { output = "", truncated = false } end
+  oldTerm = oldTerm or previous
+  local ran, exitCode = pcall(shell.run, command)
+  local restored, restoreError = pcall(term.redirect, oldTerm)
+  local output, truncated = readOutput()
+  if not restored then return false, tostring(restoreError), {
+    output = output, truncated = truncated,
+  } end
+  if not ran then
+    -- Ctrl+T is a local operator stop and must propagate through the remote
+    -- path exactly as it does through GPS/rednet receive.
+    if remoteIsTerminated(exitCode) then error(exitCode, 0) end
+    return false, tostring(exitCode), { output = output, truncated = truncated }
+  end
+  local success = exitCode == true or (type(exitCode) == "number" and exitCode == 0)
+  return success, success and "Remote command completed." or "Remote command failed.", {
+    output = output,
+    exitCode = exitCode,
+    truncated = truncated,
+  }
+end
+
+local function remoteConsoleAction(sender, payload)
+  payload = payload or {}
+  if config.remoteConsole.enabled ~= true then
+    return false, "Remote console is disabled.", nil, nil
+  end
+  local action = string.lower(common.trim(payload.action or payload.remoteAction or ""))
+  remoteSessionExpired()
+  if action == "open" then
+    if tonumber(config.controllerId or 0) <= 0 then
+      return false, "Remote console requires a pinned controllerId.", nil, nil
+    end
+    if tonumber(sender) ~= tonumber(config.controllerId) then
+      return false, "Remote console sender is not the pinned controller.", nil, nil
+    end
+    if remoteSession then
+      if tonumber(remoteSession.sender) ~= tonumber(sender) then
+        return false, "Remote console session is already open for another controller.", nil, nil
+      end
+      -- Re-opening from the pinned controller is idempotent.  This recovers
+      -- when the OPEN ACK was lost without making the operator wait for the
+      -- whole session timeout or issuing a second shell session.
+      local existing = {
+        action = "open",
+        sessionId = remoteSession.sessionId,
+        nonce = remoteSession.nonce,
+        expiresAt = remoteSession.expiresAt,
+        seq = tonumber(remoteSession.lastSeq) or 0,
+        nextSeq = (tonumber(remoteSession.lastSeq) or 0) + 1,
+        resumed = true,
+      }
+      return true, "Remote console session resumed.", existing, existing
+    end
+    local ready, readyError = remoteConsoleReady()
+    if not ready then return false, readyError, nil, nil end
+    local now = common.nowSeconds()
+    remoteSession = {
+      sessionId = remoteToken("session", sender),
+      nonce = remoteToken("nonce", sender),
+      sender = tonumber(sender),
+      openedAt = now,
+      expiresAt = now + math.max(1, math.floor(tonumber(config.remoteConsole.sessionSeconds) or 120)),
+      lastSeq = 0,
+    }

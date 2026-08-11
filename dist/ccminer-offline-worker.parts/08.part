@@ -1,3 +1,141 @@
+    materials.retainSealTarget = discard.retainSealTarget
+    materials.discard = common.copy(discard)
+
+    -- Dock/group identity is intentionally simple for first-time users.  GPS
+    -- calibration later fills homeWorld/facing; existing calibration is copied
+    -- here so a setup rerun cannot erase it.
+    dock.id = identifierPrompt("Dock ID", dock.id, "main")
+    dock.groupId = identifierPrompt("Worker group ID", dock.groupId, "default")
+    dock.bayId = identifierPrompt("Dock bay ID", dock.bayId, "main")
+    dock.requireSameFloor = common.promptYesNo("Require same-floor dock checks", dock.requireSameFloor ~= false)
+    dock.sameFloor, dock.verifySameFloor = dock.requireSameFloor, dock.requireSameFloor
+    group.id, group.groupId = dock.groupId, dock.groupId
+    if type(config.gps) == "table" and config.gps.calibration and config.gps.calibration.home then
+      dock.homeWorld = common.copy(config.gps.calibration.home)
+    end
+    config.lavaMode = enumPrompt("Lava behavior (seal/stop)", config.lavaMode or "seal", {
+      seal = true, stop = true,
+    }, "seal")
+    if config.lavaMode == "seal" then
+      config.sealSide = enumPrompt("Seal-block chest side (right/left)", config.sealSide or "right", {
+        right = true, left = true,
+      }, "right")
+      config.sealTarget = common.promptNumber("Seal-block target count", validInteger(config.sealTarget, 64, 16, 512), 16, 512)
+      local reserveMaximum = math.min(64, config.sealTarget - 1)
+      config.sealReserve = common.promptNumber("Return when seal blocks reach", validInteger(config.sealReserve, 8, 1, reserveMaximum), 1, reserveMaximum)
+    end
+    lighting.mode = enumPrompt("Lighting mode (off/safe/custom)", lighting.mode or "safe", {
+      off = true, safe = true, custom = true,
+    }, "safe")
+    if lighting.mode == "custom" then
+      lighting.interval = common.promptNumber("Torch interval (moves)", validInteger(lighting.interval, 10, 1, 4096), 1, 4096)
+      lighting.temporaryFloor = common.promptYesNo("Use temporary lighting floor", lighting.temporaryFloor ~= false)
+      lighting.torchTarget = common.promptNumber("Torch target count", validInteger(lighting.torchTarget, 64, 1, 512), 1, 512)
+      local torchReserveMaximum = math.min(128, lighting.torchTarget - 1)
+      lighting.torchReserve = common.promptNumber("Return when torches reach", validInteger(lighting.torchReserve, 8, 0, torchReserveMaximum), 0, torchReserveMaximum)
+    end
+    if lighting.mode ~= "off" then
+      lighting.side = torchSidePrompt(lighting.side or config.torchSide or "left", config.lavaMode == "seal" and config.sealSide or nil)
+      config.torchSide = lighting.side
+    else
+      lighting.side = lighting.side or config.torchSide or "left"
+      config.torchSide = lighting.side
+    end
+    materials.compactEveryMoves = validInteger(materials.compactEveryMoves, 32, 1, 100000)
+    materials.retainSealTarget = validInteger(materials.retainSealTarget, 64, 1, 512)
+    materials.retainSealTarget = discard.retainSealTarget
+    config.retainSealTarget = discard.retainSealTarget
+    materials.discard = common.copy(discard)
+    materials.recycleMinedBlocks = common.promptYesNo("Recycle mined blocks", materials.recycleMinedBlocks ~= false)
+    journal.checkpointEvery = validInteger(journal.checkpointEvery, 32, 1, 100000)
+    journal.maxEntries = validInteger(journal.maxEntries, 256, 1, 10000)
+    journal.enabled = common.promptYesNo("Enable resumable journal", journal.enabled ~= false)
+    performance.gpsVerifyEveryMoves = validInteger(performance.gpsVerifyEveryMoves, 32, 32, 64)
+    performance.gpsVerifyMoves = performance.gpsVerifyEveryMoves
+    performance.gpsVerifyCadence = performance.gpsVerifyEveryMoves
+    performance.lightweightCheckpointEveryMoves = validInteger(
+      performance.lightweightCheckpointEveryMoves,
+      16,
+      1,
+      100000
+    )
+    performance.lightweightCheckpointCadence = performance.lightweightCheckpointEveryMoves
+    performance.journalEveryMoves = performance.lightweightCheckpointEveryMoves
+    performance.checkpointEveryMoves = validInteger(performance.checkpointEveryMoves, journal.checkpointEvery, 1, 100000)
+    performance.checkpointCadence = performance.checkpointEveryMoves
+    config.gps = ensureTable(config, "gps", workerDefaults.gps)
+    config.gps.enabled = common.promptYesNo("Use GPS when available", config.gps.enabled ~= false)
+    if config.gps.enabled then
+      config.gps.required = common.promptYesNo("Require GPS for mining", config.gps.required == true)
+    else
+      config.gps.required = false
+    end
+    config.gps.verifyEveryMoves = performance.gpsVerifyEveryMoves
+    if config.gps.calibration and common.promptYesNo("Clear stored GPS calibration for a relocated dock", false) then
+      config.gps.calibration = nil
+      dock.homeWorld = { x = nil, y = nil, z = nil }
+    end
+    config.attackEntities = common.promptYesNo("Attack blocking entities", config.attackEntities == true)
+    config.outputSide, config.fuelSide = "back", "top"
+    if os.setComputerLabel then os.setComputerLabel(config.workerName) end
+  else
+    config = common.merge(common.defaultControllerConfig(), current and current.role == "controller" and current or {})
+    config.role, config.networkKey = "controller", key
+    local controllerDefaults = common.defaultControllerConfig()
+    local group = ensureTable(config, "group", controllerDefaults.group)
+    local dock = ensureTable(config, "dock", controllerDefaults.dock)
+    local alerts = ensureTable(config, "alerts", controllerDefaults.alerts)
+    config.historyLimit = common.promptNumber("History entries to retain", validInteger(config.historyLimit, 50, 1, 1000), 1, 1000)
+    config.queueEnabled = common.promptYesNo("Enable job queue", config.queueEnabled ~= false)
+    config.overlapProtection = common.promptYesNo("Protect overlapping jobs", config.overlapProtection ~= false)
+    config.adaptiveRefresh = common.promptYesNo("Enable adaptive refresh", config.adaptiveRefresh ~= false)
+    -- Keep group setup approachable: one worker-capacity value, one service
+    -- concurrency value, and an explicit GPS safety gate for partitioning.
+    group.maxWorkers = common.promptNumber("Maximum workers in a group", validInteger(group.maxWorkers, 16, 1, 256), 1, 256)
+    group.maxConcurrentService = common.promptNumber(
+      "Maximum concurrent service returns",
+      validInteger(group.maxConcurrentService, 1, 1, 64),
+      1,
+      64
+    )
+    group.partitionMode = enumPrompt("Partition mode (stripe/round_robin)", group.partitionMode or "stripe", {
+      stripe = true, round_robin = true,
+    }, "stripe")
+    group.requireGpsForPartition = common.promptYesNo(
+      "Require GPS for multi-worker partitioning",
+      group.requireGpsForPartition ~= false
+    )
+    dock.baySpacing = common.promptNumber("Dock bay spacing", validInteger(dock.baySpacing, 4, 1, 256), 1, 256)
+    dock.requireSameFloor = common.promptYesNo("Require same-floor dock checks", dock.requireSameFloor ~= false)
+    local sorting = ensureTable(config, "sorting", controllerDefaults.sorting)
+    sorting.enabled = common.promptYesNo("Enable automatic item sorting", sorting.enabled == true)
+    if sorting.enabled then
+      sorting.interval = common.promptNumber("Sorting interval (seconds)", validInteger(sorting.interval, 30, 1, 86400), 1, 86400)
+      sorting.source = peripheralNamePrompt("Sorting source inventory", sorting.source)
+      sorting.valuableTarget = peripheralNamePrompt("Valuable-items inventory", sorting.valuableTarget)
+      sorting.bulkTarget = peripheralNamePrompt("Bulk-items inventory", sorting.bulkTarget)
+      sorting.sealTarget = peripheralNamePrompt("Seal-block inventory", sorting.sealTarget)
+    end
+    config.controllerName = common.prompt("Controller name", config.controllerName or common.safeComputerLabel("Control"), function(value)
+      return #value >= 1 and #value <= 20, "Use 1 to 20 characters."
+    end)
+    config.monitorTextScale = tonumber(common.prompt("Monitor text scale", validNumber(config.monitorTextScale, 0.5, 0.5, 5), function(value)
+      local number = tonumber(value)
+      if not number or number < 0.5 or number > 5 or number * 2 ~= math.floor(number * 2) then
+        return false, "Use 0.5, 1.0, 1.5 ... 5.0."
+      end
+      return true
+    end))
+    config.touchEnabled = common.promptYesNo("Enable monitor touch controls", config.touchEnabled ~= false)
+    alerts.enabled = common.promptYesNo("Enable controller alerts", alerts.enabled ~= false)
+    if alerts.enabled then
+      alerts.speaker = common.promptYesNo("Use speaker alerts", alerts.speaker ~= false)
+      alerts.redstone = common.promptYesNo("Use redstone alerts", alerts.redstone ~= false)
+      if alerts.redstone then alerts.redstoneSide = sidePrompt("Redstone alert side", alerts.redstoneSide or "back") end
+      alerts.cooldownSeconds = common.promptNumber(
+        "Alert cooldown (seconds)",
+        validInteger(alerts.cooldownSeconds, 10, 0, 3600),
+        0,
         3600
       )
     else
@@ -62,245 +200,3 @@ end
 print("")
 print("Reboot with: reboot")
 ]=] },
-  { source = [[src/ccminer/boot.lua]], target = [[boot.lua]], digest = [[e78dedb9650ffc10004eed5856f0d30a4c3a1941aa79058a5f49ae58d1369e94]], content = [[-- CC Miner V4 boot dispatcher
-
-local common = dofile("/ccminer/lib/common.lua")
-local config, err = common.loadConfig()
-if not config or not config.role then
-  printError(err or "CC Miner is not configured.")
-  print("Run: ccm setup")
-  return
-end
-
-local programs = {
-  worker = "/ccminer/worker.lua",
-  controller = "/ccminer/controller.lua",
-  gps = "/ccminer/gps_host.lua",
-}
-local program = programs[config.role]
-if not program then error("Unknown CC Miner role: " .. tostring(config.role), 0) end
-
-if config.role ~= "worker" then
-  local ok, runError = pcall(dofile, program)
-  if not ok then common.log("ERROR", config.role .. " stopped: " .. tostring(runError)); printError(runError) end
-  return
-end
-
-while true do
-  local ok, runError = pcall(dofile, program)
-  if ok then return end
-  local text = tostring(runError)
-  common.log("ERROR", "Worker crashed: " .. text)
-  printError("CC Miner worker stopped: " .. text)
-  if text == "Terminated" or text:find("Terminated", 1, true) then
-    print("Worker stopped locally. Run 'reboot' to restart.")
-    return
-  end
-  print("Restarting worker in 5 seconds...")
-  sleep(5)
-end
-]] },
-  { source = [[src/ccminer/command.lua]], target = [[command.lua]], digest = [[a68bc52a0c91d710209a843d4d9f2aeb7a7482b2280d1307542b0b14f8e4064e]], content = [[-- CC Miner command launcher (V2/V4 compatible)
-
-local args = { ... }
-local common = dofile("/ccminer/lib/common.lua")
-local command = string.lower(tostring(args[1] or "help"))
-
-local function reportError(message)
-  if printError then printError(tostring(message or "")) else print(tostring(message or "")) end
-end
-
-local function unpackArgs(values)
-  local unpackFunction = table.unpack or unpack
-  return unpackFunction(values)
-end
-
-local function printHelp()
-  print("CC Miner " .. tostring(common.VERSION or ""))
-  print("")
-  print("ccm help | version | status | report | doctor | logs")
-  print("ccm setup [worker|controller|gps]")
-  print("ccm dashboard | discover | update")
-  print("ccm rehome RESET                 Local worker recovery")
-  print("")
-  print("Controller CLI:")
-  print("ccm start <id> <W> <L> <D>")
-  print("ccm queue [list|add|run|remove|clear] [args...]")
-  print("ccm preset(s) [list|save|use|delete] [args...]")
-  print("ccm stop <id> <now|row|layer|home|abort>")
-  print("ccm pause|resume|recall|service|abort|clear <id>")
-  print("ccm group list")
-  print("ccm group show <id>")
-  print("ccm group register <id> <workerIds comma> [name dock bay mode partition workerBayMap workerDockMap]")
-  print("ccm group start|pause|resume|return|service|abort|clear <id>")
-  print("ccm group reassign <id> <stopped> [target]")
-  print("ccm dock|bay list")
-  print("ccm dock|bay register <id> <x> <y> <z> [facing] [maxDepth]")
-  print("ccm gps <id>                    Request GPS fix")
-  print("ccm calibrate <id>              Calibrate worker GPS")
-  print("ccm rehome <id> RESET")
-end
-
-local function forwardController(forwarded)
-  forwarded = forwarded or {}
-  if #forwarded == 0 then
-    for index = 1, #args do forwarded[index] = args[index] end
-  end
-  shell.run("/ccminer/controller.lua", unpackArgs(forwarded))
-end
-
-local function loadConfigForCommand()
-  local config, configError = common.loadConfig()
-  if not config then
-    reportError(configError or "Not configured.")
-    return nil
-  end
-  return config
-end
-
--- This loader intentionally never rotates a .bak file or writes a recovery
--- copy.  `doctor` is a read-only diagnostic and must not change on-disk state.
-local function readTableNoWrite(path)
-  if not fs or not fs.exists or not fs.exists(path) then return nil, "missing" end
-  if fs.isDir and fs.isDir(path) then return nil, "directory" end
-  local handle = fs.open(path, "r")
-  if not handle then return nil, "unreadable" end
-  local text = handle.readAll()
-  handle.close()
-  if type(textutils) ~= "table" or type(textutils.unserialize) ~= "function" then
-    return nil, "unserialize unavailable"
-  end
-  local ok, value = pcall(textutils.unserialize, text)
-  if not ok or type(value) ~= "table" then return nil, "invalid" end
-  return value
-end
-
-local function readTextNoWrite(path)
-  if not fs or not fs.exists or not fs.exists(path) then return nil, "missing" end
-  if fs.isDir and fs.isDir(path) then return nil, "directory" end
-  local handle = fs.open(path, "r")
-  if not handle then return nil, "unreadable" end
-  local text = handle.readAll()
-  handle.close()
-  return text
-end
-
-local function tableValue(value, ...)
-  local current = value
-  for index = 1, select("#", ...) do
-    if type(current) ~= "table" then return nil end
-    current = current[select(index, ...)]
-  end
-  return current
-end
-
-local function valueString(value, depth)
-  depth = depth or 0
-  if value == nil then return "-" end
-  if type(value) == "boolean" then return value and "true" or "false" end
-  if type(value) ~= "table" then return tostring(value) end
-  if depth >= 2 then return "{...}" end
-  local keys = {}
-  for key in pairs(value) do keys[#keys + 1] = key end
-  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-  local parts = {}
-  for _, key in ipairs(keys) do
-    parts[#parts + 1] = tostring(key) .. "=" .. valueString(value[key], depth + 1)
-    if #parts >= 8 then
-      parts[#parts + 1] = "..."
-      break
-    end
-  end
-  return "{" .. table.concat(parts, ",") .. "}"
-end
-
-local function sortedKeys(value)
-  local keys = {}
-  if type(value) == "table" then
-    for key in pairs(value) do keys[#keys + 1] = key end
-  end
-  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-  return keys
-end
-
-local function printField(label, value)
-  print(tostring(label) .. ": " .. valueString(value))
-end
-
-local function printStatusFeature(label, value, fallback)
-  if value ~= nil then printField(label, value)
-  elseif fallback ~= nil then printField(label, fallback)
-  end
-end
-
--- Status/report payloads grew a few additive fields during V4 (and workers
--- can still be running an older payload).  Keep the CLI tolerant by looking
--- through the known aliases and only printing a field when it is present.
--- This deliberately does not stringify networkKey or any credential-like
--- value; status output must retain the existing masked-key contract.
-local function firstNestedValue(roots, paths)
-  roots = roots or {}
-  -- `roots` intentionally contains optional entries; numeric iteration keeps
-  -- searching past nil job/report/service slots instead of stopping at the
-  -- first hole as `ipairs` would.
-  for index = 1, #roots do
-    local root = roots[index]
-    if type(root) == "table" then
-      for _, path in ipairs(paths or {}) do
-        local value = tableValue(root, unpackArgs(path))
-        if value ~= nil then return value end
-      end
-    end
-  end
-  return nil
-end
-
-local function printOperationalFields(root, config)
-  root = type(root) == "table" and root or {}
-  config = type(config) == "table" and config or {}
-  local job = type(root.job) == "table" and root.job or nil
-  local report = type(root.report) == "table" and root.report or nil
-  local lastReport = type(root.lastReport) == "table" and root.lastReport or nil
-  local service = type(root.service) == "table" and root.service or nil
-  local group = type(root.group) == "table" and root.group or nil
-  local stats = type(root.stats) == "table" and root.stats or nil
-  local roots = {}
-  local function addRoot(value)
-    if type(value) == "table" then roots[#roots + 1] = value end
-  end
-  addRoot(root); addRoot(job); addRoot(report); addRoot(lastReport)
-  addRoot(service); addRoot(group); addRoot(stats); addRoot(config)
-
-  local dock = firstNestedValue(roots, {
-    { "dock" }, { "dockInfo" }, { "location", "dock" },
-    { "gps", "calibration", "home" }, { "homeWorld" },
-  })
-  if dock ~= nil then printField("Dock", dock) end
-  local bay = firstNestedValue(roots, {
-    { "bay" }, { "bayInfo" }, { "location", "bay" },
-  })
-  if bay ~= nil then printField("Bay", bay) end
-
-  local groupId = firstNestedValue(roots, {
-    { "groupId" }, { "group", "id" }, { "group", "groupId" },
-  })
-  local groupJobId = firstNestedValue(roots, {
-    { "groupJobId" }, { "group", "groupJobId" }, { "group", "jobId" },
-    { "job", "groupJobId" },
-  })
-  local assignmentId = firstNestedValue(roots, {
-    { "assignmentId" }, { "assignment", "id" }, { "group", "assignmentId" },
-    { "job", "assignmentId" },
-  })
-  if groupId ~= nil then printField("Group", groupId) end
-  if groupJobId ~= nil then printField("Group job", groupJobId) end
-  if assignmentId ~= nil then printField("Assignment", assignmentId) end
-
-  local bottomY = firstNestedValue(roots, {
-    { "bottomY" }, { "bottom_y" }, { "targetY" },
-    { "job", "bottomY" }, { "job", "targetY" }, { "job", "bottom_y" },
-    { "dock", "bottomY" }, { "dock", "bottom_y" },
-  })
-  if bottomY ~= nil then printField("BOTTOM Y", bottomY) end
-
-  local completionReason = firstNestedValue(roots, {

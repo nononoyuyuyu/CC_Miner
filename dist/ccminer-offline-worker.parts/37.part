@@ -1,274 +1,272 @@
-  state.serviceReturn.startedAt = state.serviceReturn.startedAt or common.nowSeconds()
-  state.returnReason = state.service.reason or state.returnReason or "service"
-  if not isHome() then
-    state.phase = "returning"
-    local returnDistance = estimatedReturnDistance(state.pose)
-    if returnDistance then state.service.returnDistance = returnDistance end
-    saveState("service_return_start", true)
-    local preReturnGPS, preReturnError = verifyGPS(true)
-    if not preReturnGPS then markBlocked("GPS verification before return failed: " .. tostring(preReturnError)); return false end
-    local ok, err
-    if state.job and state.job.strategy == "chunk_plan" then
-      ok, err = navigateChunkPlanHome("service")
-    else
-      ok, err = navigateTo({ x = 0, y = 0, z = 0 }, "home", "service")
-    end
-    if not ok then
-      if err == "control_request" then return false end
-      markBlocked("Return to home failed: " .. tostring(err))
-      return false
-    end
+    discardStats.lastError = discardError or "Discard inventory verification failed."
+    saveState("discard_inventory_error")
+    return false, discardStats.lastError
   end
 
-  local ok, err = turnTo(0)
-  if not ok then markBlocked("Cannot face quarry at home: " .. tostring(err)); return false end
-  if movementInterrupted("service") then return false end
-  local dockGPS, dockGPSError = verifyGPS(true)
-  if not dockGPS then markBlocked("GPS verification at dock failed: " .. tostring(dockGPSError)); return false end
+  -- Consolidate locally before output.  This does not move the turtle and is
+  -- deliberately independent of compactEvery service returns.
+  compressSealStacks()
+  local retainedCount = updateRecycleInventoryState()
+  local maxStacks = math.max(1, math.floor(tonumber(policy.maxStacksPerPass) or 8))
+  local discardedStacks, allDropped = 0, true
+  local totalSeal = retainedCount
 
-  ok, err = unloadAtHome()
-  if not ok then
-    if err == "control_request" then return false end
-    state.status, state.phase, state.lastError = "waiting_output", "waiting_output", err
-    saveState(); heartbeat(true); return false
-  end
-  if movementInterrupted("service") then return false end
-
-  ok, err = refuelAtHome()
-  if not ok then
-    if err == "control_request" then return false end
-    state.status, state.phase, state.lastError = "waiting_fuel", "waiting_fuel", err
-    saveState(); heartbeat(true); return false
-  end
-  if movementInterrupted("service") then return false end
-
-  ok, err = refillSealAtHome()
-  if not ok then
-    if err == "control_request" then return false end
-    state.status, state.phase, state.lastError = "waiting_seal", "waiting_seal", err
-    saveState(); heartbeat(true); return false
-  end
-  if movementInterrupted("service") then return false end
-
-  ok, err = refillTorchAtHome()
-  if not ok then
-    if err == "control_request" then return false end
-    state.status, state.phase, state.lastError = "waiting_torch", "waiting_torch", err
-    saveState("waiting_torch"); heartbeat(true); return false
-  end
-  if movementInterrupted("service") then return false end
-
-  if state.service.resumeAfter and (state.resumeToken or state.checkpoint) then
-    local token = state.resumeToken or state.checkpoint
-    local checkpoint = poseCopy(token)
-    checkpoint.dir = tonumber(token.dir) or checkpoint.dir
-    state.phase, state.status, state.lastError = "going_back", "working", nil
-    saveState("service_resume_start", true)
-    local preResumeGPS, preResumeError = verifyGPS(true)
-    if not preResumeGPS then markBlocked("GPS verification before resume failed: " .. tostring(preResumeError)); return false end
-    if state.job and state.job.strategy == "chunk_plan" then
-      ok, err = navigateChunkPlanWork(checkpoint, "service")
-    else
-      ok, err = navigateTo(checkpoint, "work", "service")
-    end
-    if not ok then
-      if err == "control_request" then return false end
-      markBlocked("Return to work point failed: " .. tostring(err))
-      return false
-    end
-    ok, err = turnTo(checkpoint.dir)
-    if not ok then markBlocked("Cannot restore work direction: " .. tostring(err)); return false end
-    if movementInterrupted("service") then return false end
-    local arrivedGPS, arrivedGPSError = verifyGPS(true)
-    if not arrivedGPS then markBlocked("GPS verification after resume failed: " .. tostring(arrivedGPSError)); return false end
-    if state.job and state.job.route then
-      for _, key in ipairs({ "layer", "walkIndex", "localCursor", "phase", "currentKey" }) do
-        if token[key] ~= nil then state.job.route[key] = token[key] end
+  -- Drop each slot as a whole stack.  Protected/valuable/unknown items are
+  -- always routed to output, never the discard inventory.
+  for slot = 1, 16 do
+    local count, name = turtle.getItemCount(slot), itemName(slot)
+    if count > 0 then
+      local protected = discardProtectedItem(slot, name)
+      local keepReserved = isSealItemName(name) or isTorchItemName(name)
+        or (slotRoleContains(slot, "fuel") and isFuelItem(slot))
+      local candidate = discardEnabled and discardedStacks < maxStacks
+        and discardCandidate(slot, name, totalSeal, policy, mode)
+      if candidate and isSealItemName(name) and totalSeal - count < (tonumber(policy.retainSealTarget) or 64) then
+        candidate = false -- whole-stack semantics: never split below reserve
+      end
+      if candidate and discardDrop then
+        if discardTargetDir ~= nil then turnTo(discardTargetDir) else turnTo(outRestore) end
+        turtle.select(slot)
+        discardStats.attempts = (discardStats.attempts or 0) + 1
+        local before = turtle.getItemCount(slot)
+        local prepared, prepareError = beginPhysicalAction("discard_home", {
+          slot = slot, item = name, count = before, direction = discardSide,
+        }, poseCopy())
+        if not prepared then
+          allDropped = false
+          discardStats.lastError = prepareError or "Could not journal discard action."
+          break
+        end
+        local dropped = discardDrop() -- no count argument: one complete stack
+        local after = turtle.getItemCount(slot)
+        if dropped and after == 0 then
+          commitPhysicalAction()
+          discardedStacks = discardedStacks + 1
+          noteDiscard(name, before)
+          if isSealItemName(name) then totalSeal = totalSeal - before end
+        else
+          cancelPhysicalAction()
+          allDropped = false
+          noteDiscardSkip(name, isUnknownModItem(name))
+        end
+      elseif keepReserved then
+        -- Keep seal/torch/fuel material on the turtle.  It is never sent to
+        -- either output or discard, even when the output chest is available.
+      elseif not protected then
+        if outputTargetDir ~= nil then turnTo(outputTargetDir) else turnTo(outRestore) end
+        turtle.select(slot)
+        local before = turtle.getItemCount(slot)
+        local prepared, prepareError = beginPhysicalAction("unload_home", {
+          slot = slot, item = name, count = before, direction = outputSide,
+        }, poseCopy())
+        if not prepared then
+          allDropped = false
+          discardStats.lastError = prepareError or "Could not journal output action."
+          break
+        end
+        local dropped = outDrop() -- output receives all non-discard items
+        if dropped and turtle.getItemCount(slot) == 0 then commitPhysicalAction()
+        else cancelPhysicalAction(); allDropped = false end
+      else
+        -- Reserved seal/torch/fuel remain on the turtle.  Unknown and ore
+        -- stacks are retained in the output path when they are not reserved.
+          if not keepReserved then
+            if outputTargetDir ~= nil then turnTo(outputTargetDir) else turnTo(outRestore) end
+            turtle.select(slot)
+          local before = turtle.getItemCount(slot)
+          local prepared, prepareError = beginPhysicalAction("unload_home", {
+            slot = slot, item = name, count = before, direction = outputSide,
+          }, poseCopy())
+          if not prepared then
+            allDropped = false
+            discardStats.lastError = prepareError or "Could not journal output action."
+            break
+          end
+          local dropped = outDrop()
+          if dropped and turtle.getItemCount(slot) == 0 then commitPhysicalAction()
+          else cancelPhysicalAction(); allDropped = false end
+        end
       end
     end
-    state.checkpoint = nil
-    state.resumeToken = nil
   end
-  state.service.returnEndedAt = common.nowSeconds()
-  state.service.returnSeconds = math.max(0, state.service.returnEndedAt - (state.service.returnStartedAt or state.service.returnEndedAt))
-  state.serviceReturn.endedAt = state.service.returnEndedAt
-  state.serviceReturn.seconds = state.service.returnSeconds
-  state.serviceReturn.distance = state.service.returnDistance or 0
-  state.timeMetrics = state.timeMetrics or {}
-  state.timeMetrics.returnSeconds = (state.timeMetrics.returnSeconds or 0) + state.service.returnSeconds
-  finishService()
+  discardStats.passes = (discardStats.passes or 0) + (discardEnabled and 1 or 0)
+  discardStats.enabled = mode ~= "KEEP_ALL"
+  discardStats.triggered = discardEnabled
+  discardStats.mode = mode
+  local _, _, heldItems = inventoryStats()
+  discardStats.held = heldItems
+  if discardEnabled then discardStats.lastError = nil end
+
+  local restored, restoreError = turnTo(outRestore)
+  turtle.select(originalSlot)
+  if not restored then return false, restoreError end
+  if not allDropped then
+    return false, "Output/discard inventory is full or a protected stack could not be retained safely."
+  end
+  updateRecycleInventoryState()
+  state.stats.unloads = (state.stats.unloads or 0) + 1
+  saveState("unload_done")
   return true
 end
 
-local function requiredDirectionTo(target)
-  local dx, dy, dz = target.x - state.pose.x, target.y - state.pose.y, target.z - state.pose.z
-  local manhattan = math.abs(dx) + math.abs(dy) + math.abs(dz)
-  if manhattan ~= 1 then return nil, "path_desync:" .. tostring(manhattan) end
-  if dy == 1 then return "up", nil, dy end
-  if dy == -1 then return "down", nil, dy end
-  if dx == 1 then return "forward", 1, 0 end
-  if dx == -1 then return "forward", 3, 0 end
-  if dz == 1 then return "forward", 0, 0 end
-  if dz == -1 then return "forward", 2, 0 end
-  return nil, "invalid_delta"
-end
+local function discardAtField()
+  local policy, mode = discardPolicy()
+  if mode == "KEEP_ALL" then return true end
+  local _, emptySlots = inventoryStats()
+  local trigger = tonumber(policy.triggerEmptySlots) or 3
+  if emptySlots > trigger then return true end
 
-local function shouldService()
-  local _, empty = inventoryStats()
-  local materials, recycle = materialsConfig()
-  local reserveEmpty = profileReserveEmptySlots()
-  if empty <= reserveEmpty then return true, "inventory" end
-  local level = fuelLevel()
-  if level ~= "unlimited" then
-    local returnDistance, returnError = estimatedReturnDistance(state.pose)
-    if not returnDistance then
-      return true, "fuel_route:" .. tostring(returnError)
+  local discardStats = discardStatsTable()
+  discardStats.lastError = nil
+  local side = policy.direction or "back"
+  if side == "up" then side = "top" end
+  if side == "down" then side = "bottom" end
+  local originalSlot = turtle.getSelectedSlot()
+  local inspectFunction, _, dropFunction, restoreDir, sideError = sideFunctions(side)
+  if not inspectFunction then
+    discardStats.lastError = sideError or "Discard direction is invalid."
+    turtle.select(originalSlot)
+    return false, discardStats.lastError
+  end
+  local checkSide = (side == "top" and "top") or (side == "bottom" and "bottom") or "front"
+  -- A configured inventory at the field direction is an explicit safety
+  -- boundary: never accidentally inject a discard stack into it.
+  if inventoryPresent(checkSide, inspectFunction) then
+    discardStats.skipped = (discardStats.skipped or 0) + 1
+    discardStats.lastError = "Field discard skipped because the configured direction contains an inventory."
+    state.stats.discardSkipped = (state.stats.discardSkipped or 0) + 1
+    restoreSideDirection(side, restoreDir)
+    turtle.select(originalSlot)
+    saveState("field_discard_inventory")
+    return true
+  end
+
+  local _, _, totalItems = inventoryStats()
+  local totalSeal = updateRecycleInventoryState()
+  local maxStacks = math.max(1, math.floor(tonumber(policy.maxStacksPerPass) or 8))
+  local discardedStacks = 0
+  for slot = 1, 16 do
+    if discardedStacks >= maxStacks then break end
+    local count, name = turtle.getItemCount(slot), itemName(slot)
+    if count > 0 and discardCandidate(slot, name, totalSeal, policy, mode)
+      and not (isSealItemName(name) and totalSeal - count < (tonumber(policy.retainSealTarget) or 64)) then
+      turtle.select(slot)
+      discardStats.attempts = (discardStats.attempts or 0) + 1
+      local before = turtle.getItemCount(slot)
+      local prepared, prepareError = beginPhysicalAction("discard_field", {
+        slot = slot, item = name, count = before, direction = side,
+      }, poseCopy())
+      if not prepared then
+        discardStats.lastError = prepareError or "Could not journal field discard action."
+        break
+      end
+      local dropped = dropFunction() -- world discard is always stack-at-a-time
+      local after = turtle.getItemCount(slot)
+      if dropped and after == 0 then
+        commitPhysicalAction()
+        discardedStacks = discardedStacks + 1
+        noteDiscard(name, before)
+        if isSealItemName(name) then totalSeal = totalSeal - before end
+      else
+        cancelPhysicalAction()
+        noteDiscardSkip(name, isUnknownModItem(name))
+        discardStats.lastError = "Field discard failed; stack retained."
+      end
     end
-    local nextCost = math.max(1, tonumber(config.nextSectionCost or config.serviceNextSectionCost) or 16)
-    if state.job then
-      local remaining = math.max(0, (state.job.total or 0) - (state.job.cursor or 0))
-      nextCost = math.min(nextCost + math.floor(remaining > 0 and math.sqrt(remaining) or 0), math.max(nextCost, remaining))
+  end
+  discardStats.passes = (discardStats.passes or 0) + 1
+  discardStats.enabled = true
+  discardStats.mode = mode
+  discardStats.lastAt = common.nowSeconds()
+  discardStats.lastInventoryItems = totalItems
+  restoreSideDirection(side, restoreDir)
+  turtle.select(originalSlot)
+  saveState("field_discard")
+  return discardStats.lastError == nil, discardStats.lastError
+end
+
+local function targetFuelForService()
+  local target = tonumber(config.fuelTarget) or 12000
+  if state.service and state.service.resumeAfter and state.checkpoint then
+    local checkpointDistance = estimatedReturnDistance(state.checkpoint)
+    if not checkpointDistance then
+      checkpointDistance = distance({ x = 0, y = 0, z = 0 }, state.checkpoint)
     end
-    local needed = returnDistance + nextCost + profileFuelBuffer()
-    if tonumber(level or 0) <= needed then return true, "fuel" end
+    target = math.max(target, checkpointDistance * 2 + profileFuelBuffer())
   end
-  if (config.lavaMode or "seal") == "seal" and sealMaterialCount() <= (tonumber(config.sealReserve) or 8) then
-    return true, "seal"
-  end
-  local lightingMode = effectiveLighting()
-  if lightingMode ~= "off" and torchMaterialCount() <= (tonumber((config.lighting or {}).reserve) or tonumber((config.lighting or {}).torchReserve) or tonumber(config.torchReserve) or 4) then
-    return true, "torch"
-  end
-  local _, lightInterval = effectiveLighting()
-  if lightingMode ~= "off" and lightInterval > 0 then
-    local moves = tonumber(state.stats.moves) or 0
-    if moves > 0 and moves % lightInterval == 0 and torchMaterialCount() <= 0 then return true, "torch" end
-  end
-  -- compactEvery is intentionally handled by compressInventoryAtField()
-  -- from runMiningStep.  Returning home solely to merge stacks wastes fuel
-  -- and violates the local-compression contract.
-  return false
+  local limit = fuelLimit()
+  if limit == "unlimited" then return "unlimited" end
+  if type(limit) == "number" and limit > 0 then target = math.min(target, limit) end
+  return math.max(1, math.floor(target))
 end
 
-local function handlePendingRequest()
-  if state.request == "recall" or state.request == "return_home" then beginService(false, "paused", "recall", true); return true end
-  if state.request == "service" then beginService(false, "paused", "manual_service", true); return true end
-  if state.request == "abort" then beginService(false, "aborted", "abort", false); return true end
-  if state.request == "pause_now" then
-    state.request = nil
-    if state.stagedStop and type(state.stagedStop) == "table" then
-      state.stagedStop.reachedAt = common.nowSeconds()
-      state.stagedStop.boundary = "physical_safe"
+local function refuelAtHome()
+  state.phase, state.status = "refueling", "working"
+  saveState()
+  local current = fuelLevel()
+  if current == "unlimited" then return true end
+  local target = targetFuelForService()
+  local fuelSide = config.fuelSide or "top"
+  local inspectFunction, suckFunction, dropFunction, restoreDir, sideError = sideFunctions(fuelSide)
+  if not inspectFunction then return false, sideError end
+  local checkSide = (fuelSide == "top" and "top") or (fuelSide == "bottom" and "bottom") or "front"
+  if not inventoryPresent(checkSide, inspectFunction) then
+    restoreSideDirection(fuelSide, restoreDir)
+    return false, "Fuel inventory missing on configured side " .. fuelSide .. "."
+  end
+  if target == "unlimited" or current >= target then
+    restoreSideDirection(fuelSide, restoreDir)
+    return true
+  end
+
+  local originalSlot = turtle.getSelectedSlot()
+  local attempts = 0
+  while fuelLevel() ~= "unlimited" and fuelLevel() < target do
+    drainNetwork(3)
+    if movementInterrupted("service") then
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "control_request"
     end
-    state.status, state.phase = "paused", "paused"
-    saveState("pause_now_reached")
-    return true
-  end
-  return false
-end
-
-local function beginAutomaticService(reason)
-  beginService(true, "working", "automatic_" .. tostring(reason), false)
-  continueService()
-end
-
-local function handleMoveFailure(prefix, err, allowBedrock)
-  if err == "control_request" then return true end
-  if err == "seal_material" then beginAutomaticService("seal"); return true end
-  if err == "torch_material" then beginAutomaticService("torch"); return true end
-  if err == "torch_surface_unavailable" then
-    markBlocked(prefix .. ": no safe torch wall/floor surface was available.")
-    return true
-  end
-  if err == "inventory_full" then beginAutomaticService("inventory"); return true end
-  if err == "water_seal_limit" then
-    state.status, state.phase, state.lastError = "blocked", "water_seal_limit", prefix .. ": continuous water sealing limit reached."
-    state.stats.waterBlocked = (state.stats.waterBlocked or 0) + 1
-    saveState("water_seal_limit")
-    return true
-  end
-  if err == "lava_seal_limit" then
-    markBlocked(prefix .. ": continuous lava sealing limit reached.")
-    return true
-  end
-  if common.startsWith(err or "", "water:") then
-    state.status, state.phase, state.lastError = "blocked", "water_detected", prefix .. ": water detected (mode=" .. waterMode() .. ")."
-    saveState("water_stop")
-    return true
-  end
-  if err == "out_of_fuel" then
-    markBlocked(prefix .. ": fuel was exhausted before the safety return threshold.")
-    return true
-  end
-  if allowBedrock and common.startsWith(err or "", "protected:minecraft:bedrock") then
-    state.completionReason = "bedrock_reached"
-    beginService(false, "complete", "bedrock", false)
-    continueService()
-    return true
-  end
-  return false
-end
-
-local function completeJob(reason)
-  state.completionReason = reason or "completed"
-  beginService(false, "complete", "job_complete", false)
-  continueService()
-end
-
-local function stagedStopAtBoundary(job, boundary)
-  local staged = state.stagedStop
-  if not staged then return false end
-  local mode = tostring(staged.mode or "")
-  local safe = false
-  if mode == "pause_now" or mode == "return_home" or mode == "abort" then
-    safe = true
-  elseif mode == "finish_row" then
-    safe = boundary == "row"
-  elseif mode == "finish_layer" then
-    safe = boundary == "layer"
-  end
-  if not safe then return false end
-  state.stagedStop.reachedAt = common.nowSeconds()
-  state.stagedStop.boundary = boundary
-  local finalStatus = mode == "abort" and "aborted" or "paused"
-  beginService(false, finalStatus, "staged_" .. mode, true)
-  return true
-end
-
-local function rowBoundary(job)
-  if not job then return false end
-  local width = math.max(1, tonumber(job.length) or 1)
-  local cursor = tonumber(job.cursor) or 0
-  return cursor > 0 and cursor % width == 0
-end
-
-local function layerBoundary(job)
-  if not job then return false end
-  local rowVolume = math.max(1, (tonumber(job.width) or 1) * (tonumber(job.length) or 1))
-  local cursor = tonumber(job.cursor) or 0
-  return cursor > 0 and cursor % rowVolume == 0
-end
-
-local function runSerpentineStep(job)
-  job.cursor = tonumber(job.cursor) or 0
-  job.total = tonumber(job.total) or (job.width * job.length * job.depth)
-  if job.cursor >= job.total then completeJob(state.completionReason or "completed"); return end
-
-  local target = quarry.cellForJob(job, job.cursor)
-  if samePosePosition(state.pose, target) then
-    -- GPS recovery may prove that an interrupted move completed before the
-    -- cursor update was persisted. Treat the occupied cell as completed.
-    job.cursor = job.cursor + 1
-    if layerBoundary(job) then
-      local layerGPS, layerGPSError = verifyGPS(true)
-      if not layerGPS then markBlocked("GPS verification at recovered layer boundary failed: " .. tostring(layerGPSError)); return end
+    attempts = attempts + 1
+    if attempts > 1024 then
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Fuel loading safety limit reached."
     end
-    saveState()
-    if stagedStopAtBoundary(job, layerBoundary(job) and "layer" or (rowBoundary(job) and "row" or nil)) then return end
-    return
-  end
-
-  local direction, targetDir, verticalDelta = requiredDirectionTo(target)
-  if not direction then
-    markBlocked("Quarry path/state mismatch at cell " .. tostring(job.cursor) .. ": " .. tostring(targetDir))
-    return
+    local slot = firstFuelSlot()
+    if not slot then
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "No empty slot available while refueling."
+    end
+    turtle.select(slot)
+    local sucked = runInventoryPhysicalAction("refuel_suck", {
+      slot = slot, count = 1, direction = fuelSide,
+    }, function() return suckFunction(1) end)
+    if not sucked then
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Fuel inventory is empty."
+    end
+    local validFuel = runInventoryPhysicalAction("refuel_probe", {
+      slot = slot, count = turtle.getItemCount(slot), direction = fuelSide,
+    }, function() return turtle.refuel(0) end)
+    if not validFuel then
+      runInventoryPhysicalAction("refuel_reject", {
+        slot = slot, item = itemName(slot), direction = fuelSide,
+      }, dropFunction)
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Fuel inventory contains a non-fuel item."
+    end
+    local before = fuelLevel()
+    local consumed = runInventoryPhysicalAction("refuel_consume", {
+      slot = slot, item = itemName(slot), direction = fuelSide,
+    }, function() return turtle.refuel(1) end)
+    local after = fuelLevel()
+    if not consumed then
+      runInventoryPhysicalAction("refuel_reject", {
+        slot = slot, item = itemName(slot), direction = fuelSide,
+      }, dropFunction)
+      restoreSideDirection(fuelSide, restoreDir)
