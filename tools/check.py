@@ -290,10 +290,12 @@ def main() -> None:
     check_bundle()
     lua = find_lua()
     check_lua_syntax(lua)
+    run([lua, "tests/test_startup.lua", str(ROOT)])
     run([lua, "tests/test_quarry.lua", str(ROOT)])
     run([lua, "tests/test_geo.lua", str(ROOT)])
     run([lua, "tests/test_common.lua", str(ROOT)])
     run([lua, "tests/test_protocol.lua", str(ROOT)])
+    run([lua, "tests/test_controller_persistence.lua", str(ROOT)])
     run([lua, "tests/test_v3_contract.lua", str(ROOT)])
     print("All CC Miner V3 checks passed.")
 

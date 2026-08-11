@@ -1,3 +1,18 @@
+  local prepared, prepareError = beginPhysicalAction("torch_wall", {
+    side = relativeDir, material = itemName(slot), pose = poseCopy(),
+  }, poseCopy())
+  if not prepared then return restoreContext(prepareError) end
+  local placed, placeError = turtle.place()
+  if placed then
+    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
+    state.lighting.placed = (state.lighting.placed or 0) + 1
+    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
+    commitPhysicalAction()
+  else
+    cancelPhysicalAction()
+  end
+  turtle.select(originalSlot)
+  local restored, restoreError = turnTo(originalDir)
   if not restored then return false, restoreError end
   if not placed then return false, placeError or "torch_wall_failed" end
   state.lighting.lastAt = common.nowSeconds()
@@ -268,15 +283,3 @@ local function navigateChunkPlanHome(context)
   end
   ok, err = moveY(0, context); if not ok then return false, err end
   local rootAnchor = chunkAnchor(plan, plan.rootKey, 0)
-  ok, err = navigateTo(rootAnchor, "inside", context); if not ok then return false, err end
-  return navigateTo({ x = 0, y = 0, z = 0 }, "inside", context)
-end
-
-local function navigateChunkPlanWork(checkpoint, context)
-  local plan = state.job and state.job.chunkPlan
-  if not plan then return navigateTo(checkpoint, "work", context) end
-  local targetKey = quarry.findChunk(plan, checkpoint.x, checkpoint.z)
-  if not targetKey then return false, "Checkpoint is outside every allowed chunk." end
-  local rootAnchor = chunkAnchor(plan, plan.rootKey, 0)
-  local ok, err = navigateTo(rootAnchor, "inside", context)
-  if not ok then return false, err end

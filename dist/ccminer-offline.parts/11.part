@@ -1,3 +1,23 @@
+    finalStatus = "working",
+    preserveCheckpoint = false,
+    reason = "job_start",
+    startedAt = common.nowSeconds(),
+  }
+  state.request = nil
+  state.stagedStop = false
+  state.status = "working"
+  state.phase = "starting_service"
+  state.lastError = nil
+  state.completionReason = nil
+  state.report = nil
+  state.estimate = {
+    estimated = math.max(1, job.total or 1),
+    actual = 0,
+    variance = 0,
+    startedAt = common.nowSeconds(),
+  }
+  state.lighting.mode = (job.lighting and job.lighting.mode) or (config.lighting and config.lighting.mode) or "off"
+  state.lighting.interval = (job.lighting and job.lighting.interval) or (config.lighting and config.lighting.interval) or 32
   state.water.mode = job.waterMode or config.waterMode or (config.water and config.water.mode) or "ignore"
   state.pose = { x = 0, y = 0, z = 0, dir = state.pose.dir or 0 }
   saveState()
@@ -244,15 +264,3 @@ end
 local function handleMessage(sender, message)
   local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
   if not valid then return end
-  if tonumber(config.controllerId or 0) > 0 and tonumber(sender) ~= tonumber(config.controllerId) then return end
-  if message.kind == "discover" then sendStatus(sender, message); return end
-  if message.kind ~= "command" then return end
-  if tonumber(message.target) ~= tonumber(os.getComputerID()) then return end
-  if commandSeen(message.id) then
-    sendAck(sender, message, true, "Duplicate command ignored; previous result retained.")
-    return
-  end
-  local payload = message.payload
-  local command = tostring(payload.command or "")
-  local ok, text = applyControlCommand(command, payload)
-  sendAck(sender, message, ok, text)

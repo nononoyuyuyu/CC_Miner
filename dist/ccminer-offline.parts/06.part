@@ -1,3 +1,9 @@
+  chunks[rootKey].optimizedAnchor = { x = chunks[rootKey].anchor.x, z = chunks[rootKey].anchor.z }
+  walk[1] = { key = rootKey, first = true, anchor = { x = chunks[rootKey].anchor.x, z = chunks[rootKey].anchor.z } }
+  order[1] = rootKey
+  while #order < #keys do
+    local nextKey
+    for _, neighbor in ipairs(chunks[current].neighbors or {}) do
       if not visited[neighbor] then nextKey = neighbor; break end
     end
     local path
@@ -15,11 +21,11 @@
         order[#order + 1] = key
       end
       local anchor = M.chunkAnchor(chunks[key], chunks[previous]) or chunks[key].anchor
-      if first then chunks[key].optimizedAnchor = anchor end
+      if first then chunks[key].optimizedAnchor = { x = anchor.x, z = anchor.z } end
       walk[#walk + 1] = {
         key = key,
         first = first,
-        anchor = anchor,
+        anchor = { x = anchor.x, z = anchor.z },
       }
       previous, current = key, key
     end
@@ -107,7 +113,14 @@ function M.buildChunkPlan(job, calibration)
     -- DFS parent/walk representation above.
     optimizedWalk = optimized,
     optimizedRoute = optimizedOrder,
-    route = optimizedOrder,
+    -- `route` is a legacy alias.  It must be a separate array because the
+    -- runtime state is saved with textutils.serialize, which rejects shared
+    -- table references even when the values are otherwise valid.
+    route = (function()
+      local copy = {}
+      for index, key in ipairs(optimizedOrder) do copy[index] = key end
+      return copy
+    end)(),
     columns = columns,
     selectedChunks = #keys,
     excludedCount = excludedCount,
@@ -284,23 +297,3 @@ local function catalogGraph(catalog)
     local minZ, maxZ = integerValue(source.minZ), integerValue(source.maxZ)
     local cells = integerValue(source.cells, 1, MAX_COLUMNS)
     if not cx or not cz or not minX or not maxX or not minZ or not maxZ or maxX < minX or maxZ < minZ or not cells or cells < 1 then
-      return nil, "invalid_chunk_catalog"
-    end
-    if chunks[key] then return nil, "duplicate_chunk_key" end
-    chunks[key] = {
-      key = key, mode = "world", cx = cx, cz = cz,
-      minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ, cells = cells,
-    }
-    keys[#keys + 1] = key
-    if #keys > MAX_CHUNKS then return nil, "too_many_chunks" end
-  end
-  if #keys == 0 then return nil, "empty_chunk_catalog" end
-  table.sort(keys, function(left, right) return chunkComparator(chunks[left], chunks[right]) end)
-  buildNeighborGraph(chunks, keys)
-  return chunks, keys
-end
-
-local function graphConnected(chunks, keys)
-  local root = keys[1]
-  local queue, head, tail = { root }, 1, 1
-  local seen = { [root] = true }

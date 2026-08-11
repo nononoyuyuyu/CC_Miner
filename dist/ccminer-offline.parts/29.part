@@ -1,3 +1,36 @@
+
+  local modems = wirelessModems()
+  if #modems > 0 then finding("PASS", "modem", table.concat(modems, ", "))
+  elseif role == "worker" or role == "controller" or role == "gps" then finding("FAIL", "modem", "no wireless modem detected")
+  else finding("WARN", "modem", "role is not configured") end
+
+  local gpsApi = gps and type(gps.locate) == "function"
+  local gpsConfig = type(config.gps) == "table" and config.gps or {}
+  if role == "worker" and gpsConfig.enabled == false then finding("WARN", "gps.api", "disabled in config")
+  elseif gpsApi then finding("PASS", "gps.api", "gps.locate available")
+  elseif role == "worker" and gpsConfig.required == true then finding("FAIL", "gps.api", "required GPS API unavailable")
+  else finding("WARN", "gps.api", "gps.locate unavailable") end
+
+  if role == "worker" then
+    if not turtle then
+      finding("FAIL", "turtle", "worker role is running without a turtle API")
+    else
+      local sides = {
+        { "inventory.output", config.outputSide or "back", true },
+        { "inventory.fuel", config.fuelSide or "top", true },
+      }
+      if (config.lavaMode or "seal") == "seal" then sides[#sides + 1] = { "inventory.seal", config.sealSide or "right", true } end
+      local usedSides = {}
+      for _, item in ipairs(sides) do
+        local side = tostring(item[2])
+        if usedSides[side] then finding("WARN", item[1], "same side as another inventory: " .. side) end
+        usedSides[side] = true
+        if inventoryAvailable(side) then
+          local slots = inventorySlots(side)
+          finding("PASS", item[1], side .. (slots and (" (" .. slots .. " slots)") or ""))
+        else finding("FAIL", item[1], "inventory missing on " .. side) end
+      end
+      local fuel, fuelLimit = fuelStatus()
       if fuel == nil then finding("FAIL", "fuel.api", "turtle fuel API unavailable")
       elseif fuel == "unlimited" then finding("PASS", "fuel", "unlimited")
       else
@@ -186,38 +219,3 @@ elseif command == "status" then
   if config.role == "worker" then
     local state, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
     if stateError then reportError(stateError) end
-    print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
-    if state.pose then print(("Pose: x=%s y=%s z=%s dir=%s"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir)) end
-    print("GPS calibrated: " .. tostring(config.gps and config.gps.calibration ~= nil))
-    print("Lava mode: " .. tostring(config.lavaMode))
-    printStatusFeature("Lighting", state.lighting, config.lighting or config.lightMode)
-    printStatusFeature("Water", state.water, config.water or config.waterMode)
-    printStatusFeature("Profile", state.profile, config.profile)
-    printStatusFeature("Materials", state.materials, config.materials)
-    printStatusFeature("Staged stop", state.stagedStop, config.stagedStop)
-    if state.job then print(("Job: %s %s/%s [%s]"):format(tostring(state.job.name), tostring(state.job.cursor), tostring(state.job.total), tostring(state.job.strategy))) end
-    if state.lastError then print("Error: " .. tostring(state.lastError)) end
-  elseif config.role == "gps" then
-    print(("Coordinates: %s, %s, %s"):format(config.x, config.y, config.z))
-  end
-elseif command == "logs" then
-  if not fs.exists(common.LOG_PATH) then print("No log file yet."); return end
-  local handle = fs.open(common.LOG_PATH, "r")
-  local lines = {}
-  while true do
-    local line = handle.readLine()
-    if not line then break end
-    lines[#lines + 1] = line
-    if #lines > 30 then table.remove(lines, 1) end
-  end
-  handle.close()
-  for _, line in ipairs(lines) do print(line) end
-elseif command == "update" then
-  if not http then reportError("HTTP API is disabled."); return end
-  shell.run("wget", "run", "https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua", "update")
-else
-  reportError("Unknown command: " .. command)
-  printHelp()
-end
-]] },
-}

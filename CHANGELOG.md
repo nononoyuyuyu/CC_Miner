@@ -14,6 +14,9 @@
 - 通常 serpentine の高速化、除外時 DFS／グラフ計算の高速化、adaptive service、render cache、stack compression を追加。未使用の optimizedWalk は採用しない
 - ACK/status の保持と再試行、補助 journal（maxEntries／size rotate／checkpoint）を追加。journal は state.db の代替ではない
 - チャンクロード状態の取得・表示・自動化、管理者機能、単一フットプリントの自動分割は提供しない
+- setup が生成する startup marker の改行欠落による line 4 構文エラーを修正し、回帰テストを追加
+- preflight で LIGHT OFF、local GPS、十分な fuel を不要な warning ではなく OK と表示
+- controller DB の leases alias／永続化 draft と worker chunk plan の共有 table 参照で CC serializer が失敗する問題を修正し、CC 互換回帰テストを追加
 
 ## 2.1.0
 

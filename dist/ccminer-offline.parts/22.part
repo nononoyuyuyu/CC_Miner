@@ -1,3 +1,45 @@
+    elseif sealItems[item.name] == true then destination = seal end
+    local targetName = destination == valuable and (settings.valuableTarget or "") or destination == seal and (settings.sealTarget or "") or (settings.bulkTarget or "")
+    pcall(source.pushItems, targetName, slot, item.count)
+  end
+end
+]] },
+  { target = [[controller_parts/02.part]], content = [[-- CC Miner V3 - adaptive touch views.  Every view has a keyboard fallback and
+-- uses bounded hitboxes, so a 20x8 monitor remains operable.
+
+local fieldOrder = { "width", "length", "depth", "targetY" }
+local fieldLabels = { width = "WIDTH", length = "LENGTH", depth = "DEPTH", targetY = "TARGET Y" }
+local fieldLimits = { width = 128, length = 512, depth = 128, targetY = 32000 }
+
+local function currentFieldOrder()
+  if draft and draftCalibration() then return { "width", "length", "targetY" } end
+  return { "width", "length", "depth" }
+end
+
+local function commitDraftField()
+  if not draft then return end
+  local field = draft.selectedField or "width"
+  local value = tonumber(draft.buffer)
+  if not value then value = draft[field] or 1 end
+  value = common.clamp(math.floor(value), fieldLimits[field] and -fieldLimits[field] or 1, fieldLimits[field] or 512)
+  if field ~= "targetY" then value = math.max(1, value) end
+  draft[field], draft.buffer = value, tostring(value)
+end
+
+local function chooseDraftField(field)
+  commitDraftField()
+  draft.selectedField = field
+  draft.buffer = tostring(draft[field] or 0)
+end
+
+local function draftDigit(digit)
+  if not draft then return end
+  local buffer = tostring(draft.buffer or "")
+  if tostring(digit) == "-" then
+    if draft.selectedField == "targetY" and buffer:sub(1, 1) ~= "-" then draft.buffer = "-" .. (buffer == "0" and "" or buffer) end
+    return
+  end
+  if buffer == "0" then buffer = "" end
   if #buffer < 6 then draft.buffer = buffer .. tostring(digit) end
 end
 
@@ -165,44 +207,3 @@ local function chunkGrid(catalog)
   local xIndex, zIndex = {}, {}
   for index, value in ipairs(xValues) do xIndex[value] = index end
   for index, value in ipairs(zValues) do zIndex[value] = index end
-  return byCoordinate, xValues, zValues, xIndex, zIndex
-end
-
-local function toggleChunk(chunk, catalog, rootKey)
-  if not draft then return end
-  if not chunk or chunk.key == rootKey then setNotice("Entrance chunk is locked.", true); return end
-  draft.excluded = draft.excluded or {}
-  if draft.rectMode and draft.rectStart then
-    local sx, sz = draft.rectStart.cx, draft.rectStart.cz
-    local minX, maxX = math.min(sx, chunk.cx), math.max(sx, chunk.cx)
-    local minZ, maxZ = math.min(sz, chunk.cz), math.max(sz, chunk.cz)
-    for _, candidate in ipairs(catalog or {}) do
-      if candidate.key ~= rootKey then
-        local inside = candidate.cx >= minX and candidate.cx <= maxX and candidate.cz >= minZ and candidate.cz <= maxZ
-        draft.excluded[candidate.key] = not inside
-      end
-    end
-    draft.rectStart = nil; draft.rectMode = false
-    setNotice("RECT mining selection applied to whole chunks.", false)
-  elseif draft.rectMode then
-    draft.rectStart = { cx = tonumber(chunk.cx), cz = tonumber(chunk.cz), key = chunk.key }
-    setNotice("RECT first point stored; touch a second chunk.", false)
-  else
-    draft.excluded[chunk.key] = not draft.excluded[chunk.key]
-  end
-  invalidate()
-end
-
-local function allGrid(value)
-  local catalog, err, _, _, rootKey = gridCatalog()
-  if not catalog then setNotice(err, true); return end
-  normalizeChunkMask(catalog, rootKey)
-  draft.excluded = draft.excluded or {}
-  for _, chunk in ipairs(catalog) do if chunk.key ~= rootKey then draft.excluded[chunk.key] = not (value == true) end end
-  draft.partialMask = false
-  setNotice(value == true and "ALL: all chunks selected for mining." or "CLEAR: all non-entry chunks deselected.", false)
-  invalidate()
-end
-
-local function invertGrid()
-  local catalog, err, _, _, rootKey = gridCatalog()

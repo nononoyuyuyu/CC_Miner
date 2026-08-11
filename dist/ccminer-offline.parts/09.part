@@ -1,3 +1,22 @@
+
+local function profileReserveEmptySlots()
+  local materials = config.materials or {}
+  local base = math.max(0, math.floor(tonumber(materials.reserveEmptySlots or config.reserveEmptySlots) or 3))
+  local profile = effectiveProfile()
+  if profile == "safe" then return math.min(8, base + 2) end
+  if profile == "turbo" then return math.max(1, base - 1) end
+  return base
+end
+
+local function profileFuelBuffer()
+  local base = math.max(0, tonumber(config.fuelBuffer) or 256)
+  if effectiveProfile() == "safe" then return math.ceil(base * 1.5) end
+  -- Turbo may not reduce the configured fuel safety margin.  There is no
+  -- speed-up worth weakening the return-home guarantee, so retain base.
+  return base
+end
+
+local function profileCompactEvery()
   local materials = config.materials or {}
   local base = math.max(0, math.floor(tonumber(materials.compactEveryMoves or config.compactEveryMoves) or 32))
   local profile = effectiveProfile()
@@ -310,17 +329,3 @@ local function statusPayload()
       last = state.water and common.copy(state.water.last) or nil,
     },
     materials = {
-      torchCount = torchMaterialCount(),
-      sealCount = sealMaterialCount(),
-      recycled = state.stats.recycledBlocks or state.stats.recycled or 0,
-      retained = state.recycle and state.recycle.held or 0,
-      overflow = state.recycle and state.recycle.overflow or 0,
-    },
-    stagedStop = state.stagedStop == false and false or (state.stagedStop and common.copy(state.stagedStop) or nil),
-    progress = progress,
-    report = state.report and common.copy(state.report) or nil,
-    lastReport = state.report and common.copy(state.report) or state.lastReport,
-    jobReport = state.jobReport and common.copy(state.jobReport) or nil,
-    estimate = state.estimate and common.copy(state.estimate) or nil,
-    capabilities = {
-      gps = true,

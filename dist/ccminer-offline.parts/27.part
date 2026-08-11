@@ -1,3 +1,27 @@
+    config.queueEnabled = common.promptYesNo("Enable job queue", config.queueEnabled ~= false)
+    config.overlapProtection = common.promptYesNo("Protect overlapping jobs", config.overlapProtection ~= false)
+    config.adaptiveRefresh = common.promptYesNo("Enable adaptive refresh", config.adaptiveRefresh ~= false)
+    local sorting = ensureTable(config, "sorting", controllerDefaults.sorting)
+    sorting.enabled = common.promptYesNo("Enable automatic item sorting", sorting.enabled == true)
+    if sorting.enabled then
+      sorting.interval = common.promptNumber("Sorting interval (seconds)", validInteger(sorting.interval, 30, 1, 86400), 1, 86400)
+      sorting.source = peripheralNamePrompt("Sorting source inventory", sorting.source)
+      sorting.valuableTarget = peripheralNamePrompt("Valuable-items inventory", sorting.valuableTarget)
+      sorting.bulkTarget = peripheralNamePrompt("Bulk-items inventory", sorting.bulkTarget)
+      sorting.sealTarget = peripheralNamePrompt("Seal-block inventory", sorting.sealTarget)
+    end
+    config.controllerName = common.prompt("Controller name", config.controllerName or common.safeComputerLabel("Control"), function(value)
+      return #value >= 1 and #value <= 20, "Use 1 to 20 characters."
+    end)
+    config.monitorTextScale = tonumber(common.prompt("Monitor text scale", validNumber(config.monitorTextScale, 0.5, 0.5, 5), function(value)
+      local number = tonumber(value)
+      if not number or number < 0.5 or number > 5 or number * 2 ~= math.floor(number * 2) then
+        return false, "Use 0.5, 1.0, 1.5 ... 5.0."
+      end
+      return true
+    end))
+    config.touchEnabled = common.promptYesNo("Enable monitor touch controls", config.touchEnabled ~= false)
+    alerts.enabled = common.promptYesNo("Enable controller alerts", alerts.enabled ~= false)
     if alerts.enabled then
       alerts.speaker = common.promptYesNo("Use speaker alerts", alerts.speaker ~= false)
       alerts.redstone = common.promptYesNo("Use redstone alerts", alerts.redstone ~= false)
@@ -33,7 +57,7 @@ if existingStartup and not existingStartup:find(startupMarker, 1, true) then
   if not backupOk then error("Cannot preserve existing startup.lua: " .. tostring(backupError), 0) end
 end
 
-local startup = startupMarker .. [[
+local startup = startupMarker .. "\n" .. [[
 if fs.exists("/startup.user.lua") then
   local ok, err = pcall(function() shell.run("/startup.user.lua") end)
   if not ok then printError("User startup failed: " .. tostring(err)) end
@@ -279,39 +303,3 @@ end
 
 local function printWorkerReport(state)
   print("Worker report")
-  local current = state.currentReport or state.activeReport or state.progressReport or state.currentJobReport
-  local last = state.lastReport or state.report or state.lastJobReport or state.completionReport
-  if current then printReportTable("Current report", current) else print("Current report: none") end
-  if last then printReportTable("Last report", last) else print("Last report: none") end
-  -- V3 keeps both names while older state files only have `report`; show both
-  -- when they are genuinely distinct so no completion data is hidden.
-  if state.report and state.report ~= last then printReportTable("Report", state.report) end
-  if state.jobReport and state.jobReport ~= last and state.jobReport ~= state.report then
-    printReportTable("Job report", state.jobReport)
-  end
-  local stats = type(state.stats) == "table" and state.stats or {}
-  print("Stats")
-  for _, key in ipairs(sortedKeys(stats)) do
-    if type(stats[key]) ~= "table" then print("  " .. tostring(key) .. ": " .. valueString(stats[key])) end
-  end
-  if state.job then
-    local job = state.job
-    print(("Job: %s %s/%s (%s%%)"):format(
-      tostring(job.name or job.id or "-"), tostring(job.cursor or 0), tostring(job.total or 0),
-      tostring(common.percent and common.percent(job.cursor or 0, job.total or 0) or 0)
-    ))
-  else
-    print("Job: none")
-  end
-end
-
-local function printControllerReport(config)
-  print("Controller history report")
-  local loaded, loadedPath, loadError
-  for _, path in ipairs(controllerDbCandidates(config)) do
-    local candidate, err = readTableNoWrite(path)
-    if candidate then loaded, loadedPath = candidate, path; break end
-    loadError = err
-  end
-  if not loaded then
-    print("History: none (controller.db not found)")

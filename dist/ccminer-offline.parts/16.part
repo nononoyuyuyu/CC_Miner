@@ -1,3 +1,26 @@
+    if not preserveCheckpoint then state.checkpoint = nil end
+    state.status, state.phase = "paused", "home_paused"
+  else
+    state.checkpoint = nil
+    state.status, state.phase = "working", "mining"
+  end
+  saveState()
+  heartbeat(true)
+end
+
+local function continueService()
+  if not state.service then return true end
+  state.status = "working"
+  if not isHome() then
+    state.phase = "returning"
+    saveState()
+    local ok, err
+    if state.job and state.job.strategy == "chunk_plan" then
+      ok, err = navigateChunkPlanHome("service")
+    else
+      ok, err = navigateTo({ x = 0, y = 0, z = 0 }, "home", "service")
+    end
+    if not ok then
       if err == "control_request" then return false end
       markBlocked("Return to home failed: " .. tostring(err))
       return false
@@ -278,21 +301,3 @@ local function runChunkPlanStep(job)
   if not chunk then markBlocked("Chunk plan references an unknown chunk: " .. tostring(walkStep.key)); return end
   local y = -route.layer
   local anchor = { x = chunk.anchor.x, y = y, z = chunk.anchor.z }
-
-  if route.phase == "travel" then
-    local ok, err
-    if samePosePosition(state.pose, anchor) then
-      ok = true
-    elseif route.currentKey and route.currentKey ~= walkStep.key then
-      ok, err = moveBetweenChunkAnchors(plan, route.currentKey, walkStep.key, y, "mining")
-    else
-      ok, err = navigateTo(anchor, "inside", "mining")
-    end
-    if not ok then
-      if handleMoveFailure("Chunk transit failed", err, false) then return end
-      markBlocked("Chunk transit failed: " .. tostring(err)); return
-    end
-    route.currentKey = walkStep.key
-    if walkStep.first then
-      route.phase, route.localCursor = "mine", 0
-    else

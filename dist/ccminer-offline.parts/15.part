@@ -1,3 +1,23 @@
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "No empty slot available while refueling."
+    end
+    turtle.select(slot)
+    local sucked = suckFunction(1)
+    if not sucked then
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Fuel inventory is empty."
+    end
+    if not turtle.refuel(0) then
+      dropFunction()
+      restoreSideDirection(fuelSide, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Fuel inventory contains a non-fuel item."
+    end
+    local before = fuelLevel()
+    local consumed = turtle.refuel(1)
+    local after = fuelLevel()
     if not consumed then
       dropFunction()
       restoreSideDirection(fuelSide, restoreDir)
@@ -256,26 +276,3 @@ local function finishService()
     state.lastReport = common.copy(state.report)
     state.jobReport = common.copy(state.report)
   elseif finalStatus == "paused" then
-    if not preserveCheckpoint then state.checkpoint = nil end
-    state.status, state.phase = "paused", "home_paused"
-  else
-    state.checkpoint = nil
-    state.status, state.phase = "working", "mining"
-  end
-  saveState()
-  heartbeat(true)
-end
-
-local function continueService()
-  if not state.service then return true end
-  state.status = "working"
-  if not isHome() then
-    state.phase = "returning"
-    saveState()
-    local ok, err
-    if state.job and state.job.strategy == "chunk_plan" then
-      ok, err = navigateChunkPlanHome("service")
-    else
-      ok, err = navigateTo({ x = 0, y = 0, z = 0 }, "home", "service")
-    end
-    if not ok then

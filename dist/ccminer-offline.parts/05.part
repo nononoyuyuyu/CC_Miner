@@ -309,9 +309,6 @@ end
 local function optimizedWalk(chunks, keys, rootKey)
   local walk, order, visited = {}, {}, { [rootKey] = true }
   local current = rootKey
-  chunks[rootKey].optimizedAnchor = chunks[rootKey].anchor
-  walk[1] = { key = rootKey, first = true, anchor = chunks[rootKey].anchor }
-  order[1] = rootKey
-  while #order < #keys do
-    local nextKey
-    for _, neighbor in ipairs(chunks[current].neighbors or {}) do
+  -- Every plan is persisted in worker state.  CC:Tweaked's serializer rejects
+  -- shared table references, so keep compatibility fields as independent
+  -- point values instead of aliasing the chunk's anchor table.

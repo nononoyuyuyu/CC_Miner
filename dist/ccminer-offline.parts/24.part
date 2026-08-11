@@ -1,3 +1,34 @@
+    for row = 0, rows - 1 do
+      local cz = zValues[row + 1]
+      for col = 0, cols - 1 do
+        local cx = xValues[col + 1]
+        local chunk = cx and cz and byCoordinate[tostring(cx) .. ":" .. tostring(cz)] or nil
+        if chunk then
+        local state = progressChunkState(data, chunk, row * cols + col + 1, excludedSet)
+        local bg = colors and colors[progressColors[state] or "gray"] or nil
+        local glyph = ({ unknown = "?", queued = "Q", working = "W", complete = "+", excluded = "X", blocked = "B", service = "S" })[state] or "?"
+        local px, py = 2 + col * cellWidth, 4 + row
+        common.writeAt(px, py, common.center(glyph, cellWidth), colors and colors.white or nil, bg)
+        end
+      end
+    end
+    common.writeAt(1, math.max(3, height - 5), common.fit("? unknown Q queued W working + complete X excluded B blocked S service (one tile=one chunk)", width), colors and colors.lightGray or nil)
+  end
+  buttonRow(key, math.max(1, height - 2), width, {
+    { "STOP", function() mode = "stop_menu" end }, { "REFRESH", function() invalidate() end }, { "BACK", function() mode = "dashboard" end },
+  })
+  noticeLine(target, height)
+end
+
+local function renderStopMenu(target, key)
+  local width, height = target.getSize()
+  writeHeader("STAGED STOP", target, colors and colors.orange or nil)
+  common.writeAt(1, 2, common.fit("Select a boundary; payload is command=stop, mode=...", width), colors and colors.lightGray or nil)
+  local id = selectedWorker()
+  local function action(stopMode, message)
+    return function() setNotice(message, false); stageStop(id, stopMode); mode = "dashboard" end
+  end
+  buttonRow(key, 4, width, { { "PAUSE NOW", action("pause_now", "Pause requested now.") }, { "FINISH ROW", action("finish_row", "Finish current row then stop.") } })
   buttonRow(key, 5, width, { { "FINISH LAYER", action("finish_layer", "Finish current layer then stop.") }, { "RETURN HOME", action("return_home", "Return-home stop requested.") } })
   buttonRow(key, math.max(6, height - 3), width, { { "ABORT", action("abort", "Abort requested.") }, { "BACK", function() mode = "dashboard" end } })
   noticeLine(target, height)
@@ -168,57 +199,3 @@ local function processChar(character)
   elseif character == "l" then dashboardAction("gps")()
   elseif character == "q" then running = false end
 end
-
-local function processKey(keyCode)
-  if keys and keyCode == keys.escape then
-    if mode == "dashboard" then
-      running = false
-    else
-      mode, draft, confirmState = "dashboard", nil, nil
-      invalidate()
-    end
-    return
-  end
-  if mode == "dashboard" then
-    local ids = orderedIds()
-    if keys and keyCode == keys.up then
-      selected = math.max(1, selected - 1)
-      invalidate()
-    elseif keys and keyCode == keys.down then
-      selected = math.min(math.max(1, #ids), selected + 1)
-      invalidate()
-    elseif keys and keyCode == keys.enter then
-      mode = "info"
-      invalidate()
-    end
-  elseif mode == "job_dimensions" then
-    if keys and keyCode == keys.backspace then
-      draftBackspace()
-      invalidate()
-    elseif keys and keyCode == keys.tab then
-      local position = 1
-      local fields = currentFieldOrder()
-      for index, field in ipairs(fields) do
-        if field == draft.selectedField then position = index end
-      end
-      chooseDraftField(fields[position % #fields + 1])
-      invalidate()
-    elseif keys and keyCode == keys.enter then
-      commitDraftField()
-      mode = "job_grid"
-      invalidate()
-    elseif keys and keyCode == keys.left then
-      adjustDraft(draft.selectedField or "width", -1)
-      invalidate()
-    elseif keys and keyCode == keys.right then
-      adjustDraft(draft.selectedField or "width", 1)
-      invalidate()
-    end
-  elseif mode == "job_grid" or mode == "job_chunks" then
-    if keys and keyCode == keys.left then
-      draft.gridPageX = math.max(1, (draft.gridPageX or 1) - 1)
-      invalidate()
-    elseif keys and keyCode == keys.right then
-      draft.gridPageX = (draft.gridPageX or 1) + 1
-      invalidate()
-    elseif keys and keyCode == keys.up then

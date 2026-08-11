@@ -1,3 +1,43 @@
+      local relays = {}
+      for _, entry in ipairs(redstoneDevices) do
+        local relay = entry.device
+        if relay and relay.setOutput then
+          pcall(relay.setOutput, side, true)
+          relays[#relays + 1] = relay
+        end
+      end
+      if timer and #relays > 0 then alertTimers[timer] = { relays = relays, side = side } end
+    end
+  end
+  if text and text ~= "" then setNotice(text, kind == "blocked") end
+end
+
+local function clearAlert(id, kind)
+  alertLedger[tostring(id) .. ":" .. tostring(kind)] = nil
+end
+
+local function handleMessage(sender, message)
+  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
+  if not valid then return false end
+  if message.kind == "status" then
+    local payload = normalizeStatus(message.payload)
+    local id = tonumber(payload.id)
+    if not id or id ~= tonumber(sender) then return false end
+    workers[id] = workers[id] or {}
+    local previous = workers[id].data
+    workers[id].data = payload
+    workers[id].lastSeen = common.nowSeconds()
+    workers[id].sender = sender
+    acknowledgeQueuedStart(id, payload)
+    local oldStatus = previous and tostring(previous.status or "") or ""
+    local newStatus = tostring(payload.status or "unknown")
+    if newStatus == "complete" and oldStatus ~= "complete" then
+      addHistory(id, payload, payload.completionReason or "complete")
+      releaseLeasesForWorker(id, activeJobId(previous))
+      alert("complete", id, "Worker #" .. tostring(id) .. " completed a job.")
+    elseif newStatus == "aborted" and oldStatus ~= "aborted" then
+      addHistory(id, payload, payload.completionReason or "aborted")
+      releaseLeasesForWorker(id, activeJobId(previous))
     elseif newStatus == "blocked" and oldStatus ~= "blocked" then
       alert("blocked", id, "Worker #" .. tostring(id) .. " is blocked.")
     elseif newStatus == "waiting_fuel" or newStatus == "waiting_output" or newStatus == "waiting_seal" or newStatus == "waiting_torch" or newStatus == "waiting_water" then
@@ -239,22 +279,3 @@ local function computePreflight()
       width = draft.width, length = draft.length, depth = jobDepth,
       chunkMode = chunkMode, excludedChunks = excludedChunks,
       lighting = common.copy(draft.lighting), waterMode = draft.waterMode,
-      targetY = targetY,
-    }, calibration, { torchInterval = interval })
-  end
-  if not estimate and estimateError then planError = estimateError end
-  local id, worker = draftWorker()
-  local data = worker and worker.data or {}
-  local checks = {}
-  local function check(name, state, detail, fatal)
-    checks[#checks + 1] = { name = name, state = state, detail = detail, fatal = fatal == true }
-  end
-  local baseFuelEstimate = estimate and (estimate.minimumFuel or estimate.minFuel) or estimateFuel(blocks, draft.width, draft.length, jobDepth)
-  check("cells", "ok", tostring(estimate and (estimate.surfaceCells or estimate.columns) or (cells - cellExcluded)), false)
-  check("chunks", "ok", tostring((plan and plan.catalogCount or #catalog) - #excludedChunks) .. "/" .. tostring(#catalog), false)
-  check("blocks", "ok", common.humanNumber(estimate and (estimate.blocks or estimate.totalBlocks) or blocks), false)
-  check("fuel", "warn", "need " .. tostring(math.ceil(baseFuelEstimate * profileInfo.fuelMultiplier)) .. " (base " .. tostring(baseFuelEstimate) .. "), worker " .. tostring(data.fuel or "unknown"), false)
-  local torchNeed = profileInfo.effectiveInterval == 0 and 0 or (estimate and (estimate.torches or estimate.estimatedTorches) or math.ceil((blocks or 0) / interval))
-  check("profile", "ok", profileInfo.profile .. " interval=" .. tostring(profileInfo.effectiveInterval), false)
-  check("torches", "warn", tostring(torchNeed) .. " estimated @" .. tostring(profileInfo.effectiveInterval), false)
-  check("exclusions", #excludedChunks > 0 and "warn" or "ok", tostring(#excludedChunks), false)

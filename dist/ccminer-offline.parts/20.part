@@ -1,18 +1,46 @@
+      targetY = targetY,
+    }, calibration, { torchInterval = interval })
+  end
+  if not estimate and estimateError then planError = estimateError end
+  local id, worker = draftWorker()
+  local data = worker and worker.data or {}
+  local checks = {}
+  local function check(name, state, detail, fatal)
+    checks[#checks + 1] = { name = name, state = state, detail = detail, fatal = fatal == true }
+  end
+  local baseFuelEstimate = estimate and (estimate.minimumFuel or estimate.minFuel) or estimateFuel(blocks, draft.width, draft.length, jobDepth)
+  local requiredFuel = math.ceil(baseFuelEstimate * profileInfo.fuelMultiplier)
+  local fuel = tonumber(data.fuel)
+  local fuelState = fuel and fuel >= requiredFuel and "ok" or "warn"
+  local fuelDetail = ("estimate need %d (base %d), worker %s"):format(requiredFuel, baseFuelEstimate, tostring(data.fuel or "unknown"))
+  check("cells", "ok", tostring(estimate and (estimate.surfaceCells or estimate.columns) or (cells - cellExcluded)), false)
+  check("chunks", "ok", tostring((plan and plan.catalogCount or #catalog) - #excludedChunks) .. "/" .. tostring(#catalog), false)
+  check("blocks", "ok", common.humanNumber(estimate and (estimate.blocks or estimate.totalBlocks) or blocks), false)
+  check("fuel", fuelState, fuelDetail, false)
+  local torchNeed = profileInfo.effectiveInterval == 0 and 0 or (estimate and (estimate.torches or estimate.estimatedTorches) or math.ceil((blocks or 0) / interval))
+  check("profile", "ok", profileInfo.profile .. " interval=" .. tostring(profileInfo.effectiveInterval), false)
+  if profileInfo.effectiveInterval == 0 then
+    check("torches", "ok", "0 (lighting off)", false)
+  else
+    check("torches", "warn", tostring(torchNeed) .. " estimated @" .. tostring(profileInfo.effectiveInterval), false)
+  end
+  check("exclusions", #excludedChunks > 0 and "warn" or "ok", tostring(#excludedChunks), false)
   if plan then check("connectivity", "ok", "connected", false) else check("connectivity", "bad", tostring(planError), true) end
   if partialMask then check("selection", "bad", "partial cell mask cannot be sent; select whole chunks", true) end
   if chunkMode == "world" then
     check("GPS", calibration and "ok" or "bad", calibration and "calibrated" or "calibration required", not calibration)
   else
-    check("GPS", "warn", "local mode", false)
+    check("GPS", "ok", "local mode (world features unavailable)", false)
   end
   if id and worker and statusOf(worker) ~= "offline" then check("worker", "ok", workerLabel(worker, id), false)
   else check("worker", "bad", "offline or not selected", true) end
-  local baseFuel = baseFuelEstimate
-  local requiredFuel = math.ceil(baseFuel * profileInfo.fuelMultiplier)
-  local fuel = tonumber(data.fuel)
-  if fuel and fuel ~= math.huge and fuel < requiredFuel then
-    check("worker fuel", "warn", tostring(fuel) .. " (dock refill expected)", false)
-  elseif fuel then check("worker fuel", "ok", tostring(fuel), false) else check("worker fuel", "warn", "unknown", false) end
+  if fuel and fuel >= requiredFuel then
+    check("worker fuel", "ok", ("available %s / need %d"):format(tostring(fuel), requiredFuel), false)
+  elseif fuel then
+    check("worker fuel", "warn", ("available %s / need %d (dock refill expected)"):format(tostring(fuel), requiredFuel), false)
+  else
+    check("worker fuel", "warn", ("unknown / need %d"):format(requiredFuel), false)
+  end
   if data.inventoryEmpty ~= nil then
     check("inventory", tonumber(data.inventoryEmpty) > 0 and "ok" or "warn", tostring(data.inventoryEmpty or 0) .. " empty", false)
   else check("inventory", "warn", "unknown", false) end
@@ -156,7 +184,7 @@ local function startDraft()
     setNotice("One or more workers rejected the job; all assignments were stopped.", true)
     return false
   end
-  db.lastDraft = common.copy(draft)
+  db.lastDraft = persistentDraft(draft)
   db.lastPreset = draft.profile or db.lastPreset
   if draft.queueIndex and db.queue[draft.queueIndex] then
     db.queue[draft.queueIndex].awaiting = { workerId = assignments[1].workerId, jobId = assignments[1].jobId, sentAt = common.nowSeconds() }
@@ -169,38 +197,3 @@ local function startDraft()
 end
 
 local normalizedProfile, normalizedWaterMode, normalizedLighting
-
-local function queueDraft()
-  if not draft then return false end
-  if config.queueEnabled == false then setNotice("Queue is disabled by controller configuration.", true); return false end
-  local previousQueueing = draft.queueing
-  draft.queueing = true
-  local result = computePreflight()
-  draft.queueing = previousQueueing
-  if not result or result.fatal then setNotice("Cannot queue: preflight has a fatal item.", true); return false end
-  local queuedKeys = {}
-  for _, chunk in ipairs(result.catalog or {}) do
-    local excluded = false
-    for _, item in ipairs(result.excludedChunks or {}) do if item.key == chunk.key then excluded = true; break end end
-    if not excluded then queuedKeys[#queuedKeys + 1] = chunk.key end
-  end
-  if result.chunkMode == "world" then
-    local conflict = activeLeaseOverlap(result.chunkMode, draft.workerId, queuedKeys)
-    if conflict then setNotice("Cannot queue: world chunks overlap active job " .. tostring(conflict.jobId or "unknown"), true); return false end
-    for _, queued in ipairs(db.queue or {}) do
-      if queued.chunkMode == "world" and type(queued.chunkKeys) == "table" then
-        local seen = {}; for _, value in ipairs(queued.chunkKeys) do seen[tostring(value)] = true end
-        for _, value in ipairs(queuedKeys) do if seen[tostring(value)] then setNotice("Cannot queue: world chunks overlap another queued job.", true); return false end end
-      end
-    end
-  end
-  local item = common.copy(draft)
-  item.workerId, item.queuedAt = draft.workerId, common.nowSeconds()
-  item.chunkMode, item.chunkKeys = result.chunkMode, queuedKeys
-  item.excludedChunks, item.jobDepth, item.targetY = common.copy(result.excludedChunks), result.jobDepth, result.targetY
-  item.retryAt, item.awaiting = common.nowSeconds(), nil
-  db.queue[#db.queue + 1] = item
-  saveControllerDb()
-  setNotice("Job added to queue.", false)
-  return true
-end

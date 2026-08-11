@@ -1,3 +1,35 @@
+if not config or config.role ~= "gps" then error(err or "GPS host is not configured. Run: ccm setup gps", 0) end
+
+if os.setComputerLabel then os.setComputerLabel(config.gpsName or common.safeComputerLabel("GPS")) end
+local opened = common.openWirelessModems()
+if #opened == 0 then error("No wireless modem found. Attach a wireless modem to this GPS host.", 0) end
+
+common.clear(colors and colors.black or nil, colors and colors.white or nil)
+print("CC Miner V3 GPS Host " .. common.VERSION)
+print("Name: " .. tostring(config.gpsName))
+print(("Coordinates: %d, %d, %d"):format(config.x, config.y, config.z))
+print("Modem: " .. table.concat(opened, ", "))
+print("")
+print("Hosting GPS. Keep this chunk loaded.")
+common.log("INFO", ("GPS host started at %d,%d,%d"):format(config.x, config.y, config.z))
+
+local ok = shell.run("gps", "host", tostring(config.x), tostring(config.y), tostring(config.z))
+if not ok then error("The built-in GPS host program exited unexpectedly.", 0) end
+]] },
+  { target = [[setup.lua]], content = [=[-- CC Miner V3 - interactive configuration
+
+local args = { ... }
+local common = dofile("/ccminer/lib/common.lua")
+local current = common.loadConfig()
+local requestedRole = string.lower(tostring(args[1] or (current and current.role) or ""))
+
+-- Setup is intentionally forgiving when it reads a hand-edited/old config:
+-- malformed values are replaced by a safe default before they are passed to
+-- the interactive validators.  This prevents an invalid stored default from
+-- trapping a user in a prompt loop while preserving every valid old value.
+local function validInteger(value, fallback, minimum, maximum)
+  local number = tonumber(value)
+  if not number or number ~= math.floor(number) then return fallback end
   if minimum and number < minimum then return fallback end
   if maximum and number > maximum then return fallback end
   return number
@@ -193,27 +225,3 @@ else
     local controllerDefaults = common.defaultControllerConfig()
     local alerts = ensureTable(config, "alerts", controllerDefaults.alerts)
     config.historyLimit = common.promptNumber("History entries to retain", validInteger(config.historyLimit, 50, 1, 1000), 1, 1000)
-    config.queueEnabled = common.promptYesNo("Enable job queue", config.queueEnabled ~= false)
-    config.overlapProtection = common.promptYesNo("Protect overlapping jobs", config.overlapProtection ~= false)
-    config.adaptiveRefresh = common.promptYesNo("Enable adaptive refresh", config.adaptiveRefresh ~= false)
-    local sorting = ensureTable(config, "sorting", controllerDefaults.sorting)
-    sorting.enabled = common.promptYesNo("Enable automatic item sorting", sorting.enabled == true)
-    if sorting.enabled then
-      sorting.interval = common.promptNumber("Sorting interval (seconds)", validInteger(sorting.interval, 30, 1, 86400), 1, 86400)
-      sorting.source = peripheralNamePrompt("Sorting source inventory", sorting.source)
-      sorting.valuableTarget = peripheralNamePrompt("Valuable-items inventory", sorting.valuableTarget)
-      sorting.bulkTarget = peripheralNamePrompt("Bulk-items inventory", sorting.bulkTarget)
-      sorting.sealTarget = peripheralNamePrompt("Seal-block inventory", sorting.sealTarget)
-    end
-    config.controllerName = common.prompt("Controller name", config.controllerName or common.safeComputerLabel("Control"), function(value)
-      return #value >= 1 and #value <= 20, "Use 1 to 20 characters."
-    end)
-    config.monitorTextScale = tonumber(common.prompt("Monitor text scale", validNumber(config.monitorTextScale, 0.5, 0.5, 5), function(value)
-      local number = tonumber(value)
-      if not number or number < 0.5 or number > 5 or number * 2 ~= math.floor(number * 2) then
-        return false, "Use 0.5, 1.0, 1.5 ... 5.0."
-      end
-      return true
-    end))
-    config.touchEnabled = common.promptYesNo("Enable monitor touch controls", config.touchEnabled ~= false)
-    alerts.enabled = common.promptYesNo("Enable controller alerts", alerts.enabled ~= false)

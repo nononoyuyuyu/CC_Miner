@@ -1,3 +1,17 @@
+      torchCount = torchMaterialCount(),
+      sealCount = sealMaterialCount(),
+      recycled = state.stats.recycledBlocks or state.stats.recycled or 0,
+      retained = state.recycle and state.recycle.held or 0,
+      overflow = state.recycle and state.recycle.overflow or 0,
+    },
+    stagedStop = state.stagedStop == false and false or (state.stagedStop and common.copy(state.stagedStop) or nil),
+    progress = progress,
+    report = state.report and common.copy(state.report) or nil,
+    lastReport = state.report and common.copy(state.report) or state.lastReport,
+    jobReport = state.jobReport and common.copy(state.jobReport) or nil,
+    estimate = state.estimate and common.copy(state.estimate) or nil,
+    capabilities = {
+      gps = true,
       gpsCalibration = true,
       lavaSeal = true,
       chunkExclusions = true,
@@ -273,23 +287,3 @@ local function startJob(payload)
   state.checkpoint = nil
   state.service = {
     resumeAfter = true,
-    finalStatus = "working",
-    preserveCheckpoint = false,
-    reason = "job_start",
-    startedAt = common.nowSeconds(),
-  }
-  state.request = nil
-  state.stagedStop = false
-  state.status = "working"
-  state.phase = "starting_service"
-  state.lastError = nil
-  state.completionReason = nil
-  state.report = nil
-  state.estimate = {
-    estimated = math.max(1, job.total or 1),
-    actual = 0,
-    variance = 0,
-    startedAt = common.nowSeconds(),
-  }
-  state.lighting.mode = (job.lighting and job.lighting.mode) or (config.lighting and config.lighting.mode) or "off"
-  state.lighting.interval = (job.lighting and job.lighting.interval) or (config.lighting and config.lighting.interval) or 32

@@ -1,3 +1,15 @@
+  if tonumber(config.controllerId or 0) > 0 and tonumber(sender) ~= tonumber(config.controllerId) then return end
+  if message.kind == "discover" then sendStatus(sender, message); return end
+  if message.kind ~= "command" then return end
+  if tonumber(message.target) ~= tonumber(os.getComputerID()) then return end
+  if commandSeen(message.id) then
+    sendAck(sender, message, true, "Duplicate command ignored; previous result retained.")
+    return
+  end
+  local payload = message.payload
+  local command = tostring(payload.command or "")
+  local ok, text = applyControlCommand(command, payload)
+  sendAck(sender, message, ok, text)
   if command == "status" or command == "ping" or command == "gps_fix" then sendStatus(sender, message) end
 end
 
@@ -297,18 +309,3 @@ local function tryPlaceTorchWall(relativeDir)
 
   local slot = selectTorchMaterial()
   if not slot then return restoreContext("torch_material") end
-  local prepared, prepareError = beginPhysicalAction("torch_wall", {
-    side = relativeDir, material = itemName(slot), pose = poseCopy(),
-  }, poseCopy())
-  if not prepared then return restoreContext(prepareError) end
-  local placed, placeError = turtle.place()
-  if placed then
-    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
-    state.lighting.placed = (state.lighting.placed or 0) + 1
-    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
-    commitPhysicalAction()
-  else
-    cancelPhysicalAction()
-  end
-  turtle.select(originalSlot)
-  local restored, restoreError = turnTo(originalDir)

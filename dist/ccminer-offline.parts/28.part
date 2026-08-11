@@ -1,3 +1,39 @@
+  local current = state.currentReport or state.activeReport or state.progressReport or state.currentJobReport
+  local last = state.lastReport or state.report or state.lastJobReport or state.completionReport
+  if current then printReportTable("Current report", current) else print("Current report: none") end
+  if last then printReportTable("Last report", last) else print("Last report: none") end
+  -- V3 keeps both names while older state files only have `report`; show both
+  -- when they are genuinely distinct so no completion data is hidden.
+  if state.report and state.report ~= last then printReportTable("Report", state.report) end
+  if state.jobReport and state.jobReport ~= last and state.jobReport ~= state.report then
+    printReportTable("Job report", state.jobReport)
+  end
+  local stats = type(state.stats) == "table" and state.stats or {}
+  print("Stats")
+  for _, key in ipairs(sortedKeys(stats)) do
+    if type(stats[key]) ~= "table" then print("  " .. tostring(key) .. ": " .. valueString(stats[key])) end
+  end
+  if state.job then
+    local job = state.job
+    print(("Job: %s %s/%s (%s%%)"):format(
+      tostring(job.name or job.id or "-"), tostring(job.cursor or 0), tostring(job.total or 0),
+      tostring(common.percent and common.percent(job.cursor or 0, job.total or 0) or 0)
+    ))
+  else
+    print("Job: none")
+  end
+end
+
+local function printControllerReport(config)
+  print("Controller history report")
+  local loaded, loadedPath, loadError
+  for _, path in ipairs(controllerDbCandidates(config)) do
+    local candidate, err = readTableNoWrite(path)
+    if candidate then loaded, loadedPath = candidate, path; break end
+    loadError = err
+  end
+  if not loaded then
+    print("History: none (controller.db not found)")
     if loadError and loadError ~= "missing" then print("History read warning: " .. tostring(loadError)) end
     return
   end
@@ -235,36 +271,3 @@ local function runDoctor()
   if not labelApi then finding("WARN", "label.api", "getComputerLabel unavailable")
   elseif label and label ~= "" then finding("PASS", "label", tostring(label))
   else finding("WARN", "label", "computer label is not set") end
-
-  local modems = wirelessModems()
-  if #modems > 0 then finding("PASS", "modem", table.concat(modems, ", "))
-  elseif role == "worker" or role == "controller" or role == "gps" then finding("FAIL", "modem", "no wireless modem detected")
-  else finding("WARN", "modem", "role is not configured") end
-
-  local gpsApi = gps and type(gps.locate) == "function"
-  local gpsConfig = type(config.gps) == "table" and config.gps or {}
-  if role == "worker" and gpsConfig.enabled == false then finding("WARN", "gps.api", "disabled in config")
-  elseif gpsApi then finding("PASS", "gps.api", "gps.locate available")
-  elseif role == "worker" and gpsConfig.required == true then finding("FAIL", "gps.api", "required GPS API unavailable")
-  else finding("WARN", "gps.api", "gps.locate unavailable") end
-
-  if role == "worker" then
-    if not turtle then
-      finding("FAIL", "turtle", "worker role is running without a turtle API")
-    else
-      local sides = {
-        { "inventory.output", config.outputSide or "back", true },
-        { "inventory.fuel", config.fuelSide or "top", true },
-      }
-      if (config.lavaMode or "seal") == "seal" then sides[#sides + 1] = { "inventory.seal", config.sealSide or "right", true } end
-      local usedSides = {}
-      for _, item in ipairs(sides) do
-        local side = tostring(item[2])
-        if usedSides[side] then finding("WARN", item[1], "same side as another inventory: " .. side) end
-        usedSides[side] = true
-        if inventoryAvailable(side) then
-          local slots = inventorySlots(side)
-          finding("PASS", item[1], side .. (slots and (" (" .. slots .. " slots)") or ""))
-        else finding("FAIL", item[1], "inventory missing on " .. side) end
-      end
-      local fuel, fuelLimit = fuelStatus()

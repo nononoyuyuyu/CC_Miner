@@ -1,3 +1,21 @@
+
+  if route.phase == "travel" then
+    local ok, err
+    if samePosePosition(state.pose, anchor) then
+      ok = true
+    elseif route.currentKey and route.currentKey ~= walkStep.key then
+      ok, err = moveBetweenChunkAnchors(plan, route.currentKey, walkStep.key, y, "mining")
+    else
+      ok, err = navigateTo(anchor, "inside", "mining")
+    end
+    if not ok then
+      if handleMoveFailure("Chunk transit failed", err, false) then return end
+      markBlocked("Chunk transit failed: " .. tostring(err)); return
+    end
+    route.currentKey = walkStep.key
+    if walkStep.first then
+      route.phase, route.localCursor = "mine", 0
+    else
       route.walkIndex = route.walkIndex + 1
     end
     saveState()
@@ -251,17 +269,3 @@ local function preflight()
         if not state.job and state.status ~= "working" then
           local corrected = geo.worldToLocal(gpsCalibration(), fix, state.pose.dir)
           state.pose = poseCopy(corrected)
-          state.gps.corrections = (state.gps.corrections or 0) + 1
-          common.log("WARN", "GPS corrected idle local coordinates at boot.")
-        else
-          state.status, state.phase = "blocked", "gps_drift"
-          state.lastError = ("Boot GPS mismatch: expected %d,%d,%d, located %d,%d,%d."):format(
-            expected.x, expected.y, expected.z, fix.x, fix.y, fix.z
-          )
-        end
-      end
-    elseif gpsConfig().required then
-      state.status, state.phase = "blocked", "gps_error"
-      state.lastError = "Required GPS fix failed at boot: " .. tostring(fixError)
-    end
-  elseif gpsConfig().required then

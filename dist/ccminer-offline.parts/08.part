@@ -1,3 +1,23 @@
+    width = maxX - minX + 1, length = maxZ - minZ + 1,
+    count = count, cellsCount = count,
+    clipped = minX ~= x1 or maxX ~= x2 or minZ ~= z1 or maxZ ~= z2,
+  }
+  local includeCells = true
+  if type(options) == "table" and options.includeCells == false then includeCells = false end
+  if type(options) == "boolean" then includeCells = options end
+  if includeCells and count <= MAX_SELECTION_CELLS then
+    result.cells = {}
+    for x = minX, maxX do
+      for z = minZ, maxZ do result.cells[#result.cells + 1] = { x = x, z = z } end
+    end
+    result.selectedCells = result.cells
+  elseif includeCells then
+    result.cellsTruncated = true
+  end
+  return result
+end
+
+M.rectangleSelection = M.selectRectangle
 M.selectRect = M.selectRectangle
 M.rectangle = M.selectRectangle
 M.selectRectangleCells = M.selectRectangle
@@ -299,22 +319,3 @@ local function effectiveProfile()
   end
   return profile
 end
-
-local function profileReserveEmptySlots()
-  local materials = config.materials or {}
-  local base = math.max(0, math.floor(tonumber(materials.reserveEmptySlots or config.reserveEmptySlots) or 3))
-  local profile = effectiveProfile()
-  if profile == "safe" then return math.min(8, base + 2) end
-  if profile == "turbo" then return math.max(1, base - 1) end
-  return base
-end
-
-local function profileFuelBuffer()
-  local base = math.max(0, tonumber(config.fuelBuffer) or 256)
-  if effectiveProfile() == "safe" then return math.ceil(base * 1.5) end
-  -- Turbo may not reduce the configured fuel safety margin.  There is no
-  -- speed-up worth weakening the return-home guarantee, so retain base.
-  return base
-end
-
-local function profileCompactEvery()

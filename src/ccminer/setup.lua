@@ -266,7 +266,7 @@ if existingStartup and not existingStartup:find(startupMarker, 1, true) then
   if not backupOk then error("Cannot preserve existing startup.lua: " .. tostring(backupError), 0) end
 end
 
-local startup = startupMarker .. [[
+local startup = startupMarker .. "\n" .. [[
 if fs.exists("/startup.user.lua") then
   local ok, err = pcall(function() shell.run("/startup.user.lua") end)
   if not ok then printError("User startup failed: " .. tostring(err)) end

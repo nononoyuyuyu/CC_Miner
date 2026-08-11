@@ -1,3 +1,44 @@
+  return byCoordinate, xValues, zValues, xIndex, zIndex
+end
+
+local function toggleChunk(chunk, catalog, rootKey)
+  if not draft then return end
+  if not chunk or chunk.key == rootKey then setNotice("Entrance chunk is locked.", true); return end
+  draft.excluded = draft.excluded or {}
+  if draft.rectMode and draft.rectStart then
+    local sx, sz = draft.rectStart.cx, draft.rectStart.cz
+    local minX, maxX = math.min(sx, chunk.cx), math.max(sx, chunk.cx)
+    local minZ, maxZ = math.min(sz, chunk.cz), math.max(sz, chunk.cz)
+    for _, candidate in ipairs(catalog or {}) do
+      if candidate.key ~= rootKey then
+        local inside = candidate.cx >= minX and candidate.cx <= maxX and candidate.cz >= minZ and candidate.cz <= maxZ
+        draft.excluded[candidate.key] = not inside
+      end
+    end
+    draft.rectStart = nil; draft.rectMode = false
+    setNotice("RECT mining selection applied to whole chunks.", false)
+  elseif draft.rectMode then
+    draft.rectStart = { cx = tonumber(chunk.cx), cz = tonumber(chunk.cz), key = chunk.key }
+    setNotice("RECT first point stored; touch a second chunk.", false)
+  else
+    draft.excluded[chunk.key] = not draft.excluded[chunk.key]
+  end
+  invalidate()
+end
+
+local function allGrid(value)
+  local catalog, err, _, _, rootKey = gridCatalog()
+  if not catalog then setNotice(err, true); return end
+  normalizeChunkMask(catalog, rootKey)
+  draft.excluded = draft.excluded or {}
+  for _, chunk in ipairs(catalog) do if chunk.key ~= rootKey then draft.excluded[chunk.key] = not (value == true) end end
+  draft.partialMask = false
+  setNotice(value == true and "ALL: all chunks selected for mining." or "CLEAR: all non-entry chunks deselected.", false)
+  invalidate()
+end
+
+local function invertGrid()
+  local catalog, err, _, _, rootKey = gridCatalog()
   if not catalog then setNotice(err, true); return end
   normalizeChunkMask(catalog, rootKey)
   draft.excluded = draft.excluded or {}
@@ -149,34 +190,3 @@ local function renderProgress(target, key)
     local cellWidth = width >= 48 and 2 or 1
     local cols = common.clamp(math.floor((width - 3) / cellWidth), 1, math.max(1, #xValues))
     local rows = common.clamp(height - 8, 1, math.max(1, #zValues))
-    for row = 0, rows - 1 do
-      local cz = zValues[row + 1]
-      for col = 0, cols - 1 do
-        local cx = xValues[col + 1]
-        local chunk = cx and cz and byCoordinate[tostring(cx) .. ":" .. tostring(cz)] or nil
-        if chunk then
-        local state = progressChunkState(data, chunk, row * cols + col + 1, excludedSet)
-        local bg = colors and colors[progressColors[state] or "gray"] or nil
-        local glyph = ({ unknown = "?", queued = "Q", working = "W", complete = "+", excluded = "X", blocked = "B", service = "S" })[state] or "?"
-        local px, py = 2 + col * cellWidth, 4 + row
-        common.writeAt(px, py, common.center(glyph, cellWidth), colors and colors.white or nil, bg)
-        end
-      end
-    end
-    common.writeAt(1, math.max(3, height - 5), common.fit("? unknown Q queued W working + complete X excluded B blocked S service (one tile=one chunk)", width), colors and colors.lightGray or nil)
-  end
-  buttonRow(key, math.max(1, height - 2), width, {
-    { "STOP", function() mode = "stop_menu" end }, { "REFRESH", function() invalidate() end }, { "BACK", function() mode = "dashboard" end },
-  })
-  noticeLine(target, height)
-end
-
-local function renderStopMenu(target, key)
-  local width, height = target.getSize()
-  writeHeader("STAGED STOP", target, colors and colors.orange or nil)
-  common.writeAt(1, 2, common.fit("Select a boundary; payload is command=stop, mode=...", width), colors and colors.lightGray or nil)
-  local id = selectedWorker()
-  local function action(stopMode, message)
-    return function() setNotice(message, false); stageStop(id, stopMode); mode = "dashboard" end
-  end
-  buttonRow(key, 4, width, { { "PAUSE NOW", action("pause_now", "Pause requested now.") }, { "FINISH ROW", action("finish_row", "Finish current row then stop.") } })

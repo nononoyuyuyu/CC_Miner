@@ -400,8 +400,11 @@ end
 local function optimizedWalk(chunks, keys, rootKey)
   local walk, order, visited = {}, {}, { [rootKey] = true }
   local current = rootKey
-  chunks[rootKey].optimizedAnchor = chunks[rootKey].anchor
-  walk[1] = { key = rootKey, first = true, anchor = chunks[rootKey].anchor }
+  -- Every plan is persisted in worker state.  CC:Tweaked's serializer rejects
+  -- shared table references, so keep compatibility fields as independent
+  -- point values instead of aliasing the chunk's anchor table.
+  chunks[rootKey].optimizedAnchor = { x = chunks[rootKey].anchor.x, z = chunks[rootKey].anchor.z }
+  walk[1] = { key = rootKey, first = true, anchor = { x = chunks[rootKey].anchor.x, z = chunks[rootKey].anchor.z } }
   order[1] = rootKey
   while #order < #keys do
     local nextKey
@@ -423,11 +426,11 @@ local function optimizedWalk(chunks, keys, rootKey)
         order[#order + 1] = key
       end
       local anchor = M.chunkAnchor(chunks[key], chunks[previous]) or chunks[key].anchor
-      if first then chunks[key].optimizedAnchor = anchor end
+      if first then chunks[key].optimizedAnchor = { x = anchor.x, z = anchor.z } end
       walk[#walk + 1] = {
         key = key,
         first = first,
-        anchor = anchor,
+        anchor = { x = anchor.x, z = anchor.z },
       }
       previous, current = key, key
     end
@@ -515,7 +518,14 @@ function M.buildChunkPlan(job, calibration)
     -- DFS parent/walk representation above.
     optimizedWalk = optimized,
     optimizedRoute = optimizedOrder,
-    route = optimizedOrder,
+    -- `route` is a legacy alias.  It must be a separate array because the
+    -- runtime state is saved with textutils.serialize, which rejects shared
+    -- table references even when the values are otherwise valid.
+    route = (function()
+      local copy = {}
+      for index, key in ipairs(optimizedOrder) do copy[index] = key end
+      return copy
+    end)(),
     columns = columns,
     selectedChunks = #keys,
     excludedCount = excludedCount,

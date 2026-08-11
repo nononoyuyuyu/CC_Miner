@@ -1,3 +1,17 @@
+          state.gps.corrections = (state.gps.corrections or 0) + 1
+          common.log("WARN", "GPS corrected idle local coordinates at boot.")
+        else
+          state.status, state.phase = "blocked", "gps_drift"
+          state.lastError = ("Boot GPS mismatch: expected %d,%d,%d, located %d,%d,%d."):format(
+            expected.x, expected.y, expected.z, fix.x, fix.y, fix.z
+          )
+        end
+      end
+    elseif gpsConfig().required then
+      state.status, state.phase = "blocked", "gps_error"
+      state.lastError = "Required GPS fix failed at boot: " .. tostring(fixError)
+    end
+  elseif gpsConfig().required then
     state.status, state.phase = "blocked", "gps_error"
     state.lastError = "GPS is required but no calibration is stored."
   end
@@ -78,7 +92,7 @@ local function dbDefaults()
     queue = {},
     history = {},
     leases = {},
-    activeLeases = {}, -- alias retained for tools written against the V3 draft format.
+    activeLeases = {}, -- independent compatibility snapshot for V3 draft tools.
     lastPreset = nil,
     lastDraft = nil,
     updatedAt = common.nowSeconds(),
@@ -87,18 +101,42 @@ end
 
 local db = dbDefaults()
 local dbError = nil
+
+-- Drafts carry UI-only preflight data.  That data includes chunk plans with
+-- compatibility aliases (for example `route`/`optimizedRoute`) which
+-- textutils.serialize cannot encode.  Keep only the durable form when a
+-- draft is copied into the controller database; copy each field separately
+-- so an accidental shared reference between fields cannot leak into storage.
+local function persistentDraft(source)
+  local value = {}
+  if type(source) ~= "table" then return value end
+  for key, item in pairs(source) do
+    if key ~= "preflight" and key ~= "queueIndex" and key ~= "awaiting" then
+      value[key] = common.copy(item)
+    end
+  end
+  return value
+end
+
 local function loadControllerDb()
   local loaded, err = common.loadTable(DB_PATH, dbDefaults())
   db = common.merge(dbDefaults(), loaded or {})
-  db.leases = db.leases or db.activeLeases or {}
-  db.activeLeases = db.leases
+  -- `leases` is authoritative for V3.  Fall back to the old draft alias only
+  -- when a legacy file has no leases table at all.
+  if type(loaded) == "table" and type(loaded.leases) ~= "table" and type(loaded.activeLeases) == "table" then
+    db.leases = common.copy(loaded.activeLeases)
+  end
+  db.leases = type(db.leases) == "table" and db.leases or {}
+  db.activeLeases = common.copy(db.leases)
   db.presets, db.queue, db.history = db.presets or {}, db.queue or {}, db.history or {}
   dbError = err
 end
 
 local function saveControllerDb()
   db.schema, db.version, db.updatedAt = common.SCHEMA, common.VERSION, common.nowSeconds()
-  db.activeLeases = db.leases or {}
+  -- Keep the compatibility field, but never point it at `leases`: CC's
+  -- serializer rejects repeated table references.
+  db.activeLeases = common.copy(db.leases or {})
   local ok, err = common.saveTable(DB_PATH, db)
   if not ok then dbError = err end
   return ok, err
@@ -275,43 +313,3 @@ local function alert(kind, id, text)
       pcall(redstone.setOutput, side, true)
       if timer then alertTimers[timer] = { global = true, side = side } end
     else
-      local relays = {}
-      for _, entry in ipairs(redstoneDevices) do
-        local relay = entry.device
-        if relay and relay.setOutput then
-          pcall(relay.setOutput, side, true)
-          relays[#relays + 1] = relay
-        end
-      end
-      if timer and #relays > 0 then alertTimers[timer] = { relays = relays, side = side } end
-    end
-  end
-  if text and text ~= "" then setNotice(text, kind == "blocked") end
-end
-
-local function clearAlert(id, kind)
-  alertLedger[tostring(id) .. ":" .. tostring(kind)] = nil
-end
-
-local function handleMessage(sender, message)
-  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
-  if not valid then return false end
-  if message.kind == "status" then
-    local payload = normalizeStatus(message.payload)
-    local id = tonumber(payload.id)
-    if not id or id ~= tonumber(sender) then return false end
-    workers[id] = workers[id] or {}
-    local previous = workers[id].data
-    workers[id].data = payload
-    workers[id].lastSeen = common.nowSeconds()
-    workers[id].sender = sender
-    acknowledgeQueuedStart(id, payload)
-    local oldStatus = previous and tostring(previous.status or "") or ""
-    local newStatus = tostring(payload.status or "unknown")
-    if newStatus == "complete" and oldStatus ~= "complete" then
-      addHistory(id, payload, payload.completionReason or "complete")
-      releaseLeasesForWorker(id, activeJobId(previous))
-      alert("complete", id, "Worker #" .. tostring(id) .. " completed a job.")
-    elseif newStatus == "aborted" and oldStatus ~= "aborted" then
-      addHistory(id, payload, payload.completionReason or "aborted")
-      releaseLeasesForWorker(id, activeJobId(previous))

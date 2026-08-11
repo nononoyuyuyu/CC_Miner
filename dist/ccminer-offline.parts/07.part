@@ -1,3 +1,23 @@
+      return nil, "invalid_chunk_catalog"
+    end
+    if chunks[key] then return nil, "duplicate_chunk_key" end
+    chunks[key] = {
+      key = key, mode = "world", cx = cx, cz = cz,
+      minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ, cells = cells,
+    }
+    keys[#keys + 1] = key
+    if #keys > MAX_CHUNKS then return nil, "too_many_chunks" end
+  end
+  if #keys == 0 then return nil, "empty_chunk_catalog" end
+  table.sort(keys, function(left, right) return chunkComparator(chunks[left], chunks[right]) end)
+  buildNeighborGraph(chunks, keys)
+  return chunks, keys
+end
+
+local function graphConnected(chunks, keys)
+  local root = keys[1]
+  local queue, head, tail = { root }, 1, 1
+  local seen = { [root] = true }
   while head <= tail do
     local key = queue[head]; head = head + 1
     for _, neighbor in ipairs(chunks[key].neighbors or {}) do
@@ -256,23 +276,3 @@ function M.selectRectangle(bounds, x1, z1, x2, z2, options)
   local count = (maxX - minX + 1) * (maxZ - minZ + 1)
   local result = {
     minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
-    width = maxX - minX + 1, length = maxZ - minZ + 1,
-    count = count, cellsCount = count,
-    clipped = minX ~= x1 or maxX ~= x2 or minZ ~= z1 or maxZ ~= z2,
-  }
-  local includeCells = true
-  if type(options) == "table" and options.includeCells == false then includeCells = false end
-  if type(options) == "boolean" then includeCells = options end
-  if includeCells and count <= MAX_SELECTION_CELLS then
-    result.cells = {}
-    for x = minX, maxX do
-      for z = minZ, maxZ do result.cells[#result.cells + 1] = { x = x, z = z } end
-    end
-    result.selectedCells = result.cells
-  elseif includeCells then
-    result.cellsTruncated = true
-  end
-  return result
-end
-
-M.rectangleSelection = M.selectRectangle

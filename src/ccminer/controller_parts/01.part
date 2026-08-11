@@ -29,7 +29,7 @@ local function dbDefaults()
     queue = {},
     history = {},
     leases = {},
-    activeLeases = {}, -- alias retained for tools written against the V3 draft format.
+    activeLeases = {}, -- independent compatibility snapshot for V3 draft tools.
     lastPreset = nil,
     lastDraft = nil,
     updatedAt = common.nowSeconds(),
@@ -38,18 +38,42 @@ end
 
 local db = dbDefaults()
 local dbError = nil
+
+-- Drafts carry UI-only preflight data.  That data includes chunk plans with
+-- compatibility aliases (for example `route`/`optimizedRoute`) which
+-- textutils.serialize cannot encode.  Keep only the durable form when a
+-- draft is copied into the controller database; copy each field separately
+-- so an accidental shared reference between fields cannot leak into storage.
+local function persistentDraft(source)
+  local value = {}
+  if type(source) ~= "table" then return value end
+  for key, item in pairs(source) do
+    if key ~= "preflight" and key ~= "queueIndex" and key ~= "awaiting" then
+      value[key] = common.copy(item)
+    end
+  end
+  return value
+end
+
 local function loadControllerDb()
   local loaded, err = common.loadTable(DB_PATH, dbDefaults())
   db = common.merge(dbDefaults(), loaded or {})
-  db.leases = db.leases or db.activeLeases or {}
-  db.activeLeases = db.leases
+  -- `leases` is authoritative for V3.  Fall back to the old draft alias only
+  -- when a legacy file has no leases table at all.
+  if type(loaded) == "table" and type(loaded.leases) ~= "table" and type(loaded.activeLeases) == "table" then
+    db.leases = common.copy(loaded.activeLeases)
+  end
+  db.leases = type(db.leases) == "table" and db.leases or {}
+  db.activeLeases = common.copy(db.leases)
   db.presets, db.queue, db.history = db.presets or {}, db.queue or {}, db.history or {}
   dbError = err
 end
 
 local function saveControllerDb()
   db.schema, db.version, db.updatedAt = common.SCHEMA, common.VERSION, common.nowSeconds()
-  db.activeLeases = db.leases or {}
+  -- Keep the compatibility field, but never point it at `leases`: CC's
+  -- serializer rejects repeated table references.
+  db.activeLeases = common.copy(db.leases or {})
   local ok, err = common.saveTable(DB_PATH, db)
   if not ok then dbError = err end
   return ok, err
@@ -518,29 +542,38 @@ local function computePreflight()
     checks[#checks + 1] = { name = name, state = state, detail = detail, fatal = fatal == true }
   end
   local baseFuelEstimate = estimate and (estimate.minimumFuel or estimate.minFuel) or estimateFuel(blocks, draft.width, draft.length, jobDepth)
+  local requiredFuel = math.ceil(baseFuelEstimate * profileInfo.fuelMultiplier)
+  local fuel = tonumber(data.fuel)
+  local fuelState = fuel and fuel >= requiredFuel and "ok" or "warn"
+  local fuelDetail = ("estimate need %d (base %d), worker %s"):format(requiredFuel, baseFuelEstimate, tostring(data.fuel or "unknown"))
   check("cells", "ok", tostring(estimate and (estimate.surfaceCells or estimate.columns) or (cells - cellExcluded)), false)
   check("chunks", "ok", tostring((plan and plan.catalogCount or #catalog) - #excludedChunks) .. "/" .. tostring(#catalog), false)
   check("blocks", "ok", common.humanNumber(estimate and (estimate.blocks or estimate.totalBlocks) or blocks), false)
-  check("fuel", "warn", "need " .. tostring(math.ceil(baseFuelEstimate * profileInfo.fuelMultiplier)) .. " (base " .. tostring(baseFuelEstimate) .. "), worker " .. tostring(data.fuel or "unknown"), false)
+  check("fuel", fuelState, fuelDetail, false)
   local torchNeed = profileInfo.effectiveInterval == 0 and 0 or (estimate and (estimate.torches or estimate.estimatedTorches) or math.ceil((blocks or 0) / interval))
   check("profile", "ok", profileInfo.profile .. " interval=" .. tostring(profileInfo.effectiveInterval), false)
-  check("torches", "warn", tostring(torchNeed) .. " estimated @" .. tostring(profileInfo.effectiveInterval), false)
+  if profileInfo.effectiveInterval == 0 then
+    check("torches", "ok", "0 (lighting off)", false)
+  else
+    check("torches", "warn", tostring(torchNeed) .. " estimated @" .. tostring(profileInfo.effectiveInterval), false)
+  end
   check("exclusions", #excludedChunks > 0 and "warn" or "ok", tostring(#excludedChunks), false)
   if plan then check("connectivity", "ok", "connected", false) else check("connectivity", "bad", tostring(planError), true) end
   if partialMask then check("selection", "bad", "partial cell mask cannot be sent; select whole chunks", true) end
   if chunkMode == "world" then
     check("GPS", calibration and "ok" or "bad", calibration and "calibrated" or "calibration required", not calibration)
   else
-    check("GPS", "warn", "local mode", false)
+    check("GPS", "ok", "local mode (world features unavailable)", false)
   end
   if id and worker and statusOf(worker) ~= "offline" then check("worker", "ok", workerLabel(worker, id), false)
   else check("worker", "bad", "offline or not selected", true) end
-  local baseFuel = baseFuelEstimate
-  local requiredFuel = math.ceil(baseFuel * profileInfo.fuelMultiplier)
-  local fuel = tonumber(data.fuel)
-  if fuel and fuel ~= math.huge and fuel < requiredFuel then
-    check("worker fuel", "warn", tostring(fuel) .. " (dock refill expected)", false)
-  elseif fuel then check("worker fuel", "ok", tostring(fuel), false) else check("worker fuel", "warn", "unknown", false) end
+  if fuel and fuel >= requiredFuel then
+    check("worker fuel", "ok", ("available %s / need %d"):format(tostring(fuel), requiredFuel), false)
+  elseif fuel then
+    check("worker fuel", "warn", ("available %s / need %d (dock refill expected)"):format(tostring(fuel), requiredFuel), false)
+  else
+    check("worker fuel", "warn", ("unknown / need %d"):format(requiredFuel), false)
+  end
   if data.inventoryEmpty ~= nil then
     check("inventory", tonumber(data.inventoryEmpty) > 0 and "ok" or "warn", tostring(data.inventoryEmpty or 0) .. " empty", false)
   else check("inventory", "warn", "unknown", false) end
@@ -684,7 +717,7 @@ local function startDraft()
     setNotice("One or more workers rejected the job; all assignments were stopped.", true)
     return false
   end
-  db.lastDraft = common.copy(draft)
+  db.lastDraft = persistentDraft(draft)
   db.lastPreset = draft.profile or db.lastPreset
   if draft.queueIndex and db.queue[draft.queueIndex] then
     db.queue[draft.queueIndex].awaiting = { workerId = assignments[1].workerId, jobId = assignments[1].jobId, sentAt = common.nowSeconds() }
@@ -722,7 +755,7 @@ local function queueDraft()
       end
     end
   end
-  local item = common.copy(draft)
+  local item = persistentDraft(draft)
   item.workerId, item.queuedAt = draft.workerId, common.nowSeconds()
   item.chunkMode, item.chunkKeys = result.chunkMode, queuedKeys
   item.excludedChunks, item.jobDepth, item.targetY = common.copy(result.excludedChunks), result.jobDepth, result.targetY
@@ -800,8 +833,7 @@ end
 local function savePreset(name, source)
   name = common.trim(name or "")
   if name == "" then return false, "Preset name is empty." end
-  local draftValue = common.copy(source or draft or db.lastDraft or {})
-  draftValue.queueIndex, draftValue.preflight, draftValue.awaiting = nil, nil, nil
+  local draftValue = persistentDraft(source or draft or db.lastDraft or {})
   local value = { name = name, schema = common.SCHEMA, version = common.VERSION, updatedAt = common.nowSeconds(), draft = draftValue }
   local replaced = false
   for index, preset in ipairs(db.presets) do
@@ -890,7 +922,7 @@ local function dashboardAction(name)
         partialMask = previous.partialMask == true, chunkPage = 1, gridPageX = 1, gridPageZ = 1,
         rectMode = false, rectStart = nil, autoAssign = false, name = previous.name,
       }
-      db.lastDraft = common.copy(draft)
+      db.lastDraft = persistentDraft(draft)
       mode = "job_dimensions"
       invalidate()
     elseif name == "info" then

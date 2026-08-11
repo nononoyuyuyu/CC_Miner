@@ -1,4 +1,39 @@
 
+local function queueDraft()
+  if not draft then return false end
+  if config.queueEnabled == false then setNotice("Queue is disabled by controller configuration.", true); return false end
+  local previousQueueing = draft.queueing
+  draft.queueing = true
+  local result = computePreflight()
+  draft.queueing = previousQueueing
+  if not result or result.fatal then setNotice("Cannot queue: preflight has a fatal item.", true); return false end
+  local queuedKeys = {}
+  for _, chunk in ipairs(result.catalog or {}) do
+    local excluded = false
+    for _, item in ipairs(result.excludedChunks or {}) do if item.key == chunk.key then excluded = true; break end end
+    if not excluded then queuedKeys[#queuedKeys + 1] = chunk.key end
+  end
+  if result.chunkMode == "world" then
+    local conflict = activeLeaseOverlap(result.chunkMode, draft.workerId, queuedKeys)
+    if conflict then setNotice("Cannot queue: world chunks overlap active job " .. tostring(conflict.jobId or "unknown"), true); return false end
+    for _, queued in ipairs(db.queue or {}) do
+      if queued.chunkMode == "world" and type(queued.chunkKeys) == "table" then
+        local seen = {}; for _, value in ipairs(queued.chunkKeys) do seen[tostring(value)] = true end
+        for _, value in ipairs(queuedKeys) do if seen[tostring(value)] then setNotice("Cannot queue: world chunks overlap another queued job.", true); return false end end
+      end
+    end
+  end
+  local item = persistentDraft(draft)
+  item.workerId, item.queuedAt = draft.workerId, common.nowSeconds()
+  item.chunkMode, item.chunkKeys = result.chunkMode, queuedKeys
+  item.excludedChunks, item.jobDepth, item.targetY = common.copy(result.excludedChunks), result.jobDepth, result.targetY
+  item.retryAt, item.awaiting = common.nowSeconds(), nil
+  db.queue[#db.queue + 1] = item
+  saveControllerDb()
+  setNotice("Job added to queue.", false)
+  return true
+end
+
 local lastQueueDispatch = 0
 local function workerCanStart(worker)
   local status = statusOf(worker)
@@ -66,8 +101,7 @@ end
 local function savePreset(name, source)
   name = common.trim(name or "")
   if name == "" then return false, "Preset name is empty." end
-  local draftValue = common.copy(source or draft or db.lastDraft or {})
-  draftValue.queueIndex, draftValue.preflight, draftValue.awaiting = nil, nil, nil
+  local draftValue = persistentDraft(source or draft or db.lastDraft or {})
   local value = { name = name, schema = common.SCHEMA, version = common.VERSION, updatedAt = common.nowSeconds(), draft = draftValue }
   local replaced = false
   for index, preset in ipairs(db.presets) do
@@ -156,7 +190,7 @@ local function dashboardAction(name)
         partialMask = previous.partialMask == true, chunkPage = 1, gridPageX = 1, gridPageZ = 1,
         rectMode = false, rectStart = nil, autoAssign = false, name = previous.name,
       }
-      db.lastDraft = common.copy(draft)
+      db.lastDraft = persistentDraft(draft)
       mode = "job_dimensions"
       invalidate()
     elseif name == "info" then
@@ -202,45 +236,3 @@ local function sortingTick()
   for slot, item in pairs(source.list() or {}) do
     local destination = bulk
     if valuableItems[item.name] == true then destination = valuable
-    elseif sealItems[item.name] == true then destination = seal end
-    local targetName = destination == valuable and (settings.valuableTarget or "") or destination == seal and (settings.sealTarget or "") or (settings.bulkTarget or "")
-    pcall(source.pushItems, targetName, slot, item.count)
-  end
-end
-]] },
-  { target = [[controller_parts/02.part]], content = [[-- CC Miner V3 - adaptive touch views.  Every view has a keyboard fallback and
--- uses bounded hitboxes, so a 20x8 monitor remains operable.
-
-local fieldOrder = { "width", "length", "depth", "targetY" }
-local fieldLabels = { width = "WIDTH", length = "LENGTH", depth = "DEPTH", targetY = "TARGET Y" }
-local fieldLimits = { width = 128, length = 512, depth = 128, targetY = 32000 }
-
-local function currentFieldOrder()
-  if draft and draftCalibration() then return { "width", "length", "targetY" } end
-  return { "width", "length", "depth" }
-end
-
-local function commitDraftField()
-  if not draft then return end
-  local field = draft.selectedField or "width"
-  local value = tonumber(draft.buffer)
-  if not value then value = draft[field] or 1 end
-  value = common.clamp(math.floor(value), fieldLimits[field] and -fieldLimits[field] or 1, fieldLimits[field] or 512)
-  if field ~= "targetY" then value = math.max(1, value) end
-  draft[field], draft.buffer = value, tostring(value)
-end
-
-local function chooseDraftField(field)
-  commitDraftField()
-  draft.selectedField = field
-  draft.buffer = tostring(draft[field] or 0)
-end
-
-local function draftDigit(digit)
-  if not draft then return end
-  local buffer = tostring(draft.buffer or "")
-  if tostring(digit) == "-" then
-    if draft.selectedField == "targetY" and buffer:sub(1, 1) ~= "-" then draft.buffer = "-" .. (buffer == "0" and "" or buffer) end
-    return
-  end
-  if buffer == "0" then buffer = "" end

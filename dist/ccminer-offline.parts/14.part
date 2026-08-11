@@ -1,3 +1,15 @@
+  ok, err = navigateTo(rootAnchor, "inside", context); if not ok then return false, err end
+  return navigateTo({ x = 0, y = 0, z = 0 }, "inside", context)
+end
+
+local function navigateChunkPlanWork(checkpoint, context)
+  local plan = state.job and state.job.chunkPlan
+  if not plan then return navigateTo(checkpoint, "work", context) end
+  local targetKey = quarry.findChunk(plan, checkpoint.x, checkpoint.z)
+  if not targetKey then return false, "Checkpoint is outside every allowed chunk." end
+  local rootAnchor = chunkAnchor(plan, plan.rootKey, 0)
+  local ok, err = navigateTo(rootAnchor, "inside", context)
+  if not ok then return false, err end
   ok, err = moveY(checkpoint.y, context); if not ok then return false, err end
   local path, pathError = quarry.pathFromRoot(plan, targetKey)
   if not path then return false, pathError end
@@ -277,23 +289,3 @@ local function refuelAtHome()
     end
     local slot = firstFuelSlot()
     if not slot then
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "No empty slot available while refueling."
-    end
-    turtle.select(slot)
-    local sucked = suckFunction(1)
-    if not sucked then
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Fuel inventory is empty."
-    end
-    if not turtle.refuel(0) then
-      dropFunction()
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Fuel inventory contains a non-fuel item."
-    end
-    local before = fuelLevel()
-    local consumed = turtle.refuel(1)
-    local after = fuelLevel()
