@@ -1,3 +1,7 @@
+          or rowStats.discarded or rowStats.discardedBlocks or rowStats.discardStats
+        local rowThroughput = row.throughput or rowReport.throughput or rowStats.throughput or row.performance or rowReport.performance
+        local rowReturn = row.lastReturn or row.returnInfo or row.returnRoute or rowReport.lastReturn or rowReport["return"] or rowReport.returnRoute
+        print(("  #%s id=%s status=%s mode=%s at=%s"):format(
           tostring(key), tostring(row.id or row.jobId or row.workerId or "-"),
           tostring(row.status or row.result or row.outcome or "-"),
           tostring(row.stopMode or row.mode or row.command or "-"),
@@ -245,13 +249,3 @@ local function doctorDiscardAllowlist(config, finding)
     local name
     if type(key) == "number" then name = value else name = key end
     if type(name) ~= "string" or name == "" or name:find("[%c%s]") or name:find("%*")
-      or (type(key) ~= "number" and value ~= true) then
-      unsafe = unsafe + 1
-    elseif protected[name] == true then
-      unsafe = unsafe + 1
-    else
-      count = count + 1
-    end
-  end
-  if unsafe > 0 then finding("FAIL", "discard.allowlist", ("%d unsafe entries (protected/empty/wildcard)"):format(unsafe))
-  elseif count == 0 and mode == "KEEP_ALL" then finding("PASS", "discard.allowlist", "KEEP_ALL (empty allowlist)")

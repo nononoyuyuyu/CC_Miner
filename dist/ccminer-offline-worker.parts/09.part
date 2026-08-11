@@ -1,3 +1,7 @@
+    { "return", "reason" }, { "lastReturn", "reason" },
+    { "returnRoute", "reason" }, { "service", "reason" },
+    { "report", "return", "reason" }, { "report", "returnRoute", "reason" },
+  })
   if completionReason == nil then
     completionReason = firstNestedValue(roots, {
       { "returnReason" }, { "serviceReason" }, { "completionReason" },
@@ -254,6 +258,3 @@ local function printControllerReport(config)
         local rowDiscard = row.discard or row.discardStats or rowReport.discard or rowReport.discardStats
           or rowStats.discarded or rowStats.discardedBlocks or rowStats.discardStats
         local rowThroughput = row.throughput or rowReport.throughput or rowStats.throughput or row.performance or rowReport.performance
-        local rowReturn = row.lastReturn or row.returnInfo or row.returnRoute or rowReport.lastReturn or rowReport["return"] or rowReport.returnRoute
-        print(("  #%s id=%s status=%s mode=%s at=%s"):format(
-          tostring(key), tostring(row.id or row.jobId or row.workerId or "-"),

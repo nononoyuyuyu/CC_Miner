@@ -1,3 +1,10 @@
+  local maxEntries = math.max(1, tonumber(journalConfig.maxEntries) or 256)
+  if not fs or not fs.open then return false end
+  if common.ensureDir then common.ensureDir(fs.getDir(path)) end
+  state.journal = state.journal or {}
+  local entries = tonumber(state.journal.entries) or 0
+  if entries >= maxEntries and fs.exists(path) then
+    local old = path .. ".1"
     local rotated = pcall(function()
       if fs.exists(old) then fs.delete(old) end
       fs.move(path, old)
@@ -254,17 +261,3 @@ local function beginPhysicalAction(kind, details, poseAfter)
     return false, "An unresolved physical action is already recorded. Rehome the turtle before continuing."
   end
   state.pendingAction = {
-    kind = tostring(kind or "unknown"),
-    poseBefore = poseCopy(),
-    poseAfter = poseAfter and poseCopy(poseAfter) or nil,
-    details = details or {},
-    startedAt = common.nowSeconds(),
-  }
-  saveState()
-  return true
-end
-
-local function cancelPhysicalAction()
-  state.pendingAction = nil
-  state.journal = state.journal or {}
-  state.journal.lightweight = state.journal.lightweight or {}

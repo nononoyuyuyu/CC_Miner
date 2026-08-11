@@ -1,3 +1,7 @@
+    config = common.merge(common.defaultWorkerConfig(), current and current.role == "worker" and current or {})
+    config.role, config.networkKey = "worker", key
+    local workerDefaults = common.defaultWorkerConfig()
+    local discard = ensureTable(config, "discard", workerDefaults.discard)
     local performance = ensureTable(config, "performance", workerDefaults.performance)
     local dock = ensureTable(config, "dock", workerDefaults.dock)
     local group = ensureTable(config, "group", workerDefaults.group)
@@ -179,12 +183,3 @@
     if alerts.enabled then
       alerts.speaker = common.promptYesNo("Use speaker alerts", alerts.speaker ~= false)
       alerts.redstone = common.promptYesNo("Use redstone alerts", alerts.redstone ~= false)
-      if alerts.redstone then alerts.redstoneSide = sidePrompt("Redstone alert side", alerts.redstoneSide or "back") end
-      alerts.cooldownSeconds = common.promptNumber(
-        "Alert cooldown (seconds)",
-        validInteger(alerts.cooldownSeconds, 10, 0, 3600),
-        0,
-        3600
-      )
-    else
-      -- Keep disabled outputs explicit so old controllers do not emit a

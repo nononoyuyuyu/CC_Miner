@@ -1,3 +1,12 @@
+        local position
+        for levelIndex, value in ipairs(candidateLevels) do
+          if value == level then position = levelIndex; break end
+        end
+        if not position or used[position] then return nil end
+        used[position] = true
+        positions[index] = position
+      end
+    end
     if anyBay then
       for index = 1, #workers do if not positions[index] then return nil end end
     end
@@ -271,10 +280,3 @@ function M.partitionGroup(catalog, workersInput, options)
       if not worker.bayChunkKey then return nil, "worker_bay_required:" .. worker.key end
     end
   end
-  if not graphConnected(chunks, keys) then return nil, "chunk_catalog_disconnected" end
-
-  local bottomY = options.bottomY
-  if bottomY == nil then bottomY = options.commonBottomY end
-  if bottomY == nil then bottomY = options.targetY end
-  if bottomY == nil then bottomY = options.bottom end
-  if bottomY ~= nil then

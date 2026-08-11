@@ -1,3 +1,11 @@
+  state.serviceReturn.startedAt = state.serviceReturn.startedAt or common.nowSeconds()
+  state.returnReason = state.service.reason or state.returnReason or "service"
+  if not isHome() then
+    state.phase = "returning"
+    local returnDistance = estimatedReturnDistance(state.pose)
+    if returnDistance then state.service.returnDistance = returnDistance end
+    saveState("service_return_start", true)
+    local preReturnGPS, preReturnError = verifyGPS(true)
     if not preReturnGPS then markBlocked("GPS verification before return failed: " .. tostring(preReturnError)); return false end
     local ok, err
     if state.job and state.job.strategy == "chunk_plan" then
@@ -264,14 +272,3 @@ local function runSerpentineStep(job)
   if not direction then
     markBlocked("Quarry path/state mismatch at cell " .. tostring(job.cursor) .. ": " .. tostring(targetDir))
     return
-  end
-  if targetDir ~= nil then
-    local ok, err = turnTo(targetDir)
-    if not ok then markBlocked("Turn failed: " .. tostring(err)); return end
-  end
-  local ok, err = moveOne(direction, "mining")
-  if not ok then
-    if handleMoveFailure("Mining stopped at cell " .. tostring(job.cursor), err, verticalDelta == -1) then return end
-    markBlocked("Mining stopped at cell " .. tostring(job.cursor) .. ": " .. tostring(err))
-    return
-  end

@@ -1,3 +1,10 @@
+  if not graphConnected(chunks, keys) then return nil, "chunk_catalog_disconnected" end
+
+  local bottomY = options.bottomY
+  if bottomY == nil then bottomY = options.commonBottomY end
+  if bottomY == nil then bottomY = options.targetY end
+  if bottomY == nil then bottomY = options.bottom end
+  if bottomY ~= nil then
     bottomY = integerValue(bottomY)
     if not bottomY then return nil, "invalid_bottom_y" end
   end
@@ -252,14 +259,3 @@ local function assignedCatalogEntries(catalog)
         -- explicit key required by its world-key validation.
         local copy = {}
         for field, value in pairs(entry) do copy[field] = value end
-        copy.key = normalized
-        entry = copy
-      end
-      byKey[normalized] = entry; entries[#entries + 1] = entry
-    end
-  end
-  return entries, byKey
-end
-
-local function assignedKeyList(value, field)
-  if type(value) == "table" and field and type(value[field]) == "table" then value = value[field] end

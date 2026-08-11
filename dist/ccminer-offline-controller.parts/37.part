@@ -1,3 +1,4 @@
+  for _, chunk in ipairs(catalog) do if chunk.key ~= rootKey then draft.excluded[chunk.key] = not draft.excluded[chunk.key] end end
   setNotice("INVERT: chunk mining selection inverted; entrance remains selected.", false)
   invalidate()
 end
@@ -176,4 +177,3 @@ local function renderStopMenu(target, key)
     return function() setNotice(message, false); stageStop(id, stopMode); mode = "dashboard" end
   end
   buttonRow(key, 4, width, { { "PAUSE NOW", action("pause_now", "Pause requested now.") }, { "FINISH ROW", action("finish_row", "Finish current row then stop.") } })
-  buttonRow(key, 5, width, { { "FINISH LAYER", action("finish_layer", "Finish current layer then stop.") }, { "RETURN HOME", action("return_home", "Return-home stop requested.") } })

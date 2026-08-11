@@ -1,3 +1,11 @@
+    if not sourceChunks[key] then return nil, "unknown_assigned_chunk:" .. key end
+    mineSet[key] = true
+  end
+  for _, key in ipairs(transitKeys) do
+    if not sourceChunks[key] then return nil, "unknown_transit_chunk:" .. key end
+    if mineSet[key] then return nil, "transit_overlaps_assigned:" .. key end
+    transitSet[key] = true
+  end
 
   -- Shared catalogs are expressed in the reference worker's local frame.
   -- Rebase every catalog rectangle through world coordinates before building
@@ -224,7 +232,3 @@ local function boundsFrom(value, length, options)
   options = type(options) == "table" and options or {}
   local minX, maxX, minZ, maxZ
   if type(value) == "table" then
-    if value.minX ~= nil and value.maxX ~= nil and value.minZ ~= nil and value.maxZ ~= nil then
-      minX, maxX = integerValue(value.minX), integerValue(value.maxX)
-      minZ, maxZ = integerValue(value.minZ), integerValue(value.maxZ)
-    elseif value.width ~= nil and value.length ~= nil then

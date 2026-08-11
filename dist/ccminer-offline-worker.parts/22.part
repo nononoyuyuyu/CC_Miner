@@ -1,3 +1,10 @@
+
+  -- Runtime movement still consumes `chunk.anchor`, including on older
+  -- workers that do not understand serviceRoute waypoints.  Populate every
+  -- mine/transit chunk with independent valid cells before constructing the
+  -- assigned DFS walk.
+  for _, key in ipairs(allKeys) do
+    local chunk = chunks[key]
     local anchor = M.chunkAnchor(chunk) or { x = chunk.minX, z = chunk.minZ }
     chunk.anchor = { x = anchor.x, z = anchor.z }
   end
@@ -257,10 +264,3 @@ end
 M.rectangleSelection = M.selectRectangle
 M.selectRect = M.selectRectangle
 M.rectangle = M.selectRectangle
-M.selectRectangleCells = M.selectRectangle
-
-return M
-]=] },
-  { source = [[src/ccminer/worker.lua]], target = [[worker.lua]], digest = [[86fccf7d92a52fb66c9569efb0654f7b4cbfb808c7044984eeeca99f3a370425]], content = [[-- CC Miner V4 - generated worker source loader.
-local parts = {
-  "/ccminer/worker_parts/01.part",

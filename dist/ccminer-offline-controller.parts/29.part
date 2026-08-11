@@ -1,3 +1,7 @@
+    local value = legacy[spec.workerId] or legacy[tostring(spec.workerId)]
+    if type(value) ~= "table" then return nil, "legacy_partition_missing_worker_" .. tostring(spec.workerId) end
+    normalized[tostring(spec.workerId)] = {
+      workerId = spec.workerId,
       chunkKeys = common.copy(value.chunkKeys or value.chunks or {}),
       transitKeys = common.copy(value.transitKeys or {}),
       seedKey = value.seedKey,
@@ -174,7 +178,3 @@ local function computeGroupPreflight(groupId, value)
         if type(quarry.inverseWorldToLocal) == "function" and referenceCalibration then
           local okInverse, localForward = pcall(quarry.inverseWorldToLocal, referenceCalibration, forwardX, forwardZ)
           if not okInverse or type(localForward) ~= "table" then
-            check("bay cell:#" .. tostring(id), "bad", "cannot rebase worker forward entrance to common catalog", true)
-          else
-            local forwardCell = false
-            for _, chunk in ipairs(catalog or {}) do

@@ -1,3 +1,13 @@
+      or (type(key) ~= "number" and value ~= true) then
+      unsafe = unsafe + 1
+    elseif protected[name] == true then
+      unsafe = unsafe + 1
+    else
+      count = count + 1
+    end
+  end
+  if unsafe > 0 then finding("FAIL", "discard.allowlist", ("%d unsafe entries (protected/empty/wildcard)"):format(unsafe))
+  elseif count == 0 and mode == "KEEP_ALL" then finding("PASS", "discard.allowlist", "KEEP_ALL (empty allowlist)")
   elseif count == 0 then finding("WARN", "discard.allowlist", "allowlist is empty")
   else finding("PASS", "discard.allowlist", tostring(count) .. " explicit entries") end
 end
@@ -196,10 +206,3 @@ local function runDoctor()
 
       local bay = state.bay or config.bay
       if bay == nil then finding("PASS", "bay", "not configured")
-      elseif type(bay) ~= "table" then finding("FAIL", "bay", "bay metadata is malformed")
-      elseif bay.capacity ~= nil and (not tonumber(bay.capacity) or tonumber(bay.capacity) < 1) then
-        finding("FAIL", "bay", "capacity must be a positive number")
-      else finding("PASS", "bay", valueString(bay)) end
-
-      local group = state.group or config.group
-      if group == nil and state.groupId == nil and config.groupId == nil then

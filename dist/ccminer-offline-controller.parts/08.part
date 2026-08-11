@@ -1,3 +1,12 @@
+      if alerts.redstone then alerts.redstoneSide = sidePrompt("Redstone alert side", alerts.redstoneSide or "back") end
+      alerts.cooldownSeconds = common.promptNumber(
+        "Alert cooldown (seconds)",
+        validInteger(alerts.cooldownSeconds, 10, 0, 3600),
+        0,
+        3600
+      )
+    else
+      -- Keep disabled outputs explicit so old controllers do not emit a
       -- notification merely because a peripheral was attached later.
       alerts.speaker, alerts.redstone = false, false
     end
@@ -293,12 +302,3 @@ local function printOperationalFields(root, config)
   if assignmentId ~= nil then printField("Assignment", assignmentId) end
 
   local bottomY = firstNestedValue(roots, {
-    { "bottomY" }, { "bottom_y" }, { "targetY" },
-    { "job", "bottomY" }, { "job", "targetY" }, { "job", "bottom_y" },
-    { "dock", "bottomY" }, { "dock", "bottom_y" },
-  })
-  if bottomY ~= nil then printField("BOTTOM Y", bottomY) end
-
-  local completionReason = firstNestedValue(roots, {
-    { "return", "reason" }, { "lastReturn", "reason" },
-    { "returnRoute", "reason" }, { "service", "reason" },

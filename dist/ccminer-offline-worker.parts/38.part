@@ -1,3 +1,14 @@
+  end
+  if targetDir ~= nil then
+    local ok, err = turnTo(targetDir)
+    if not ok then markBlocked("Turn failed: " .. tostring(err)); return end
+  end
+  local ok, err = moveOne(direction, "mining")
+  if not ok then
+    if handleMoveFailure("Mining stopped at cell " .. tostring(job.cursor), err, verticalDelta == -1) then return end
+    markBlocked("Mining stopped at cell " .. tostring(job.cursor) .. ": " .. tostring(err))
+    return
+  end
   job.cursor = job.cursor + 1
   if layerBoundary(job) then
     local layerGPS, layerGPSError = verifyGPS(true)
@@ -253,14 +264,3 @@ local function resolveNonMovementPending(pending)
   if common.startsWith(kind, "dig_") then
     local present, data = inspectPendingSide(kind)
     if present then
-      local expected = pending.details and pending.details.block
-      if not expected or blockName(data) == expected then
-        return false, "Pending dig target is still present; refusing a blind retry."
-      end
-      return false, "Pending dig target changed to " .. blockName(data) .. "."
-    end
-    return true
-  end
-  if common.startsWith(kind, "seal_") then
-    local present, data = inspectPendingSide(kind)
-    if present and (isLava(data) or isWater(data)) then

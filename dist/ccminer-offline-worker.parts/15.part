@@ -1,3 +1,9 @@
+  if fromKey == toKey then return { fromKey } end
+  local queue, head, tail = { fromKey }, 1, 1
+  local previous, seen = {}, { [fromKey] = true }
+  while head <= tail do
+    local key = queue[head]; head = head + 1
+    for _, neighbor in ipairs(chunks[key].neighbors or {}) do
       if not seen[neighbor] then
         seen[neighbor] = true
         previous[neighbor] = key
@@ -298,9 +304,3 @@ local function edgeTransitionPoints(left, right, y)
 end
 
 local function normalizePlanKey(plan, value)
-  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
-  local key
-  if type(value) == "table" then
-    key = value.chunkKey or value.chunk or value.key
-    if key == nil and value.cx ~= nil and value.cz ~= nil then
-      local cx, cz = integerValue(value.cx), integerValue(value.cz)

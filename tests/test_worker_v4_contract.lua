@@ -84,6 +84,8 @@ marker(worker, "if not job.assignmentProvided and not job.groupJobId and not job
 assert(not worker:find("if not job.groupJobId and not job.groupId and not job.assignmentId and not job.homeWorld then return true end", 1, true),
   "dock homeWorld still makes an ordinary job require GPS")
 marker(worker, "Explicit group assignment requires GPS calibration.", "group-only GPS rejection")
+marker(worker, 'if text == "Terminated" or text:find("Terminated", 1, true) then error(x, 0) end',
+  "GPS wait Ctrl+T propagation")
 
 -- The worker calls the assigned planner with one canonical (catalog, keys,
 -- options) signature.  Keep this assertion close to the implementation so a

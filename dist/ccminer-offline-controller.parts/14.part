@@ -1,3 +1,15 @@
+  for _, chunk in pairs(byKey) do catalog[#catalog + 1] = chunk end
+  table.sort(catalog, chunkComparator)
+  return catalog
+end
+
+local function exclusionSet(exclusions, mode)
+  local set = {}
+  if exclusions == nil then return set end
+  if type(exclusions) ~= "table" then return nil, "invalid_exclusions" end
+  local seen = 0
+  for _, item in ipairs(exclusions) do
+    seen = seen + 1
     if seen > MAX_CHUNKS then return nil, "too_many_exclusions" end
     if type(item) == "string" then
       if item ~= "" then set[item] = true end
@@ -293,11 +305,3 @@ function M.buildChunkPlan(job, calibration)
       columns = columns + copy.cells
     end
   end
-
-  if not rootKey then return nil, "entrance_chunk_missing" end
-  if excluded[rootKey] then return nil, "The quarry entrance chunk cannot be excluded." end
-  if not chunks[rootKey] then return nil, "No mineable chunks remain." end
-
-  local keys = {}
-  for key in pairs(chunks) do keys[#keys + 1] = key end
-  table.sort(keys, function(left, right) return chunkComparator(chunks[left], chunks[right]) end)

@@ -1,3 +1,11 @@
+      -- awaiting ACK entries until their worker confirms/returns, since the
+      -- START packet may already be in flight.
+      groupJob.pending = {}
+    end
+    groupJob.returnReason = groupJob.returnReason or (command == "abort" and "group_abort" or "group_clear")
+    maybeFinalizeGroup(groupJob)
+    saveControllerDb()
+  end
   if sent < attempted then setNotice(("Group %s: %d/%d commands sent."):format(payload.groupCommand, sent, attempted), true) else setNotice(("Group %s sent to %d workers."):format(payload.groupCommand, sent), false) end
   return sent == attempted and attempted > 0, sent
 end
@@ -243,5 +251,3 @@ local function computePreflight()
   local workerStatus = worker and statusOf(worker) or "offline"
   if id and worker and workerStatus ~= "offline" then check("worker", "ok", workerLabel(worker, id), false)
   else check("worker", "bad", "offline or not selected", true) end
-  local startableStatus = workerStatus == "idle" or workerStatus == "complete" or workerStatus == "completed" or workerStatus == "aborted"
-  check("start state", startableStatus and "ok" or "bad", workerStatus, not startableStatus)

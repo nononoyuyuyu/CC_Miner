@@ -1,3 +1,19 @@
+  local lighting = config.lighting or {}
+  if mode == "custom" and lighting.temporaryFloor == true then
+    local placed, reason = tryPlaceTorchFloor()
+    if placed then return true end
+    if reason == "torch_material" then return false, reason end
+    -- Floor placement is an optional custom fallback; inability to place it
+    -- must not turn a navigable route into a hard failure.
+    return true
+  end
+  if failureReason == "occupied" or failureReason == "torch_wall_failed" then
+    return false, "torch_surface_unavailable"
+  end
+  return false, failureReason or "torch_surface_unavailable"
+end
+
+local function moveOne(direction, context)
   local action = movement[direction]
   if not action then return false, "Unknown movement: " .. tostring(direction) end
   local retries = tonumber(config.moveRetries) or 20
@@ -273,16 +289,3 @@ end
 local function navigateServiceRoute(plan, fromPose, toPose, context, mode)
   if not plan then return navigateTo(toPose, mode or "work", context) end
   fromPose, toPose = poseCopy(fromPose), poseCopy(toPose)
-  local endpointFromKey = quarry.findChunk(plan, fromPose.x, fromPose.z)
-  local endpointToKey = quarry.findChunk(plan, toPose.x, toPose.z)
-  if not endpointFromKey or not endpointToKey then
-    return false, "Service route endpoint is outside the assigned chunk plan."
-  end
-  local routeResult
-  if type(quarry.shortestServiceRoute) == "function" then
-    local ok, result = pcall(quarry.shortestServiceRoute, plan, fromPose, toPose, {
-      mode = mode or "work", context = context,
-      breadcrumbs = state.job and state.job.route and state.job.route.breadcrumbs or nil,
-    })
-    if ok and type(result) == "table" then routeResult = result end
-  end

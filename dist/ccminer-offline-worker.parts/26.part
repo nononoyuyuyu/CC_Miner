@@ -1,3 +1,13 @@
+    bay = state.job.bay or state.job.bayId,
+    dock = state.job.dock and common.copy(state.job.dock) or nil,
+    seedKey = state.job.seedKey,
+    dockKey = state.job.dockKey,
+    lease = state.job.lease and common.copy(state.job.lease) or nil,
+    profile = state.job.profile,
+    name = state.job.name,
+    kind = state.job.kind,
+    strategy = state.job.strategy,
+    width = state.job.width,
     length = state.job.length,
     depth = state.job.depth,
     targetY = state.job.targetY,
@@ -258,18 +268,5 @@ local function locateGPS()
     return nil, state.gps.lastError
   end
   local ok, x, y, z = pcall(gps.locate, tonumber(gpsConfig().timeout) or 2, false)
-  if not ok or x == nil then
-    state.gps.available = false
-    state.gps.lastError = ok and "No GPS fix received." or tostring(x)
-    return nil, state.gps.lastError
-  end
-  local fix, fixError = geo.integerFix(x, y, z, 0.35)
-  if not fix then
-    state.gps.available = false
-    state.gps.lastError = fixError
-    return nil, fixError
-  end
-  state.gps.available = true
-  state.gps.lastFix = fix
-  state.gps.lastFixAt = common.nowSeconds()
-  state.gps.lastError = nil
+  if not ok then
+    local text = tostring(x)

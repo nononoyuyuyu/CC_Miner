@@ -1,3 +1,8 @@
+  db.groupScheduler = type(db.groupScheduler) == "table" and db.groupScheduler or { replenishConcurrency = 1, staggerSeconds = 0 }
+  db.groupScheduler.replenishConcurrency = math.max(1, math.floor(tonumber(db.groupScheduler.replenishConcurrency) or 1))
+  db.groupScheduler.staggerSeconds = math.max(0, tonumber(db.groupScheduler.staggerSeconds) or 0)
+  dbError = err
+end
 
 local function saveControllerDb()
   db.schema, db.version, db.updatedAt = common.SCHEMA, common.VERSION, common.nowSeconds()
@@ -70,12 +75,13 @@ end
 
 local function setNotice(text, isError)
   local errorNotice = isError == true
-  if not errorNotice and mode == "error_detail" and noticeIsError then return end
+  -- Keep the last error visible without stealing the whole screen. Normal
+  -- status/heartbeat messages cannot erase it; the operator can continue
+  -- working and open LAST ERR only when the full text is needed.
+  if not errorNotice and noticeIsError then return end
   notice, noticeIsError = tostring(text or ""), errorNotice
   if errorNotice then
     noticeState.detail = notice
-    if mode ~= "error_detail" then noticeState.returnMode = mode end
-    mode = "error_detail"
   end
   invalidate()
 end
@@ -278,8 +284,3 @@ local function registerGroup(groupId, workerIds, options)
   if maxWorkers and #ids > maxWorkers then return false, "group_max_workers_exceeded:" .. tostring(maxWorkers) end
   table.sort(ids, function(a, b) return tostring(a) < tostring(b) end)
   local previous = groupRecord(groupId) or {}
-  local mode = tostring(options.mode or previous.mode or "world"):lower()
-  if mode ~= "world" and mode ~= "local" then return false, "group_mode_unsupported:" .. mode end
-  local partition = tostring(options.partition or previous.partition or (config.group and config.group.partitionMode) or "stripe"):lower()
-  if partition ~= "stripe" and partition ~= "round_robin" then return false, "partition_mode_unsupported:" .. partition end
-  local allowedWorkers = {}

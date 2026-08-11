@@ -1,3 +1,14 @@
+      local expected = pending.details and pending.details.block
+      if not expected or blockName(data) == expected then
+        return false, "Pending dig target is still present; refusing a blind retry."
+      end
+      return false, "Pending dig target changed to " .. blockName(data) .. "."
+    end
+    return true
+  end
+  if common.startsWith(kind, "seal_") then
+    local present, data = inspectPendingSide(kind)
+    if present and (isLava(data) or isWater(data)) then
       return false, "Pending fluid seal target remains present; refusing a blind retry."
     end
     local direction = kind:match("_(forward|up|down)$")
@@ -256,15 +267,4 @@ local function validateParts(label, targets)
     for _, file in ipairs(files) do if file.target == target then found = file.content; break end end
     if not found then fail("Embedded runtime part is missing: " .. target) end
     source[index] = found
-  end
-  local ok, compileError = compileText(label .. ".assembled.lua", table.concat(source))
-  if not ok then fail("Assembled source failed syntax validation: " .. label .. ": " .. compileError) end
-end
-local function validateAll()
-  validateEmbedded()
-  for _, file in ipairs(files) do
-    if not file.target:match("%.part$") then
-      local ok, compileError = compileText(file.target, file.content)
-      if not ok then fail("Embedded file failed syntax validation: " .. file.target .. ": " .. compileError) end
-    end
   end

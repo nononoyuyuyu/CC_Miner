@@ -1,3 +1,7 @@
+    if value.minX ~= nil and value.maxX ~= nil and value.minZ ~= nil and value.maxZ ~= nil then
+      minX, maxX = integerValue(value.minX), integerValue(value.maxX)
+      minZ, maxZ = integerValue(value.minZ), integerValue(value.maxZ)
+    elseif value.width ~= nil and value.length ~= nil then
       local width, validLength = integerValue(value.width, 1, MAX_DIMENSION), integerValue(value.length, 1, MAX_DIMENSION)
       if not width or not validLength or width * validLength > MAX_COLUMNS then return nil, "invalid_bounds" end
       local originX = integerValue(value.originX ~= nil and value.originX or options.originX or 0)
@@ -167,7 +171,7 @@ local program, compileError = loader(table.concat(source), "@/ccminer/controller
 if not program then error("Cannot assemble controller: " .. tostring(compileError), 0) end
 return program(...)
 ]] },
-  { source = [[src/ccminer/controller_parts/01.part]], target = [[controller_parts/01.part]], digest = [[abf3c092f1fcd9ce5f20a6502b2db65b822439ff768ab50683b6ea07a00f045b]], content = [[-- CC Miner V4 - controller state, persistence and job orchestration.
+  { source = [[src/ccminer/controller_parts/01.part]], target = [[controller_parts/01.part]], digest = [[0dbd6188306870e5075ff888951631cc313bede8237250411a6108450bf56c80]], content = [[-- CC Miner V4 - controller state, persistence and job orchestration.
 -- The controller is deliberately tolerant of V2 worker payloads.  New
 -- fields are additive and every command has a legacy equivalent where one
 -- exists.
@@ -265,8 +269,3 @@ local function loadControllerDb()
   if #db.groupLeases == 0 then
     for _, lease in ipairs(db.leases) do if type(lease) == "table" and lease.groupJobId then db.groupLeases[#db.groupLeases + 1] = common.copy(lease) end end
   end
-  db.groupScheduler = type(db.groupScheduler) == "table" and db.groupScheduler or { replenishConcurrency = 1, staggerSeconds = 0 }
-  db.groupScheduler.replenishConcurrency = math.max(1, math.floor(tonumber(db.groupScheduler.replenishConcurrency) or 1))
-  db.groupScheduler.staggerSeconds = math.max(0, tonumber(db.groupScheduler.staggerSeconds) or 0)
-  dbError = err
-end

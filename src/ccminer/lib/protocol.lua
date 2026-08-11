@@ -64,7 +64,13 @@ end
 function M.receive(timeout)
   if not rednet then return nil, nil, "rednet_unavailable" end
   local ok, sender, message, protocolName = pcall(rednet.receive, common.PROTOCOL, timeout)
-  if not ok then return nil, nil, tostring(sender) end
+  if not ok then
+    local text = tostring(sender)
+    -- Ctrl+T raises Terminated from the event API. It is an explicit local
+    -- stop request, not a recoverable network error, so never swallow it.
+    if text == "Terminated" or text:find("Terminated", 1, true) then error(sender, 0) end
+    return nil, nil, text
+  end
   if not sender then return nil, nil, nil end
   return sender, message, protocolName
 end

@@ -1,3 +1,17 @@
+    kind = tostring(kind or "unknown"),
+    poseBefore = poseCopy(),
+    poseAfter = poseAfter and poseCopy(poseAfter) or nil,
+    details = details or {},
+    startedAt = common.nowSeconds(),
+  }
+  saveState()
+  return true
+end
+
+local function cancelPhysicalAction()
+  state.pendingAction = nil
+  state.journal = state.journal or {}
+  state.journal.lightweight = state.journal.lightweight or {}
   state.journal.lightweight.force = true
   saveState()
 end
@@ -332,13 +346,3 @@ local function jobSnapshot()
     assignmentId = state.job.assignmentId,
     groupJobId = state.job.groupJobId,
     groupId = state.job.groupId,
-    bay = state.job.bay or state.job.bayId,
-    dock = state.job.dock and common.copy(state.job.dock) or nil,
-    seedKey = state.job.seedKey,
-    dockKey = state.job.dockKey,
-    lease = state.job.lease and common.copy(state.job.lease) or nil,
-    profile = state.job.profile,
-    name = state.job.name,
-    kind = state.job.kind,
-    strategy = state.job.strategy,
-    width = state.job.width,

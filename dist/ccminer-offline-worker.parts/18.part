@@ -1,3 +1,10 @@
+      local seed = descriptor
+      width, length, worldSeed = length, worldSeed, seed
+      descriptor = nil
+    end
+    if descriptor == nil then
+      local calibration = options.calibration or worldSeedCalibration(worldSeed, options)
+      if not calibration then return nil, "gps_not_calibrated" end
       local catalog, catalogError = M.buildCatalog(width, length, "world", calibration)
       if not catalog then return nil, catalogError end
       catalog.referenceCalibration = {
@@ -259,12 +266,3 @@ local function stripeOwner(chunks, keys, workers, options)
         local chunk = chunks[worker.bayChunkKey]
         if not chunk then return nil end
         local level = candidateAxis == "x" and chunk.cx or chunk.cz
-        local position
-        for levelIndex, value in ipairs(candidateLevels) do
-          if value == level then position = levelIndex; break end
-        end
-        if not position or used[position] then return nil end
-        used[position] = true
-        positions[index] = position
-      end
-    end

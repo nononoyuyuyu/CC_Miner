@@ -1,3 +1,8 @@
+  local mode = tostring(options.mode or previous.mode or "world"):lower()
+  if mode ~= "world" and mode ~= "local" then return false, "group_mode_unsupported:" .. mode end
+  local partition = tostring(options.partition or previous.partition or (config.group and config.group.partitionMode) or "stripe"):lower()
+  if partition ~= "stripe" and partition ~= "round_robin" then return false, "partition_mode_unsupported:" .. partition end
+  local allowedWorkers = {}
   for _, id in ipairs(ids) do allowedWorkers[tostring(id)] = true end
   local function validateResourceMap(source, name)
     if source == nil then return true end
@@ -204,12 +209,3 @@ end
 
 local function groupStatusLabel(status)
   status = tostring(status or "unknown")
-  if status == "completed" then return "complete" end
-  if status == "waiting" or status == "service_requested" then return "service" end
-  return status
-end
-
-local function updateGroupAggregate(groupJob)
-  if type(groupJob) ~= "table" then return nil end
-  local group = groupRecord(groupJob.groupId)
-  local ids = groupWorkerIds(group)

@@ -1,3 +1,10 @@
+M.selectRectangleCells = M.selectRectangle
+
+return M
+]=] },
+  { source = [[src/ccminer/worker.lua]], target = [[worker.lua]], digest = [[86fccf7d92a52fb66c9569efb0654f7b4cbfb808c7044984eeeca99f3a370425]], content = [[-- CC Miner V4 - generated worker source loader.
+local parts = {
+  "/ccminer/worker_parts/01.part",
   "/ccminer/worker_parts/02.part",
   "/ccminer/worker_parts/03.part",
   "/ccminer/worker_parts/04.part",
@@ -15,7 +22,7 @@ local program, compileError = loader(table.concat(source), "@/ccminer/worker.ass
 if not program then error("Cannot assemble worker: " .. tostring(compileError), 0) end
 return program(...)
 ]] },
-  { source = [[src/ccminer/worker_parts/01.part]], target = [[worker_parts/01.part]], digest = [[1cfca8cee0a20cb06813359710d99a0fe2e4802b4364d24d9142e6eea131e092]], content = [[-- CC Miner V4 - autonomous quarry worker
+  { source = [[src/ccminer/worker_parts/01.part]], target = [[worker_parts/01.part]], digest = [[52cb73f7bf7ea3d503dac7dcb52049521a8fafa749f864dcd8cb93ea59ff1ca5]], content = [[-- CC Miner V4 - autonomous quarry worker
 -- Home=(0,0,0), forward=+Z, right=+X, down=-Y.
 
 local common = dofile("/ccminer/lib/common.lua")
@@ -221,10 +228,3 @@ local function appendJournal(event)
   local journalConfig = config.journal or {}
   if journalConfig.enabled == false then return true end
   local path = journalConfig.path or "/ccminer/data/state.journal"
-  local maxEntries = math.max(1, tonumber(journalConfig.maxEntries) or 256)
-  if not fs or not fs.open then return false end
-  if common.ensureDir then common.ensureDir(fs.getDir(path)) end
-  state.journal = state.journal or {}
-  local entries = tonumber(state.journal.entries) or 0
-  if entries >= maxEntries and fs.exists(path) then
-    local old = path .. ".1"

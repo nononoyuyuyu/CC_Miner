@@ -1,3 +1,4 @@
+  writeHeader("GROUP DRILLDOWN", target, colors and colors.cyan or nil)
   if not gid or not group then
     common.writeAt(1, 3, common.fit("No group selected.", width), colors and colors.yellow or nil)
   else
@@ -166,4 +167,3 @@ local function invertGrid()
   if not catalog then setNotice(err, true); return end
   normalizeChunkMask(catalog, rootKey)
   draft.excluded = draft.excluded or {}
-  for _, chunk in ipairs(catalog) do if chunk.key ~= rootKey then draft.excluded[chunk.key] = not draft.excluded[chunk.key] end end

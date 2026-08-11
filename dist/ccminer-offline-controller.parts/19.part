@@ -1,3 +1,11 @@
+          local distance = 0
+          if worker.bay then
+            local chunk = chunks[key]
+            distance = math.abs(worker.bay.x - (chunk.cx * 16 + 8)) + math.abs(worker.bay.z - (chunk.cz * 16 + 8))
+          else
+            distance = MAX_CHUNKS
+            local maps = seedDistanceCache
+            for _, seed in ipairs(seeds) do
               if not maps[seed] then maps[seed] = graphDistances(chunks, seed) end
               local d = maps[seed][key] or MAX_CHUNKS
               -- Farthest-point seeding maximises the nearest distance to an
@@ -259,11 +267,3 @@ function M.partitionGroup(catalog, workersInput, options)
   -- Prefer the canonical entrance chunk in the shared reference-local
   -- catalog.  Falling back to lexicographic order is only for hand-authored
   -- catalogs that do not expose the (0,1) entrance cell.
-  local rootKey = options.rootKey and tostring(options.rootKey) or nil
-  if not rootKey then
-    for _, key in ipairs(keys) do
-      if contains(chunks[key], 0, 1) then rootKey = key; break end
-    end
-  end
-  rootKey = rootKey or keys[1]
-  if not chunks[rootKey] then return nil, "unknown_root_chunk" end

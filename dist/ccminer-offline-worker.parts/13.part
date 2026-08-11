@@ -1,3 +1,8 @@
+    elseif command == "dock" or command == "bay" then
+      local sub = string.lower(tostring(args[2] or "list"))
+      if sub ~= "list" and sub ~= "register" then
+        reportError("Usage: ccm " .. command .. " list|register <id> <x> <y> <z> [facing] [maxDepth]")
+      else
         -- Registry validation and coordinate normalization stay in the
         -- controller.  Preserve every argument so legacy and extended
         -- register forms remain compatible.
@@ -284,8 +289,3 @@ function M.cell(width, length, depth, index)
   if not validWidth then return nil, validLength end
   if not validDepth then return nil, "invalid_dimensions" end
   index = integerValue(index, 0)
-  if not index or index >= totalColumns * validDepth then return nil, "index_out_of_range" end
-  local perLayer = validWidth * validLength
-  local layer = math.floor(index / perLayer)
-  local offset = index % perLayer
-  if layer % 2 == 1 then offset = perLayer - 1 - offset end

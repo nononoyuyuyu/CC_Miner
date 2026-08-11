@@ -1,3 +1,6 @@
+    local workerDefaults = common.defaultWorkerConfig()
+    local discard = ensureTable(config, "discard", workerDefaults.discard)
+    local performance = ensureTable(config, "performance", workerDefaults.performance)
     local dock = ensureTable(config, "dock", workerDefaults.dock)
     local group = ensureTable(config, "group", workerDefaults.group)
     local lighting = ensureTable(config, "lighting", workerDefaults.lighting)
@@ -183,8 +186,3 @@
         "Alert cooldown (seconds)",
         validInteger(alerts.cooldownSeconds, 10, 0, 3600),
         0,
-        3600
-      )
-    else
-      -- Keep disabled outputs explicit so old controllers do not emit a
-      -- notification merely because a peripheral was attached later.

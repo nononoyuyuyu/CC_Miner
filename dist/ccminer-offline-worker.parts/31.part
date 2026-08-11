@@ -1,3 +1,20 @@
+  local mode = state.job and state.job.waterMode
+  if not mode then mode = config.waterMode or (config.water and config.water.mode) or state.water.mode end
+  mode = tostring(mode or "ignore")
+  if mode ~= "ignore" and mode ~= "stop" and mode ~= "seal" then mode = "ignore" end
+  return mode
+end
+
+local function maxContinuousSeal()
+  return profileMaxContinuousSeal()
+end
+
+local function isInventoryBlock(side, data)
+  if peripheral and peripheral.hasType then
+    local ok, result = pcall(peripheral.hasType, side, "inventory")
+    if ok and result == true then return true end
+  end
+  local wrapped = peripheral and peripheral.wrap(side) or nil
   if wrapped and (type(wrapped.list) == "function" or type(wrapped.size) == "function") then return true end
   local name = string.lower(blockName(data))
   for _, marker in ipairs({ "chest", "barrel", "shulker_box", "drawer", "crate", "vault" }) do
@@ -260,19 +277,3 @@ local function maybePlaceTorch(context)
       if reason == "torch_material" or reason == "inventory_full" then return false, reason end
     end
   end
-  local lighting = config.lighting or {}
-  if mode == "custom" and lighting.temporaryFloor == true then
-    local placed, reason = tryPlaceTorchFloor()
-    if placed then return true end
-    if reason == "torch_material" then return false, reason end
-    -- Floor placement is an optional custom fallback; inability to place it
-    -- must not turn a navigable route into a hard failure.
-    return true
-  end
-  if failureReason == "occupied" or failureReason == "torch_wall_failed" then
-    return false, "torch_surface_unavailable"
-  end
-  return false, failureReason or "torch_surface_unavailable"
-end
-
-local function moveOne(direction, context)

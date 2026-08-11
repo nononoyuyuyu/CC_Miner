@@ -1,3 +1,14 @@
+    if not generated then return nil, nil, generatedError end
+    local chunks, keys = catalogGraph(generated)
+    if not chunks then return nil, nil, keys end
+    return chunks, keys
+  end
+  local chunks, keys = catalogGraph(catalog)
+  if not chunks then return nil, nil, keys end
+  return chunks, keys
+end
+
+local function groupWorkerList(values)
   if type(values) ~= "table" then return nil, "invalid_worker_ids" end
   local raw = {}
   if #values > 0 then
@@ -279,11 +290,3 @@ local function graphOwner(chunks, keys, workers, strategyLabel, distanceWeight)
       local best, bestDistance
       for _, key in ipairs(keys) do
         if not seedSet[key] then
-          local distance = 0
-          if worker.bay then
-            local chunk = chunks[key]
-            distance = math.abs(worker.bay.x - (chunk.cx * 16 + 8)) + math.abs(worker.bay.z - (chunk.cz * 16 + 8))
-          else
-            distance = MAX_CHUNKS
-            local maps = seedDistanceCache
-            for _, seed in ipairs(seeds) do

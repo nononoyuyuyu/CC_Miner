@@ -1,3 +1,7 @@
+            check("bay cell:#" .. tostring(id), "bad", "cannot rebase worker forward entrance to common catalog", true)
+          else
+            local forwardCell = false
+            for _, chunk in ipairs(catalog or {}) do
               if tonumber(localForward.x) >= tonumber(chunk.minX) and tonumber(localForward.x) <= tonumber(chunk.maxX)
                 and tonumber(localForward.z) >= tonumber(chunk.minZ) and tonumber(localForward.z) <= tonumber(chunk.maxZ) then
                 forwardCell = tostring(chunk.key) == tostring(homeKey) or forwardCell
@@ -165,6 +169,3 @@ local function dispatchGroupJob(job, force)
   job.acks = job.acks or {}
   for _ in pairs(job.awaitingAck) do return true end
   local now = common.nowSeconds()
-  local stagger = math.max(0, tonumber(job.staggerSeconds) or 0)
-  for _, assignment in ipairs(sortedJobAssignments(job)) do
-    local key = tostring(assignment.workerId)

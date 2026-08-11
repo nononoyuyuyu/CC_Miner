@@ -1,3 +1,12 @@
+    { "bottomY" }, { "bottom_y" }, { "targetY" },
+    { "job", "bottomY" }, { "job", "targetY" }, { "job", "bottom_y" },
+    { "dock", "bottomY" }, { "dock", "bottom_y" },
+  })
+  if bottomY ~= nil then printField("BOTTOM Y", bottomY) end
+
+  local completionReason = firstNestedValue(roots, {
+    { "return", "reason" }, { "lastReturn", "reason" },
+    { "returnRoute", "reason" }, { "service", "reason" },
     { "report", "return", "reason" }, { "report", "returnRoute", "reason" },
   })
   if completionReason == nil then
@@ -254,7 +263,3 @@ local function printControllerReport(config)
         local rowGroup = row.groupJobId or row.groupId or rowReport.groupJobId or rowReport.groupId
         local rowBottomY = row.bottomY or row.targetY or rowReport.bottomY or rowReport.targetY
         local rowDiscard = row.discard or row.discardStats or rowReport.discard or rowReport.discardStats
-          or rowStats.discarded or rowStats.discardedBlocks or rowStats.discardStats
-        local rowThroughput = row.throughput or rowReport.throughput or rowStats.throughput or row.performance or rowReport.performance
-        local rowReturn = row.lastReturn or row.returnInfo or row.returnRoute or rowReport.lastReturn or rowReport["return"] or rowReport.returnRoute
-        print(("  #%s id=%s status=%s mode=%s at=%s"):format(

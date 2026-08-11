@@ -1,3 +1,9 @@
+  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
+  local key
+  if type(value) == "table" then
+    key = value.chunkKey or value.chunk or value.key
+    if key == nil and value.cx ~= nil and value.cz ~= nil then
+      local cx, cz = integerValue(value.cx), integerValue(value.cz)
       if cx and cz then key = chunkKey(plan.mode, cx, cz) end
     end
   else
@@ -261,14 +267,3 @@ function M.estimateJob(job, calibration, options)
     minedCells = totalCells,
     totalCells = totalCells,
     cells = totalCells,
-    cellCount = totalCells,
-    totalBlocks = totalCells,
-    blocks = totalCells,
-    blockCount = totalCells,
-    total = totalCells,
-    baseMovement = baseMovement,
-    baseMoves = baseMovement,
-    baseDistance = baseMovement,
-    estimatedMovement = baseMovement,
-    transitionMovement = transitionMovement,
-    returnMovement = returnMovement,

@@ -1,3 +1,5 @@
+  local startableStatus = workerStatus == "idle" or workerStatus == "complete" or workerStatus == "completed" or workerStatus == "aborted"
+  check("start state", startableStatus and "ok" or "bad", workerStatus, not startableStatus)
   check("home", data.atHome == true and "ok" or "bad", data.atHome == true and "at home" or "worker is not at home", data.atHome ~= true)
   local poseDir = tonumber(data.pose and data.pose.dir)
   check("facing", poseDir == 0 and "ok" or "bad", poseDir == 0 and "facing quarry" or (poseDir and ("direction=" .. tostring(poseDir)) or "direction unknown"), poseDir ~= 0)
@@ -195,7 +197,3 @@ local function partitionGroupCatalog(catalog, group, options, workerSpecs)
   if not ok or not legacy then return nil, tostring(legacy or "group_partition_api_unavailable") end
   local normalized = {}
   for _, spec in ipairs(specs) do
-    local value = legacy[spec.workerId] or legacy[tostring(spec.workerId)]
-    if type(value) ~= "table" then return nil, "legacy_partition_missing_worker_" .. tostring(spec.workerId) end
-    normalized[tostring(spec.workerId)] = {
-      workerId = spec.workerId,

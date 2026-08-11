@@ -1,3 +1,20 @@
+    return false, "Lava-seal block inventory missing on configured side " .. side .. "."
+  end
+
+  local originalSlot = turtle.getSelectedSlot()
+  local attempts = 0
+  while sealMaterialCount() < target do
+    drainNetwork(3)
+    if movementInterrupted("service") then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "control_request"
+    end
+    attempts = attempts + 1
+    if attempts > 64 then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+]=] },
   { source = [[src/ccminer/worker_parts/04.part]], target = [[worker_parts/04.part]], digest = [[fbc125a385c7b9fe8ddbd65fc66320420dbdc3759a9df33db0b5523e2c96bee5]], content = [[      return false, "Seal-block loading safety limit reached."
     end
     local slot = refillSlotForSeal()
@@ -241,11 +258,3 @@ local function continueService()
   state.service.returnStartedAt = state.service.returnStartedAt or common.nowSeconds()
   state.service.returnDistance = state.service.returnDistance or 0
   state.serviceReturn = state.serviceReturn or {}
-  state.serviceReturn.startedAt = state.serviceReturn.startedAt or common.nowSeconds()
-  state.returnReason = state.service.reason or state.returnReason or "service"
-  if not isHome() then
-    state.phase = "returning"
-    local returnDistance = estimatedReturnDistance(state.pose)
-    if returnDistance then state.service.returnDistance = returnDistance end
-    saveState("service_return_start", true)
-    local preReturnGPS, preReturnError = verifyGPS(true)

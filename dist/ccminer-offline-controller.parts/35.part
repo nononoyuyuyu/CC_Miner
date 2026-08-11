@@ -1,3 +1,4 @@
+  buttonRow(key, bottom + 2, width, {
     { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
     { "RECALL", dashboardAction("recall") }, { "SERVICE", dashboardAction("service") },
   })
@@ -167,4 +168,3 @@ local function renderGroupInfo(target, key)
   local width, height = target.getSize()
   local gid, group = selectedGroupRecord()
   local job = gid and activeGroupJob(gid) or nil
-  writeHeader("GROUP DRILLDOWN", target, colors and colors.cyan or nil)

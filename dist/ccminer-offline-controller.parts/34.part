@@ -1,3 +1,5 @@
+    elseif name == "report" then mode = "report"
+    elseif name == "last_error" then noticeState.showLast()
     elseif name == "stop" then if id then mode = "stop_menu" else setNotice("No worker selected.", true) end
     elseif name == "pause" or name == "resume" or name == "recall" or name == "service" then sendCommand(id, name)
     elseif name == "abort" then
@@ -238,4 +240,3 @@ local function renderDashboard(target, key)
     { "STOP", dashboardAction("stop") }, { "RECOVERY", dashboardAction("recovery") },
     { "REPORT", dashboardAction("report") }, { "GPS", dashboardAction("gps") },
   })
-  buttonRow(key, bottom + 2, width, {

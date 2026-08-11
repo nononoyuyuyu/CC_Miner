@@ -1,3 +1,10 @@
+  for index = first, #LOW_SPACE_STEPS do
+    local step = LOW_SPACE_STEPS[index]
+    marked, markerError = markerWrite("committing", index)
+    if not marked then lowSpaceFailure("Cannot record commit progress for step " .. tostring(index) .. ": " .. tostring(markerError)) end
+    local applied, applyError = applyLowSpaceStep(step)
+    if not applied then lowSpaceFailure(applyError) end
+    marked, markerError = markerWrite("committing", index + 1)
     if not marked then lowSpaceFailure("Applied low-space step " .. tostring(index) .. ", but cannot advance recovery marker: " .. tostring(markerError)) end
   end
   local finalContent = embeddedEntrypoint()

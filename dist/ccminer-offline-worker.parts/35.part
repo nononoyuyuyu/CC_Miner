@@ -1,3 +1,16 @@
+        -- Keep seal/torch/fuel material on the turtle.  It is never sent to
+        -- either output or discard, even when the output chest is available.
+      elseif not protected then
+        if outputTargetDir ~= nil then turnTo(outputTargetDir) else turnTo(outRestore) end
+        turtle.select(slot)
+        local before = turtle.getItemCount(slot)
+        local prepared, prepareError = beginPhysicalAction("unload_home", {
+          slot = slot, item = name, count = before, direction = outputSide,
+        }, poseCopy())
+        if not prepared then
+          allDropped = false
+          discardStats.lastError = prepareError or "Could not journal output action."
+          break
         end
         local dropped = outDrop() -- output receives all non-discard items
         if dropped and turtle.getItemCount(slot) == 0 then commitPhysicalAction()
@@ -260,20 +273,3 @@ local function refillSealAtHome()
   local checkSide = (side == "top" and "top") or (side == "bottom" and "bottom") or "front"
   if not inventoryPresent(checkSide, inspectFunction) then
     restoreSideDirection(side, restoreDir)
-    return false, "Lava-seal block inventory missing on configured side " .. side .. "."
-  end
-
-  local originalSlot = turtle.getSelectedSlot()
-  local attempts = 0
-  while sealMaterialCount() < target do
-    drainNetwork(3)
-    if movementInterrupted("service") then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "control_request"
-    end
-    attempts = attempts + 1
-    if attempts > 64 then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-]=] },

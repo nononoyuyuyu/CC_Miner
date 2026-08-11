@@ -1,3 +1,4 @@
+  buttonRow(key, 5, width, { { "FINISH LAYER", action("finish_layer", "Finish current layer then stop.") }, { "RETURN HOME", action("return_home", "Return-home stop requested.") } })
   buttonRow(key, math.max(6, height - 3), width, { { "ABORT", action("abort", "Abort requested.") }, { "BACK", function() mode = "dashboard" end } })
   noticeLine(target, height)
 end
@@ -185,9 +186,3 @@ local function processChar(character)
     return
   elseif mode == "group_info" then
     if character == "b" or character == "q" then mode = "groups"; invalidate() end
-    return
-  end
-  if mode ~= "dashboard" then return end
-  local id = selectedWorker()
-  if character == "d" then discover()
-  elseif character == "n" then dashboardAction("new")()

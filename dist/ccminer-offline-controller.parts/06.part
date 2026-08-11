@@ -9,7 +9,7 @@ end
 
 return M
 ]] },
-  { source = [[src/ccminer/lib/protocol.lua]], target = [[lib/protocol.lua]], digest = [[a54c89ea1bed23e86e77932bcddd36d256edb868346d137ecdabeedc0c033ae9]], content = [[-- CC Miner V4/V2-compatible rednet protocol helpers
+  { source = [[src/ccminer/lib/protocol.lua]], target = [[lib/protocol.lua]], digest = [[25a20fabc06bbf6ef855e1c3e46b9aac3bb05ee1361da50ed812989ee74c8040]], content = [[-- CC Miner V4/V2-compatible rednet protocol helpers
 
 local common = dofile("/ccminer/lib/common.lua")
 local M = {}
@@ -75,7 +75,13 @@ end
 function M.receive(timeout)
   if not rednet then return nil, nil, "rednet_unavailable" end
   local ok, sender, message, protocolName = pcall(rednet.receive, common.PROTOCOL, timeout)
-  if not ok then return nil, nil, tostring(sender) end
+  if not ok then
+    local text = tostring(sender)
+    -- Ctrl+T raises Terminated from the event API. It is an explicit local
+    -- stop request, not a recoverable network error, so never swallow it.
+    if text == "Terminated" or text:find("Terminated", 1, true) then error(sender, 0) end
+    return nil, nil, text
+  end
   if not sender then return nil, nil, nil end
   return sender, message, protocolName
 end
@@ -280,7 +286,3 @@ else
   end)
 
   if requestedRole == "worker" then
-    config = common.merge(common.defaultWorkerConfig(), current and current.role == "worker" and current or {})
-    config.role, config.networkKey = "worker", key
-    local workerDefaults = common.defaultWorkerConfig()
-    local discard = ensureTable(config, "discard", workerDefaults.discard)

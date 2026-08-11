@@ -1,3 +1,9 @@
+    else restored, restoreError = false, "Backup directory is missing." end
+  end
+  if not restored then
+    fail("Install swap failed and rollback failed. Previous files remain at " .. BACKUP .. ": "
+      .. tostring(moveError) .. "; rollback: " .. tostring(restoreError))
+  end
   fail("Install swap failed; previous installation was restored: " .. tostring(moveError))
 end
 print("")

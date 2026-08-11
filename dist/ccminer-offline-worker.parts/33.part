@@ -1,3 +1,16 @@
+  local endpointFromKey = quarry.findChunk(plan, fromPose.x, fromPose.z)
+  local endpointToKey = quarry.findChunk(plan, toPose.x, toPose.z)
+  if not endpointFromKey or not endpointToKey then
+    return false, "Service route endpoint is outside the assigned chunk plan."
+  end
+  local routeResult
+  if type(quarry.shortestServiceRoute) == "function" then
+    local ok, result = pcall(quarry.shortestServiceRoute, plan, fromPose, toPose, {
+      mode = mode or "work", context = context,
+      breadcrumbs = state.job and state.job.route and state.job.route.breadcrumbs or nil,
+    })
+    if ok and type(result) == "table" then routeResult = result end
+  end
   if routeResult and type(routeResult.waypoints) == "table" then
     local waypoints = routeResult.waypoints
     if waypoints.from and waypoints.to then waypoints = { waypoints.from, waypoints.to } end
@@ -241,21 +254,3 @@ local function discardStatsTable()
   stats.mode = (config.discard and config.discard.mode) or stats.mode or "KEEP_ALL"
   stats.triggerEmptySlots = tonumber(config.discard and config.discard.triggerEmptySlots) or 3
   stats.maxStacksPerPass = tonumber(config.discard and config.discard.maxStacksPerPass) or 8
-  stats.byName = stats.byName or {}
-  return stats
-end
-
-local function noteDiscard(name, count)
-  local stats = discardStatsTable()
-  count = math.max(0, tonumber(count) or 0)
-  stats.items = (stats.items or 0) + count
-  stats.discarded = (stats.discarded or 0) + count
-  stats.stacks = (stats.stacks or 0) + 1
-  stats.byName[name] = (stats.byName[name] or 0) + count
-  stats.lastAt = common.nowSeconds()
-  state.stats.discardedBlocks = (state.stats.discardedBlocks or 0) + count
-  state.stats.discardPasses = (state.stats.discardPasses or 0) + 1
-end
-
-local function noteDiscardSkip(name, unknown)
-  local stats = discardStatsTable()

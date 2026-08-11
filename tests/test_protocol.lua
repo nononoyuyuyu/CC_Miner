@@ -52,4 +52,16 @@ numericEnvelope.sender = "42"
 numericEnvelope.target = "7"
 assert(protocol.validate(numericEnvelope, "shared-key", 7, 42))
 
+-- Ctrl+T is an explicit operator request. protocol.receive may contain other
+-- rednet failures, but must propagate Terminated so boot.lua can stop the
+-- worker instead of immediately returning to its loop.
+rednet = { receive = function() error("Terminated", 0) end }
+local terminatedOk, terminatedError = pcall(protocol.receive, 0.1)
+assert(not terminatedOk and tostring(terminatedError):find("Terminated", 1, true),
+  "protocol.receive swallowed Ctrl+T termination")
+rednet.receive = function() error("network_boom", 0) end
+local sender, received, receiveError = protocol.receive(0.1)
+assert(sender == nil and received == nil and receiveError == "network_boom",
+  "ordinary rednet errors should remain recoverable")
+
 print("protocol V4 positive and adversarial envelope tests passed")

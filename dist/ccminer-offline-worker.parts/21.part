@@ -1,3 +1,14 @@
+        copy.key = normalized
+        entry = copy
+      end
+      byKey[normalized] = entry; entries[#entries + 1] = entry
+    end
+  end
+  return entries, byKey
+end
+
+local function assignedKeyList(value, field)
+  if type(value) == "table" and field and type(value[field]) == "table" then value = value[field] end
   if type(value) ~= "table" then return nil, "invalid_assigned_keys" end
   local list, seen = {}, {}
   if #value > 0 then
@@ -238,10 +249,3 @@ function M.buildAssignedChunkPlan(catalog, assignedKeys, options)
   for _, key in ipairs(servicePath) do
     if not mineSet[key] and not transitSet[key] then return nil, "service_route_requires_transit:" .. key end
   end
-
-  -- Runtime movement still consumes `chunk.anchor`, including on older
-  -- workers that do not understand serviceRoute waypoints.  Populate every
-  -- mine/transit chunk with independent valid cells before constructing the
-  -- assigned DFS walk.
-  for _, key in ipairs(allKeys) do
-    local chunk = chunks[key]

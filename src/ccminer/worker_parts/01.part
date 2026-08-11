@@ -1085,6 +1085,12 @@ local function locateGPS()
     return nil, state.gps.lastError
   end
   local ok, x, y, z = pcall(gps.locate, tonumber(gpsConfig().timeout) or 2, false)
+  if not ok then
+    local text = tostring(x)
+    -- gps.locate waits for events. Preserve Ctrl+T as a real local stop even
+    -- when it arrives during a GPS lookup instead of a rednet receive.
+    if text == "Terminated" or text:find("Terminated", 1, true) then error(x, 0) end
+  end
   if not ok or x == nil then
     state.gps.available = false
     state.gps.lastError = ok and "No GPS fix received." or tostring(x)

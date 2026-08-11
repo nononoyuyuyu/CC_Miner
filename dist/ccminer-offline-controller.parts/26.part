@@ -1,3 +1,14 @@
+  if text and text ~= "" then setNotice(text, kind == "blocked") end
+end
+
+local function clearAlert(id, kind)
+  alertLedger[tostring(id) .. ":" .. tostring(kind)] = nil
+end
+
+local function handleMessage(sender, message)
+  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
+  if not valid then return false end
+  if message.kind == "status" then
     local payload = normalizeStatus(message.payload)
     local id = tonumber(payload.id)
     if not id or id ~= tonumber(sender) then return false end
@@ -199,11 +210,3 @@ local function groupCommand(groupId, command, payload)
     groupJob.status = command == "clear" and "clear_requested" or "aborting"
     if command == "abort" then
       -- Assignments that were never sent cannot later race an ABORT.  Keep
-      -- awaiting ACK entries until their worker confirms/returns, since the
-      -- START packet may already be in flight.
-      groupJob.pending = {}
-    end
-    groupJob.returnReason = groupJob.returnReason or (command == "abort" and "group_abort" or "group_clear")
-    maybeFinalizeGroup(groupJob)
-    saveControllerDb()
-  end

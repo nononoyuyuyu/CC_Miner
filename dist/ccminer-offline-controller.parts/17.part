@@ -1,3 +1,15 @@
+  local reversed, current = { targetKey }, targetKey
+  while current ~= startKey do
+    current = previous[current]
+    if not current then return nil, "chunks_disconnected" end
+    reversed[#reversed + 1] = current
+  end
+  local path = {}
+  for index = #reversed, 1, -1 do path[#path + 1] = reversed[index] end
+  return path
+end
+
+local function workerList(workerIds)
   if type(workerIds) ~= "table" then return nil, "invalid_worker_ids" end
   local workers, seen = {}, {}
   for _, id in ipairs(workerIds) do
@@ -239,14 +251,3 @@ local function groupCatalogInput(catalog, options)
   if not hasChunks and options.width ~= nil and options.length ~= nil then
     local generated, generatedError = M.buildWorldCatalog(options.width, options.length,
       descriptor.worldSeed or descriptor.seed or options.worldSeed, options)
-    if not generated then return nil, nil, generatedError end
-    local chunks, keys = catalogGraph(generated)
-    if not chunks then return nil, nil, keys end
-    return chunks, keys
-  end
-  local chunks, keys = catalogGraph(catalog)
-  if not chunks then return nil, nil, keys end
-  return chunks, keys
-end
-
-local function groupWorkerList(values)

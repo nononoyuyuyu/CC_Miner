@@ -1,3 +1,20 @@
+    return false, state.lastError
+  end
+  state.gps.available = true
+  state.gps.lastFix = homeFix
+  state.gps.lastFixAt = common.nowSeconds()
+  state.gps.lastError = nil
+  state.status, state.phase, state.lastError = "idle", "home", nil
+  commitPhysicalAction()
+  common.log("INFO", ("GPS calibrated at %d,%d,%d forward=%d,%d"):format(
+    homeFix.x, homeFix.y, homeFix.z, calibration.forward.x, calibration.forward.z
+  ))
+  return true, "GPS calibrated."
+end
+
+local function applyControlCommand(command, payload)
+  payload = payload or {}
+  if command == "pause_now" or command == "finish_row" or command == "finish_layer" or command == "return_home" then
     payload.mode = command
     command = "stop"
   end
@@ -269,20 +286,3 @@ local function isWater(data)
 end
 
 local function waterMode()
-  local mode = state.job and state.job.waterMode
-  if not mode then mode = config.waterMode or (config.water and config.water.mode) or state.water.mode end
-  mode = tostring(mode or "ignore")
-  if mode ~= "ignore" and mode ~= "stop" and mode ~= "seal" then mode = "ignore" end
-  return mode
-end
-
-local function maxContinuousSeal()
-  return profileMaxContinuousSeal()
-end
-
-local function isInventoryBlock(side, data)
-  if peripheral and peripheral.hasType then
-    local ok, result = pcall(peripheral.hasType, side, "inventory")
-    if ok and result == true then return true end
-  end
-  local wrapped = peripheral and peripheral.wrap(side) or nil

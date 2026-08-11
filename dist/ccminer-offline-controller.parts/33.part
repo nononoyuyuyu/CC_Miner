@@ -1,3 +1,6 @@
+      jobId = assignment.jobId,
+    }
+    if result.chunkMode == "world" then payload.targetY = result.targetY end
     local sentOK, _, messageId = sendCommand(assignment.workerId, "start", payload)
     if not sentOK then sent = false; break end
     db.pendingStarts[tostring(assignment.workerId)] = {
@@ -237,5 +240,3 @@ local function dashboardAction(name)
       if id then mode = "progress" else setNotice("No worker selected.", true) end
     elseif name == "recovery" then
       if id then mode = "recovery" else setNotice("No worker selected.", true) end
-    elseif name == "report" then mode = "report"
-    elseif name == "last_error" then noticeState.showLast()

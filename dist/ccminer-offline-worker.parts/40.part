@@ -1,3 +1,14 @@
+  local ok, compileError = compileText(label .. ".assembled.lua", table.concat(source))
+  if not ok then fail("Assembled source failed syntax validation: " .. label .. ": " .. compileError) end
+end
+local function validateAll()
+  validateEmbedded()
+  for _, file in ipairs(files) do
+    if not file.target:match("%.part$") then
+      local ok, compileError = compileText(file.target, file.content)
+      if not ok then fail("Embedded file failed syntax validation: " .. file.target .. ": " .. compileError) end
+    end
+  end
   validateParts("worker", WORKER_PARTS)
   validateParts("controller", CONTROLLER_PARTS)
 end
@@ -253,10 +264,3 @@ local function lowSpaceUpdate()
   end
   local marked, markerError = markerWrite("ready", first)
   if not marked then lowSpaceFailure("Cannot mark validated runtime: " .. tostring(markerError)) end
-  for index = first, #LOW_SPACE_STEPS do
-    local step = LOW_SPACE_STEPS[index]
-    marked, markerError = markerWrite("committing", index)
-    if not marked then lowSpaceFailure("Cannot record commit progress for step " .. tostring(index) .. ": " .. tostring(markerError)) end
-    local applied, applyError = applyLowSpaceStep(step)
-    if not applied then lowSpaceFailure(applyError) end
-    marked, markerError = markerWrite("committing", index + 1)

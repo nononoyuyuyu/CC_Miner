@@ -173,12 +173,13 @@ end
 
 local function setNotice(text, isError)
   local errorNotice = isError == true
-  if not errorNotice and mode == "error_detail" and noticeIsError then return end
+  -- Keep the last error visible without stealing the whole screen. Normal
+  -- status/heartbeat messages cannot erase it; the operator can continue
+  -- working and open LAST ERR only when the full text is needed.
+  if not errorNotice and noticeIsError then return end
   notice, noticeIsError = tostring(text or ""), errorNotice
   if errorNotice then
     noticeState.detail = notice
-    if mode ~= "error_detail" then noticeState.returnMode = mode end
-    mode = "error_detail"
   end
   invalidate()
 end

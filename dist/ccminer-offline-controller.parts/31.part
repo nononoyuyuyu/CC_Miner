@@ -1,3 +1,6 @@
+  local stagger = math.max(0, tonumber(job.staggerSeconds) or 0)
+  for _, assignment in ipairs(sortedJobAssignments(job)) do
+    local key = tostring(assignment.workerId)
     if not job.started[key] and not job.failed[key] and (force or not job.pending[key] or now >= (job.nextDispatchAt or 0)) then
       local payload = {
         scope = "group", group = true, groupId = tostring(job.groupId), groupJobId = tostring(job.groupJobId), parentGroupJobId = tostring(job.groupJobId), groupCommand = "START", requestedCommand = "start", assignmentCatalog = common.copy(job.catalog),
@@ -149,4 +152,3 @@ local function reassignGroupAssignment(groupJobId, stoppedWorkerId, targetWorker
       if tonumber(candidate) ~= tonumber(stoppedWorkerId) and (candidateStatus == "idle" or candidateStatus == "complete" or candidateStatus == "aborted") and candidateData.atHome == true then targetWorkerId = candidate; break end
     end
   end
-  if not targetWorkerId then setNotice("No online target for residual range.", true); return false end

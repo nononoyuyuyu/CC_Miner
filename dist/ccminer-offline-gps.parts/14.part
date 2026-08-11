@@ -1,3 +1,9 @@
+    if fs.exists(temp) then fs.delete(temp) end
+    return false, "Atomic replace failed: " .. tostring(moveError) .. "; rollback: " .. tostring(restoreError or restored)
+  end
+  if fs.exists(backup) then fs.delete(backup) end
+  if fs.exists(temp) then fs.delete(temp) end
+  return true
 end
 local function readConfigRole()
   local text = readFile(ROOT .. "/config.db")
@@ -247,9 +253,3 @@ if not moved then
   local restored, restoreError = true, nil
   if hadRoot then
     if fs.exists(BACKUP) then restored, restoreError = moveChecked(BACKUP, ROOT)
-    else restored, restoreError = false, "Backup directory is missing." end
-  end
-  if not restored then
-    fail("Install swap failed and rollback failed. Previous files remain at " .. BACKUP .. ": "
-      .. tostring(moveError) .. "; rollback: " .. tostring(restoreError))
-  end

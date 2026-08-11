@@ -1,3 +1,4 @@
+  if not targetWorkerId then setNotice("No online target for residual range.", true); return false end
   local targetData, targetStatus = workerData(targetWorkerId) or {}, statusOf(workers[targetWorkerId])
   if not ((targetStatus == "idle" or targetStatus == "complete" or targetStatus == "aborted") and targetData.atHome == true) then setNotice("Reassign target must be idle/terminal and at home.", true); return false end
   if job.chunkMode == "world" and not (targetData.gps and targetData.gps.calibration) then setNotice("Reassign target requires GPS calibration.", true); return false end
@@ -174,6 +175,3 @@ local function startDraft()
       -- assignmentId is group-only wire metadata. Sending it for an ordinary
       -- one-worker quarry makes the worker correctly demand assignmentChunks
       -- and reject the otherwise valid full-footprint job.
-      jobId = assignment.jobId,
-    }
-    if result.chunkMode == "world" then payload.targetY = result.targetY end

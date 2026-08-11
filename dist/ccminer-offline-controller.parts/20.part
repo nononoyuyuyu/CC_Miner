@@ -1,3 +1,11 @@
+  local rootKey = options.rootKey and tostring(options.rootKey) or nil
+  if not rootKey then
+    for _, key in ipairs(keys) do
+      if contains(chunks[key], 0, 1) then rootKey = key; break end
+    end
+  end
+  rootKey = rootKey or keys[1]
+  if not chunks[rootKey] then return nil, "unknown_root_chunk" end
   local assignments, totalCost, assignedSet = {}, 0, {}
   for index, worker in ipairs(workers) do
     local chunkKeys = uniqueSortedKeys(owned[index], chunks)
@@ -271,11 +279,3 @@ function M.buildAssignedChunkPlan(catalog, assignedKeys, options)
   end
   local mineSet, transitSet = {}, {}
   for _, key in ipairs(mineKeys) do
-    if not sourceChunks[key] then return nil, "unknown_assigned_chunk:" .. key end
-    mineSet[key] = true
-  end
-  for _, key in ipairs(transitKeys) do
-    if not sourceChunks[key] then return nil, "unknown_transit_chunk:" .. key end
-    if mineSet[key] then return nil, "transit_overlaps_assigned:" .. key end
-    transitSet[key] = true
-  end

@@ -1,3 +1,18 @@
+      if not ok or type(assignedPlan) ~= "table" or type(assignedPlan.chunks) ~= "table" then
+        return nil, tostring(ok and assignedPlan or assignedPlan or "assigned plan failed")
+      end
+      plan = assignedPlan
+      planError = nil
+    else
+      plan, planError = quarry.buildChunkPlan(job, planCalibration)
+    end
+    if not plan then return nil, planError end
+    job.strategy = "chunk_plan"
+    job.chunkPlan = plan
+    local selectedCells = plan.columns or 0
+    if assignmentPlanRequested then
+      -- The planner returns independent arrays (serializer-safe); normalize
+      -- them into lookup sets used by the runtime's transit-only guard.
       local assignedKeys = plan.assignedKeys or plan.mineChunkKeys or assignmentChunks
       local transitKeys = plan.transitKeys or plan.transitRouteKeys or job.assignmentTransitChunks or {}
       job.assignmentChunks = common.copy(assignedKeys)
@@ -234,20 +249,3 @@ local function calibrateGPS()
     state.status, state.phase = "blocked", "gps_error"
     state.lastError = "Could not save GPS calibration: " .. tostring(saveError)
     saveState()
-    return false, state.lastError
-  end
-  state.gps.available = true
-  state.gps.lastFix = homeFix
-  state.gps.lastFixAt = common.nowSeconds()
-  state.gps.lastError = nil
-  state.status, state.phase, state.lastError = "idle", "home", nil
-  commitPhysicalAction()
-  common.log("INFO", ("GPS calibrated at %d,%d,%d forward=%d,%d"):format(
-    homeFix.x, homeFix.y, homeFix.z, calibration.forward.x, calibration.forward.z
-  ))
-  return true, "GPS calibrated."
-end
-
-local function applyControlCommand(command, payload)
-  payload = payload or {}
-  if command == "pause_now" or command == "finish_row" or command == "finish_layer" or command == "return_home" then

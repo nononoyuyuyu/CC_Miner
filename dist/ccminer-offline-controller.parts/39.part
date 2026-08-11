@@ -1,3 +1,9 @@
+    return
+  end
+  if mode ~= "dashboard" then return end
+  local id = selectedWorker()
+  if character == "d" then discover()
+  elseif character == "n" then dashboardAction("new")()
   elseif character == "p" then sendCommand(id, "pause")
   elseif character == "r" then sendCommand(id, "resume")
   elseif character == "h" then sendCommand(id, "recall")

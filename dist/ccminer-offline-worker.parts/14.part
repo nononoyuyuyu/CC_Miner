@@ -1,3 +1,8 @@
+  if not index or index >= totalColumns * validDepth then return nil, "index_out_of_range" end
+  local perLayer = validWidth * validLength
+  local layer = math.floor(index / perLayer)
+  local offset = index % perLayer
+  if layer % 2 == 1 then offset = perLayer - 1 - offset end
   local row = math.floor(offset / validLength)
   local column = offset % validLength
   local z = row % 2 == 0 and (column + 1) or (validLength - column)
@@ -290,9 +295,3 @@ M.chunkEntrance = M.chunkAnchor
 local function shortestPathInternal(chunks, fromKey, toKey)
   if not chunks or not chunks[fromKey] then return nil, "unknown_chunk:" .. tostring(fromKey) end
   if not chunks[toKey] then return nil, "unknown_chunk:" .. tostring(toKey) end
-  if fromKey == toKey then return { fromKey } end
-  local queue, head, tail = { fromKey }, 1, 1
-  local previous, seen = {}, { [fromKey] = true }
-  while head <= tail do
-    local key = queue[head]; head = head + 1
-    for _, neighbor in ipairs(chunks[key].neighbors or {}) do

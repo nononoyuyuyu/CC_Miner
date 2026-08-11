@@ -1,3 +1,9 @@
+  routeY = numberValue(routeY) or 0
+  if fromPose == nil and plan.rootKey and plan.chunks[plan.rootKey] and contains(plan.chunks[plan.rootKey], 0, 1) then
+    fromPose = { chunkKey = plan.rootKey, x = 0, y = routeY, z = 1 }
+  end
+  local fromKey, fromPoint, fromError = normalizeRoutePose(plan, fromPose, plan.rootKey, routeY)
+  if not fromKey then return nil, fromError end
   local toKey, toPoint, toError = normalizeRoutePose(plan, toPose, nil, routeY)
   if not toKey then return nil, toError end
 
@@ -269,15 +275,3 @@ end
 local function pathFromBreadthTree(previous, startKey, targetKey)
   if startKey == targetKey then return { startKey } end
   if not previous[targetKey] then return nil, "chunks_disconnected" end
-  local reversed, current = { targetKey }, targetKey
-  while current ~= startKey do
-    current = previous[current]
-    if not current then return nil, "chunks_disconnected" end
-    reversed[#reversed + 1] = current
-  end
-  local path = {}
-  for index = #reversed, 1, -1 do path[#path + 1] = reversed[index] end
-  return path
-end
-
-local function workerList(workerIds)

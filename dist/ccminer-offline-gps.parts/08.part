@@ -1,3 +1,8 @@
+        3600
+      )
+    else
+      -- Keep disabled outputs explicit so old controllers do not emit a
+      -- notification merely because a peripheral was attached later.
       alerts.speaker, alerts.redstone = false, false
     end
     if os.setComputerLabel then os.setComputerLabel(config.controllerName) end
@@ -299,7 +304,3 @@ local function printOperationalFields(root, config)
   if bottomY ~= nil then printField("BOTTOM Y", bottomY) end
 
   local completionReason = firstNestedValue(roots, {
-    { "return", "reason" }, { "lastReturn", "reason" },
-    { "returnRoute", "reason" }, { "service", "reason" },
-    { "report", "return", "reason" }, { "report", "returnRoute", "reason" },
-  })

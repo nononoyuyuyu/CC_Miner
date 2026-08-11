@@ -1,3 +1,15 @@
+    if targetY ~= math.floor(targetY) then return nil, "targetY must be a whole number." end
+    if requestedChunkMode ~= "world" then
+      return nil, "targetY requires chunkMode=world with GPS calibration."
+    end
+    local calibration = gpsCalibration()
+    if not calibration then return nil, "targetY requires GPS calibration." end
+    local homeY = tonumber(calibration.home and calibration.home.y)
+    if not homeY then return nil, "GPS calibration has no home Y coordinate." end
+    local derivedDepth = homeY - targetY + 1
+    if derivedDepth < 1 or derivedDepth > config.maxDepth then
+      return nil, "targetY is outside the configured depth range."
+    end
     if depth ~= nil and (depth ~= math.floor(depth) or depth ~= derivedDepth) then
       return nil, "depth must equal the depth derived from targetY."
     end
@@ -204,18 +216,3 @@
       }
       local ok, assignedPlan = pcall(quarry.buildAssignedChunkPlan,
         assignmentCatalog, assignmentChunks, assignmentOptions)
-      if not ok or type(assignedPlan) ~= "table" or type(assignedPlan.chunks) ~= "table" then
-        return nil, tostring(ok and assignedPlan or assignedPlan or "assigned plan failed")
-      end
-      plan = assignedPlan
-      planError = nil
-    else
-      plan, planError = quarry.buildChunkPlan(job, planCalibration)
-    end
-    if not plan then return nil, planError end
-    job.strategy = "chunk_plan"
-    job.chunkPlan = plan
-    local selectedCells = plan.columns or 0
-    if assignmentPlanRequested then
-      -- The planner returns independent arrays (serializer-safe); normalize
-      -- them into lookup sets used by the runtime's transit-only guard.

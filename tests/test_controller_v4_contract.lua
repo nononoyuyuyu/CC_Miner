@@ -49,6 +49,11 @@ for _, item in ipairs({
 }) do
   marker(controller, item[1], item[2])
 end
+local noticeStart = assert(controller:find("local function setNotice(text, isError)", 1, true))
+local noticeEnd = assert(controller:find("noticeState.dismiss = function()", noticeStart, true))
+local noticeBody = controller:sub(noticeStart, noticeEnd - 1)
+marker(noticeBody, "if not errorNotice and noticeIsError then return end", "non-blocking sticky error")
+assert(not noticeBody:find('mode = "error_detail"', 1, true), "setNotice still forces the blocking error screen")
 
 for _, item in ipairs({
   { "local function renderErrorDetail(target, key)", "persistent rejection detail screen" },

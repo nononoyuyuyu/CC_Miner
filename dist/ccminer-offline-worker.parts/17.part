@@ -1,3 +1,14 @@
+    cellCount = totalCells,
+    totalBlocks = totalCells,
+    blocks = totalCells,
+    blockCount = totalCells,
+    total = totalCells,
+    baseMovement = baseMovement,
+    baseMoves = baseMovement,
+    baseDistance = baseMovement,
+    estimatedMovement = baseMovement,
+    transitionMovement = transitionMovement,
+    returnMovement = returnMovement,
     minimumFuel = minimumFuel,
     minFuel = minimumFuel,
     torchInterval = interval,
@@ -272,10 +283,3 @@ function M.buildWorldCatalog(width, length, worldSeed, options)
     if descriptor.width == nil and descriptor.length == nil and integerValue(length, 1, MAX_DIMENSION)
         and integerValue(worldSeed, 1, MAX_DIMENSION) then
       -- Flexible seed-first form: buildWorldCatalog(worldSeed, width, length).
-      local seed = descriptor
-      width, length, worldSeed = length, worldSeed, seed
-      descriptor = nil
-    end
-    if descriptor == nil then
-      local calibration = options.calibration or worldSeedCalibration(worldSeed, options)
-      if not calibration then return nil, "gps_not_calibrated" end
