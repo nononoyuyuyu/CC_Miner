@@ -7,6 +7,7 @@
 <h2 id="password">最初に合言葉を決める</h2>
 <p>採掘タートルと管理用コンピューターが、お互いを見分けるための文字です。紙などに控え、すべて同じ文字を入力します。画面では <code>network key</code> と表示されます。</p>
 <div class="callout danger"><strong>公開しないでください。</strong>配信や画面写真に合言葉を写さないでください。また、強い暗号ではないため、信頼できる人だけが入れるゲーム内ネットワークで使ってください。</div>
+<div class="callout note"><strong>初回から省容量方式を使います。</strong>CCのコンピューターは保存容量が小さいため、最新版はファイルを1個ずつ確認しながら入れます。途中で止まっても、<code>/ccminer</code>や復旧用ファイルを消さず、まったく同じインストールコマンドをもう一度実行してください。</div>
 <h2 id="worker">1. 採掘タートルへ入れる</h2>
 <ol class="steps"><li><div><h3>左側へ無線モデムを装備する</h3><p>右側にもともと付いているピッケルは外しません。持ち物の1番へ無線モデムを入れ、Lua入力画面で <code>turtle.select(1)</code> と <code>turtle.equipLeft()</code> を実行します。<a href="worker-dock.html#modem">詳しい手順</a>どおり、左側が <code>modem</code> になったことを確認します。</p></div></li><li><div><h3>次の1行を入力する</h3><pre><code>wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua worker</code></pre><p class="copy-note">1行のまま入力し、<kbd>Enter</kbd>を押します。</p></div></li><li><div><h3>質問に答える</h3><p>初回は SAFE、不要品を捨てない、GPSは使わない、照明OFF、水と溶岩はSTOPがおすすめです。項目の説明は<a href="settings.html#worker">採掘タートルの設定</a>にあります。</p></div></li><li><div><h3>再起動する</h3><pre><code>reboot</code></pre><p>起動後、エラーを表示せず待機すれば完了です。</p></div></li></ol>
 <h2 id="controller">2. 管理用コンピューターへ入れる</h2>

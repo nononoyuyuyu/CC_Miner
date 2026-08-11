@@ -258,6 +258,6 @@ end
 
 local action = validateAction()
 if action == "" then usage(); return end
-if action ~= "update-low-space" then
+if action == "update" then
   term.clear(); term.setCursorPos(1, 1)
   print("CC MINER V4 OFFLINE " .. string.upper(action) .. " / " .. ROLE); print("")

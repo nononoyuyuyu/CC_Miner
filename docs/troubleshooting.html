@@ -27,6 +27,7 @@ shell.run("/ccminer/boot.lua")</code></pre></div></li><li><div><h3>再起動す�
 <p>古いプログラムの控えを作る空き容量がありません。古い <code>/ccminer</code> を削除しないでください。</p>
 <pre><code>wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua update-low-space</code></pre>
 <p>途中で止まった場合は、少し空きを作り、同じコマンドをもう一度実行します。</p>
+<p>初回の <code>install.lua worker</code>、<code>install.lua controller</code>、<code>install.lua gps</code> でこの表示が出た場合は、最新版で初回インストールも省容量方式になっています。最初に入力したものと同じコマンドを、もう一度実行してください。</p>
 <h2 id="staging">[1/13] lib/common.lua ... FAILED / Staging verification failed</h2>
 <p>通常更新が作る一時コピーの空き容量不足、または古いCC環境で保存時に文字データが変換された状態です。空きが十分あるのに「expected」と「wrote」がほぼ同じ大きさなら、文字変換が原因です。最新版は取得・保存・再読込をバイナリ方式に統一し、正確なバイト数を表示します。空き容量が本当に不足している場合だけ、省容量更新へ自動で切り替わります。</p>
 <ol><li>最新版の <code>install.lua update</code> をもう一度実行します。</li><li><code>Switching automatically to update-low-space mode</code> と表示されたら、そのまま待ちます。</li><li>古い <code>/ccminer</code>、設定、作業記録は手で削除しません。</li><li>古いインストーラーのままなら、上の <code>update-low-space</code> コマンドを直接実行します。</li></ol>

@@ -547,8 +547,11 @@ end
 local function lowFailure(message)
   local free = freeSpace(ROOT)
   local suffix = free and (" Free space: " .. formatBytes(free) .. ".") or ""
+  local retryAction = (action == "worker" or action == "controller" or action == "gps")
+    and action or "update-low-space"
   error(tostring(message) .. "\nRecovery marker: " .. LOW_MARKER .. "." .. suffix
-    .. "\nFree space or repair the reported path, then rerun: install.lua update-low-space", 0)
+    .. "\nFree space or repair the reported path, then rerun:\n  wget run "
+    .. BASE_URL .. "install.lua " .. retryAction, 0)
 end
 
 local function lowPlan(role)
@@ -718,7 +721,7 @@ local function cleanupCommittedOld(plan, nextIndex)
   return true
 end
 
-local function runLowSpace(role)
+local function runLowSpace(role, installing)
   local plan, selected = lowPlan(role)
   local marker, markerError = readMarker()
   if marker == false then lowFailure(markerError) end
@@ -738,7 +741,7 @@ local function runLowSpace(role)
   local cleaned, cleanupError = cleanupCommittedOld(plan, marker.next)
   if not cleaned then lowFailure(cleanupError) end
 
-  print("CC MINER V4 UPDATE-LOW-SPACE " .. string.upper(role))
+  print("CC MINER V4 " .. (installing and "INSTALL" or "UPDATE") .. "-LOW-SPACE " .. string.upper(role))
   print("Per-file mode: no complete runtime staging tree is created.")
   local currentBytes = 0
   for _, file in ipairs(selected) do
@@ -800,8 +803,12 @@ local function runLowSpace(role)
   local removedTmp, tempDeleteError = deleteKnown(LOW_MARKER_TMP)
   if not removedTmp or fs.exists(LOW_MARKER_TMP) then lowFailure("Runtime is valid but marker temporary file could not be cleared: " .. tostring(tempDeleteError)) end
   showCapacity(role, totalBytes, "installed and assembled-validated")
-  print("Low-space update installed successfully: " .. VERSION)
-  print("User data under /ccminer (config/state/journal/log files) was left in place. Reboot with: reboot")
+  print("Low-space " .. (installing and "installation" or "update") .. " completed: " .. VERSION)
+  if installing then
+    print("Starting first-time setup.")
+  else
+    print("User data under /ccminer was left in place. Reboot with: reboot")
+  end
 end
 
 local function usage()
@@ -833,8 +840,29 @@ else
   if not validExisting then fail(existingError) end
 end
 
+local function finishFirstInstall(installRole)
+  local setupOk, setupError = pcall(shell.run, ROOT .. "/setup.lua", installRole)
+  if not setupOk or setupError == false then
+    printError("Setup did not complete. Run: " .. ROOT .. "/setup.lua " .. installRole)
+  else
+    print("Installation complete for role " .. installRole .. ".")
+    print("Reboot with: reboot")
+  end
+end
+
+-- A complete controller or worker runtime is roughly half of a standard
+-- ComputerCraft computer's 1 MiB disk. A staging tree plus the installed
+-- files cannot fit reliably, even on a fresh computer. Initial installs
+-- therefore use the same verified, resumable per-file transaction as the
+-- low-space updater from the outset.
+if action == "worker" or action == "controller" or action == "gps" then
+  runLowSpace(role, true)
+  finishFirstInstall(role)
+  return
+end
+
 if action == "update-low-space" then
-  runLowSpace(role)
+  runLowSpace(role, false)
   return
 end
 
@@ -851,22 +879,13 @@ if not base and action == "update" and lowSpaceRecommended then
   printError(stageError)
   print("Regular staging does not fit. Switching automatically to update-low-space mode.")
   print("No complete second copy of /ccminer will be created.")
-  runLowSpace(role)
+  runLowSpace(role, false)
   return
 end
 if not base then fail(stageError) end
 local committed, commitError = regularCommit(role, base, selected)
 if not committed then fail(commitError) end
 
-if action == "update" then
-  print("Update installed successfully: " .. VERSION .. " (role " .. role .. ")")
-  print("User data under /ccminer (config/state/journal/log files) and unknown files were left in place.")
-  print("Reboot with: reboot")
-else
-  local setupOk, setupError = pcall(shell.run, ROOT .. "/setup.lua", role)
-  if not setupOk or setupError == false then
-    printError("Setup did not complete. Run: " .. ROOT .. "/setup.lua " .. role)
-  else
-    print("Installation complete for role " .. role .. ".")
-  end
-end
+print("Update installed successfully: " .. VERSION .. " (role " .. role .. ")")
+print("User data under /ccminer (config/state/journal/log files) and unknown files were left in place.")
+print("Reboot with: reboot")

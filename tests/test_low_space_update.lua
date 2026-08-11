@@ -134,10 +134,9 @@ requireText(installer, "local removedMarker, markerDeleteError = deleteKnown(LOW
 requireText(installer, "if not removedTmp or fs.exists(LOW_MARKER_TMP) then lowFailure", "online marker cleanup failure")
 requireText(installer, "User data under /ccminer", "online low-space user-data preservation")
 
--- A regular update may not have enough room for a second complete runtime.
--- Detect a truncated staged file, explain the expected/written sizes, and
--- switch only updates (never first installs) to the fail-closed low-space
--- transaction.
+-- A first install always uses the per-file transaction because a complete
+-- controller/worker staging tree plus its installed copy exceeds a standard
+-- 1 MiB ComputerCraft disk. Regular updates may also fall back to it.
 local regularStage = block(installer, "local function stageRegular", "local function backupRuntime",
   "online regular staging")
 requireText(regularStage, "local required = #body + 4096", "online regular staging reserve")
@@ -152,8 +151,14 @@ requireText(installer, 'fs.open(path, "wb")', "online binary-safe write")
 requireText(installer, "if not base and action == \"update\" and lowSpaceRecommended then",
   "online update-only automatic low-space fallback")
 requireOrdered(installer, {
+  'if action == "worker" or action == "controller" or action == "gps" then',
+  "runLowSpace(role, true)",
+  "finishFirstInstall(role)",
+  "return",
+}, "online initial low-space installation")
+requireOrdered(installer, {
   "Regular staging does not fit. Switching automatically to update-low-space mode.",
-  "runLowSpace(role)",
+  "runLowSpace(role, false)",
   "return",
 }, "online automatic low-space fallback")
 
@@ -172,7 +177,10 @@ requireText(builder, "ENTRYPOINT", "offline role entrypoint")
 local templateStart = assert(builder:find("template = r'''", 1, true), "offline installer template start")
 local templateEnd = assert(builder:find("'''", templateStart + #"template = r'''", true), "offline installer template end")
 local template = builder:sub(templateStart, templateEnd - 1)
-local offlineLow = block(template, "local function lowSpaceUpdate", "if action == \"update-low-space\" then", "offline low-space implementation")
+local offlineLow = block(template, "local function lowSpaceUpdate", "if action == \"update-low-space\" or action == ROLE then", "offline low-space implementation")
+requireText(template, 'if action == "update" then', "offline regular staging limited to updates")
+requireText(template, 'if action == "update-low-space" or action == ROLE then', "offline initial low-space branch")
+requireText(template, 'shell.run(ROOT .. "/setup.lua", ROLE)', "offline initial setup after low-space install")
 requireText(template, "local function validateLowSpaceStage()", "offline assembled prevalidation helper")
 requireText(template, "local function ensureUpdateSentinel()", "offline sentinel installer")
 requireText(template, "local function applyLowSpaceStep(step)", "offline per-file step applicator")
@@ -231,6 +239,6 @@ requireText(template, "marker.state ~= \"ready\" and marker.state ~= \"committin
 requireText(template, "local function clearMarker()", "offline marker cleanup helper")
 requireText(template, "for _, suffix in ipairs({ \"\", \".tmp\", \".bak\" }) do", "offline marker cleanup paths")
 requireText(template, "local function lowSpaceFailure(message)", "offline low-space failure path")
-requireText(template, "LOW-SPACE UPDATE PAUSED", "offline marker failure safety message")
+requireText(template, "LOW-SPACE INSTALL/UPDATE PAUSED", "offline marker failure safety message")
 
 print("V4 online/offline low-space marker, sentinel, resume and rollback contracts passed")

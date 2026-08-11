@@ -429,7 +429,7 @@ end
 
 local action = validateAction()
 if action == "" then usage(); return end
-if action ~= "update-low-space" then
+if action == "update" then
   term.clear(); term.setCursorPos(1, 1)
   print("CC MINER V4 OFFLINE " .. string.upper(action) .. " / " .. ROLE); print("")
   if fs.exists(TEMP) then fs.delete(TEMP) end
@@ -456,7 +456,7 @@ local preserved = {
   { ROOT .. "/data/ccminer.log", TEMP .. "/data/ccminer.log" },
   { ROOT .. "/data/ccminer.log.1", TEMP .. "/data/ccminer.log.1" },
 }
-if action ~= "update-low-space" then
+if action == "update" then
   for _, pair in ipairs(preserved) do
     local ok, copyError = copyIfPresent(pair[1], pair[2])
     if not ok then fs.delete(TEMP); fail("Cannot preserve existing data: " .. tostring(copyError)) end
@@ -523,9 +523,10 @@ local function clearMarker()
   return true
 end
 local function lowSpaceFailure(message)
-  printError("LOW-SPACE UPDATE PAUSED")
+  printError("LOW-SPACE INSTALL/UPDATE PAUSED")
+  local retryAction = action == ROLE and ROLE or "update-low-space"
   fail(tostring(message) .. "\nRecovery marker: " .. LOW_SPACE_MARKER
-    .. "\nRe-transfer ccminer-offline-" .. ROLE .. ".lua and its parts, then rerun update-low-space.")
+    .. "\nRe-transfer ccminer-offline-" .. ROLE .. ".lua and its parts, then rerun " .. retryAction .. ".")
 end
 local function embeddedEntrypoint()
   for _, file in ipairs(files) do
@@ -616,14 +617,20 @@ local function lowSpaceUpdate()
   end
   local cleared, clearError = clearMarker()
   if not cleared then lowSpaceFailure(clearError) end
-  print("Low-space update installed: " .. VERSION .. " (schema " .. SCHEMA .. ")")
+  print("Low-space " .. (action == ROLE and "installation" or "update")
+    .. " completed: " .. VERSION .. " (schema " .. SCHEMA .. ")")
   print("User data under /ccminer was left in place. Run: reboot")
 end
 
-if action == "update-low-space" then
+if action == "update-low-space" or action == ROLE then
   term.clear(); term.setCursorPos(1, 1)
-  print("CC MINER V4 OFFLINE UPDATE-LOW-SPACE / " .. ROLE); print("")
+  print("CC MINER V4 OFFLINE " .. (action == ROLE and "INSTALL" or "UPDATE") .. "-LOW-SPACE / " .. ROLE); print("")
   lowSpaceUpdate()
+  if action == ROLE then
+    local setupOk = shell.run(ROOT .. "/setup.lua", ROLE)
+    if not setupOk then printError("Setup did not complete. Run: " .. ROOT .. "/setup.lua " .. ROLE)
+    else print(""); print("Installation complete. Run: reboot") end
+  end
   return
 end
 
