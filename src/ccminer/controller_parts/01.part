@@ -1,4 +1,7 @@
--- CC Miner V2 - touch-capable fleet controller dashboard.
+-- CC Miner V3 - controller state, persistence and job orchestration.
+-- The controller is deliberately tolerant of V2 worker payloads.  New
+-- fields are additive and every command has a legacy equivalent where one
+-- exists.
 
 local args = { ... }
 local common = dofile("/ccminer/lib/common.lua")
@@ -17,9 +20,46 @@ end
 local networkReady, modemNames = protocol.open()
 if not networkReady then error("No wireless modem found next to the controller.", 0) end
 
+local DB_PATH = "/ccminer/data/controller.db"
+local function dbDefaults()
+  return {
+    schema = common.SCHEMA,
+    version = common.VERSION,
+    presets = {},
+    queue = {},
+    history = {},
+    leases = {},
+    activeLeases = {}, -- alias retained for tools written against the V3 draft format.
+    lastPreset = nil,
+    lastDraft = nil,
+    updatedAt = common.nowSeconds(),
+  }
+end
+
+local db = dbDefaults()
+local dbError = nil
+local function loadControllerDb()
+  local loaded, err = common.loadTable(DB_PATH, dbDefaults())
+  db = common.merge(dbDefaults(), loaded or {})
+  db.leases = db.leases or db.activeLeases or {}
+  db.activeLeases = db.leases
+  db.presets, db.queue, db.history = db.presets or {}, db.queue or {}, db.history or {}
+  dbError = err
+end
+
+local function saveControllerDb()
+  db.schema, db.version, db.updatedAt = common.SCHEMA, common.VERSION, common.nowSeconds()
+  db.activeLeases = db.leases or {}
+  local ok, err = common.saveTable(DB_PATH, db)
+  if not ok then dbError = err end
+  return ok, err
+end
+
+loadControllerDb()
+
 local workers = {}
 local selected = 1
-local notice = "Controller ready. Touch DISCOVER or press D."
+local notice = dbError and ("Controller DB recovered: " .. tostring(dbError)) or "Controller ready. Touch DISCOVER or press D."
 local noticeIsError = false
 local lastDiscovery = 0
 local running = true
@@ -27,14 +67,27 @@ local mode = "dashboard"
 local draft = nil
 local confirmState = nil
 local hitboxes = {}
+local renderCache = {}
+local dirty = true
 local monitors = common.findPeripherals("monitor")
+local speakers = common.findPeripherals("speaker")
+local redstoneDevices = common.findPeripherals("redstoneIntegrator")
+local alertLedger = {}
+local alertTimers = {}
+local lastSorting = 0
+local sortingWarned = false
 
 for _, entry in ipairs(monitors) do
   if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end
 end
 
+local function invalidate()
+  dirty = true
+end
+
 local function setNotice(text, isError)
   notice, noticeIsError = tostring(text or ""), isError == true
+  invalidate()
 end
 
 local function orderedIds()
@@ -57,7 +110,8 @@ end
 local function statusOf(worker)
   if not worker then return "offline" end
   if common.nowSeconds() - (worker.lastSeen or 0) > (config.workerTimeoutSeconds or 10) then return "offline" end
-  return worker.data.status or "unknown"
+  local data = worker.data or {}
+  return tostring(data.status or data.phase or "unknown")
 end
 
 local function workerLabel(worker, id)
@@ -65,28 +119,179 @@ local function workerLabel(worker, id)
   return "Miner-" .. tostring(id)
 end
 
+local function workerData(id)
+  local worker = workers[id]
+  return worker and worker.data or nil
+end
+
+local function normalizeStatus(data)
+  data = data or {}
+  -- V2 workers expose cursor/total under job and have no progress/materials
+  -- objects.  Keep a normalized view without requiring a worker upgrade.
+  data.progress = type(data.progress) == "table" and data.progress or {}
+  if data.job then
+    if data.progress.cursor == nil then data.progress.cursor = data.job.cursor end
+    if data.progress.total == nil then data.progress.total = data.job.total end
+    if data.progress.percent == nil then data.progress.percent = data.job.percent end
+    if data.progress.layer == nil then data.progress.layer = data.job.currentLayer end
+  end
+  data.materials = type(data.materials) == "table" and data.materials or {}
+  if data.materials.fuel == nil then data.materials.fuel = data.fuel end
+  if data.materials.inventoryEmpty == nil then data.materials.inventoryEmpty = data.inventoryEmpty end
+  if data.materials.seal == nil and data.seal then data.materials.seal = data.seal.count end
+  data.capabilities = type(data.capabilities) == "table" and data.capabilities or {}
+  return data
+end
+
+local function activeJobId(data)
+  return data and data.job and tostring(data.job.id or "") or nil
+end
+
+local function addHistory(id, data, reason)
+  if not data then return end
+  local job = data.job or {}
+  local report = data.report or {}
+  db.history[#db.history + 1] = {
+    id = tostring(job.id or ("worker-" .. tostring(id) .. "-" .. common.nowMillis())),
+    jobId = job.id,
+    workerId = tonumber(id) or id,
+    worker = workerLabel(workers[id], id),
+    name = job.name,
+    status = data.status,
+    reason = reason or data.completionReason,
+    startedAt = job.startedAt,
+    finishedAt = common.nowSeconds(),
+    progress = common.copy(data.progress or job),
+    stats = common.copy(data.stats or {}),
+    report = common.copy(report),
+  }
+  local historyLimit = math.max(1, tonumber(config.historyLimit) or 50)
+  while #db.history > historyLimit do table.remove(db.history, 1) end
+  saveControllerDb()
+end
+
+local function releaseLeasesForWorker(id, jobId)
+  local kept = {}
+  for _, lease in ipairs(db.leases or {}) do
+    local sameWorker = tonumber(lease.workerId) == tonumber(id)
+    local sameJob = not jobId or tostring(lease.jobId) == tostring(jobId)
+    if not (sameWorker and sameJob) then kept[#kept + 1] = lease end
+  end
+  db.leases = kept
+  db.activeLeases = kept
+  saveControllerDb()
+end
+
+local function acknowledgeQueuedStart(id, data)
+  local job = data and data.job
+  if not job then return end
+  for index, item in ipairs(db.queue or {}) do
+    local awaiting = item.awaiting
+    if awaiting and tonumber(awaiting.workerId) == tonumber(id) and tostring(awaiting.jobId) == tostring(job.id) then
+      table.remove(db.queue, index)
+      saveControllerDb()
+      setNotice("Queued job accepted by worker #" .. tostring(id) .. ".", false)
+      return
+    end
+  end
+end
+
+local function alert(kind, id, text)
+  -- Offline/unknown are intentionally not alerts.  Respect the optional
+  -- per-channel settings and allow the same condition after cooldown.
+  local settings = config.alerts or {}
+  if settings.enabled == false then return end
+  if kind == "complete" and settings.onComplete == false then return end
+  if kind == "material" and settings.onWaiting == false then return end
+  if kind == "blocked" and settings.onError == false then return end
+  local key = tostring(id) .. ":" .. tostring(kind)
+  local now = common.nowSeconds()
+  local previous = alertLedger[key]
+  local cooldown = math.max(0, tonumber(settings.cooldownSeconds) or 30)
+  if previous and now - (previous.at or 0) < cooldown then return end
+  alertLedger[key] = { at = now }
+  if settings.speaker ~= false then
+    local instrument = kind == "complete" and "pling" or kind == "material" and "bell" or "bass"
+    local pitch = kind == "complete" and 12 or kind == "material" and 6 or 4
+    for _, entry in ipairs(speakers) do
+      local speaker = entry.device
+      if speaker and speaker.playNote then pcall(speaker.playNote, instrument, 1, pitch)
+      elseif speaker and speaker.playSound then pcall(speaker.playSound, "minecraft:block.note_block." .. instrument, 1, 1) end
+    end
+  end
+  if settings.redstone ~= false then
+    local side = tostring(settings.redstoneSide or "back")
+    local timer = os.startTimer and os.startTimer(0.25)
+    if redstone and redstone.setOutput then
+      pcall(redstone.setOutput, side, true)
+      if timer then alertTimers[timer] = { global = true, side = side } end
+    else
+      local relays = {}
+      for _, entry in ipairs(redstoneDevices) do
+        local relay = entry.device
+        if relay and relay.setOutput then
+          pcall(relay.setOutput, side, true)
+          relays[#relays + 1] = relay
+        end
+      end
+      if timer and #relays > 0 then alertTimers[timer] = { relays = relays, side = side } end
+    end
+  end
+  if text and text ~= "" then setNotice(text, kind == "blocked") end
+end
+
+local function clearAlert(id, kind)
+  alertLedger[tostring(id) .. ":" .. tostring(kind)] = nil
+end
+
 local function handleMessage(sender, message)
   local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
   if not valid then return false end
   if message.kind == "status" then
-    local payload = message.payload
+    local payload = normalizeStatus(message.payload)
     local id = tonumber(payload.id)
     if not id or id ~= tonumber(sender) then return false end
     workers[id] = workers[id] or {}
+    local previous = workers[id].data
     workers[id].data = payload
     workers[id].lastSeen = common.nowSeconds()
     workers[id].sender = sender
+    acknowledgeQueuedStart(id, payload)
+    local oldStatus = previous and tostring(previous.status or "") or ""
+    local newStatus = tostring(payload.status or "unknown")
+    if newStatus == "complete" and oldStatus ~= "complete" then
+      addHistory(id, payload, payload.completionReason or "complete")
+      releaseLeasesForWorker(id, activeJobId(previous))
+      alert("complete", id, "Worker #" .. tostring(id) .. " completed a job.")
+    elseif newStatus == "aborted" and oldStatus ~= "aborted" then
+      addHistory(id, payload, payload.completionReason or "aborted")
+      releaseLeasesForWorker(id, activeJobId(previous))
+    elseif newStatus == "blocked" and oldStatus ~= "blocked" then
+      alert("blocked", id, "Worker #" .. tostring(id) .. " is blocked.")
+    elseif newStatus == "waiting_fuel" or newStatus == "waiting_output" or newStatus == "waiting_seal" or newStatus == "waiting_torch" or newStatus == "waiting_water" then
+      alert("material", id, "Worker #" .. tostring(id) .. " needs materials.")
+    else
+      clearAlert(id, "blocked"); clearAlert(id, "material")
+    end
+    invalidate()
     return true
   elseif message.kind == "ack" then
-    local payload = message.payload
+    local payload = message.payload or {}
     setNotice((payload.ok and "OK: " or "ERROR: ") .. tostring(payload.message or ""), not payload.ok)
     if type(payload.status) == "table" and payload.status.id then
       local id = tonumber(payload.status.id)
       if not id or id ~= tonumber(sender) then return false end
+      local previous = workers[id] and workers[id].data
       workers[id] = workers[id] or {}
-      workers[id].data = payload.status
+      workers[id].data = normalizeStatus(payload.status)
       workers[id].lastSeen = common.nowSeconds()
       workers[id].sender = sender
+      acknowledgeQueuedStart(id, workers[id].data)
+      local st = workers[id].data.status
+      if (st == "complete" or st == "aborted") and previous and previous.status ~= st then
+        addHistory(id, workers[id].data, workers[id].data.completionReason or st)
+        releaseLeasesForWorker(id, activeJobId(previous))
+      end
     end
     return true
   end
@@ -94,7 +299,7 @@ local function handleMessage(sender, message)
 end
 
 local function discover()
-  protocol.broadcast(protocol.message("discover", config.networkKey, { controllerName = config.controllerName }))
+  protocol.broadcast(protocol.message("discover", config.networkKey, { controllerName = config.controllerName, v3 = true }))
   lastDiscovery = common.nowSeconds()
   setNotice("Discovery broadcast sent.", false)
 end
@@ -111,10 +316,11 @@ end
 
 local function progressText(data)
   if not data or not data.job then return "-" end
+  local p = data.progress or {}
   return ("%3d%% %s/%s"):format(
-    tonumber(data.job.percent) or 0,
-    common.humanNumber(data.job.cursor or 0),
-    common.humanNumber(data.job.total or 0)
+    tonumber(p.percent or data.job.percent) or 0,
+    common.humanNumber(p.cursor or data.job.cursor or 0),
+    common.humanNumber(p.total or data.job.total or 0)
   )
 end
 
@@ -138,14 +344,522 @@ local function drawButton(key, x, y, width, label, action, enabled, selectedButt
 end
 
 local function buttonRow(key, y, width, definitions)
-  local count = #definitions
-  local base = math.floor(width / count)
+  if width < 1 or y < 1 then return end
+  local count = math.max(1, #definitions)
+  local base = math.max(1, math.floor(width / count))
   local x = 1
   for index, definition in ipairs(definitions) do
     local buttonWidth = index == count and (width - x + 1) or base
     drawButton(key, x, y, buttonWidth, definition[1], definition[2], definition[3] ~= false, definition[4])
     x = x + buttonWidth
   end
+end
+
+local function draftWorker()
+  if not draft then return nil, nil end
+  return draft.workerId, workers[draft.workerId]
+end
+
+local function draftCalibration(workerId)
+  local worker
+  if workerId then worker = workers[workerId] else local _, selectedWorkerValue = draftWorker(); worker = selectedWorkerValue end
+  local gpsData = worker and worker.data and worker.data.gps
+  if gpsData and gpsData.calibrated and type(gpsData.calibration) == "table" then return gpsData.calibration end
+  return nil
+end
+
+local function cellKey(x, z)
+  return tostring(math.floor(x)) .. ":" .. tostring(math.floor(z))
+end
+
+local function parseCellKey(key)
+  local x, z = tostring(key):match("^(-?%d+):(-?%d+)$")
+  return tonumber(x), tonumber(z)
+end
+
+-- V3 selection is chunk-granular.  A short-lived V2 draft could contain the
+-- old cellExcluded map; migrate complete chunks, but keep a fatal marker for a
+-- partial chunk instead of silently dropping the user's selection.
+local function normalizeChunkMask(catalog, rootKey)
+  if not draft then return false end
+  draft.excluded = draft.excluded or {}
+  local legacy = draft.cellExcluded
+  if type(legacy) ~= "table" then return draft.partialMask == true end
+  local partial = draft.partialMask == true
+  for _, chunk in ipairs(catalog or {}) do
+    local total, selectedCells = 0, 0
+    for x = chunk.minX, chunk.maxX do
+      for z = chunk.minZ, chunk.maxZ do
+        total = total + 1
+        if legacy[cellKey(x, z)] then selectedCells = selectedCells + 1 end
+      end
+    end
+    if selectedCells > 0 and selectedCells < total then partial = true end
+    if selectedCells == total and chunk.key ~= rootKey then draft.excluded[chunk.key] = true end
+  end
+  draft.cellExcluded = nil
+  draft.partialMask = partial
+  return partial
+end
+
+local function buildDraftCatalog()
+  if not draft then return nil, "No draft." end
+  local calibration = draftCalibration()
+  local chunkMode = calibration and "world" or "local"
+  local catalog, err = quarry.buildCatalog(draft.width, draft.length, chunkMode, calibration)
+  if not catalog then return nil, err end
+  local rootKey
+  for _, chunk in ipairs(catalog) do
+    if 0 >= chunk.minX and 0 <= chunk.maxX and 1 >= chunk.minZ and 1 <= chunk.maxZ then rootKey = chunk.key end
+  end
+  return catalog, nil, chunkMode, calibration, rootKey
+end
+
+local function excludedChunksForDraft(catalog, chunkMode, rootKey)
+  local out = {}
+  local chunkExcluded = draft and draft.excluded or {}
+  for _, chunk in ipairs(catalog or {}) do
+    if chunk.key ~= rootKey and chunkExcluded[chunk.key] == true then
+      out[#out + 1] = { mode = chunkMode, cx = chunk.cx, cz = chunk.cz, key = chunk.key }
+    end
+  end
+  return out, #out
+end
+
+local function draftCells(catalog, rootKey)
+  local total, excluded = 0, 0
+  local chunkExcluded = draft and draft.excluded or {}
+  for _, chunk in ipairs(catalog or {}) do
+    total = total + 1
+    if chunk.key ~= rootKey and chunkExcluded[chunk.key] then excluded = excluded + 1 end
+  end
+  return total, excluded
+end
+
+local function estimateFuel(blocks, width, length, depth)
+  -- Conservative enough to gate an obviously empty turtle, but unknown fuel
+  -- remains yellow rather than fatal so old workers can still be used.
+  local travel = (width or 1) * (length or 1) + (depth or 1) * 2
+  return math.max(16, math.floor((blocks or 0) * 2 + travel * 3 + 32))
+end
+
+local function profileParameters(profile, lighting)
+  local name = tostring(profile or "balanced")
+  if name ~= "safe" and name ~= "balanced" and name ~= "turbo" then return nil, "Invalid profile: " .. name end
+  local light = type(lighting) == "table" and lighting or {}
+  local mode = tostring(light.mode or "safe")
+  local requested = math.max(1, math.floor(tonumber(light.interval) or 10))
+  local interval
+  if mode == "off" then interval = 0
+  elseif name == "safe" then interval = math.min(requested, 8)
+  elseif name == "turbo" then interval = 12
+  else interval = requested end
+  return {
+    profile = name,
+    lightingMode = mode,
+    requestedInterval = requested,
+    effectiveInterval = interval,
+    fuelMultiplier = name == "safe" and 1.5 or 1,
+  }
+end
+
+local function effectiveJobDepth(chunkMode, calibration)
+  if chunkMode == "world" then
+    if not (calibration and calibration.home and tonumber(calibration.home.y)) then return nil, "GPS calibration home Y is unavailable." end
+    local homeY = tonumber(calibration.home.y)
+    local targetY = tonumber(draft.targetY) or (homeY - (tonumber(draft.depth) or 1) + 1)
+    draft.targetY = targetY
+    local depth = math.floor(homeY - targetY + 1)
+    if depth < 1 then return nil, "targetY must be at or below the calibrated home Y." end
+    return depth, targetY
+  end
+  return math.max(1, math.floor(tonumber(draft.depth) or 1)), nil
+end
+
+local activeLeaseOverlap
+
+local function computePreflight()
+  if not draft then return nil, "No draft." end
+  local profileInfo, profileError = profileParameters(draft.profile, draft.lighting)
+  if not profileInfo then
+    draft.preflight = { fatal = true, checks = { { name = "profile", state = "bad", detail = profileError, fatal = true } }, profile = draft.profile }
+    return draft.preflight
+  end
+  local catalog, catalogError, chunkMode, calibration, rootKey = buildDraftCatalog()
+  if not catalog then return nil, catalogError end
+  local partialMask = normalizeChunkMask(catalog, rootKey)
+  local excludedChunks, excludedColumns = excludedChunksForDraft(catalog, chunkMode, rootKey)
+  local jobDepth, targetY = effectiveJobDepth(chunkMode, calibration)
+  if not jobDepth then
+    draft.preflight = { fatal = true, checks = { { name = "targetY", state = "bad", detail = targetY, fatal = true } } }
+    return draft.preflight
+  end
+  local plan, planError = quarry.buildChunkPlan({
+    width = draft.width, length = draft.length, depth = jobDepth,
+    chunkMode = chunkMode, excludedChunks = excludedChunks,
+  }, calibration)
+  local cells, cellExcluded = draftCells(catalog, rootKey)
+  local blocks = plan and (plan.columns * jobDepth) or ((cells - cellExcluded) * jobDepth)
+  local interval = math.max(1, profileInfo.effectiveInterval > 0 and profileInfo.effectiveInterval or 1)
+  local estimate, estimateError
+  if type(quarry.estimateJob) == "function" then
+    estimate, estimateError = quarry.estimateJob({
+      width = draft.width, length = draft.length, depth = jobDepth,
+      chunkMode = chunkMode, excludedChunks = excludedChunks,
+      lighting = common.copy(draft.lighting), waterMode = draft.waterMode,
+      targetY = targetY,
+    }, calibration, { torchInterval = interval })
+  end
+  if not estimate and estimateError then planError = estimateError end
+  local id, worker = draftWorker()
+  local data = worker and worker.data or {}
+  local checks = {}
+  local function check(name, state, detail, fatal)
+    checks[#checks + 1] = { name = name, state = state, detail = detail, fatal = fatal == true }
+  end
+  local baseFuelEstimate = estimate and (estimate.minimumFuel or estimate.minFuel) or estimateFuel(blocks, draft.width, draft.length, jobDepth)
+  check("cells", "ok", tostring(estimate and (estimate.surfaceCells or estimate.columns) or (cells - cellExcluded)), false)
+  check("chunks", "ok", tostring((plan and plan.catalogCount or #catalog) - #excludedChunks) .. "/" .. tostring(#catalog), false)
+  check("blocks", "ok", common.humanNumber(estimate and (estimate.blocks or estimate.totalBlocks) or blocks), false)
+  check("fuel", "warn", "need " .. tostring(math.ceil(baseFuelEstimate * profileInfo.fuelMultiplier)) .. " (base " .. tostring(baseFuelEstimate) .. "), worker " .. tostring(data.fuel or "unknown"), false)
+  local torchNeed = profileInfo.effectiveInterval == 0 and 0 or (estimate and (estimate.torches or estimate.estimatedTorches) or math.ceil((blocks or 0) / interval))
+  check("profile", "ok", profileInfo.profile .. " interval=" .. tostring(profileInfo.effectiveInterval), false)
+  check("torches", "warn", tostring(torchNeed) .. " estimated @" .. tostring(profileInfo.effectiveInterval), false)
+  check("exclusions", #excludedChunks > 0 and "warn" or "ok", tostring(#excludedChunks), false)
+  if plan then check("connectivity", "ok", "connected", false) else check("connectivity", "bad", tostring(planError), true) end
+  if partialMask then check("selection", "bad", "partial cell mask cannot be sent; select whole chunks", true) end
+  if chunkMode == "world" then
+    check("GPS", calibration and "ok" or "bad", calibration and "calibrated" or "calibration required", not calibration)
+  else
+    check("GPS", "warn", "local mode", false)
+  end
+  if id and worker and statusOf(worker) ~= "offline" then check("worker", "ok", workerLabel(worker, id), false)
+  else check("worker", "bad", "offline or not selected", true) end
+  local baseFuel = baseFuelEstimate
+  local requiredFuel = math.ceil(baseFuel * profileInfo.fuelMultiplier)
+  local fuel = tonumber(data.fuel)
+  if fuel and fuel ~= math.huge and fuel < requiredFuel then
+    check("worker fuel", "warn", tostring(fuel) .. " (dock refill expected)", false)
+  elseif fuel then check("worker fuel", "ok", tostring(fuel), false) else check("worker fuel", "warn", "unknown", false) end
+  if data.inventoryEmpty ~= nil then
+    check("inventory", tonumber(data.inventoryEmpty) > 0 and "ok" or "warn", tostring(data.inventoryEmpty or 0) .. " empty", false)
+  else check("inventory", "warn", "unknown", false) end
+  local seal = tonumber(data.materials and (data.materials.sealCount or data.materials.seal) or data.seal and data.seal.count)
+  local torchStock = tonumber(data.lighting and data.lighting.torchCount or data.materials and data.materials.torchCount)
+  if draft.waterMode == "seal" and seal and seal <= 0 then check("seal material", "warn", "0 (dock refill expected)", false)
+  elseif draft.waterMode == "seal" then check("seal material", "warn", "seal stock unknown", false) end
+  if draft.lighting and draft.lighting.mode ~= "off" and torchStock and torchStock < torchNeed then check("torch material", "warn", tostring(torchStock) .. "/" .. tostring(torchNeed) .. " (dock refill expected)", false)
+  elseif draft.lighting and draft.lighting.mode ~= "off" then check("torch material", "warn", "torch stock unknown", false) end
+  local caps = data.capabilities or {}
+  if draft.waterMode ~= "ignore" then
+    if caps.waterHandling == false then check("water capability", "bad", "worker lacks waterHandling", true)
+    elseif caps.waterHandling == nil then check("water capability", "warn", "worker capability unknown", false)
+    else check("water capability", "ok", "ready", false) end
+  else check("water capability", "ok", "ignore", false) end
+  if draft.lighting and draft.lighting.mode ~= "off" then
+    if caps.lighting == false then check("lighting capability", "bad", "worker lacks lighting", true)
+    elseif caps.lighting == nil then check("lighting capability", "warn", "worker capability unknown", false)
+    else check("lighting capability", "ok", "ready", false) end
+  else check("lighting capability", "ok", "off", false) end
+  local selectedChunkKeys = {}
+  for _, chunk in ipairs(catalog) do
+    local excluded = false
+    for _, item in ipairs(excludedChunks) do if item.key == chunk.key then excluded = true; break end end
+    if not excluded then selectedChunkKeys[#selectedChunkKeys + 1] = chunk.key end
+  end
+  local leaseConflict = (not draft.queueing) and id and activeLeaseOverlap and activeLeaseOverlap(chunkMode, id, selectedChunkKeys)
+  if leaseConflict then check("lease", "bad", "overlaps active job " .. tostring(leaseConflict.jobId or "unknown"), true) end
+  local fatal = false
+  for _, item in ipairs(checks) do if item.fatal or item.state == "bad" and item.fatal then fatal = true end end
+  local result = {
+    checks = checks, fatal = fatal, catalog = catalog, plan = plan, planError = planError,
+    chunkMode = chunkMode, calibration = calibration, rootKey = rootKey,
+    excludedChunks = excludedChunks, cells = estimate and (estimate.surfaceCells or estimate.columns) or (cells - cellExcluded), blocks = estimate and (estimate.blocks or estimate.totalBlocks) or blocks,
+    chunks = plan and plan.catalogCount or #catalog, selectedChunks = (plan and plan.selectedChunks) or (#catalog - #excludedChunks), totalChunks = #catalog, exclusions = #excludedChunks,
+    torches = torchNeed, fuel = requiredFuel, baseFuel = baseFuel, estimate = estimate, jobDepth = jobDepth, targetY = targetY,
+    profile = profileInfo.profile, requestedInterval = profileInfo.requestedInterval, effectiveInterval = profileInfo.effectiveInterval,
+    fuelMultiplier = profileInfo.fuelMultiplier,
+  }
+  draft.preflight = result
+  return result
+end
+
+activeLeaseOverlap = function(mode, workerId, chunks)
+  for _, lease in ipairs(db.leases or {}) do
+    local leaseMode = lease.mode == "world" and "world" or "local"
+    if mode == "world" and leaseMode == "world" then
+      local set = {}
+      for _, key in ipairs(lease.chunks or {}) do set[tostring(key)] = true end
+      for _, key in ipairs(chunks or {}) do if set[tostring(key)] then return lease end end
+    elseif mode == "local" and leaseMode == "local" and tonumber(lease.workerId) == tonumber(workerId) then
+      return lease
+    end
+  end
+  return nil
+end
+
+local function reserveLease(jobId, workerId, mode, chunks, assignmentId)
+  local conflict = activeLeaseOverlap(mode, workerId, chunks)
+  if conflict then return nil, "Active lease overlap with " .. tostring(conflict.jobId or conflict.assignmentId) end
+  local lease = {
+    jobId = tostring(jobId), assignmentId = assignmentId, workerId = tonumber(workerId) or workerId,
+    mode = mode, chunks = common.copy(chunks or {}), createdAt = common.nowSeconds(),
+  }
+  db.leases[#db.leases + 1] = lease
+  db.activeLeases = db.leases
+  local ok, err = saveControllerDb()
+  if not ok then table.remove(db.leases); return nil, err or "Could not persist active lease" end
+  return lease
+end
+
+local function chunkKeySet(catalog)
+  local set = {}
+  for _, chunk in ipairs(catalog or {}) do set[chunk.key] = true end
+  return set
+end
+
+local function deterministicPartition(chunks, count)
+  local out = {}
+  count = math.max(1, tonumber(count) or 1)
+  for index = 1, count do out[index] = {} end
+  for index, chunk in ipairs(chunks or {}) do out[((index - 1) % count) + 1][#out[((index - 1) % count) + 1] + 1] = chunk end
+  return out
+end
+
+local function buildAssignments(result)
+  local id, worker = draftWorker()
+  if not id or not worker then return nil, "No worker selected." end
+  -- A worker's calibrated home is the authoritative entrance for its plan.
+  -- Until a future protocol can describe independent entrances, never split a
+  -- single footprint at runtime; queue dispatch below handles parallel jobs.
+  local assignments = {}
+  local base = "q-" .. tostring(os.getComputerID()) .. "-" .. tostring(common.nowMillis())
+  local selectedKeys = {}
+  for _, chunk in ipairs(result.catalog or {}) do
+    local excluded = false
+    for _, item in ipairs(result.excludedChunks or {}) do if item.key == chunk.key then excluded = true; break end end
+    if not excluded then selectedKeys[#selectedKeys + 1] = chunk.key end
+  end
+  assignments[1] = { workerId = id, assignmentId = base .. ":1", jobId = base, chunks = selectedKeys }
+  return assignments
+end
+
+local function startDraft()
+  if not draft then return false end
+  local result = draft.preflight or computePreflight()
+  if not result then setNotice("Preflight failed.", true); return false end
+  if result.fatal then setNotice("Start blocked by a fatal preflight item.", true); return false end
+  local assignments, assignmentError = buildAssignments(result)
+  if not assignments then setNotice(assignmentError, true); return false end
+  local leases = {}
+  for _, assignment in ipairs(assignments) do
+    local lease, err = reserveLease(assignment.jobId, assignment.workerId, result.chunkMode, assignment.chunks, assignment.assignmentId)
+    if not lease then
+      for _, prior in ipairs(leases) do releaseLeasesForWorker(prior.workerId, prior.jobId) end
+      setNotice(err, true)
+      return false
+    end
+    leases[#leases + 1] = lease
+  end
+  local sent, sentAssignments = true, {}
+  for _, assignment in ipairs(assignments) do
+    local payloadDepth = result.jobDepth or draft.depth
+    local payloadLighting = common.copy(draft.lighting)
+    if type(payloadLighting) ~= "table" then payloadLighting = { mode = "safe" } end
+    if result.effectiveInterval == 0 then payloadLighting.interval = nil else payloadLighting.interval = result.effectiveInterval end
+    local payload = {
+      width = draft.width, length = draft.length, depth = payloadDepth,
+      chunkMode = result.chunkMode, excludedChunks = result.excludedChunks,
+      lighting = payloadLighting, waterMode = draft.waterMode, profile = draft.profile,
+      name = draft.name or ("Quarry %dx%dx%d"):format(draft.width, draft.length, payloadDepth),
+      jobId = assignment.jobId, assignmentId = assignment.assignmentId,
+    }
+    if result.chunkMode == "world" then payload.targetY = result.targetY end
+    if not sendCommand(assignment.workerId, "start", payload) then sent = false; break end
+    sentAssignments[#sentAssignments + 1] = assignment
+  end
+  if not sent then
+    for _, assignment in ipairs(sentAssignments) do sendCommand(assignment.workerId, "stop", { mode = "abort", assignmentId = assignment.assignmentId }) end
+    for _, assignment in ipairs(assignments) do releaseLeasesForWorker(assignment.workerId, assignment.jobId) end
+    setNotice("One or more workers rejected the job; all assignments were stopped.", true)
+    return false
+  end
+  db.lastDraft = common.copy(draft)
+  db.lastPreset = draft.profile or db.lastPreset
+  if draft.queueIndex and db.queue[draft.queueIndex] then
+    db.queue[draft.queueIndex].awaiting = { workerId = assignments[1].workerId, jobId = assignments[1].jobId, sentAt = common.nowSeconds() }
+    db.queue[draft.queueIndex].retryAt = common.nowSeconds() + 10
+  end
+  saveControllerDb()
+  mode, draft = "dashboard", nil
+  setNotice(("Job sent to %d worker%s."):format(#assignments, #assignments == 1 and "" or "s"), false)
+  return true
+end
+
+local normalizedProfile, normalizedWaterMode, normalizedLighting
+
+local function queueDraft()
+  if not draft then return false end
+  if config.queueEnabled == false then setNotice("Queue is disabled by controller configuration.", true); return false end
+  local previousQueueing = draft.queueing
+  draft.queueing = true
+  local result = computePreflight()
+  draft.queueing = previousQueueing
+  if not result or result.fatal then setNotice("Cannot queue: preflight has a fatal item.", true); return false end
+  local queuedKeys = {}
+  for _, chunk in ipairs(result.catalog or {}) do
+    local excluded = false
+    for _, item in ipairs(result.excludedChunks or {}) do if item.key == chunk.key then excluded = true; break end end
+    if not excluded then queuedKeys[#queuedKeys + 1] = chunk.key end
+  end
+  if result.chunkMode == "world" then
+    local conflict = activeLeaseOverlap(result.chunkMode, draft.workerId, queuedKeys)
+    if conflict then setNotice("Cannot queue: world chunks overlap active job " .. tostring(conflict.jobId or "unknown"), true); return false end
+    for _, queued in ipairs(db.queue or {}) do
+      if queued.chunkMode == "world" and type(queued.chunkKeys) == "table" then
+        local seen = {}; for _, value in ipairs(queued.chunkKeys) do seen[tostring(value)] = true end
+        for _, value in ipairs(queuedKeys) do if seen[tostring(value)] then setNotice("Cannot queue: world chunks overlap another queued job.", true); return false end end
+      end
+    end
+  end
+  local item = common.copy(draft)
+  item.workerId, item.queuedAt = draft.workerId, common.nowSeconds()
+  item.chunkMode, item.chunkKeys = result.chunkMode, queuedKeys
+  item.excludedChunks, item.jobDepth, item.targetY = common.copy(result.excludedChunks), result.jobDepth, result.targetY
+  item.retryAt, item.awaiting = common.nowSeconds(), nil
+  db.queue[#db.queue + 1] = item
+  saveControllerDb()
+  setNotice("Job added to queue.", false)
+  return true
+end
+
+local lastQueueDispatch = 0
+local function workerCanStart(worker)
+  local status = statusOf(worker)
+  if not worker or not worker.data or worker.data.atHome == false then return false end
+  return status == "idle" or status == "complete" or status == "aborted"
+end
+
+local function idleWorkerId(preferred)
+  if preferred and workers[preferred] and workerCanStart(workers[preferred]) then return preferred end
+  for _, id in ipairs(orderedIds()) do
+    local worker = workers[id]
+    if workerCanStart(worker) then return id end
+  end
+  return nil
+end
+
+local function dispatchQueue()
+  local now = common.nowSeconds()
+  if config.queueEnabled == false or now - lastQueueDispatch < 5 or #db.queue == 0 then return end
+  lastQueueDispatch = now
+  for index, item in ipairs(db.queue) do
+    if item.awaiting and now - (item.awaiting.sentAt or now) > 10 then item.awaiting, item.retryAt, item.lastError = nil, now + 5, "start acknowledgement timeout" end
+    if not item.awaiting and (not item.retryAt or now >= item.retryAt) then
+      -- A queued job is dock-relative (and world calibration is worker
+      -- specific), so it must run only on its explicitly selected worker.
+      local id = item.workerId and idleWorkerId(item.workerId) or nil
+      if id then
+        local candidate = common.copy(item)
+        candidate.workerId, candidate.queueIndex = id, index
+        candidate.lighting = normalizedLighting(candidate.lighting)
+        candidate.waterMode = normalizedWaterMode(candidate.waterMode)
+        candidate.profile = normalizedProfile(candidate.profile)
+        draft = candidate
+        local result = computePreflight()
+        local sent = false
+        if result and not result.fatal then
+          sent = startDraft()
+          if not sent and db.queue[index] then db.queue[index].retryAt, db.queue[index].lastError = now + 5, notice end
+        elseif db.queue[index] then
+          db.queue[index].retryAt, db.queue[index].lastError = now + 15, result and "preflight blocked" or "preflight unavailable"
+          saveControllerDb()
+        end
+        if draft then draft = nil end
+        if sent then return end
+      end
+    end
+  end
+end
+
+local function applyPreset(name)
+  for _, preset in ipairs(db.presets or {}) do
+    if tostring(preset.name) == tostring(name) then
+      if draft then
+        local source = type(preset.draft) == "table" and preset.draft or preset
+        for key, value in pairs(source) do if key ~= "name" and key ~= "schema" and key ~= "version" and key ~= "updatedAt" then draft[key] = common.copy(value) end end
+      end
+      db.lastPreset = name
+      saveControllerDb()
+      return true
+    end
+  end
+  return false
+end
+
+local function savePreset(name, source)
+  name = common.trim(name or "")
+  if name == "" then return false, "Preset name is empty." end
+  local draftValue = common.copy(source or draft or db.lastDraft or {})
+  draftValue.queueIndex, draftValue.preflight, draftValue.awaiting = nil, nil, nil
+  local value = { name = name, schema = common.SCHEMA, version = common.VERSION, updatedAt = common.nowSeconds(), draft = draftValue }
+  local replaced = false
+  for index, preset in ipairs(db.presets) do
+    if tostring(preset.name) == name then db.presets[index] = value; replaced = true end
+  end
+  if not replaced then db.presets[#db.presets + 1] = value end
+  db.lastPreset = name
+  saveControllerDb()
+  return true
+end
+
+local function stageStop(id, stopMode)
+  if not id then setNotice("No worker selected.", true); return false end
+  local worker = workers[id]
+  local caps = worker and worker.data and worker.data.capabilities or {}
+  local sent = sendCommand(id, "stop", { mode = stopMode, staged = true })
+  -- V2 workers do not know `stop`; provide the old command after the explicit
+  -- V3 request, but only when capability is absent/false.
+  if not caps.stagedStop then
+    local legacy = ({ pause_now = "pause", finish_row = "pause", finish_layer = "pause", return_home = "recall", abort = "abort" })[stopMode]
+    if legacy then sent = sendCommand(id, legacy, { stopMode = stopMode }) or sent end
+  end
+  return sent
+end
+
+local function recoveryAction(action)
+  local id = selectedWorker()
+  if not id then setNotice("No worker selected.", true); return end
+  if action == "gps_fix" then sendCommand(id, "gps_fix")
+  elseif action == "retry" or action == "resume" then sendCommand(id, "resume")
+  elseif action == "return" then stageStop(id, "return_home")
+  elseif action == "rehome" then
+    confirmState = { command = "rehome", payload = { confirm = "RESET" }, twoStep = true, message = "REHOME RESET clears the active job. Press YES twice only when the turtle is physically in its dock." }
+    mode = "confirm"
+  end
+end
+
+normalizedProfile = function(value)
+  value = tostring(value or "balanced")
+  if value == "fast" then value = "turbo" end
+  if value == "" then return "balanced" end
+  if value == "safe" or value == "balanced" or value == "turbo" then return value end
+  return value -- preserve invalid values so preflight can block explicitly.
+end
+
+normalizedWaterMode = function(value)
+  value = tostring(value or "seal")
+  if value == "skip" then value = "ignore" elseif value == "drain" then value = "stop" end
+  if value == "ignore" or value == "stop" then return value end
+  return "seal"
+end
+
+normalizedLighting = function(value)
+  local source = type(value) == "table" and value or {}
+  local mode = tostring(source.mode or "safe")
+  if mode == "auto" then mode = "safe" elseif mode == "on" then mode = "custom" end
+  if mode ~= "off" and mode ~= "safe" and mode ~= "custom" then mode = "safe" end
+  return { mode = mode, interval = math.max(1, math.floor(tonumber(source.interval) or 10)) }
 end
 
 local function dashboardAction(name)
@@ -156,195 +870,74 @@ local function dashboardAction(name)
       local workerId, worker = selectedWorker()
       if not workerId or not worker then setNotice("Select a worker first.", true); return end
       if statusOf(worker) == "offline" then setNotice("Selected worker is offline.", true); return end
+      local previous = db.lastDraft or {}
+      local previousLighting = normalizedLighting(previous.lighting)
+      local previousWater = normalizedWaterMode(previous.waterMode)
+      local previousProfile = normalizedProfile(previous.profile)
+      local previousDepth = tonumber(previous.depth) or 16
+      local calibration = draftCalibration(workerId)
+      local previousTarget = tonumber(previous.targetY)
+      if calibration and calibration.home and tonumber(calibration.home.y) then
+        previousTarget = previousTarget or (tonumber(calibration.home.y) - previousDepth + 1)
+      else
+        previousTarget = nil
+      end
       draft = {
-        workerId = workerId,
-        width = 8,
-        length = 32,
-        depth = 16,
-        selectedField = "width",
-        buffer = "8",
-        excluded = {},
-        chunkPage = 1,
+        workerId = workerId, width = tonumber(previous.width) or 8, length = tonumber(previous.length) or 32,
+        depth = previousDepth, targetY = previousTarget,
+        lighting = previousLighting, waterMode = previousWater, profile = previousProfile,
+        selectedField = "width", buffer = tostring(previous.width or 8), excluded = common.copy(previous.excluded or {}),
+        partialMask = previous.partialMask == true, chunkPage = 1, gridPageX = 1, gridPageZ = 1,
+        rectMode = false, rectStart = nil, autoAssign = false, name = previous.name,
       }
+      db.lastDraft = common.copy(draft)
       mode = "job_dimensions"
+      invalidate()
     elseif name == "info" then
       if id then mode = "info" else setNotice("No worker selected.", true) end
-    elseif name == "pause" or name == "resume" or name == "recall" or name == "service" then
-      sendCommand(id, name)
+    elseif name == "progress" then
+      if id then mode = "progress" else setNotice("No worker selected.", true) end
+    elseif name == "recovery" then
+      if id then mode = "recovery" else setNotice("No worker selected.", true) end
+    elseif name == "report" then mode = "report"
+    elseif name == "stop" then if id then mode = "stop_menu" else setNotice("No worker selected.", true) end
+    elseif name == "pause" or name == "resume" or name == "recall" or name == "service" then sendCommand(id, name)
     elseif name == "abort" then
-      if id then confirmState = { command = "abort", message = "Abort the active job and return home?" }; mode = "confirm" end
+      if id then confirmState = { command = "stop", payload = { mode = "abort" }, message = "Abort the active job and return home?" }; mode = "confirm" end
     elseif name == "clear" then
       if id then confirmState = { command = "clear", message = "Clear the completed or aborted job record?" }; mode = "confirm" end
     elseif name == "rehome" then
-      if id then confirmState = { command = "rehome", payload = { confirm = "RESET" }, message = "REHOME erases the active job. Is the turtle physically in its dock facing forward?" }; mode = "confirm" end
+      if id then confirmState = { command = "rehome", payload = { confirm = "RESET" }, twoStep = true, message = "REHOME RESET clears the active job. Press YES twice only when the turtle is physically in its dock." }; mode = "confirm" end
     elseif name == "gps" then
       if id then confirmState = { command = "calibrate_gps", message = "GPS calibration moves forward one block and back. Is the dock front clear?" }; mode = "confirm" end
     elseif name == "quit" then running = false end
+    invalidate()
   end
 end
 
-local function renderDashboard(target, key)
-  local width, height = target.getSize()
-  common.writeAt(1, 1, common.center("CC MINER V2 TOUCH CONTROL", width), colors and colors.black or nil, colors and colors.cyan or nil)
-  local ids = orderedIds()
-  local online = 0
-  for _, id in ipairs(ids) do if statusOf(workers[id]) ~= "offline" then online = online + 1 end end
-  common.writeAt(1, 2, common.fit(("Controller #%d | Workers %d/%d | v%s"):format(os.getComputerID(), online, #ids, common.VERSION), width), colors and colors.lightGray or nil)
-  local headerY = 4
-  if width >= 48 then
-    common.writeAt(1, headerY, common.fit("  ID    NAME           STATUS       PROGRESS          FUEL  SEAL", width), colors and colors.yellow or nil)
-  else
-    common.writeAt(1, headerY, common.fit("  ID   NAME       STATUS   PROGRESS", width), colors and colors.yellow or nil)
+local function sortingTick()
+  local settings = config.sorting
+  if not settings or settings.enabled ~= true or common.nowSeconds() - lastSorting < (tonumber(settings.interval) or 30) then return end
+  lastSorting = common.nowSeconds()
+  if not peripheral or not peripheral.wrap then return end
+  local source = peripheral.wrap(settings.source or "")
+  local valuable = peripheral.wrap(settings.valuableTarget or "")
+  local bulk = peripheral.wrap(settings.bulkTarget or "")
+  local seal = peripheral.wrap(settings.sealTarget or "")
+  if not source or type(source.list) ~= "function" or type(source.pushItems) ~= "function" then
+    if not sortingWarned then sortingWarned = true; setNotice("Sorting WARN: source inventory is not configured.", false) end
+    return
   end
-
-  local maxRows = math.max(1, height - 9)
-  if #ids == 0 then
-    common.writeAt(2, headerY + 2, common.fit("No workers found. Touch DISCOVER.", width - 2), colors and colors.lightGray or nil)
-  else
-    local first = 1
-    if selected > maxRows then first = selected - maxRows + 1 end
-    for row = 1, maxRows do
-      local index = first + row - 1
-      local id = ids[index]
-      if not id then break end
-      local worker = workers[id]
-      local data = worker.data or {}
-      local status = statusOf(worker)
-      local marker = index == selected and ">" or " "
-      local line
-      if width >= 48 then
-        line = ("%s %-5s %-14s %-12s %-17s %-5s %-4s"):format(
-          marker, tostring(id), common.fit(workerLabel(worker, id), 14), common.fit(status, 12),
-          common.fit(progressText(data), 17), tostring(data.fuel or "-"), tostring(data.seal and data.seal.count or "-")
-        )
-      else
-        line = ("%s%-5s %-10s %-8s %s"):format(
-          marker, tostring(id), common.fit(workerLabel(worker, id), 10), common.fit(status, 8), progressText(data)
-        )
-      end
-      local foreground = index == selected and (colors and colors.black or nil) or common.statusColor(status)
-      local background = index == selected and (colors and colors.white or nil) or (colors and colors.black or nil)
-      local y = headerY + row
-      common.writeAt(1, y, common.fit(line, width), foreground, background)
-      addHitbox(key, 1, y, width, y, function() selected = index end)
-    end
+  if not valuable or not bulk or not seal then
+    if not sortingWarned then sortingWarned = true; setNotice("Sorting WARN: one or more target inventories are missing.", false) end
+    return
   end
-
-  buttonRow(key, height - 4, width, {
-    { "DISCOVER", dashboardAction("discover") }, { "NEW JOB", dashboardAction("new") },
-    { "GPS CAL", dashboardAction("gps") }, { "INFO", dashboardAction("info") },
-  })
-  buttonRow(key, height - 3, width, {
-    { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
-    { "RECALL", dashboardAction("recall") }, { "SERVICE", dashboardAction("service") },
-  })
-  buttonRow(key, height - 2, width, {
-    { "ABORT", dashboardAction("abort") }, { "CLEAR", dashboardAction("clear") },
-    { "REHOME", dashboardAction("rehome") }, { "QUIT", dashboardAction("quit") },
-  })
-  local noticeColor = noticeIsError and (colors and colors.red or nil) or (colors and colors.lime or nil)
-  common.writeAt(1, height, common.fit(notice, width), noticeColor)
-end
-
-local fieldOrder = { "width", "length", "depth" }
-local fieldLabels = { width = "WIDTH (right)", length = "LENGTH (forward)", depth = "DEPTH (down)" }
-local fieldLimits = { width = 128, length = 512, depth = 128 }
-
-local function commitDraftField()
-  if not draft then return end
-  local field = draft.selectedField or "width"
-  local value = tonumber(draft.buffer)
-  if not value then value = draft[field] or 1 end
-  value = common.clamp(math.floor(value), 1, fieldLimits[field])
-  draft[field], draft.buffer = value, tostring(value)
-end
-
-local function chooseDraftField(field)
-  commitDraftField()
-  draft.selectedField = field
-  draft.buffer = tostring(draft[field])
-end
-
-local function draftDigit(digit)
-  if not draft then return end
-  local buffer = tostring(draft.buffer or "")
-  if buffer == "0" then buffer = "" end
-  if #buffer < 4 then draft.buffer = buffer .. tostring(digit) end
-end
-
-local function draftBackspace()
-  if not draft then return end
-  local buffer = tostring(draft.buffer or "")
-  draft.buffer = buffer:sub(1, math.max(0, #buffer - 1))
-  if draft.buffer == "" then draft.buffer = "0" end
-end
-
-local function adjustDraft(field, delta)
-  chooseDraftField(field)
-  local value = common.clamp((draft[field] or 1) + delta, 1, fieldLimits[field])
-  draft[field], draft.buffer = value, tostring(value)
-end
-
-local function draftWorker()
-  if not draft then return nil, nil end
-  return draft.workerId, workers[draft.workerId]
-end
-
-local function draftCalibration()
-  local _, worker = draftWorker()
-  local gpsData = worker and worker.data and worker.data.gps
-  if gpsData and gpsData.calibrated and type(gpsData.calibration) == "table" then return gpsData.calibration end
-  return nil
-end
-
-local function buildDraftCatalog()
-  commitDraftField()
-  local calibration = draftCalibration()
-  local chunkMode = calibration and "world" or "local"
-  local catalog, err = quarry.buildCatalog(draft.width, draft.length, chunkMode, calibration)
-  if not catalog then return nil, err end
-  local rootKey = nil
-  for _, chunk in ipairs(catalog) do
-    if 0 >= chunk.minX and 0 <= chunk.maxX and 1 >= chunk.minZ and 1 <= chunk.maxZ then rootKey = chunk.key end
+  local valuableItems, sealItems = settings.valuableItems or {}, settings.sealBlocks or {}
+  for slot, item in pairs(source.list() or {}) do
+    local destination = bulk
+    if valuableItems[item.name] == true then destination = valuable
+    elseif sealItems[item.name] == true then destination = seal end
+    local targetName = destination == valuable and (settings.valuableTarget or "") or destination == seal and (settings.sealTarget or "") or (settings.bulkTarget or "")
+    pcall(source.pushItems, targetName, slot, item.count)
   end
-  return catalog, nil, chunkMode, calibration, rootKey
 end
-
-local function startDraft(useExclusions)
-  if not draft then return end
-  commitDraftField()
-  local catalog, catalogError, chunkMode, calibration, rootKey = buildDraftCatalog()
-  if not catalog then setNotice(catalogError, true); return end
-  local excludedChunks = {}
-  if useExclusions then
-    for _, chunk in ipairs(catalog) do
-      if draft.excluded[chunk.key] and chunk.key ~= rootKey then
-        excludedChunks[#excludedChunks + 1] = { mode = chunkMode, cx = chunk.cx, cz = chunk.cz }
-      end
-    end
-  end
-  if #excludedChunks > 0 then
-    local plan, planError = quarry.buildChunkPlan({
-      width = draft.width, length = draft.length, depth = draft.depth,
-      chunkMode = chunkMode, excludedChunks = excludedChunks,
-    }, calibration)
-    if not plan then setNotice(planError, true); return end
-  end
-  local sent = sendCommand(draft.workerId, "start", {
-    width = draft.width,
-    length = draft.length,
-    depth = draft.depth,
-    chunkMode = chunkMode,
-    excludedChunks = excludedChunks,
-    name = ("Quarry %dx%dx%d%s"):format(
-      draft.width, draft.length, draft.depth, #excludedChunks > 0 and (" -" .. #excludedChunks .. " chunks") or ""
-    ),
-    jobId = ("q-%d-%d"):format(draft.workerId, common.nowMillis()),
-  })
-  if sent then mode, draft = "dashboard", nil end
-end
-
-local function renderDimensions(target, key)
-  local width, height = target.getSize()
-  local id, worker = draftWorker()
-  common.writeAt(1, 1, common.center("NEW QUARRY - DIMENSIONS", width), colors and colors.black or nil, colors and colors.cyan or nil)

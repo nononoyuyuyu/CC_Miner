@@ -1,0 +1,246 @@
+
+local lastQueueDispatch = 0
+local function workerCanStart(worker)
+  local status = statusOf(worker)
+  if not worker or not worker.data or worker.data.atHome == false then return false end
+  return status == "idle" or status == "complete" or status == "aborted"
+end
+
+local function idleWorkerId(preferred)
+  if preferred and workers[preferred] and workerCanStart(workers[preferred]) then return preferred end
+  for _, id in ipairs(orderedIds()) do
+    local worker = workers[id]
+    if workerCanStart(worker) then return id end
+  end
+  return nil
+end
+
+local function dispatchQueue()
+  local now = common.nowSeconds()
+  if config.queueEnabled == false or now - lastQueueDispatch < 5 or #db.queue == 0 then return end
+  lastQueueDispatch = now
+  for index, item in ipairs(db.queue) do
+    if item.awaiting and now - (item.awaiting.sentAt or now) > 10 then item.awaiting, item.retryAt, item.lastError = nil, now + 5, "start acknowledgement timeout" end
+    if not item.awaiting and (not item.retryAt or now >= item.retryAt) then
+      -- A queued job is dock-relative (and world calibration is worker
+      -- specific), so it must run only on its explicitly selected worker.
+      local id = item.workerId and idleWorkerId(item.workerId) or nil
+      if id then
+        local candidate = common.copy(item)
+        candidate.workerId, candidate.queueIndex = id, index
+        candidate.lighting = normalizedLighting(candidate.lighting)
+        candidate.waterMode = normalizedWaterMode(candidate.waterMode)
+        candidate.profile = normalizedProfile(candidate.profile)
+        draft = candidate
+        local result = computePreflight()
+        local sent = false
+        if result and not result.fatal then
+          sent = startDraft()
+          if not sent and db.queue[index] then db.queue[index].retryAt, db.queue[index].lastError = now + 5, notice end
+        elseif db.queue[index] then
+          db.queue[index].retryAt, db.queue[index].lastError = now + 15, result and "preflight blocked" or "preflight unavailable"
+          saveControllerDb()
+        end
+        if draft then draft = nil end
+        if sent then return end
+      end
+    end
+  end
+end
+
+local function applyPreset(name)
+  for _, preset in ipairs(db.presets or {}) do
+    if tostring(preset.name) == tostring(name) then
+      if draft then
+        local source = type(preset.draft) == "table" and preset.draft or preset
+        for key, value in pairs(source) do if key ~= "name" and key ~= "schema" and key ~= "version" and key ~= "updatedAt" then draft[key] = common.copy(value) end end
+      end
+      db.lastPreset = name
+      saveControllerDb()
+      return true
+    end
+  end
+  return false
+end
+
+local function savePreset(name, source)
+  name = common.trim(name or "")
+  if name == "" then return false, "Preset name is empty." end
+  local draftValue = common.copy(source or draft or db.lastDraft or {})
+  draftValue.queueIndex, draftValue.preflight, draftValue.awaiting = nil, nil, nil
+  local value = { name = name, schema = common.SCHEMA, version = common.VERSION, updatedAt = common.nowSeconds(), draft = draftValue }
+  local replaced = false
+  for index, preset in ipairs(db.presets) do
+    if tostring(preset.name) == name then db.presets[index] = value; replaced = true end
+  end
+  if not replaced then db.presets[#db.presets + 1] = value end
+  db.lastPreset = name
+  saveControllerDb()
+  return true
+end
+
+local function stageStop(id, stopMode)
+  if not id then setNotice("No worker selected.", true); return false end
+  local worker = workers[id]
+  local caps = worker and worker.data and worker.data.capabilities or {}
+  local sent = sendCommand(id, "stop", { mode = stopMode, staged = true })
+  -- V2 workers do not know `stop`; provide the old command after the explicit
+  -- V3 request, but only when capability is absent/false.
+  if not caps.stagedStop then
+    local legacy = ({ pause_now = "pause", finish_row = "pause", finish_layer = "pause", return_home = "recall", abort = "abort" })[stopMode]
+    if legacy then sent = sendCommand(id, legacy, { stopMode = stopMode }) or sent end
+  end
+  return sent
+end
+
+local function recoveryAction(action)
+  local id = selectedWorker()
+  if not id then setNotice("No worker selected.", true); return end
+  if action == "gps_fix" then sendCommand(id, "gps_fix")
+  elseif action == "retry" or action == "resume" then sendCommand(id, "resume")
+  elseif action == "return" then stageStop(id, "return_home")
+  elseif action == "rehome" then
+    confirmState = { command = "rehome", payload = { confirm = "RESET" }, twoStep = true, message = "REHOME RESET clears the active job. Press YES twice only when the turtle is physically in its dock." }
+    mode = "confirm"
+  end
+end
+
+normalizedProfile = function(value)
+  value = tostring(value or "balanced")
+  if value == "fast" then value = "turbo" end
+  if value == "" then return "balanced" end
+  if value == "safe" or value == "balanced" or value == "turbo" then return value end
+  return value -- preserve invalid values so preflight can block explicitly.
+end
+
+normalizedWaterMode = function(value)
+  value = tostring(value or "seal")
+  if value == "skip" then value = "ignore" elseif value == "drain" then value = "stop" end
+  if value == "ignore" or value == "stop" then return value end
+  return "seal"
+end
+
+normalizedLighting = function(value)
+  local source = type(value) == "table" and value or {}
+  local mode = tostring(source.mode or "safe")
+  if mode == "auto" then mode = "safe" elseif mode == "on" then mode = "custom" end
+  if mode ~= "off" and mode ~= "safe" and mode ~= "custom" then mode = "safe" end
+  return { mode = mode, interval = math.max(1, math.floor(tonumber(source.interval) or 10)) }
+end
+
+local function dashboardAction(name)
+  return function()
+    local id = selectedWorker()
+    if name == "discover" then discover()
+    elseif name == "new" then
+      local workerId, worker = selectedWorker()
+      if not workerId or not worker then setNotice("Select a worker first.", true); return end
+      if statusOf(worker) == "offline" then setNotice("Selected worker is offline.", true); return end
+      local previous = db.lastDraft or {}
+      local previousLighting = normalizedLighting(previous.lighting)
+      local previousWater = normalizedWaterMode(previous.waterMode)
+      local previousProfile = normalizedProfile(previous.profile)
+      local previousDepth = tonumber(previous.depth) or 16
+      local calibration = draftCalibration(workerId)
+      local previousTarget = tonumber(previous.targetY)
+      if calibration and calibration.home and tonumber(calibration.home.y) then
+        previousTarget = previousTarget or (tonumber(calibration.home.y) - previousDepth + 1)
+      else
+        previousTarget = nil
+      end
+      draft = {
+        workerId = workerId, width = tonumber(previous.width) or 8, length = tonumber(previous.length) or 32,
+        depth = previousDepth, targetY = previousTarget,
+        lighting = previousLighting, waterMode = previousWater, profile = previousProfile,
+        selectedField = "width", buffer = tostring(previous.width or 8), excluded = common.copy(previous.excluded or {}),
+        partialMask = previous.partialMask == true, chunkPage = 1, gridPageX = 1, gridPageZ = 1,
+        rectMode = false, rectStart = nil, autoAssign = false, name = previous.name,
+      }
+      db.lastDraft = common.copy(draft)
+      mode = "job_dimensions"
+      invalidate()
+    elseif name == "info" then
+      if id then mode = "info" else setNotice("No worker selected.", true) end
+    elseif name == "progress" then
+      if id then mode = "progress" else setNotice("No worker selected.", true) end
+    elseif name == "recovery" then
+      if id then mode = "recovery" else setNotice("No worker selected.", true) end
+    elseif name == "report" then mode = "report"
+    elseif name == "stop" then if id then mode = "stop_menu" else setNotice("No worker selected.", true) end
+    elseif name == "pause" or name == "resume" or name == "recall" or name == "service" then sendCommand(id, name)
+    elseif name == "abort" then
+      if id then confirmState = { command = "stop", payload = { mode = "abort" }, message = "Abort the active job and return home?" }; mode = "confirm" end
+    elseif name == "clear" then
+      if id then confirmState = { command = "clear", message = "Clear the completed or aborted job record?" }; mode = "confirm" end
+    elseif name == "rehome" then
+      if id then confirmState = { command = "rehome", payload = { confirm = "RESET" }, twoStep = true, message = "REHOME RESET clears the active job. Press YES twice only when the turtle is physically in its dock." }; mode = "confirm" end
+    elseif name == "gps" then
+      if id then confirmState = { command = "calibrate_gps", message = "GPS calibration moves forward one block and back. Is the dock front clear?" }; mode = "confirm" end
+    elseif name == "quit" then running = false end
+    invalidate()
+  end
+end
+
+local function sortingTick()
+  local settings = config.sorting
+  if not settings or settings.enabled ~= true or common.nowSeconds() - lastSorting < (tonumber(settings.interval) or 30) then return end
+  lastSorting = common.nowSeconds()
+  if not peripheral or not peripheral.wrap then return end
+  local source = peripheral.wrap(settings.source or "")
+  local valuable = peripheral.wrap(settings.valuableTarget or "")
+  local bulk = peripheral.wrap(settings.bulkTarget or "")
+  local seal = peripheral.wrap(settings.sealTarget or "")
+  if not source or type(source.list) ~= "function" or type(source.pushItems) ~= "function" then
+    if not sortingWarned then sortingWarned = true; setNotice("Sorting WARN: source inventory is not configured.", false) end
+    return
+  end
+  if not valuable or not bulk or not seal then
+    if not sortingWarned then sortingWarned = true; setNotice("Sorting WARN: one or more target inventories are missing.", false) end
+    return
+  end
+  local valuableItems, sealItems = settings.valuableItems or {}, settings.sealBlocks or {}
+  for slot, item in pairs(source.list() or {}) do
+    local destination = bulk
+    if valuableItems[item.name] == true then destination = valuable
+    elseif sealItems[item.name] == true then destination = seal end
+    local targetName = destination == valuable and (settings.valuableTarget or "") or destination == seal and (settings.sealTarget or "") or (settings.bulkTarget or "")
+    pcall(source.pushItems, targetName, slot, item.count)
+  end
+end
+]] },
+  { target = [[controller_parts/02.part]], content = [[-- CC Miner V3 - adaptive touch views.  Every view has a keyboard fallback and
+-- uses bounded hitboxes, so a 20x8 monitor remains operable.
+
+local fieldOrder = { "width", "length", "depth", "targetY" }
+local fieldLabels = { width = "WIDTH", length = "LENGTH", depth = "DEPTH", targetY = "TARGET Y" }
+local fieldLimits = { width = 128, length = 512, depth = 128, targetY = 32000 }
+
+local function currentFieldOrder()
+  if draft and draftCalibration() then return { "width", "length", "targetY" } end
+  return { "width", "length", "depth" }
+end
+
+local function commitDraftField()
+  if not draft then return end
+  local field = draft.selectedField or "width"
+  local value = tonumber(draft.buffer)
+  if not value then value = draft[field] or 1 end
+  value = common.clamp(math.floor(value), fieldLimits[field] and -fieldLimits[field] or 1, fieldLimits[field] or 512)
+  if field ~= "targetY" then value = math.max(1, value) end
+  draft[field], draft.buffer = value, tostring(value)
+end
+
+local function chooseDraftField(field)
+  commitDraftField()
+  draft.selectedField = field
+  draft.buffer = tostring(draft[field] or 0)
+end
+
+local function draftDigit(digit)
+  if not draft then return end
+  local buffer = tostring(draft.buffer or "")
+  if tostring(digit) == "-" then
+    if draft.selectedField == "targetY" and buffer:sub(1, 1) ~= "-" then draft.buffer = "-" .. (buffer == "0" and "" or buffer) end
+    return
+  end
+  if buffer == "0" then buffer = "" end

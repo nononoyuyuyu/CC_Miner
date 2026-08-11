@@ -1,248 +1,258 @@
-  common.writeAt(1, 1, common.center("WORKER DETAILS", width), colors and colors.black or nil, colors and colors.cyan or nil)
-  if not id or not worker then
-    common.writeAt(2, 3, "No worker selected.", colors and colors.red or nil)
-  else
-    local lines = {
-      ("ID: %s  Name: %s"):format(tostring(id), workerLabel(worker, id)),
-      ("Status: %s / %s"):format(statusOf(worker), tostring(data.phase or "-")),
-      data.pose and ("Local pose: x=%s y=%s z=%s dir=%s"):format(data.pose.x, data.pose.y, data.pose.z, data.pose.dir) or "Local pose: -",
-      data.world and ("GPS world: %s, %s, %s"):format(data.world.x, data.world.y, data.world.z) or "GPS world: no fix",
-      ("GPS: %s / %s"):format(data.gps and data.gps.calibrated and "calibrated" or "uncalibrated", data.gps and data.gps.available and "available" or "unavailable"),
-      ("Fuel: %s / %s"):format(tostring(data.fuel or "-"), tostring(data.fuelLimit or "-")),
-      ("Inventory: %s used, %s empty, %s items"):format(tostring(data.inventoryUsed or "-"), tostring(data.inventoryEmpty or "-"), tostring(data.inventoryItems or "-")),
-      ("Lava seal: %s/%s (%s)"):format(tostring(data.seal and data.seal.count or "-"), tostring(data.seal and data.seal.target or "-"), tostring(data.seal and data.seal.mode or "-")),
+  state.water.mode = job.waterMode or config.waterMode or (config.water and config.water.mode) or "ignore"
+  state.pose = { x = 0, y = 0, z = 0, dir = state.pose.dir or 0 }
+  saveState()
+  common.log("INFO", ("Job started: %s %dx%dx%d strategy=%s exclusions=%d"):format(
+    job.id, job.width, job.length, job.depth, job.strategy, #job.excludedChunks
+  ))
+  return true, "Job accepted."
+end
+
+local function calibrateGPS()
+  if state.pendingAction then return false, "Resolve the pending physical action first." end
+  if not isHome() or state.pose.dir ~= 0 then return false, "Place the turtle at home facing the quarry before GPS calibration." end
+  if state.job then return false, "Clear the active job before GPS calibration." end
+  if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
+    return false, "Worker must be stopped before GPS calibration."
+  end
+  if fuelLevel() ~= "unlimited" and tonumber(fuelLevel() or 0) < 2 then return false, "At least 2 fuel is required." end
+]] },
+  { target = [[worker_parts/02.part]], content = [[  local blocked = turtle.inspect()
+  if blocked then return false, "The block directly in front of the dock must be empty for calibration." end
+
+  state.status, state.phase, state.lastError = "calibrating", "gps_calibration", nil
+  saveState()
+  local homeFix, homeError = locateGPS()
+  if not homeFix then
+    state.status, state.phase = "blocked", "gps_error"
+    state.lastError = homeError
+    saveState()
+    return false, homeError
+  end
+
+  local prepared, prepareError = beginPhysicalAction("gps_calibration", { home = homeFix })
+  if not prepared then return false, prepareError end
+  local moved, moveError = turtle.forward()
+  if not moved then
+    cancelPhysicalAction()
+    state.status, state.phase, state.lastError = "blocked", "gps_error", moveError or "Calibration move failed."
+    saveState()
+    return false, state.lastError
+  end
+  sleep(0.15)
+  local forwardFix, forwardError = locateGPS()
+  local returned, returnError = turtle.back()
+  if not returned then
+    state.status, state.phase = "blocked", "recovery_required"
+    state.lastError = "GPS calibration moved forward but could not return: " .. tostring(returnError)
+    saveState()
+    return false, state.lastError
+  end
+  if not forwardFix then
+    cancelPhysicalAction()
+    state.status, state.phase, state.lastError = "blocked", "gps_error", forwardError
+    saveState()
+    return false, forwardError
+  end
+
+  local calibration, calibrationError = geo.calibrationFromFixes(homeFix, forwardFix)
+  if not calibration then
+    cancelPhysicalAction()
+    state.status, state.phase, state.lastError = "blocked", "gps_error", calibrationError
+    saveState()
+    return false, calibrationError
+  end
+  config.gps = config.gps or {}
+  config.gps.enabled = true
+  config.gps.calibration = calibration
+  local saved, saveError = common.saveConfig(config)
+  if not saved then
+    cancelPhysicalAction()
+    state.status, state.phase = "blocked", "gps_error"
+    state.lastError = "Could not save GPS calibration: " .. tostring(saveError)
+    saveState()
+    return false, state.lastError
+  end
+  state.gps.available = true
+  state.gps.lastFix = homeFix
+  state.gps.lastFixAt = common.nowSeconds()
+  state.gps.lastError = nil
+  state.status, state.phase, state.lastError = "idle", "home", nil
+  commitPhysicalAction()
+  common.log("INFO", ("GPS calibrated at %d,%d,%d forward=%d,%d"):format(
+    homeFix.x, homeFix.y, homeFix.z, calibration.forward.x, calibration.forward.z
+  ))
+  return true, "GPS calibrated."
+end
+
+local function applyControlCommand(command, payload)
+  payload = payload or {}
+  if command == "pause_now" or command == "finish_row" or command == "finish_layer" or command == "return_home" then
+    payload.mode = command
+    command = "stop"
+  end
+  if state.pendingAction and command ~= "rehome" and command ~= "ping" and command ~= "status" and command ~= "gps_fix" then
+    return false, "Recovery required: return the turtle to its dock and use REHOME, or reboot with working GPS recovery."
+  end
+  if command == "start" then
+    return startJob(payload)
+  elseif command == "stop" then
+    if not state.job then return false, "No active job." end
+    local mode = tostring(payload.mode or "pause_now")
+    local allowed = {
+      pause_now = true, finish_row = true, finish_layer = true,
+      return_home = true, abort = true,
     }
-    if data.job then
-      lines[#lines + 1] = ("Job: %s (%dx%dx%d) [%s]"):format(tostring(data.job.name), data.job.width, data.job.length, data.job.depth, tostring(data.job.strategy or "-"))
-      lines[#lines + 1] = ("Progress: %s/%s (%s%%) layer=%s exclusions=%s"):format(
-        tostring(data.job.cursor), tostring(data.job.total), tostring(data.job.percent), tostring(data.job.currentLayer or "-"), tostring(data.job.excludedChunks or 0)
-      )
-    else
-      lines[#lines + 1] = "Job: none"
+    if not allowed[mode] then return false, "Unknown staged stop mode: " .. mode end
+    state.stagedStop = {
+      mode = mode,
+      requestedAt = common.nowSeconds(),
+      requestedBy = payload.requestedBy and tostring(payload.requestedBy) or nil,
+      source = "stop",
+    }
+    if mode == "pause_now" then
+      state.request = "pause_now"
+      if state.status ~= "working" then state.status = "working" end
+    elseif mode == "return_home" or mode == "abort" then
+      state.request = mode
+      if mode == "abort" then state.completionReason = "aborted" end
+      if state.status ~= "working" then state.status = "working" end
+    elseif state.status ~= "working" then
+      state.status = "working"
     end
-    if data.lastError then lines[#lines + 1] = "Error: " .. tostring(data.lastError) end
-    if data.completionReason then lines[#lines + 1] = "Completion: " .. tostring(data.completionReason) end
-    if data.stats then
-      lines[#lines + 1] = ("Stats: dug=%s sealed=%s GPS recoveries=%s unloads=%s"):format(
-        tostring(data.stats.blocksDug or 0), tostring(data.stats.lavaSealed or 0), tostring(data.stats.gpsRecoveries or 0), tostring(data.stats.unloads or 0)
-      )
+    saveState("stop_" .. mode)
+    return true, "Staged stop accepted: " .. mode
+  elseif command == "pause" then
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+      state.stagedStop = { mode = "pause_now", requestedAt = common.nowSeconds(), source = "pause" }
+      state.request = "pause_now"
+      if state.status ~= "working" then state.status = "working" end
+      saveState("pause")
+      return true, "Pause accepted; stopping at the next safe boundary."
     end
-    for index, line in ipairs(lines) do
-      if index + 2 >= height - 1 then break end
-      common.writeAt(2, index + 2, common.fit(line, width - 2), colors and colors.white or nil)
+    return false, "Worker is not running."
+  elseif command == "resume" then
+    if state.status == "paused" or state.status == "blocked" then
+      if state.status == "blocked" then
+        local criticalPhase = {
+          state_corrupt = true,
+          gps_drift = true,
+          recovery_required = true,
+          gps_error = true,
+        }
+        if criticalPhase[tostring(state.phase or "")] then
+          return false, "Cannot resume from " .. tostring(state.phase) .. "; resolve GPS/state recovery or use REHOME first."
+        end
+      end
+      state.lastError = nil
+      state.stagedStop = false
+      if state.service then
+        state.status, state.phase = "working", "service_requested"
+      elseif isHome() and state.checkpoint and state.job then
+        state.service = { resumeAfter = true, finalStatus = "working", preserveCheckpoint = false, reason = "resume" }
+        state.status, state.phase = "working", "resume_service"
+      else
+        state.status, state.phase = "working", "mining"
+      end
+      state.request = nil
+      saveState()
+      return true, "Resume accepted."
+    elseif state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+      state.status = "working"
+      saveState()
+      return true, "Service retry accepted."
     end
-  end
-  drawButton(key, 1, height - 1, width, "BACK", function() mode = "dashboard" end, true)
-end
-
-local function renderConfirm(target, key)
-  local width, height = target.getSize()
-  common.writeAt(1, 1, common.center("CONFIRM COMMAND", width), colors and colors.black or nil, colors and colors.orange or nil)
-  local message = confirmState and confirmState.message or "Continue?"
-  local lineWidth = math.max(10, width - 4)
-  local words = {}
-  for word in tostring(message):gmatch("%S+") do words[#words + 1] = word end
-  local lines, current = {}, ""
-  for _, word in ipairs(words) do
-    if #current == 0 then current = word
-    elseif #current + 1 + #word <= lineWidth then current = current .. " " .. word
-    else lines[#lines + 1] = current; current = word end
-  end
-  if current ~= "" then lines[#lines + 1] = current end
-  local startY = math.max(3, math.floor((height - #lines) / 2) - 1)
-  for index, line in ipairs(lines) do common.writeAt(3, startY + index - 1, common.fit(line, lineWidth), colors and colors.white or nil) end
-  buttonRow(key, height - 2, width, {
-    { "YES", function()
-      local id = selectedWorker()
-      if confirmState and id then sendCommand(id, confirmState.command, confirmState.payload) end
-      confirmState, mode = nil, "dashboard"
-    end },
-    { "NO", function() confirmState, mode = nil, "dashboard"; setNotice("Cancelled.", false) end },
-  })
-end
-
-local function renderOne(target, key)
-  resetHitboxes(key)
-  common.withTerm(target, function()
-    common.clear(colors and colors.black or nil, colors and colors.white or nil)
-    if mode == "dashboard" then renderDashboard(target, key)
-    elseif mode == "job_dimensions" then renderDimensions(target, key)
-    elseif mode == "job_chunks" then renderChunks(target, key)
-    elseif mode == "info" then renderInfo(target, key)
-    elseif mode == "confirm" then renderConfirm(target, key)
-    else mode = "dashboard"; renderDashboard(target, key) end
-  end)
-end
-
-local function render()
-  renderOne(term.current(), "term")
-  for _, entry in ipairs(monitors) do renderOne(entry.device, entry.name) end
-end
-
-local function handlePointer(key, x, y)
-  local boxes = hitboxes[key] or {}
-  for index = #boxes, 1, -1 do
-    local box = boxes[index]
-    if x >= box.x1 and x <= box.x2 and y >= box.y1 and y <= box.y2 then
-      box.action()
-      return true
+    return false, "Worker is not paused or blocked."
+  elseif command == "recall" then
+    if not state.job then return false, "No active job." end
+    state.request = "recall"
+    state.stagedStop = { mode = "return_home", requestedAt = common.nowSeconds(), source = "recall" }
+    if state.status ~= "working" then state.status = "working" end
+    saveState()
+    return true, "Recall accepted. Worker will return and pause."
+  elseif command == "service" then
+    if not state.job then return false, "No active job." end
+    state.request = "service"
+    if state.status ~= "working" then state.status = "working" end
+    saveState()
+    return true, "Service return accepted."
+  elseif command == "abort" then
+    if not state.job then return false, "No job to abort." end
+    state.request = "abort"
+    state.completionReason = "aborted"
+    state.stagedStop = { mode = "abort", requestedAt = common.nowSeconds(), source = "abort" }
+    if state.status ~= "working" then state.status = "working" end
+    saveState()
+    return true, "Abort accepted. Worker will return home."
+  elseif command == "clear" then
+    if state.pendingAction then return false, "Cannot clear while physical position is uncertain." end
+    if not isHome() then return false, "Worker must be at home." end
+    if state.job and state.status ~= "complete" and state.status ~= "aborted" then
+      return false, "Cannot clear an unfinished job; ABORT it first."
     end
-  end
-  return false
-end
-
-local function processChar(character)
-  character = string.lower(character or "")
-  if mode == "job_dimensions" then
-    if character:match("%d") then draftDigit(character) end
-    return
-  elseif mode == "confirm" then
-    if character == "y" then
-      local id = selectedWorker()
-      if confirmState and id then sendCommand(id, confirmState.command, confirmState.payload) end
-      confirmState, mode = nil, "dashboard"
-    elseif character == "n" then
-      confirmState, mode = nil, "dashboard"
-      setNotice("Cancelled.", false)
+    if not state.job and state.status ~= "idle" then
+      return false, "No clearable job record exists in the current state."
     end
-    return
-  end
-  if mode ~= "dashboard" then return end
-  local id = selectedWorker()
-  if character == "d" then discover()
-  elseif character == "n" then dashboardAction("new")()
-  elseif character == "p" then sendCommand(id, "pause")
-  elseif character == "r" then sendCommand(id, "resume")
-  elseif character == "h" then sendCommand(id, "recall")
-  elseif character == "s" then sendCommand(id, "service")
-  elseif character == "x" then dashboardAction("abort")()
-  elseif character == "c" then dashboardAction("clear")()
-  elseif character == "i" then dashboardAction("info")()
-  elseif character == "g" then dashboardAction("rehome")()
-  elseif character == "l" then dashboardAction("gps")()
-  elseif character == "q" then running = false end
-end
-
-local function processKey(keyCode)
-  if keys and keyCode == keys.escape then
-    if mode == "dashboard" then running = false else mode, draft, confirmState = "dashboard", nil, nil end
-    return
-  end
-  if mode == "dashboard" then
-    local ids = orderedIds()
-    if keys and keyCode == keys.up then selected = math.max(1, selected - 1)
-    elseif keys and keyCode == keys.down then selected = math.min(math.max(1, #ids), selected + 1)
-    elseif keys and keyCode == keys.enter then mode = "info" end
-  elseif mode == "job_dimensions" then
-    if keys and keyCode == keys.backspace then draftBackspace()
-    elseif keys and keyCode == keys.tab then
-      local position = 1
-      for index, field in ipairs(fieldOrder) do if field == draft.selectedField then position = index end end
-      chooseDraftField(fieldOrder[position % #fieldOrder + 1])
-    elseif keys and keyCode == keys.enter then commitDraftField(); mode = "job_chunks" end
-  elseif mode == "job_chunks" then
-    if keys and keyCode == keys.left then draft.chunkPage = math.max(1, (draft.chunkPage or 1) - 1)
-    elseif keys and keyCode == keys.right then draft.chunkPage = (draft.chunkPage or 1) + 1
-    elseif keys and keyCode == keys.enter then startDraft(true) end
-  elseif mode == "info" then
-    mode = "dashboard"
-  elseif mode == "confirm" then
-    if keys and keyCode == keys.n then confirmState, mode = nil, "dashboard" end
-  end
-end
-
-local function pumpFor(seconds)
-  local deadline = common.nowSeconds() + (seconds or 1)
-  while common.nowSeconds() <= deadline do
-    local sender, message = protocol.receive(0.25)
-    if sender then handleMessage(sender, message) end
-  end
-end
-
-local function commandLineMode()
-  local command = string.lower(args[1] or "")
-  if command == "discover" or command == "status" then
-    discover(); pumpFor(3)
-    local ids = orderedIds()
-    if #ids == 0 then print("No workers found."); return true end
-    for _, id in ipairs(ids) do
-      local data = workers[id].data or {}
-]] },
-  { target = [[controller_parts/03.part]], content = [[      print(("#%s %-16s %-14s %s GPS=%s seal=%s"):format(
-        id, workerLabel(workers[id], id), statusOf(workers[id]), progressText(data),
-        data.gps and data.gps.calibrated and "ready" or "no", data.seal and data.seal.count or "-"
-      ))
+    if state.service or state.request then
+      return false, "Cannot clear while service or a control request is pending."
     end
-    return true
-  elseif command == "start" then
-    local id, width, length, depth = tonumber(args[2]), tonumber(args[3]), tonumber(args[4]), tonumber(args[5])
-    if not id or not width or not length or not depth then
-      print("Usage: controller.lua start <id> <width> <length> <depth>")
-      return true
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+      return false, "Worker is busy."
     end
-    sendCommand(id, "start", { width = width, length = length, depth = depth, name = "CLI Quarry", chunkMode = "local", excludedChunks = {} })
-    pumpFor(2); print(notice); return true
-  elseif command == "pause" or command == "resume" or command == "recall" or command == "service" or command == "abort" or command == "clear" then
-    local id = tonumber(args[2])
-    if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
-    sendCommand(id, command); pumpFor(2); print(notice); return true
-  elseif command == "gps" or command == "calibrate" then
-    local id = tonumber(args[2])
-    if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
-    sendCommand(id, command == "gps" and "gps_fix" or "calibrate_gps")
-    pumpFor(3); print(notice); return true
+    state.job, state.checkpoint, state.service, state.request = nil, nil, nil, nil
+    state.stagedStop = false
+    state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
+    saveState()
+    return true, "Job record cleared."
+  elseif command == "calibrate_gps" then
+    return calibrateGPS()
+  elseif command == "gps_fix" then
+    local fix, err = locateGPS()
+    saveState()
+    if not fix then return false, err end
+    local verified, verifyError = verifyGPS(true)
+    if not verified then return false, verifyError end
+    return true, ("GPS fix: %d,%d,%d"):format(fix.x, fix.y, fix.z)
   elseif command == "rehome" then
-    local id = tonumber(args[2])
-    if not id or args[3] ~= "RESET" then print("Usage: controller.lua rehome <id> RESET"); return true end
-    sendCommand(id, "rehome", { confirm = "RESET" }); pumpFor(2); print(notice); return true
-  end
-  return false
-end
-
-if #args > 0 and commandLineMode() then return end
-
-discover()
-local refreshTimer = os.startTimer(1)
-while running do
-  render()
-  local event, a, b, c = os.pullEvent()
-  if event == "rednet_message" and c == common.PROTOCOL then
-    handleMessage(a, b)
-  elseif event == "char" then
-    processChar(a)
-  elseif event == "key" then
-    processKey(a)
-  elseif event == "mouse_click" then
-    handlePointer("term", b, c)
-  elseif event == "monitor_touch" then
-    if config.touchEnabled ~= false then handlePointer(a, b, c) end
-  elseif event == "timer" and a == refreshTimer then
-    if common.nowSeconds() - lastDiscovery >= (config.discoverySeconds or 5) then discover() end
-    refreshTimer = os.startTimer(1)
-  elseif event == "term_resize" or event == "monitor_resize" or event == "peripheral" or event == "peripheral_detach" then
-    monitors = common.findPeripherals("monitor")
-    for _, entry in ipairs(monitors) do
-      if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end
+    if payload.confirm ~= "RESET" then return false, "Rehome requires confirm=RESET." end
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+      return false, "Stop the worker before rehoming."
     end
+    local calibration = gpsCalibration()
+    if calibration then
+      local fix, fixError = locateGPS()
+      if not fix then
+        return false, "GPS fix is required to verify the calibrated dock before REHOME: " .. tostring(fixError)
+      end
+      local expected = geo.localToWorld(calibration, { x = 0, y = 0, z = 0 })
+      if not geo.samePosition(fix, expected) then
+        return false, ("GPS says the turtle is at %d,%d,%d, not the calibrated dock %d,%d,%d."):format(
+          fix.x, fix.y, fix.z, expected.x, expected.y, expected.z
+        )
+      end
+    end
+    state.pose = { x = 0, y = 0, z = 0, dir = 0 }
+    state.job, state.checkpoint, state.service, state.request, state.pendingAction = nil, nil, nil, nil, nil
+    state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
+    saveState()
+    return true, "Local position reset to home."
+  elseif command == "ping" or command == "status" then
+    return true, "Status sent."
   end
+  return false, "Unknown command: " .. tostring(command)
 end
 
-common.clear(colors and colors.black or nil, colors and colors.white or nil)
-print("CC Miner controller stopped. Run 'ccm dashboard' to reopen it.")
-]] },
-  { target = [[gps_host.lua]], content = [[-- CC Miner V2 - managed GPS host launcher.
-
-local common = dofile("/ccminer/lib/common.lua")
-local config, err = common.loadConfig()
-if not config or config.role ~= "gps" then error(err or "GPS host is not configured. Run: ccm setup gps", 0) end
-
-if os.setComputerLabel then os.setComputerLabel(config.gpsName or common.safeComputerLabel("GPS")) end
-local opened = common.openWirelessModems()
-if #opened == 0 then error("No wireless modem found. Attach a wireless modem to this GPS host.", 0) end
-
-common.clear(colors and colors.black or nil, colors and colors.white or nil)
-print("CC Miner V2 GPS Host " .. common.VERSION)
-print("Name: " .. tostring(config.gpsName))
-print(("Coordinates: %d, %d, %d"):format(config.x, config.y, config.z))
-print("Modem: " .. table.concat(opened, ", "))
-print("")
+local function handleMessage(sender, message)
+  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
+  if not valid then return end
+  if tonumber(config.controllerId or 0) > 0 and tonumber(sender) ~= tonumber(config.controllerId) then return end
+  if message.kind == "discover" then sendStatus(sender, message); return end
+  if message.kind ~= "command" then return end
+  if tonumber(message.target) ~= tonumber(os.getComputerID()) then return end
+  if commandSeen(message.id) then
+    sendAck(sender, message, true, "Duplicate command ignored; previous result retained.")
+    return
+  end
+  local payload = message.payload
+  local command = tostring(payload.command or "")
+  local ok, text = applyControlCommand(command, payload)
+  sendAck(sender, message, ok, text)

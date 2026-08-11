@@ -1,4 +1,4 @@
--- CC Miner V2 online installer/updater
+-- CC Miner V3 online installer/updater
 -- Usage:
 --   wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua worker
 --   wget run https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua controller
@@ -7,7 +7,7 @@
 
 local args = { ... }
 local action = string.lower(tostring(args[1] or ""))
-local VERSION = "2.1.0"
+local VERSION = "3.0.0"
 local BASE_URL = "https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/"
 local ROOT, TEMP, BACKUP = "/ccminer", "/ccminer.update", "/ccminer.backup"
 
@@ -79,7 +79,7 @@ local function moveChecked(source, target)
 end
 
 local function usage()
-  print("CC Miner V2 installer " .. VERSION)
+  print("CC Miner V3 installer " .. VERSION)
   print("  install.lua worker      Mining turtle")
   print("  install.lua controller  Touch controller")
   print("  install.lua gps         GPS host computer")
@@ -92,7 +92,7 @@ if action == "worker" and not turtle then error("Worker installation requires a 
 if action == "update" and not fs.exists(ROOT .. "/config.db") then error("No existing installation found.", 0) end
 
 term.clear(); term.setCursorPos(1, 1)
-print("CC MINER V2 " .. string.upper(action))
+print("CC MINER V3 " .. string.upper(action))
 print("Source: nononoyuyuyu/CC_Miner")
 print("")
 if fs.exists(TEMP) then fs.delete(TEMP) end

@@ -1,309 +1,278 @@
-    local ok, err = turnTo(2)
-    if not ok then return nil, nil, nil, restoreDir, err end
-    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
-  elseif side == "right" then
-    local ok, err = turnTo(1)
-    if not ok then return nil, nil, nil, restoreDir, err end
-    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
-  elseif side == "left" then
-    local ok, err = turnTo(3)
-    if not ok then return nil, nil, nil, restoreDir, err end
-    return turtle.inspect, turtle.suck, turtle.drop, restoreDir
-  elseif side == "top" then
-    return turtle.inspectUp, turtle.suckUp, turtle.dropUp, restoreDir
-  elseif side == "bottom" then
-    return turtle.inspectDown, turtle.suckDown, turtle.dropDown, restoreDir
+  while head <= tail do
+    local key = queue[head]; head = head + 1
+    for _, neighbor in ipairs(chunks[key].neighbors or {}) do
+      if not seen[neighbor] then seen[neighbor] = true; tail = tail + 1; queue[tail] = neighbor end
+    end
   end
-  return nil, nil, nil, restoreDir, "Unsupported inventory side: " .. tostring(side)
-end
-
-local function restoreSideDirection(side, restoreDir)
-  if side == "front" or side == "back" or side == "right" or side == "left" then return turnTo(restoreDir) end
+  for _, key in ipairs(keys) do if not seen[key] then return false end end
   return true
 end
 
-local function unloadAtHome()
-  state.phase, state.status = "unloading", "working"
-  saveState()
-  local originalSlot = turtle.getSelectedSlot()
-  local outputSide = config.outputSide or "back"
-  local inspectFunction, _, dropFunction, restoreDir, sideError = sideFunctions(outputSide)
-  if not inspectFunction then turtle.select(originalSlot); return false, sideError end
-  local checkSide = (outputSide == "top" and "top") or (outputSide == "bottom" and "bottom") or "front"
-  if not inventoryPresent(checkSide, inspectFunction) then
-    restoreSideDirection(outputSide, restoreDir)
-    turtle.select(originalSlot)
-    return false, "Output inventory missing on configured side " .. outputSide .. "."
-  end
-
-  local allDropped = true
-  for slot = 1, 16 do
-    if turtle.getItemCount(slot) > 0 and not isSealItemName(itemName(slot)) then
-      turtle.select(slot)
-      dropFunction()
-      if turtle.getItemCount(slot) > 0 then allDropped = false end
+local function graphDistances(chunks, startKey)
+  local queue, head, tail = { startKey }, 1, 1
+  local distance = { [startKey] = 0 }
+  while head <= tail do
+    local key = queue[head]; head = head + 1
+    for _, neighbor in ipairs(chunks[key].neighbors or {}) do
+      if distance[neighbor] == nil then
+        distance[neighbor] = distance[key] + 1
+        tail = tail + 1; queue[tail] = neighbor
+      end
     end
   end
-  local restored, restoreError = restoreSideDirection(outputSide, restoreDir)
-  turtle.select(originalSlot)
-  if not restored then return false, restoreError end
-  if not allDropped then return false, "Output inventory is full." end
-  state.stats.unloads = (state.stats.unloads or 0) + 1
-  saveState()
-  return true
+  return distance
 end
 
-local function targetFuelForService()
-  local target = tonumber(config.fuelTarget) or 12000
-  if state.service and state.service.resumeAfter and state.checkpoint then
-    local checkpointDistance = estimatedReturnDistance(state.checkpoint)
-    if not checkpointDistance then
-      checkpointDistance = distance({ x = 0, y = 0, z = 0 }, state.checkpoint)
-    end
-    target = math.max(target, checkpointDistance * 2 + (tonumber(config.fuelBuffer) or 256))
+local function workerList(workerIds)
+  if type(workerIds) ~= "table" then return nil, "invalid_worker_ids" end
+  local workers, seen = {}, {}
+  for _, id in ipairs(workerIds) do
+    if #workers >= MAX_WORKERS then return nil, "too_many_workers" end
+    if id == nil or tostring(id) == "" then return nil, "invalid_worker_id" end
+    local key = tostring(id)
+    if seen[key] then return nil, "duplicate_worker_id" end
+    seen[key] = true
+    workers[#workers + 1] = { id = id, key = key }
   end
-  local limit = fuelLimit()
-  if limit == "unlimited" then return "unlimited" end
-  if type(limit) == "number" and limit > 0 then target = math.min(target, limit) end
-  return math.max(1, math.floor(target))
+  if #workers == 0 then return nil, "no_workers" end
+  table.sort(workers, function(a, b) return a.key < b.key end)
+  return workers
 end
 
-local function refuelAtHome()
-  state.phase, state.status = "refueling", "working"
-  saveState()
-  local current = fuelLevel()
-  if current == "unlimited" then return true end
-  local target = targetFuelForService()
-  local fuelSide = config.fuelSide or "top"
-  local inspectFunction, suckFunction, dropFunction, restoreDir, sideError = sideFunctions(fuelSide)
-  if not inspectFunction then return false, sideError end
-  local checkSide = (fuelSide == "top" and "top") or (fuelSide == "bottom" and "bottom") or "front"
-  if not inventoryPresent(checkSide, inspectFunction) then
-    restoreSideDirection(fuelSide, restoreDir)
-    return false, "Fuel inventory missing on configured side " .. fuelSide .. "."
+local function partitionChunks(catalog, workerIds)
+  if type(catalog) ~= "table" then return nil, "invalid_chunk_catalog" end
+  local workers, workerError = workerList(workerIds)
+  if not workers then return nil, workerError end
+  local chunks, keys = catalogGraph(catalog)
+  if not chunks then return nil, keys end
+  if #workers > #keys then return nil, "more_workers_than_chunks" end
+  if not graphConnected(chunks, keys) then return nil, "chunk_catalog_disconnected" end
+
+  local owner, loads, owned = {}, {}, {}
+  for index, worker in ipairs(workers) do loads[index], owned[index] = 0, {} end
+  local seeds = { keys[1] }
+  local seedSet = { [keys[1]] = true }
+  -- Farthest-point seeds spread workers over the world graph while keeping
+  -- every later region reachable through an adjacent frontier.
+  for index = 2, #workers do
+    local distances = {}
+    for _, seed in ipairs(seeds) do
+      local fromSeed = graphDistances(chunks, seed)
+      for key, distance in pairs(fromSeed) do
+        if distances[key] == nil or distance < distances[key] then distances[key] = distance end
+      end
+    end
+    local selected
+    for _, key in ipairs(keys) do
+      if not seedSet[key] and (not selected or distances[key] > distances[selected] or (distances[key] == distances[selected] and chunkComparator(chunks[key], chunks[selected]))) then
+        selected = key
+      end
+    end
+    if not selected then return nil, "worker_seed_failed" end
+    seeds[#seeds + 1] = selected
+    seedSet[selected] = true
   end
-  if target == "unlimited" or current >= target then
-    restoreSideDirection(fuelSide, restoreDir)
-    return true
+  for index, seed in ipairs(seeds) do
+    owner[seed] = index
+    owned[index][#owned[index] + 1] = seed
+    loads[index] = loads[index] + chunks[seed].cells
   end
 
-  local originalSlot = turtle.getSelectedSlot()
-  local attempts = 0
-  while fuelLevel() ~= "unlimited" and fuelLevel() < target do
-    drainNetwork(3)
-    if movementInterrupted("service") then
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "control_request"
+  local assigned = #seeds
+  local target = 0
+  for _, key in ipairs(keys) do target = target + chunks[key].cells end
+  target = target / #workers
+  while assigned < #keys do
+    local bestKey, bestOwner, bestDeficit, bestProjected
+    for _, key in ipairs(keys) do
+      if not owner[key] then
+        local candidates, candidateSeen = {}, {}
+        for _, neighbor in ipairs(chunks[key].neighbors or {}) do
+          local index = owner[neighbor]
+          if index and not candidateSeen[index] then candidateSeen[index] = true; candidates[#candidates + 1] = index end
+        end
+        for _, index in ipairs(candidates) do
+          local deficit = target - loads[index]
+          local projected = math.abs((loads[index] + chunks[key].cells) - target)
+          if not bestKey or deficit > bestDeficit or (deficit == bestDeficit and projected < bestProjected) or (deficit == bestDeficit and projected == bestProjected and (chunkComparator(chunks[key], chunks[bestKey]) or (key == bestKey and index < bestOwner))) then
+            bestKey, bestOwner, bestDeficit, bestProjected = key, index, deficit, projected
+          end
+        end
+      end
     end
-    attempts = attempts + 1
-    if attempts > 1024 then
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Fuel loading safety limit reached."
-    end
-    local slot = firstEmptySlot()
-    if not slot then
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "No empty slot available while refueling."
-    end
-    turtle.select(slot)
-    local sucked = suckFunction(1)
-    if not sucked then
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Fuel inventory is empty."
-    end
-    if not turtle.refuel(0) then
-      dropFunction()
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Fuel inventory contains a non-fuel item."
-    end
-    local before = fuelLevel()
-    local consumed = turtle.refuel(1)
-    local after = fuelLevel()
-    if not consumed then
-      dropFunction()
-      restoreSideDirection(fuelSide, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Turtle refused the selected fuel item."
-    end
-    if turtle.getItemCount(slot) > 0 then dropFunction() end
-    if type(before) == "number" and type(after) == "number" and after > before then
-      state.stats.refuels = (state.stats.refuels or 0) + 1
-    end
+    if not bestKey then return nil, "chunk_catalog_disconnected" end
+    owner[bestKey] = bestOwner
+    owned[bestOwner][#owned[bestOwner] + 1] = bestKey
+    loads[bestOwner] = loads[bestOwner] + chunks[bestKey].cells
+    assigned = assigned + 1
   end
-  local restored, restoreError = restoreSideDirection(fuelSide, restoreDir)
-  turtle.select(originalSlot)
-  if not restored then return false, restoreError end
-  saveState()
-  return true
+
+  local result = {}
+  for index, worker in ipairs(workers) do
+    table.sort(owned[index], function(left, right) return chunkComparator(chunks[left], chunks[right]) end)
+    result[worker.id] = { chunkKeys = owned[index], cells = loads[index] }
+  end
+  return result
 end
 
-local function refillSlotForSeal()
-  for slot = 1, 16 do
-    if isSealItemName(itemName(slot)) and turtle.getItemSpace(slot) > 0 then return slot end
-  end
-  return firstEmptySlot()
-end
+M.partitionChunks = partitionChunks
+M.assignWorkers = partitionChunks
+M.splitWorkers = partitionChunks
+M.splitWorkerChunks = partitionChunks
+M.partitionWorkers = partitionChunks
+M.assignChunkWorkers = partitionChunks
+M.splitWorkerAssignments = partitionChunks
 
-local function refillSealAtHome()
-  if (config.lavaMode or "seal") ~= "seal" then return true end
-  state.phase, state.status = "refilling_seal", "working"
-  saveState()
-  local target = math.max(1, tonumber(config.sealTarget) or 64)
-  if sealMaterialCount() >= target then return true end
-  local side = config.sealSide or "right"
-  local inspectFunction, suckFunction, dropFunction, restoreDir, sideError = sideFunctions(side)
-  if not inspectFunction then return false, sideError end
-  local checkSide = (side == "top" and "top") or (side == "bottom" and "bottom") or "front"
-  if not inventoryPresent(checkSide, inspectFunction) then
-    restoreSideDirection(side, restoreDir)
-    return false, "Lava-seal block inventory missing on configured side " .. side .. "."
-  end
-
-  local originalSlot = turtle.getSelectedSlot()
-  local attempts = 0
-  while sealMaterialCount() < target do
-    drainNetwork(3)
-    if movementInterrupted("service") then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "control_request"
+local function boundsFrom(value, length, options)
+  options = type(options) == "table" and options or {}
+  local minX, maxX, minZ, maxZ
+  if type(value) == "table" then
+    if value.minX ~= nil and value.maxX ~= nil and value.minZ ~= nil and value.maxZ ~= nil then
+      minX, maxX = integerValue(value.minX), integerValue(value.maxX)
+      minZ, maxZ = integerValue(value.minZ), integerValue(value.maxZ)
+    elseif value.width ~= nil and value.length ~= nil then
+      local width, validLength = integerValue(value.width, 1, MAX_DIMENSION), integerValue(value.length, 1, MAX_DIMENSION)
+      if not width or not validLength or width * validLength > MAX_COLUMNS then return nil, "invalid_bounds" end
+      local originX = integerValue(value.originX ~= nil and value.originX or options.originX or 0)
+      local originZ = integerValue(value.originZ ~= nil and value.originZ or options.originZ or 1)
+      if not originX or not originZ then return nil, "invalid_bounds" end
+      minX, maxX = originX, originX + width - 1
+      minZ, maxZ = originZ, originZ + validLength - 1
+    elseif value.plan then
+      return boundsFrom(value.plan, nil, options)
+    elseif value.chunks then
+      for _, chunk in pairs(value.chunks) do
+        if not minX or chunk.minX < minX then minX = chunk.minX end
+        if not maxX or chunk.maxX > maxX then maxX = chunk.maxX end
+        if not minZ or chunk.minZ < minZ then minZ = chunk.minZ end
+        if not maxZ or chunk.maxZ > maxZ then maxZ = chunk.maxZ end
+      end
     end
-    attempts = attempts + 1
-    if attempts > 64 then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-]=] },
-  { target = [[worker_parts/04.part]], content = [[      return false, "Seal-block loading safety limit reached."
-    end
-    local slot = refillSlotForSeal()
-    if not slot then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "No inventory space for lava-seal blocks."
-    end
-    turtle.select(slot)
-    local need = math.min(target - sealMaterialCount(), turtle.getItemSpace(slot))
-    if need <= 0 then need = 1 end
-    local sucked = suckFunction(need)
-    if not sucked then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Lava-seal block inventory is empty."
-    end
-    if not isSealItemName(itemName(slot)) then
-      dropFunction()
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Seal inventory contains an unsupported item. Use configured solid blocks only."
-    end
-    state.stats.sealRefills = (state.stats.sealRefills or 0) + 1
-  end
-  local restored, restoreError = restoreSideDirection(side, restoreDir)
-  turtle.select(originalSlot)
-  if not restored then return false, restoreError end
-  saveState()
-  return true
-end
-
-local function beginService(resumeAfter, finalStatus, reason, preserveCheckpoint)
-  if not state.service then
-    if not isHome() and not state.checkpoint then state.checkpoint = poseCopy() end
-    state.service = {
-      resumeAfter = resumeAfter == true,
-      finalStatus = finalStatus or (resumeAfter and "working" or "paused"),
-      preserveCheckpoint = preserveCheckpoint == true,
-      reason = reason or "service",
-      startedAt = common.nowSeconds(),
-    }
   else
-    if resumeAfter == false then state.service.resumeAfter = false end
-    if finalStatus then state.service.finalStatus = finalStatus end
-    if preserveCheckpoint ~= nil then state.service.preserveCheckpoint = preserveCheckpoint == true end
-    if reason then state.service.reason = reason end
-  end
-  state.status, state.phase, state.request = "working", "service_requested", nil
-  saveState()
-end
-
-local function finishService()
-  local service = state.service or {}
-  local finalStatus = service.finalStatus or (service.resumeAfter and "working" or "paused")
-  local preserveCheckpoint = service.preserveCheckpoint == true
-  state.service, state.request, state.lastError = nil, nil, nil
-  if finalStatus == "complete" then
-    state.stats.jobsCompleted = (state.stats.jobsCompleted or 0) + 1
-    state.checkpoint = nil
-    state.status, state.phase = "complete", "home"
-  elseif finalStatus == "aborted" then
-    state.checkpoint = nil
-    state.status, state.phase = "aborted", "home"
-  elseif finalStatus == "paused" then
-    if not preserveCheckpoint then state.checkpoint = nil end
-    state.status, state.phase = "paused", "home_paused"
-  else
-    state.checkpoint = nil
-    state.status, state.phase = "working", "mining"
-  end
-  saveState()
-  heartbeat(true)
-end
-
-local function continueService()
-  if not state.service then return true end
-  state.status = "working"
-  if not isHome() then
-    state.phase = "returning"
-    saveState()
-    local ok, err
-    if state.job and state.job.strategy == "chunk_plan" then
-      ok, err = navigateChunkPlanHome("service")
-    else
-      ok, err = navigateTo({ x = 0, y = 0, z = 0 }, "home", "service")
-    end
-    if not ok then
-      if err == "control_request" then return false end
-      markBlocked("Return to home failed: " .. tostring(err))
-      return false
+    local width = integerValue(value, 1, MAX_DIMENSION)
+    local validLength = integerValue(length, 1, MAX_DIMENSION)
+    if width and validLength and width * validLength <= MAX_COLUMNS then
+      local originX = integerValue(options.originX ~= nil and options.originX or 0)
+      local originZ = integerValue(options.originZ ~= nil and options.originZ or 1)
+      if originX and originZ then
+        minX, maxX = originX, originX + width - 1
+        minZ, maxZ = originZ, originZ + validLength - 1
+      end
     end
   end
+  if not minX or not maxX or not minZ or not maxZ or maxX < minX or maxZ < minZ then return nil, "invalid_bounds" end
+  if (maxX - minX + 1) * (maxZ - minZ + 1) > MAX_COLUMNS then return nil, "bounds_too_large" end
+  return {
+    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
+    width = maxX - minX + 1, length = maxZ - minZ + 1,
+    cells = (maxX - minX + 1) * (maxZ - minZ + 1),
+  }
+end
 
-  local ok, err = turnTo(0)
-  if not ok then markBlocked("Cannot face quarry at home: " .. tostring(err)); return false end
-  if movementInterrupted("service") then return false end
+function M.gridBounds(value, length, options)
+  return boundsFrom(value, length, options)
+end
 
-  ok, err = unloadAtHome()
-  if not ok then
-    if err == "control_request" then return false end
-    state.status, state.phase, state.lastError = "waiting_output", "waiting_output", err
-    saveState(); heartbeat(true); return false
+M.getGridBounds = M.gridBounds
+M.bounds = M.gridBounds
+
+function M.gridPage(bounds, page, pageWidth, pageHeight)
+  local normalized, boundsError = boundsFrom(bounds)
+  if not normalized then return nil, boundsError end
+  if type(pageWidth) == "table" then pageHeight, pageWidth = pageWidth.pageHeight, pageWidth.pageWidth end
+  pageWidth = integerValue(pageWidth, 1, MAX_DIMENSION) or 16
+  pageHeight = integerValue(pageHeight, 1, MAX_DIMENSION) or pageWidth
+  local pagesX = math.ceil(normalized.width / pageWidth)
+  local pagesZ = math.ceil(normalized.length / pageHeight)
+  local pageCount = pagesX * pagesZ
+  page = integerValue(page, 1, pageCount) or 1
+  local pageIndex = page - 1
+  local pageX, pageZ = pageIndex % pagesX, math.floor(pageIndex / pagesX)
+  local minX = normalized.minX + pageX * pageWidth
+  local minZ = normalized.minZ + pageZ * pageHeight
+  local maxX = math.min(normalized.maxX, minX + pageWidth - 1)
+  local maxZ = math.min(normalized.maxZ, minZ + pageHeight - 1)
+  return {
+    page = page, pageIndex = pageIndex, pageCount = pageCount,
+    pagesX = pagesX, pagesZ = pagesZ, pageX = pageX, pageZ = pageZ,
+    pageWidth = pageWidth, pageHeight = pageHeight,
+    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
+    width = maxX - minX + 1, length = maxZ - minZ + 1,
+    cells = (maxX - minX + 1) * (maxZ - minZ + 1),
+  }
+end
+
+M.getGridPage = M.gridPage
+M.page = M.gridPage
+M.gridPageInfo = M.gridPage
+M.pageInfo = M.gridPage
+
+function M.gridCell(bounds, index)
+  local normalized, boundsError = boundsFrom(bounds)
+  if not normalized then return nil, boundsError end
+  index = integerValue(index, 0)
+  if not index or index >= normalized.cells then return nil, "index_out_of_range" end
+  local row = math.floor(index / normalized.length)
+  local column = index % normalized.length
+  local z = row % 2 == 0 and (normalized.minZ + column) or (normalized.maxZ - column)
+  return { x = normalized.minX + row, z = z, index = index, row = row, column = column }
+end
+
+M.getGridCell = M.gridCell
+
+function M.gridCellInfo(bounds, x, z)
+  local normalized, boundsError = boundsFrom(bounds)
+  if not normalized then return nil, boundsError end
+  x, z = integerValue(x), integerValue(z)
+  if not x or not z then return nil, "invalid_position" end
+  local inside = contains(normalized, x, z)
+  local info = { x = x, z = z, inside = inside }
+  if inside then
+    local row, column = x - normalized.minX, z - normalized.minZ
+    info.row, info.column = row, column
+    info.index = row * normalized.length + (row % 2 == 0 and column or normalized.length - 1 - column)
   end
-  if movementInterrupted("service") then return false end
+  return info
+end
 
-  ok, err = refuelAtHome()
-  if not ok then
-    if err == "control_request" then return false end
-    state.status, state.phase, state.lastError = "waiting_fuel", "waiting_fuel", err
-    saveState(); heartbeat(true); return false
+M.getCellInfo = M.gridCellInfo
+M.cellInfo = M.gridCellInfo
+
+function M.selectRectangle(bounds, x1, z1, x2, z2, options)
+  local normalized, boundsError = boundsFrom(bounds)
+  if not normalized then return nil, boundsError end
+  if type(x1) == "table" then
+    options = z1
+    local selection = x1
+    x1, z1, x2, z2 = selection.x1 or selection.minX, selection.z1 or selection.minZ, selection.x2 or selection.maxX, selection.z2 or selection.maxZ
   end
-  if movementInterrupted("service") then return false end
-
-  ok, err = refillSealAtHome()
-  if not ok then
-    if err == "control_request" then return false end
-    state.status, state.phase, state.lastError = "waiting_seal", "waiting_seal", err
-    saveState(); heartbeat(true); return false
+  x1, z1, x2, z2 = integerValue(x1), integerValue(z1), integerValue(x2), integerValue(z2)
+  if not x1 or not z1 or not x2 or not z2 then return nil, "invalid_rectangle" end
+  if x1 > x2 then x1, x2 = x2, x1 end
+  if z1 > z2 then z1, z2 = z2, z1 end
+  local minX, maxX = math.max(x1, normalized.minX), math.min(x2, normalized.maxX)
+  local minZ, maxZ = math.max(z1, normalized.minZ), math.min(z2, normalized.maxZ)
+  if minX > maxX or minZ > maxZ then return nil, "rectangle_out_of_bounds" end
+  local count = (maxX - minX + 1) * (maxZ - minZ + 1)
+  local result = {
+    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
+    width = maxX - minX + 1, length = maxZ - minZ + 1,
+    count = count, cellsCount = count,
+    clipped = minX ~= x1 or maxX ~= x2 or minZ ~= z1 or maxZ ~= z2,
+  }
+  local includeCells = true
+  if type(options) == "table" and options.includeCells == false then includeCells = false end
+  if type(options) == "boolean" then includeCells = options end
+  if includeCells and count <= MAX_SELECTION_CELLS then
+    result.cells = {}
+    for x = minX, maxX do
+      for z = minZ, maxZ do result.cells[#result.cells + 1] = { x = x, z = z } end
+    end
+    result.selectedCells = result.cells
+  elseif includeCells then
+    result.cellsTruncated = true
   end
-  if movementInterrupted("service") then return false end
+  return result
+end
 
-  if state.service.resumeAfter and state.checkpoint then
-    local checkpoint = poseCopy(state.checkpoint)
-    state.phase, state.status, state.lastError = "going_back", "working", nil
-    saveState()
-    if state.job and state.job.strategy == "chunk_plan" then
-      ok, err = navigateChunkPlanWork(checkpoint, "service")
-    else
+M.rectangleSelection = M.selectRectangle

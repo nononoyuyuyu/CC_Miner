@@ -1,0 +1,317 @@
+    if alerts.enabled then
+      alerts.speaker = common.promptYesNo("Use speaker alerts", alerts.speaker ~= false)
+      alerts.redstone = common.promptYesNo("Use redstone alerts", alerts.redstone ~= false)
+      if alerts.redstone then alerts.redstoneSide = sidePrompt("Redstone alert side", alerts.redstoneSide or "back") end
+      alerts.cooldownSeconds = common.promptNumber(
+        "Alert cooldown (seconds)",
+        validInteger(alerts.cooldownSeconds, 10, 0, 3600),
+        0,
+        3600
+      )
+    else
+      -- Keep disabled outputs explicit so old controllers do not emit a
+      -- notification merely because a peripheral was attached later.
+      alerts.speaker, alerts.redstone = false, false
+    end
+    if os.setComputerLabel then os.setComputerLabel(config.controllerName) end
+  end
+end
+
+local ok, err = common.saveConfig(config)
+if not ok then error("Cannot save configuration: " .. tostring(err), 0) end
+
+if requestedRole == "worker" and (not fs.exists(common.STATE_PATH) or not current or current.role ~= "worker") then
+  common.saveTable(common.STATE_PATH, common.defaultState())
+end
+
+-- Keep the legacy marker: treating an existing V2 startup as user-owned
+-- during update would make the new startup wrapper invoke itself recursively.
+local startupMarker = "-- CC_MINER_V2_STARTUP"
+local existingStartup = fs.exists("/startup.lua") and common.readAll("/startup.lua") or nil
+if existingStartup and not existingStartup:find(startupMarker, 1, true) then
+  local backupOk, backupError = common.writeAllAtomic("/startup.user.lua", existingStartup)
+  if not backupOk then error("Cannot preserve existing startup.lua: " .. tostring(backupError), 0) end
+end
+
+local startup = startupMarker .. [[
+if fs.exists("/startup.user.lua") then
+  local ok, err = pcall(function() shell.run("/startup.user.lua") end)
+  if not ok then printError("User startup failed: " .. tostring(err)) end
+end
+shell.run("/ccminer/boot.lua")
+]]
+local startupOk, startupError = common.writeAllAtomic("/startup.lua", startup)
+if not startupOk then error("Cannot install startup.lua: " .. tostring(startupError), 0) end
+local commandOk, commandError = common.writeAllAtomic("/ccm.lua", [[
+shell.run("/ccminer/command.lua", ...)
+]])
+if not commandOk then error("Cannot install ccm.lua: " .. tostring(commandError), 0) end
+
+common.clear(colors and colors.black or nil, colors and colors.white or nil)
+print("SETUP COMPLETE")
+print("")
+print("Role: " .. requestedRole)
+if requestedRole == "worker" then
+  print("Output chest: BEHIND the turtle")
+  print("Fuel chest: ABOVE the turtle")
+  if config.lavaMode == "seal" then print("Seal-block chest: " .. string.upper(config.sealSide) .. " of the turtle") end
+  if config.lighting and config.lighting.mode ~= "off" then
+    print("Torch chest: " .. string.upper(config.lighting.side or config.torchSide or "left") .. " of the turtle")
+  end
+  print("Turtle front: quarry entrance")
+  if config.gps.enabled then print("After GPS hosts are online: controller -> GPS CAL") end
+elseif requestedRole == "controller" then
+  print("Attach a wireless modem and optional Advanced Monitor.")
+  print("Monitor touches and terminal mouse clicks are enabled.")
+else
+  print(("GPS host coordinates: %d, %d, %d"):format(config.x, config.y, config.z))
+  print("Keep this computer and its wireless modem chunk-loaded.")
+end
+print("")
+print("Reboot with: reboot")
+]=] },
+  { target = [[boot.lua]], content = [[-- CC Miner V3 boot dispatcher
+
+local common = dofile("/ccminer/lib/common.lua")
+local config, err = common.loadConfig()
+if not config or not config.role then
+  printError(err or "CC Miner is not configured.")
+  print("Run: ccm setup")
+  return
+end
+
+local programs = {
+  worker = "/ccminer/worker.lua",
+  controller = "/ccminer/controller.lua",
+  gps = "/ccminer/gps_host.lua",
+}
+local program = programs[config.role]
+if not program then error("Unknown CC Miner role: " .. tostring(config.role), 0) end
+
+if config.role ~= "worker" then
+  local ok, runError = pcall(dofile, program)
+  if not ok then common.log("ERROR", config.role .. " stopped: " .. tostring(runError)); printError(runError) end
+  return
+end
+
+while true do
+  local ok, runError = pcall(dofile, program)
+  if ok then return end
+  local text = tostring(runError)
+  common.log("ERROR", "Worker crashed: " .. text)
+  printError("CC Miner worker stopped: " .. text)
+  if text == "Terminated" or text:find("Terminated", 1, true) then
+    print("Worker stopped locally. Run 'reboot' to restart.")
+    return
+  end
+  print("Restarting worker in 5 seconds...")
+  sleep(5)
+end
+]] },
+  { target = [[command.lua]], content = [[-- CC Miner command launcher (V2/V3 compatible)
+
+local args = { ... }
+local common = dofile("/ccminer/lib/common.lua")
+local command = string.lower(tostring(args[1] or "help"))
+
+local function reportError(message)
+  if printError then printError(tostring(message or "")) else print(tostring(message or "")) end
+end
+
+local function unpackArgs(values)
+  local unpackFunction = table.unpack or unpack
+  return unpackFunction(values)
+end
+
+local function printHelp()
+  print("CC Miner " .. tostring(common.VERSION or ""))
+  print("")
+  print("ccm help | version | status | report | doctor | logs")
+  print("ccm setup [worker|controller|gps]")
+  print("ccm dashboard | discover | update")
+  print("ccm rehome RESET                 Local worker recovery")
+  print("")
+  print("Controller CLI:")
+  print("ccm start <id> <W> <L> <D>")
+  print("ccm queue [list|add|run|remove|clear] [args...]")
+  print("ccm preset(s) [list|save|use|delete] [args...]")
+  print("ccm stop <id> <now|row|layer|home|abort>")
+  print("ccm pause|resume|recall|service|abort|clear <id>")
+  print("ccm gps <id>                    Request GPS fix")
+  print("ccm calibrate <id>              Calibrate worker GPS")
+  print("ccm rehome <id> RESET")
+end
+
+local function forwardController(forwarded)
+  forwarded = forwarded or {}
+  if #forwarded == 0 then
+    for index = 1, #args do forwarded[index] = args[index] end
+  end
+  shell.run("/ccminer/controller.lua", unpackArgs(forwarded))
+end
+
+local function loadConfigForCommand()
+  local config, configError = common.loadConfig()
+  if not config then
+    reportError(configError or "Not configured.")
+    return nil
+  end
+  return config
+end
+
+-- This loader intentionally never rotates a .bak file or writes a recovery
+-- copy.  `doctor` is a read-only diagnostic and must not change on-disk state.
+local function readTableNoWrite(path)
+  if not fs or not fs.exists or not fs.exists(path) then return nil, "missing" end
+  if fs.isDir and fs.isDir(path) then return nil, "directory" end
+  local handle = fs.open(path, "r")
+  if not handle then return nil, "unreadable" end
+  local text = handle.readAll()
+  handle.close()
+  if type(textutils) ~= "table" or type(textutils.unserialize) ~= "function" then
+    return nil, "unserialize unavailable"
+  end
+  local ok, value = pcall(textutils.unserialize, text)
+  if not ok or type(value) ~= "table" then return nil, "invalid" end
+  return value
+end
+
+local function tableValue(value, ...)
+  local current = value
+  for index = 1, select("#", ...) do
+    if type(current) ~= "table" then return nil end
+    current = current[select(index, ...)]
+  end
+  return current
+end
+
+local function valueString(value, depth)
+  depth = depth or 0
+  if value == nil then return "-" end
+  if type(value) == "boolean" then return value and "true" or "false" end
+  if type(value) ~= "table" then return tostring(value) end
+  if depth >= 2 then return "{...}" end
+  local keys = {}
+  for key in pairs(value) do keys[#keys + 1] = key end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  local parts = {}
+  for _, key in ipairs(keys) do
+    parts[#parts + 1] = tostring(key) .. "=" .. valueString(value[key], depth + 1)
+    if #parts >= 8 then
+      parts[#parts + 1] = "..."
+      break
+    end
+  end
+  return "{" .. table.concat(parts, ",") .. "}"
+end
+
+local function sortedKeys(value)
+  local keys = {}
+  if type(value) == "table" then
+    for key in pairs(value) do keys[#keys + 1] = key end
+  end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  return keys
+end
+
+local function printField(label, value)
+  print(tostring(label) .. ": " .. valueString(value))
+end
+
+local function printStatusFeature(label, value, fallback)
+  if value ~= nil then printField(label, value)
+  elseif fallback ~= nil then printField(label, fallback)
+  end
+end
+
+local function controllerDbCandidates(config)
+  local paths, seen = {}, {}
+  local function add(path)
+    if type(path) == "string" and path ~= "" and not seen[path] then
+      seen[path] = true
+      paths[#paths + 1] = path
+    end
+  end
+  if type(config) == "table" then
+    add(config.controllerDbPath)
+    add(config.controllerDBPath)
+    add(tableValue(config.controller, "dbPath"))
+    add(tableValue(config.history, "path"))
+  end
+  add(common.CONTROLLER_DB_PATH)
+  add(common.CONTROLLER_DB)
+  add(common.CONTROLLER_STATE_PATH)
+  add("/ccminer/data/controller.db")
+  add("/ccminer/controller.db")
+  return paths
+end
+
+local function historyFromDb(db)
+  if type(db) ~= "table" then return nil end
+  if type(db.history) == "table" then
+    if type(db.history.entries) == "table" then return db.history.entries end
+    if type(db.history.rows) == "table" then return db.history.rows end
+    return db.history
+  end
+  if type(db.jobs) == "table" then return db.jobs end
+  if type(db.records) == "table" then return db.records end
+  if type(db.entries) == "table" then return db.entries end
+  -- Some V3 snapshots are themselves a numeric history array.
+  if #db > 0 then return db end
+  return nil
+end
+
+local function printReportTable(prefix, report)
+  if type(report) ~= "table" then
+    print(prefix .. ": none")
+    return
+  end
+  local printed = false
+  for _, key in ipairs(sortedKeys(report)) do
+    local value = report[key]
+    if type(value) ~= "table" then
+      print(prefix .. "." .. tostring(key) .. ": " .. valueString(value))
+      printed = true
+    end
+  end
+  if not printed then print(prefix .. ": " .. valueString(report)) end
+end
+
+local function printWorkerReport(state)
+  print("Worker report")
+  local current = state.currentReport or state.activeReport or state.progressReport or state.currentJobReport
+  local last = state.lastReport or state.report or state.lastJobReport or state.completionReport
+  if current then printReportTable("Current report", current) else print("Current report: none") end
+  if last then printReportTable("Last report", last) else print("Last report: none") end
+  -- V3 keeps both names while older state files only have `report`; show both
+  -- when they are genuinely distinct so no completion data is hidden.
+  if state.report and state.report ~= last then printReportTable("Report", state.report) end
+  if state.jobReport and state.jobReport ~= last and state.jobReport ~= state.report then
+    printReportTable("Job report", state.jobReport)
+  end
+  local stats = type(state.stats) == "table" and state.stats or {}
+  print("Stats")
+  for _, key in ipairs(sortedKeys(stats)) do
+    if type(stats[key]) ~= "table" then print("  " .. tostring(key) .. ": " .. valueString(stats[key])) end
+  end
+  if state.job then
+    local job = state.job
+    print(("Job: %s %s/%s (%s%%)"):format(
+      tostring(job.name or job.id or "-"), tostring(job.cursor or 0), tostring(job.total or 0),
+      tostring(common.percent and common.percent(job.cursor or 0, job.total or 0) or 0)
+    ))
+  else
+    print("Job: none")
+  end
+end
+
+local function printControllerReport(config)
+  print("Controller history report")
+  local loaded, loadedPath, loadError
+  for _, path in ipairs(controllerDbCandidates(config)) do
+    local candidate, err = readTableNoWrite(path)
+    if candidate then loaded, loadedPath = candidate, path; break end
+    loadError = err
+  end
+  if not loaded then
+    print("History: none (controller.db not found)")

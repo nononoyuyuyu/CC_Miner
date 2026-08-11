@@ -1,13 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="720" viewBox="0 0 1100 720" role="img" aria-labelledby="title desc">
-  <title id="title">採掘ドック上面配置図</title>
-  <desc id="desc">すべてのブロックを75ピクセルのグリッドへ正確に揃えた上面配置</desc>
+  <title id="title">V3 採掘ドック上面配置図</title>
+  <desc id="desc">搬出・燃料・Seal材・反対側の専用Torchを75ピクセル整数グリッドへ揃えた上面配置</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#1d4ed8"/></marker>
     <style>.grid{stroke:#cbd5e1;stroke-width:2}.grid-block{stroke:#334155;stroke-width:3}.h{font:700 30px sans-serif;fill:#0f172a}.l{font:600 21px sans-serif;fill:#0f172a}.s{font:17px sans-serif;fill:#334155}.white{fill:#fff}.a{stroke:#1d4ed8;stroke-width:5;marker-end:url(#arrow)}</style>
   </defs>
   <rect width="1100" height="720" fill="#fff"/>
-  <text x="550" y="52" text-anchor="middle" class="h">採掘ドック — 上面図</text>
-  <text x="550" y="86" text-anchor="middle" class="s">1マス = 1ブロック。色付きブロックの外周はマス目の線と完全に一致します。</text>
+  <text x="550" y="52" text-anchor="middle" class="h">CC Miner V3 — 採掘ドック上面図</text>
+  <text x="550" y="86" text-anchor="middle" class="s">1マス = 1ブロック。seal材とtorchは左右を分け、既定は右seal／左torchです。</text>
 
   <g id="block-grid" transform="translate(250,150)" data-grid-cell="75" data-grid-origin-x="250" data-grid-origin-y="150">
     <rect x="0" y="0" width="600" height="450" fill="#f8fafc" stroke="#94a3b8" stroke-width="3"/>
@@ -34,7 +34,11 @@
 
     <rect class="grid-block" data-col="5" data-row="3" x="375" y="225" width="75" height="75" fill="#64748b"/>
     <text x="412.5" y="254" text-anchor="middle" class="l white">S</text>
-    <text x="412.5" y="282" text-anchor="middle" class="s white">Seal</text>
+    <text x="412.5" y="282" text-anchor="middle" class="s white">Seal (右)</text>
+
+    <rect class="grid-block" data-col="3" data-row="3" x="225" y="225" width="75" height="75" fill="#f97316"/>
+    <text x="262.5" y="254" text-anchor="middle" class="l white">L</text>
+    <text x="262.5" y="282" text-anchor="middle" class="s white">Torch (左)</text>
 
     <path class="a" d="M337.5 225 L337.5 35"/>
     <text x="357" y="62" class="l" fill="#1d4ed8">採掘方向（前）</text>
@@ -43,5 +47,5 @@
   </g>
 
   <text x="550" y="645" text-anchor="middle" class="l">燃料チェストはタートルの1ブロック上です（上面図では同じマス）。</text>
-  <text x="550" y="680" text-anchor="middle" class="s">後方=搬出、右側=溶岩封鎖材。前方の入口チャンクは除外できません。</text>
+  <text x="550" y="680" text-anchor="middle" class="s">後方=搬出、右=Seal／左=専用Torch。入口チャンクは除外できません。</text>
 </svg>

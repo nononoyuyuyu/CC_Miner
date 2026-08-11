@@ -1,0 +1,317 @@
+    state.status, state.phase = "blocked", "gps_error"
+    state.lastError = "GPS is required but no calibration is stored."
+  end
+
+  saveState()
+  displayLocalStatus()
+  heartbeat(true)
+end
+
+preflight()
+
+while true do
+  drainNetwork(12)
+  if state.request and state.status ~= "working" then state.status = "working" end
+  if state.status == "working" then
+    if state.request then handlePendingRequest() end
+    if state.service then continueService() else runMiningStep() end
+  elseif state.status == "waiting_output" or state.status == "waiting_fuel" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+    if state.service then
+      continueService()
+      if state.status == "waiting_output" or state.status == "waiting_fuel" or state.status == "waiting_seal" or state.status == "waiting_torch" then sleep(3) end
+    else
+      markBlocked("Service state is missing while waiting.")
+    end
+  else
+    pollNetwork(0.5)
+  end
+  heartbeat(false)
+  if state.status ~= "working" then displayLocalStatus() end
+end
+]] },
+  { target = [[controller.lua]], content = [[-- CC Miner V3 - generated controller source loader.
+local parts = {
+  "/ccminer/controller_parts/01.part",
+  "/ccminer/controller_parts/02.part",
+  "/ccminer/controller_parts/03.part",
+}
+local source = {}
+for index, path in ipairs(parts) do
+  local handle = fs.open(path, "r")
+  if not handle then error("Missing runtime part: " .. path, 0) end
+  source[index] = handle.readAll()
+  handle.close()
+end
+local loader = loadstring or load
+local program, compileError = loader(table.concat(source), "@/ccminer/controller.assembled.lua")
+if not program then error("Cannot assemble controller: " .. tostring(compileError), 0) end
+return program(...)
+]] },
+  { target = [[controller_parts/01.part]], content = [[-- CC Miner V3 - controller state, persistence and job orchestration.
+-- The controller is deliberately tolerant of V2 worker payloads.  New
+-- fields are additive and every command has a legacy equivalent where one
+-- exists.
+
+local args = { ... }
+local common = dofile("/ccminer/lib/common.lua")
+local protocol = dofile("/ccminer/lib/protocol.lua")
+local quarry = dofile("/ccminer/lib/quarry.lua")
+
+local config, configError = common.loadConfig()
+if not config or config.role ~= "controller" then
+  error(configError or "Controller configuration not found. Run: ccm setup controller", 0)
+end
+
+if not os.getComputerLabel or not os.getComputerLabel() then
+  if os.setComputerLabel then os.setComputerLabel(config.controllerName) end
+end
+
+local networkReady, modemNames = protocol.open()
+if not networkReady then error("No wireless modem found next to the controller.", 0) end
+
+local DB_PATH = "/ccminer/data/controller.db"
+local function dbDefaults()
+  return {
+    schema = common.SCHEMA,
+    version = common.VERSION,
+    presets = {},
+    queue = {},
+    history = {},
+    leases = {},
+    activeLeases = {}, -- alias retained for tools written against the V3 draft format.
+    lastPreset = nil,
+    lastDraft = nil,
+    updatedAt = common.nowSeconds(),
+  }
+end
+
+local db = dbDefaults()
+local dbError = nil
+local function loadControllerDb()
+  local loaded, err = common.loadTable(DB_PATH, dbDefaults())
+  db = common.merge(dbDefaults(), loaded or {})
+  db.leases = db.leases or db.activeLeases or {}
+  db.activeLeases = db.leases
+  db.presets, db.queue, db.history = db.presets or {}, db.queue or {}, db.history or {}
+  dbError = err
+end
+
+local function saveControllerDb()
+  db.schema, db.version, db.updatedAt = common.SCHEMA, common.VERSION, common.nowSeconds()
+  db.activeLeases = db.leases or {}
+  local ok, err = common.saveTable(DB_PATH, db)
+  if not ok then dbError = err end
+  return ok, err
+end
+
+loadControllerDb()
+
+local workers = {}
+local selected = 1
+local notice = dbError and ("Controller DB recovered: " .. tostring(dbError)) or "Controller ready. Touch DISCOVER or press D."
+local noticeIsError = false
+local lastDiscovery = 0
+local running = true
+local mode = "dashboard"
+local draft = nil
+local confirmState = nil
+local hitboxes = {}
+local renderCache = {}
+local dirty = true
+local monitors = common.findPeripherals("monitor")
+local speakers = common.findPeripherals("speaker")
+local redstoneDevices = common.findPeripherals("redstoneIntegrator")
+local alertLedger = {}
+local alertTimers = {}
+local lastSorting = 0
+local sortingWarned = false
+
+for _, entry in ipairs(monitors) do
+  if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end
+end
+
+local function invalidate()
+  dirty = true
+end
+
+local function setNotice(text, isError)
+  notice, noticeIsError = tostring(text or ""), isError == true
+  invalidate()
+end
+
+local function orderedIds()
+  local ids = {}
+  for id in pairs(workers) do ids[#ids + 1] = tonumber(id) or id end
+  table.sort(ids, function(a, b)
+    if type(a) == type(b) then return a < b end
+    return tostring(a) < tostring(b)
+  end)
+  if #ids == 0 then selected = 1 else selected = common.clamp(selected, 1, #ids) end
+  return ids
+end
+
+local function selectedWorker()
+  local ids = orderedIds()
+  local id = ids[selected]
+  return id, id and workers[id] or nil
+end
+
+local function statusOf(worker)
+  if not worker then return "offline" end
+  if common.nowSeconds() - (worker.lastSeen or 0) > (config.workerTimeoutSeconds or 10) then return "offline" end
+  local data = worker.data or {}
+  return tostring(data.status or data.phase or "unknown")
+end
+
+local function workerLabel(worker, id)
+  if worker and worker.data and worker.data.label then return worker.data.label end
+  return "Miner-" .. tostring(id)
+end
+
+local function workerData(id)
+  local worker = workers[id]
+  return worker and worker.data or nil
+end
+
+local function normalizeStatus(data)
+  data = data or {}
+  -- V2 workers expose cursor/total under job and have no progress/materials
+  -- objects.  Keep a normalized view without requiring a worker upgrade.
+  data.progress = type(data.progress) == "table" and data.progress or {}
+  if data.job then
+    if data.progress.cursor == nil then data.progress.cursor = data.job.cursor end
+    if data.progress.total == nil then data.progress.total = data.job.total end
+    if data.progress.percent == nil then data.progress.percent = data.job.percent end
+    if data.progress.layer == nil then data.progress.layer = data.job.currentLayer end
+  end
+  data.materials = type(data.materials) == "table" and data.materials or {}
+  if data.materials.fuel == nil then data.materials.fuel = data.fuel end
+  if data.materials.inventoryEmpty == nil then data.materials.inventoryEmpty = data.inventoryEmpty end
+  if data.materials.seal == nil and data.seal then data.materials.seal = data.seal.count end
+  data.capabilities = type(data.capabilities) == "table" and data.capabilities or {}
+  return data
+end
+
+local function activeJobId(data)
+  return data and data.job and tostring(data.job.id or "") or nil
+end
+
+local function addHistory(id, data, reason)
+  if not data then return end
+  local job = data.job or {}
+  local report = data.report or {}
+  db.history[#db.history + 1] = {
+    id = tostring(job.id or ("worker-" .. tostring(id) .. "-" .. common.nowMillis())),
+    jobId = job.id,
+    workerId = tonumber(id) or id,
+    worker = workerLabel(workers[id], id),
+    name = job.name,
+    status = data.status,
+    reason = reason or data.completionReason,
+    startedAt = job.startedAt,
+    finishedAt = common.nowSeconds(),
+    progress = common.copy(data.progress or job),
+    stats = common.copy(data.stats or {}),
+    report = common.copy(report),
+  }
+  local historyLimit = math.max(1, tonumber(config.historyLimit) or 50)
+  while #db.history > historyLimit do table.remove(db.history, 1) end
+  saveControllerDb()
+end
+
+local function releaseLeasesForWorker(id, jobId)
+  local kept = {}
+  for _, lease in ipairs(db.leases or {}) do
+    local sameWorker = tonumber(lease.workerId) == tonumber(id)
+    local sameJob = not jobId or tostring(lease.jobId) == tostring(jobId)
+    if not (sameWorker and sameJob) then kept[#kept + 1] = lease end
+  end
+  db.leases = kept
+  db.activeLeases = kept
+  saveControllerDb()
+end
+
+local function acknowledgeQueuedStart(id, data)
+  local job = data and data.job
+  if not job then return end
+  for index, item in ipairs(db.queue or {}) do
+    local awaiting = item.awaiting
+    if awaiting and tonumber(awaiting.workerId) == tonumber(id) and tostring(awaiting.jobId) == tostring(job.id) then
+      table.remove(db.queue, index)
+      saveControllerDb()
+      setNotice("Queued job accepted by worker #" .. tostring(id) .. ".", false)
+      return
+    end
+  end
+end
+
+local function alert(kind, id, text)
+  -- Offline/unknown are intentionally not alerts.  Respect the optional
+  -- per-channel settings and allow the same condition after cooldown.
+  local settings = config.alerts or {}
+  if settings.enabled == false then return end
+  if kind == "complete" and settings.onComplete == false then return end
+  if kind == "material" and settings.onWaiting == false then return end
+  if kind == "blocked" and settings.onError == false then return end
+  local key = tostring(id) .. ":" .. tostring(kind)
+  local now = common.nowSeconds()
+  local previous = alertLedger[key]
+  local cooldown = math.max(0, tonumber(settings.cooldownSeconds) or 30)
+  if previous and now - (previous.at or 0) < cooldown then return end
+  alertLedger[key] = { at = now }
+  if settings.speaker ~= false then
+    local instrument = kind == "complete" and "pling" or kind == "material" and "bell" or "bass"
+    local pitch = kind == "complete" and 12 or kind == "material" and 6 or 4
+    for _, entry in ipairs(speakers) do
+      local speaker = entry.device
+      if speaker and speaker.playNote then pcall(speaker.playNote, instrument, 1, pitch)
+      elseif speaker and speaker.playSound then pcall(speaker.playSound, "minecraft:block.note_block." .. instrument, 1, 1) end
+    end
+  end
+  if settings.redstone ~= false then
+    local side = tostring(settings.redstoneSide or "back")
+    local timer = os.startTimer and os.startTimer(0.25)
+    if redstone and redstone.setOutput then
+      pcall(redstone.setOutput, side, true)
+      if timer then alertTimers[timer] = { global = true, side = side } end
+    else
+      local relays = {}
+      for _, entry in ipairs(redstoneDevices) do
+        local relay = entry.device
+        if relay and relay.setOutput then
+          pcall(relay.setOutput, side, true)
+          relays[#relays + 1] = relay
+        end
+      end
+      if timer and #relays > 0 then alertTimers[timer] = { relays = relays, side = side } end
+    end
+  end
+  if text and text ~= "" then setNotice(text, kind == "blocked") end
+end
+
+local function clearAlert(id, kind)
+  alertLedger[tostring(id) .. ":" .. tostring(kind)] = nil
+end
+
+local function handleMessage(sender, message)
+  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
+  if not valid then return false end
+  if message.kind == "status" then
+    local payload = normalizeStatus(message.payload)
+    local id = tonumber(payload.id)
+    if not id or id ~= tonumber(sender) then return false end
+    workers[id] = workers[id] or {}
+    local previous = workers[id].data
+    workers[id].data = payload
+    workers[id].lastSeen = common.nowSeconds()
+    workers[id].sender = sender
+    acknowledgeQueuedStart(id, payload)
+    local oldStatus = previous and tostring(previous.status or "") or ""
+    local newStatus = tostring(payload.status or "unknown")
+    if newStatus == "complete" and oldStatus ~= "complete" then
+      addHistory(id, payload, payload.completionReason or "complete")
+      releaseLeasesForWorker(id, activeJobId(previous))
+      alert("complete", id, "Worker #" .. tostring(id) .. " completed a job.")
+    elseif newStatus == "aborted" and oldStatus ~= "aborted" then
+      addHistory(id, payload, payload.completionReason or "aborted")
+      releaseLeasesForWorker(id, activeJobId(previous))

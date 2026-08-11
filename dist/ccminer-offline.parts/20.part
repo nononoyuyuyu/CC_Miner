@@ -1,0 +1,206 @@
+  if plan then check("connectivity", "ok", "connected", false) else check("connectivity", "bad", tostring(planError), true) end
+  if partialMask then check("selection", "bad", "partial cell mask cannot be sent; select whole chunks", true) end
+  if chunkMode == "world" then
+    check("GPS", calibration and "ok" or "bad", calibration and "calibrated" or "calibration required", not calibration)
+  else
+    check("GPS", "warn", "local mode", false)
+  end
+  if id and worker and statusOf(worker) ~= "offline" then check("worker", "ok", workerLabel(worker, id), false)
+  else check("worker", "bad", "offline or not selected", true) end
+  local baseFuel = baseFuelEstimate
+  local requiredFuel = math.ceil(baseFuel * profileInfo.fuelMultiplier)
+  local fuel = tonumber(data.fuel)
+  if fuel and fuel ~= math.huge and fuel < requiredFuel then
+    check("worker fuel", "warn", tostring(fuel) .. " (dock refill expected)", false)
+  elseif fuel then check("worker fuel", "ok", tostring(fuel), false) else check("worker fuel", "warn", "unknown", false) end
+  if data.inventoryEmpty ~= nil then
+    check("inventory", tonumber(data.inventoryEmpty) > 0 and "ok" or "warn", tostring(data.inventoryEmpty or 0) .. " empty", false)
+  else check("inventory", "warn", "unknown", false) end
+  local seal = tonumber(data.materials and (data.materials.sealCount or data.materials.seal) or data.seal and data.seal.count)
+  local torchStock = tonumber(data.lighting and data.lighting.torchCount or data.materials and data.materials.torchCount)
+  if draft.waterMode == "seal" and seal and seal <= 0 then check("seal material", "warn", "0 (dock refill expected)", false)
+  elseif draft.waterMode == "seal" then check("seal material", "warn", "seal stock unknown", false) end
+  if draft.lighting and draft.lighting.mode ~= "off" and torchStock and torchStock < torchNeed then check("torch material", "warn", tostring(torchStock) .. "/" .. tostring(torchNeed) .. " (dock refill expected)", false)
+  elseif draft.lighting and draft.lighting.mode ~= "off" then check("torch material", "warn", "torch stock unknown", false) end
+  local caps = data.capabilities or {}
+  if draft.waterMode ~= "ignore" then
+    if caps.waterHandling == false then check("water capability", "bad", "worker lacks waterHandling", true)
+    elseif caps.waterHandling == nil then check("water capability", "warn", "worker capability unknown", false)
+    else check("water capability", "ok", "ready", false) end
+  else check("water capability", "ok", "ignore", false) end
+  if draft.lighting and draft.lighting.mode ~= "off" then
+    if caps.lighting == false then check("lighting capability", "bad", "worker lacks lighting", true)
+    elseif caps.lighting == nil then check("lighting capability", "warn", "worker capability unknown", false)
+    else check("lighting capability", "ok", "ready", false) end
+  else check("lighting capability", "ok", "off", false) end
+  local selectedChunkKeys = {}
+  for _, chunk in ipairs(catalog) do
+    local excluded = false
+    for _, item in ipairs(excludedChunks) do if item.key == chunk.key then excluded = true; break end end
+    if not excluded then selectedChunkKeys[#selectedChunkKeys + 1] = chunk.key end
+  end
+  local leaseConflict = (not draft.queueing) and id and activeLeaseOverlap and activeLeaseOverlap(chunkMode, id, selectedChunkKeys)
+  if leaseConflict then check("lease", "bad", "overlaps active job " .. tostring(leaseConflict.jobId or "unknown"), true) end
+  local fatal = false
+  for _, item in ipairs(checks) do if item.fatal or item.state == "bad" and item.fatal then fatal = true end end
+  local result = {
+    checks = checks, fatal = fatal, catalog = catalog, plan = plan, planError = planError,
+    chunkMode = chunkMode, calibration = calibration, rootKey = rootKey,
+    excludedChunks = excludedChunks, cells = estimate and (estimate.surfaceCells or estimate.columns) or (cells - cellExcluded), blocks = estimate and (estimate.blocks or estimate.totalBlocks) or blocks,
+    chunks = plan and plan.catalogCount or #catalog, selectedChunks = (plan and plan.selectedChunks) or (#catalog - #excludedChunks), totalChunks = #catalog, exclusions = #excludedChunks,
+    torches = torchNeed, fuel = requiredFuel, baseFuel = baseFuel, estimate = estimate, jobDepth = jobDepth, targetY = targetY,
+    profile = profileInfo.profile, requestedInterval = profileInfo.requestedInterval, effectiveInterval = profileInfo.effectiveInterval,
+    fuelMultiplier = profileInfo.fuelMultiplier,
+  }
+  draft.preflight = result
+  return result
+end
+
+activeLeaseOverlap = function(mode, workerId, chunks)
+  for _, lease in ipairs(db.leases or {}) do
+    local leaseMode = lease.mode == "world" and "world" or "local"
+    if mode == "world" and leaseMode == "world" then
+      local set = {}
+      for _, key in ipairs(lease.chunks or {}) do set[tostring(key)] = true end
+      for _, key in ipairs(chunks or {}) do if set[tostring(key)] then return lease end end
+    elseif mode == "local" and leaseMode == "local" and tonumber(lease.workerId) == tonumber(workerId) then
+      return lease
+    end
+  end
+  return nil
+end
+
+local function reserveLease(jobId, workerId, mode, chunks, assignmentId)
+  local conflict = activeLeaseOverlap(mode, workerId, chunks)
+  if conflict then return nil, "Active lease overlap with " .. tostring(conflict.jobId or conflict.assignmentId) end
+  local lease = {
+    jobId = tostring(jobId), assignmentId = assignmentId, workerId = tonumber(workerId) or workerId,
+    mode = mode, chunks = common.copy(chunks or {}), createdAt = common.nowSeconds(),
+  }
+  db.leases[#db.leases + 1] = lease
+  db.activeLeases = db.leases
+  local ok, err = saveControllerDb()
+  if not ok then table.remove(db.leases); return nil, err or "Could not persist active lease" end
+  return lease
+end
+
+local function chunkKeySet(catalog)
+  local set = {}
+  for _, chunk in ipairs(catalog or {}) do set[chunk.key] = true end
+  return set
+end
+
+local function deterministicPartition(chunks, count)
+  local out = {}
+  count = math.max(1, tonumber(count) or 1)
+  for index = 1, count do out[index] = {} end
+  for index, chunk in ipairs(chunks or {}) do out[((index - 1) % count) + 1][#out[((index - 1) % count) + 1] + 1] = chunk end
+  return out
+end
+
+local function buildAssignments(result)
+  local id, worker = draftWorker()
+  if not id or not worker then return nil, "No worker selected." end
+  -- A worker's calibrated home is the authoritative entrance for its plan.
+  -- Until a future protocol can describe independent entrances, never split a
+  -- single footprint at runtime; queue dispatch below handles parallel jobs.
+  local assignments = {}
+  local base = "q-" .. tostring(os.getComputerID()) .. "-" .. tostring(common.nowMillis())
+  local selectedKeys = {}
+  for _, chunk in ipairs(result.catalog or {}) do
+    local excluded = false
+    for _, item in ipairs(result.excludedChunks or {}) do if item.key == chunk.key then excluded = true; break end end
+    if not excluded then selectedKeys[#selectedKeys + 1] = chunk.key end
+  end
+  assignments[1] = { workerId = id, assignmentId = base .. ":1", jobId = base, chunks = selectedKeys }
+  return assignments
+end
+
+local function startDraft()
+  if not draft then return false end
+  local result = draft.preflight or computePreflight()
+  if not result then setNotice("Preflight failed.", true); return false end
+  if result.fatal then setNotice("Start blocked by a fatal preflight item.", true); return false end
+  local assignments, assignmentError = buildAssignments(result)
+  if not assignments then setNotice(assignmentError, true); return false end
+  local leases = {}
+  for _, assignment in ipairs(assignments) do
+    local lease, err = reserveLease(assignment.jobId, assignment.workerId, result.chunkMode, assignment.chunks, assignment.assignmentId)
+    if not lease then
+      for _, prior in ipairs(leases) do releaseLeasesForWorker(prior.workerId, prior.jobId) end
+      setNotice(err, true)
+      return false
+    end
+    leases[#leases + 1] = lease
+  end
+  local sent, sentAssignments = true, {}
+  for _, assignment in ipairs(assignments) do
+    local payloadDepth = result.jobDepth or draft.depth
+    local payloadLighting = common.copy(draft.lighting)
+    if type(payloadLighting) ~= "table" then payloadLighting = { mode = "safe" } end
+    if result.effectiveInterval == 0 then payloadLighting.interval = nil else payloadLighting.interval = result.effectiveInterval end
+    local payload = {
+      width = draft.width, length = draft.length, depth = payloadDepth,
+      chunkMode = result.chunkMode, excludedChunks = result.excludedChunks,
+      lighting = payloadLighting, waterMode = draft.waterMode, profile = draft.profile,
+      name = draft.name or ("Quarry %dx%dx%d"):format(draft.width, draft.length, payloadDepth),
+      jobId = assignment.jobId, assignmentId = assignment.assignmentId,
+    }
+    if result.chunkMode == "world" then payload.targetY = result.targetY end
+    if not sendCommand(assignment.workerId, "start", payload) then sent = false; break end
+    sentAssignments[#sentAssignments + 1] = assignment
+  end
+  if not sent then
+    for _, assignment in ipairs(sentAssignments) do sendCommand(assignment.workerId, "stop", { mode = "abort", assignmentId = assignment.assignmentId }) end
+    for _, assignment in ipairs(assignments) do releaseLeasesForWorker(assignment.workerId, assignment.jobId) end
+    setNotice("One or more workers rejected the job; all assignments were stopped.", true)
+    return false
+  end
+  db.lastDraft = common.copy(draft)
+  db.lastPreset = draft.profile or db.lastPreset
+  if draft.queueIndex and db.queue[draft.queueIndex] then
+    db.queue[draft.queueIndex].awaiting = { workerId = assignments[1].workerId, jobId = assignments[1].jobId, sentAt = common.nowSeconds() }
+    db.queue[draft.queueIndex].retryAt = common.nowSeconds() + 10
+  end
+  saveControllerDb()
+  mode, draft = "dashboard", nil
+  setNotice(("Job sent to %d worker%s."):format(#assignments, #assignments == 1 and "" or "s"), false)
+  return true
+end
+
+local normalizedProfile, normalizedWaterMode, normalizedLighting
+
+local function queueDraft()
+  if not draft then return false end
+  if config.queueEnabled == false then setNotice("Queue is disabled by controller configuration.", true); return false end
+  local previousQueueing = draft.queueing
+  draft.queueing = true
+  local result = computePreflight()
+  draft.queueing = previousQueueing
+  if not result or result.fatal then setNotice("Cannot queue: preflight has a fatal item.", true); return false end
+  local queuedKeys = {}
+  for _, chunk in ipairs(result.catalog or {}) do
+    local excluded = false
+    for _, item in ipairs(result.excludedChunks or {}) do if item.key == chunk.key then excluded = true; break end end
+    if not excluded then queuedKeys[#queuedKeys + 1] = chunk.key end
+  end
+  if result.chunkMode == "world" then
+    local conflict = activeLeaseOverlap(result.chunkMode, draft.workerId, queuedKeys)
+    if conflict then setNotice("Cannot queue: world chunks overlap active job " .. tostring(conflict.jobId or "unknown"), true); return false end
+    for _, queued in ipairs(db.queue or {}) do
+      if queued.chunkMode == "world" and type(queued.chunkKeys) == "table" then
+        local seen = {}; for _, value in ipairs(queued.chunkKeys) do seen[tostring(value)] = true end
+        for _, value in ipairs(queuedKeys) do if seen[tostring(value)] then setNotice("Cannot queue: world chunks overlap another queued job.", true); return false end end
+      end
+    end
+  end
+  local item = common.copy(draft)
+  item.workerId, item.queuedAt = draft.workerId, common.nowSeconds()
+  item.chunkMode, item.chunkKeys = result.chunkMode, queuedKeys
+  item.excludedChunks, item.jobDepth, item.targetY = common.copy(result.excludedChunks), result.jobDepth, result.targetY
+  item.retryAt, item.awaiting = common.nowSeconds(), nil
+  db.queue[#db.queue + 1] = item
+  saveControllerDb()
+  setNotice("Job added to queue.", false)
+  return true
+end

@@ -1,6 +1,6 @@
 return {
-  name = "CC Miner V2",
-  version = "2.1.0",
+  name = "CC Miner V3",
+  version = "3.0.0",
   schema = 3,
   repository = "nononoyuyuyu/CC_Miner",
   files = {

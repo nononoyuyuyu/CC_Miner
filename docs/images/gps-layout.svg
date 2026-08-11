@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1100" height="700" viewBox="0 0 1100 700" role="img" aria-labelledby="title desc">
   <title id="title">GPSホスト立体配置例</title>
-  <desc id="desc">同じ常時ロード済み領域に4台のGPSホストを立体的に分散配置する例</desc>
+  <desc id="desc">4台以上のGPSホストを立体的に分散配置する例。ロード管理は外部設定</desc>
   <defs><style>.h{font:700 30px sans-serif;fill:#0f172a}.l{font:600 21px sans-serif;fill:#0f172a}.s{font:17px sans-serif;fill:#334155}.host{stroke:#334155;stroke-width:3}.edge{stroke:#94a3b8;stroke-width:3;stroke-dasharray:9 7;fill:none}</style></defs>
   <rect width="1100" height="700" fill="#fff"/>
   <text x="550" y="52" text-anchor="middle" class="h">GPSホスト — 立体配置例</text>
@@ -15,5 +15,5 @@
     <text x="360" y="217" text-anchor="middle" class="l">採掘域</text>
   </g>
   <text x="550" y="610" text-anchor="middle" class="l">各ホストには「無線モデムブロック」のワールド座標を設定します。</text>
-  <text x="550" y="646" text-anchor="middle" class="s">全ホストと採掘域をチャンクローダー等で常時ロードし、遮蔽と距離制限も確認してください。</text>
+  <text x="550" y="646" text-anchor="middle" class="s">必要なロード範囲は外部設定で用意し、遮蔽と距離制限を確認します（CC Minerは状態を取得・自動化しません）。</text>
 </svg>

@@ -1,13 +1,92 @@
--- CC Miner V2 - interactive configuration
+-- CC Miner V3 - interactive configuration
 
 local args = { ... }
 local common = dofile("/ccminer/lib/common.lua")
 local current = common.loadConfig()
 local requestedRole = string.lower(tostring(args[1] or (current and current.role) or ""))
 
+-- Setup is intentionally forgiving when it reads a hand-edited/old config:
+-- malformed values are replaced by a safe default before they are passed to
+-- the interactive validators.  This prevents an invalid stored default from
+-- trapping a user in a prompt loop while preserving every valid old value.
+local function validInteger(value, fallback, minimum, maximum)
+  local number = tonumber(value)
+  if not number or number ~= math.floor(number) then return fallback end
+  if minimum and number < minimum then return fallback end
+  if maximum and number > maximum then return fallback end
+  return number
+end
+
+local function validNumber(value, fallback, minimum, maximum)
+  local number = tonumber(value)
+  if not number then return fallback end
+  if minimum and number < minimum then return fallback end
+  if maximum and number > maximum then return fallback end
+  return number
+end
+
+local function ensureTable(config, key, defaults)
+  if type(config[key]) ~= "table" then config[key] = common.copy(defaults) end
+  config[key] = common.merge(defaults, config[key])
+  return config[key]
+end
+
+local function enumPrompt(label, defaultValue, values, fallback)
+  local normalized = string.lower(common.trim(tostring(defaultValue or "")))
+  if not values[normalized] then
+    fallback = string.lower(common.trim(tostring(fallback or "")))
+    if values[fallback] then
+      normalized = fallback
+    else
+      local options = {}
+      for value in pairs(values) do options[#options + 1] = value end
+      table.sort(options)
+      normalized = options[1]
+    end
+  end
+  return string.lower(common.prompt(label, normalized, function(value)
+    value = string.lower(common.trim(value))
+    if values[value] then return true end
+    local options = {}
+    for option in pairs(values) do options[#options + 1] = option end
+    table.sort(options)
+    return false, "Enter one of: " .. table.concat(options, "/") .. "."
+  end))
+end
+
+local function sidePrompt(label, defaultValue)
+  return enumPrompt(label, defaultValue or "back", {
+    front = true, back = true, left = true, right = true, top = true, bottom = true,
+  }, "back")
+end
+
+local function torchSidePrompt(defaultValue, sealSide)
+  local choices = { left = true, right = true }
+  local safeSide = sealSide == "left" and "right" or "left"
+  local side = enumPrompt("Torch chest side (left/right)", defaultValue or safeSide, choices, safeSide)
+  if sealSide and side == sealSide then
+    print("Warning: torch chest side must not match the seal-block chest side.")
+    local fallback = safeSide
+    repeat
+      side = enumPrompt("Re-select torch chest side", fallback, choices, fallback)
+      if side == sealSide then print("Warning: choose a side different from " .. sealSide .. ".") end
+    until side ~= sealSide
+  end
+  return side
+end
+
+local function peripheralNamePrompt(label, defaultValue)
+  local fallback = type(defaultValue) == "string" and defaultValue or ""
+  return common.prompt(label, fallback, function(value)
+    if #value > 64 or value:find("[%c]") then return false, "Use 0 to 64 printable characters." end
+    if #value == 0 then return false, "Enter a peripheral name." end
+    return true
+  end)
+end
+
 if requestedRole ~= "worker" and requestedRole ~= "controller" and requestedRole ~= "gps" then
   common.clear(colors and colors.black or nil, colors and colors.white or nil)
-  print("CC MINER V2 SETUP")
+  print("CC MINER " .. tostring(common.VERSION) .. " SETUP")
   print("")
   print("1. Worker (mining turtle)")
   print("2. Controller (computer + touch monitor)")
@@ -21,7 +100,7 @@ if requestedRole == "worker" and not turtle then error("Worker role can only be 
 if requestedRole == "gps" and turtle then print("Warning: use a stationary computer for a GPS host.") end
 
 common.clear(colors and colors.black or nil, colors and colors.white or nil)
-print("CC MINER V2 SETUP - " .. string.upper(requestedRole))
+print("CC MINER " .. tostring(common.VERSION) .. " SETUP - " .. string.upper(requestedRole))
 print("")
 
 local config
@@ -52,25 +131,64 @@ else
   if requestedRole == "worker" then
     config = common.merge(common.defaultWorkerConfig(), current and current.role == "worker" and current or {})
     config.role, config.networkKey = "worker", key
+    local workerDefaults = common.defaultWorkerConfig()
+    local lighting = ensureTable(config, "lighting", workerDefaults.lighting)
+    local materials = ensureTable(config, "materials", workerDefaults.materials)
+    ensureTable(config, "service", workerDefaults.service)
+    local journal = ensureTable(config, "journal", workerDefaults.journal)
+    ensureTable(config, "alerts", workerDefaults.alerts)
+    config.profile = enumPrompt("Operating profile (safe/balanced/turbo)", config.profile or "balanced", {
+      safe = true, balanced = true, turbo = true,
+    }, "balanced")
+    config.waterMode = enumPrompt("Water behavior (ignore/stop/seal)", config.waterMode or "seal", {
+      ignore = true, stop = true, seal = true,
+    }, "seal")
+    config.maxContinuousSeal = common.promptNumber(
+      "Maximum continuous fluid seals",
+      validInteger(config.maxContinuousSeal, 32, 1, 4096),
+      1,
+      4096
+    )
     config.workerName = common.prompt("Worker name", config.workerName or common.safeComputerLabel("Miner"), function(value)
       return #value >= 1 and #value <= 20, "Use 1 to 20 characters."
     end)
-    config.fuelTarget = common.promptNumber("Fuel target", config.fuelTarget or 12000, 500, 100000)
-    config.reserveEmptySlots = common.promptNumber("Reserved empty slots", config.reserveEmptySlots or 3, 1, 8)
-    local lavaChoice = common.prompt("Lava behavior (seal/stop)", config.lavaMode or "seal", function(value)
-      value = string.lower(value)
-      return value == "seal" or value == "stop", "Enter seal or stop."
-    end)
-    config.lavaMode = string.lower(lavaChoice)
+    config.fuelTarget = common.promptNumber("Fuel target", validInteger(config.fuelTarget, 12000, 500, 100000), 500, 100000)
+    config.reserveEmptySlots = common.promptNumber("Reserved empty slots", validInteger(config.reserveEmptySlots, 3, 1, 8), 1, 8)
+    config.lavaMode = enumPrompt("Lava behavior (seal/stop)", config.lavaMode or "seal", {
+      seal = true, stop = true,
+    }, "seal")
     if config.lavaMode == "seal" then
-      config.sealSide = common.prompt("Seal-block chest side (right/left)", config.sealSide or "right", function(value)
-        value = string.lower(value)
-        return value == "right" or value == "left", "Enter right or left."
-      end):lower()
-      config.sealTarget = common.promptNumber("Seal-block target count", config.sealTarget or 64, 16, 512)
-      config.sealReserve = common.promptNumber("Return when seal blocks reach", config.sealReserve or 8, 1, math.min(64, config.sealTarget - 1))
+      config.sealSide = enumPrompt("Seal-block chest side (right/left)", config.sealSide or "right", {
+        right = true, left = true,
+      }, "right")
+      config.sealTarget = common.promptNumber("Seal-block target count", validInteger(config.sealTarget, 64, 16, 512), 16, 512)
+      local reserveMaximum = math.min(64, config.sealTarget - 1)
+      config.sealReserve = common.promptNumber("Return when seal blocks reach", validInteger(config.sealReserve, 8, 1, reserveMaximum), 1, reserveMaximum)
     end
-    config.gps = config.gps or common.defaultWorkerConfig().gps
+    lighting.mode = enumPrompt("Lighting mode (off/safe/custom)", lighting.mode or "safe", {
+      off = true, safe = true, custom = true,
+    }, "safe")
+    if lighting.mode == "custom" then
+      lighting.interval = common.promptNumber("Torch interval (moves)", validInteger(lighting.interval, 10, 1, 4096), 1, 4096)
+      lighting.temporaryFloor = common.promptYesNo("Use temporary lighting floor", lighting.temporaryFloor ~= false)
+      lighting.torchTarget = common.promptNumber("Torch target count", validInteger(lighting.torchTarget, 64, 1, 512), 1, 512)
+      local torchReserveMaximum = math.min(128, lighting.torchTarget - 1)
+      lighting.torchReserve = common.promptNumber("Return when torches reach", validInteger(lighting.torchReserve, 8, 0, torchReserveMaximum), 0, torchReserveMaximum)
+    end
+    if lighting.mode ~= "off" then
+      lighting.side = torchSidePrompt(lighting.side or config.torchSide or "left", config.lavaMode == "seal" and config.sealSide or nil)
+      config.torchSide = lighting.side
+    else
+      lighting.side = lighting.side or config.torchSide or "left"
+      config.torchSide = lighting.side
+    end
+    materials.compactEveryMoves = validInteger(materials.compactEveryMoves, 32, 1, 100000)
+    materials.retainSealTarget = validInteger(materials.retainSealTarget, 64, 1, 512)
+    materials.recycleMinedBlocks = common.promptYesNo("Recycle mined blocks", materials.recycleMinedBlocks ~= false)
+    journal.checkpointEvery = validInteger(journal.checkpointEvery, 32, 1, 100000)
+    journal.maxEntries = validInteger(journal.maxEntries, 256, 1, 10000)
+    journal.enabled = common.promptYesNo("Enable resumable journal", journal.enabled ~= false)
+    config.gps = ensureTable(config, "gps", workerDefaults.gps)
     config.gps.enabled = common.promptYesNo("Use GPS when available", config.gps.enabled ~= false)
     if config.gps.enabled then
       config.gps.required = common.promptYesNo("Require GPS for mining", config.gps.required == true)
@@ -86,10 +204,25 @@ else
   else
     config = common.merge(common.defaultControllerConfig(), current and current.role == "controller" and current or {})
     config.role, config.networkKey = "controller", key
+    local controllerDefaults = common.defaultControllerConfig()
+    local alerts = ensureTable(config, "alerts", controllerDefaults.alerts)
+    config.historyLimit = common.promptNumber("History entries to retain", validInteger(config.historyLimit, 50, 1, 1000), 1, 1000)
+    config.queueEnabled = common.promptYesNo("Enable job queue", config.queueEnabled ~= false)
+    config.overlapProtection = common.promptYesNo("Protect overlapping jobs", config.overlapProtection ~= false)
+    config.adaptiveRefresh = common.promptYesNo("Enable adaptive refresh", config.adaptiveRefresh ~= false)
+    local sorting = ensureTable(config, "sorting", controllerDefaults.sorting)
+    sorting.enabled = common.promptYesNo("Enable automatic item sorting", sorting.enabled == true)
+    if sorting.enabled then
+      sorting.interval = common.promptNumber("Sorting interval (seconds)", validInteger(sorting.interval, 30, 1, 86400), 1, 86400)
+      sorting.source = peripheralNamePrompt("Sorting source inventory", sorting.source)
+      sorting.valuableTarget = peripheralNamePrompt("Valuable-items inventory", sorting.valuableTarget)
+      sorting.bulkTarget = peripheralNamePrompt("Bulk-items inventory", sorting.bulkTarget)
+      sorting.sealTarget = peripheralNamePrompt("Seal-block inventory", sorting.sealTarget)
+    end
     config.controllerName = common.prompt("Controller name", config.controllerName or common.safeComputerLabel("Control"), function(value)
       return #value >= 1 and #value <= 20, "Use 1 to 20 characters."
     end)
-    config.monitorTextScale = tonumber(common.prompt("Monitor text scale", config.monitorTextScale or 0.5, function(value)
+    config.monitorTextScale = tonumber(common.prompt("Monitor text scale", validNumber(config.monitorTextScale, 0.5, 0.5, 5), function(value)
       local number = tonumber(value)
       if not number or number < 0.5 or number > 5 or number * 2 ~= math.floor(number * 2) then
         return false, "Use 0.5, 1.0, 1.5 ... 5.0."
@@ -97,6 +230,22 @@ else
       return true
     end))
     config.touchEnabled = common.promptYesNo("Enable monitor touch controls", config.touchEnabled ~= false)
+    alerts.enabled = common.promptYesNo("Enable controller alerts", alerts.enabled ~= false)
+    if alerts.enabled then
+      alerts.speaker = common.promptYesNo("Use speaker alerts", alerts.speaker ~= false)
+      alerts.redstone = common.promptYesNo("Use redstone alerts", alerts.redstone ~= false)
+      if alerts.redstone then alerts.redstoneSide = sidePrompt("Redstone alert side", alerts.redstoneSide or "back") end
+      alerts.cooldownSeconds = common.promptNumber(
+        "Alert cooldown (seconds)",
+        validInteger(alerts.cooldownSeconds, 10, 0, 3600),
+        0,
+        3600
+      )
+    else
+      -- Keep disabled outputs explicit so old controllers do not emit a
+      -- notification merely because a peripheral was attached later.
+      alerts.speaker, alerts.redstone = false, false
+    end
     if os.setComputerLabel then os.setComputerLabel(config.controllerName) end
   end
 end
@@ -108,6 +257,8 @@ if requestedRole == "worker" and (not fs.exists(common.STATE_PATH) or not curren
   common.saveTable(common.STATE_PATH, common.defaultState())
 end
 
+-- Keep the legacy marker: treating an existing V2 startup as user-owned
+-- during update would make the new startup wrapper invoke itself recursively.
 local startupMarker = "-- CC_MINER_V2_STARTUP"
 local existingStartup = fs.exists("/startup.lua") and common.readAll("/startup.lua") or nil
 if existingStartup and not existingStartup:find(startupMarker, 1, true) then
@@ -137,6 +288,9 @@ if requestedRole == "worker" then
   print("Output chest: BEHIND the turtle")
   print("Fuel chest: ABOVE the turtle")
   if config.lavaMode == "seal" then print("Seal-block chest: " .. string.upper(config.sealSide) .. " of the turtle") end
+  if config.lighting and config.lighting.mode ~= "off" then
+    print("Torch chest: " .. string.upper(config.lighting.side or config.torchSide or "left") .. " of the turtle")
+  end
   print("Turtle front: quarry entrance")
   if config.gps.enabled then print("After GPS hosts are online: controller -> GPS CAL") end
 elseif requestedRole == "controller" then

@@ -1,4 +1,4 @@
--- CC Miner V2 - rednet protocol helpers
+-- CC Miner V3/V2-compatible rednet protocol helpers
 
 local common = dofile("/ccminer/lib/common.lua")
 local M = {}

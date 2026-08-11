@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Run repository integrity checks without requiring a Minecraft client."""
+"""Run repository integrity checks without requiring a Minecraft client.
+
+Requires Python 3.10+ (and a Lua 5.2-compatible interpreter for full checks).
+"""
 
 from __future__ import annotations
 
@@ -196,7 +199,7 @@ def check_feature_markers() -> None:
         "controller monitor touch": (controller, 'event == "monitor_touch"'),
         "controller terminal click": (controller, 'event == "mouse_click"'),
         "controller keypad": (controller, '"CLR", "0", "<"'),
-        "controller chunk mask": (controller, '"CHUNK MASK"'),
+        "controller touch grid": (controller, '"NEW JOB - TOUCH GRID"'),
         "controller GPS calibration": (controller, '"calibrate_gps"'),
         "GPS setup role": (setup, 'requestedRole == "gps"'),
     }
@@ -291,7 +294,8 @@ def main() -> None:
     run([lua, "tests/test_geo.lua", str(ROOT)])
     run([lua, "tests/test_common.lua", str(ROOT)])
     run([lua, "tests/test_protocol.lua", str(ROOT)])
-    print("All CC Miner V2.1 checks passed.")
+    run([lua, "tests/test_v3_contract.lua", str(ROOT)])
+    print("All CC Miner V3 checks passed.")
 
 
 if __name__ == "__main__":

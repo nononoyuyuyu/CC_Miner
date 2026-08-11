@@ -1,247 +1,295 @@
-  if #ids == 0 then
-    common.writeAt(2, headerY + 2, common.fit("No workers found. Touch DISCOVER.", width - 2), colors and colors.lightGray or nil)
-  else
-    local first = 1
-    if selected > maxRows then first = selected - maxRows + 1 end
-    for row = 1, maxRows do
-      local index = first + row - 1
-      local id = ids[index]
-      if not id then break end
-      local worker = workers[id]
-      local data = worker.data or {}
-      local status = statusOf(worker)
-      local marker = index == selected and ">" or " "
-      local line
-      if width >= 48 then
-        line = ("%s %-5s %-14s %-12s %-17s %-5s %-4s"):format(
-          marker, tostring(id), common.fit(workerLabel(worker, id), 14), common.fit(status, 12),
-          common.fit(progressText(data), 17), tostring(data.fuel or "-"), tostring(data.seal and data.seal.count or "-")
-        )
-      else
-        line = ("%s%-5s %-10s %-8s %s"):format(
-          marker, tostring(id), common.fit(workerLabel(worker, id), 10), common.fit(status, 8), progressText(data)
-        )
-      end
-      local foreground = index == selected and (colors and colors.black or nil) or common.statusColor(status)
-      local background = index == selected and (colors and colors.white or nil) or (colors and colors.black or nil)
-      local y = headerY + row
-      common.writeAt(1, y, common.fit(line, width), foreground, background)
-      addHitbox(key, 1, y, width, y, function() selected = index end)
-    end
+      gpsCalibration = true,
+      lavaSeal = true,
+      chunkExclusions = true,
+      worldPartition = false,
+      localPartition = false,
+      touchController = true,
+      lighting = true,
+      waterHandling = true,
+      materialRecycle = true,
+      stagedStop = true,
+      stateJournal = true,
+      completionReport = true,
+    },
+    job = jobSnapshot(),
+    fuel = fuelLevel(),
+    fuelLimit = fuelLimit(),
+    inventoryUsed = used,
+    inventoryEmpty = empty,
+    inventoryItems = items,
+    lastError = state.lastError,
+    completionReason = state.completionReason,
+    recoveryRequired = state.pendingAction ~= nil,
+    pendingAction = state.pendingAction and {
+      kind = state.pendingAction.kind,
+      startedAt = state.pendingAction.startedAt,
+    } or nil,
+    request = state.request,
+    stats = common.copy(state.stats),
+    version = common.VERSION,
+    updatedAt = state.updatedAt,
+  }
+end
+
+local function sendStatus(target, request)
+  if not networkReady then return false end
+  local message = protocol.message("status", config.networkKey, statusPayload(), target)
+  if request and request.id then message.replyTo = request.id end
+  if target then return protocol.send(target, message) end
+  return protocol.broadcast(message)
+end
+
+local function sendAck(target, request, ok, text)
+  return protocol.reply(target, config.networkKey, request, "ack", {
+    ok = ok == true,
+    message = tostring(text or ""),
+    status = statusPayload(),
+  })
+end
+
+local function markBlocked(message)
+  state.status = "blocked"
+  state.phase = state.pendingAction and "recovery_required" or "blocked"
+  state.lastError = tostring(message or "Unknown error")
+  common.log("ERROR", state.lastError)
+  saveState()
+  sendStatus()
+end
+
+local function commandSeen(id)
+  if not id then return false end
+  state.recentCommands = state.recentCommands or {}
+  for _, existing in ipairs(state.recentCommands) do if existing == id then return true end end
+  state.recentCommands[#state.recentCommands + 1] = id
+  while #state.recentCommands > 32 do table.remove(state.recentCommands, 1) end
+  return false
+end
+
+local function locateGPS()
+  state.gps = state.gps or common.defaultState().gps
+  if gpsConfig().enabled == false then
+    state.gps.available = false
+    state.gps.lastError = "GPS is disabled in configuration."
+    return nil, state.gps.lastError
   end
-
-  buttonRow(key, height - 4, width, {
-    { "DISCOVER", dashboardAction("discover") }, { "NEW JOB", dashboardAction("new") },
-    { "GPS CAL", dashboardAction("gps") }, { "INFO", dashboardAction("info") },
-  })
-  buttonRow(key, height - 3, width, {
-    { "PAUSE", dashboardAction("pause") }, { "RESUME", dashboardAction("resume") },
-    { "RECALL", dashboardAction("recall") }, { "SERVICE", dashboardAction("service") },
-  })
-  buttonRow(key, height - 2, width, {
-    { "ABORT", dashboardAction("abort") }, { "CLEAR", dashboardAction("clear") },
-    { "REHOME", dashboardAction("rehome") }, { "QUIT", dashboardAction("quit") },
-  })
-  local noticeColor = noticeIsError and (colors and colors.red or nil) or (colors and colors.lime or nil)
-  common.writeAt(1, height, common.fit(notice, width), noticeColor)
+  if not gps or type(gps.locate) ~= "function" then
+    state.gps.available = false
+    state.gps.lastError = "GPS API is unavailable."
+    return nil, state.gps.lastError
+  end
+  local ok, x, y, z = pcall(gps.locate, tonumber(gpsConfig().timeout) or 2, false)
+  if not ok or x == nil then
+    state.gps.available = false
+    state.gps.lastError = ok and "No GPS fix received." or tostring(x)
+    return nil, state.gps.lastError
+  end
+  local fix, fixError = geo.integerFix(x, y, z, 0.35)
+  if not fix then
+    state.gps.available = false
+    state.gps.lastError = fixError
+    return nil, fixError
+  end
+  state.gps.available = true
+  state.gps.lastFix = fix
+  state.gps.lastFixAt = common.nowSeconds()
+  state.gps.lastError = nil
+  state.stats.gpsFixes = (state.stats.gpsFixes or 0) + 1
+  return fix
 end
 
-local fieldOrder = { "width", "length", "depth" }
-local fieldLabels = { width = "WIDTH (right)", length = "LENGTH (forward)", depth = "DEPTH (down)" }
-local fieldLimits = { width = 128, length = 512, depth = 128 }
-
-local function commitDraftField()
-  if not draft then return end
-  local field = draft.selectedField or "width"
-  local value = tonumber(draft.buffer)
-  if not value then value = draft[field] or 1 end
-  value = common.clamp(math.floor(value), 1, fieldLimits[field])
-  draft[field], draft.buffer = value, tostring(value)
+local function verifyGPS(force)
+  local calibration = gpsCalibration()
+  if not calibration then
+    if gpsConfig().required then return false, "GPS is required but the worker is not calibrated." end
+    return true
+  end
+  local interval = math.max(1, tonumber(gpsConfig().verifyEveryMoves) or 16)
+  if not force and ((state.stats.moves or 0) % interval ~= 0) then return true end
+  local fix, fixError = locateGPS()
+  if not fix then
+    if gpsConfig().required then return false, "Required GPS fix failed: " .. tostring(fixError) end
+    return true
+  end
+  local expected = geo.localToWorld(calibration, state.pose)
+  if not geo.samePosition(fix, expected) then
+    return false, ("GPS drift: expected world %d,%d,%d but located %d,%d,%d."):format(
+      expected.x, expected.y, expected.z, fix.x, fix.y, fix.z
+    )
+  end
+  return true
 end
 
-local function chooseDraftField(field)
-  commitDraftField()
-  draft.selectedField = field
-  draft.buffer = tostring(draft[field])
-end
-
-local function draftDigit(digit)
-  if not draft then return end
-  local buffer = tostring(draft.buffer or "")
-  if buffer == "0" then buffer = "" end
-  if #buffer < 4 then draft.buffer = buffer .. tostring(digit) end
-end
-
-local function draftBackspace()
-  if not draft then return end
-  local buffer = tostring(draft.buffer or "")
-  draft.buffer = buffer:sub(1, math.max(0, #buffer - 1))
-  if draft.buffer == "" then draft.buffer = "0" end
-end
-
-local function adjustDraft(field, delta)
-  chooseDraftField(field)
-  local value = common.clamp((draft[field] or 1) + delta, 1, fieldLimits[field])
-  draft[field], draft.buffer = value, tostring(value)
-end
-
-local function draftWorker()
-  if not draft then return nil, nil end
-  return draft.workerId, workers[draft.workerId]
-end
-
-local function draftCalibration()
-  local _, worker = draftWorker()
-  local gpsData = worker and worker.data and worker.data.gps
-  if gpsData and gpsData.calibrated and type(gpsData.calibration) == "table" then return gpsData.calibration end
+local function assignmentChunkKey(entry, mode)
+  if type(entry) == "string" and entry ~= "" then return entry end
+  if type(entry) ~= "table" then return nil end
+  if entry.key and tostring(entry.key) ~= "" then return tostring(entry.key) end
+  local cx, cz = tonumber(entry.cx), tonumber(entry.cz)
+  if cx and cz and cx == math.floor(cx) and cz == math.floor(cz) then
+    return quarry.chunkKey(entry.mode == "world" and "world" or mode, cx, cz)
+  end
   return nil
 end
 
-local function buildDraftCatalog()
-  commitDraftField()
-  local calibration = draftCalibration()
-  local chunkMode = calibration and "world" or "local"
-  local catalog, err = quarry.buildCatalog(draft.width, draft.length, chunkMode, calibration)
-  if not catalog then return nil, err end
-  local rootKey = nil
-  for _, chunk in ipairs(catalog) do
-    if 0 >= chunk.minX and 0 <= chunk.maxX and 1 >= chunk.minZ and 1 <= chunk.maxZ then rootKey = chunk.key end
+local function validateJob(payload)
+  payload = payload or {}
+  local width, length, depth = tonumber(payload.width), tonumber(payload.length), tonumber(payload.depth)
+  local targetY = tonumber(payload.targetY)
+  local requestedChunkMode = payload.chunkMode == "world" and "world" or "local"
+  if targetY ~= nil then
+    if targetY ~= math.floor(targetY) then return nil, "targetY must be a whole number." end
+    if requestedChunkMode ~= "world" then
+      return nil, "targetY requires chunkMode=world with GPS calibration."
+    end
+    local calibration = gpsCalibration()
+    if not calibration then return nil, "targetY requires GPS calibration." end
+    local homeY = tonumber(calibration.home and calibration.home.y)
+    if not homeY then return nil, "GPS calibration has no home Y coordinate." end
+    local derivedDepth = homeY - targetY + 1
+    if derivedDepth < 1 or derivedDepth > config.maxDepth then
+      return nil, "targetY is outside the configured depth range."
+    end
+    if depth ~= nil and (depth ~= math.floor(depth) or depth ~= derivedDepth) then
+      return nil, "depth must equal the depth derived from targetY."
+    end
+    depth = derivedDepth
   end
-  return catalog, nil, chunkMode, calibration, rootKey
-end
+  if not width or width ~= math.floor(width) then return nil, "Width must be a whole number." end
+  if not length or length ~= math.floor(length) then return nil, "Length must be a whole number." end
+  if not depth or depth ~= math.floor(depth) then return nil, "Depth must be a whole number." end
+  if width < 1 or width > config.maxWidth then return nil, "Width out of range (1-" .. config.maxWidth .. ")." end
+  if length < 1 or length > config.maxLength then return nil, "Length out of range (1-" .. config.maxLength .. ")." end
+  if depth < 1 or depth > config.maxDepth then return nil, "Depth out of range (1-" .. config.maxDepth .. ")." end
+  local fullVolume = width * length * depth
+  if fullVolume > config.maxVolume then return nil, "Volume exceeds limit " .. tostring(config.maxVolume) .. "." end
 
-local function startDraft(useExclusions)
-  if not draft then return end
-  commitDraftField()
-  local catalog, catalogError, chunkMode, calibration, rootKey = buildDraftCatalog()
-  if not catalog then setNotice(catalogError, true); return end
-  local excludedChunks = {}
-  if useExclusions then
-    for _, chunk in ipairs(catalog) do
-      if draft.excluded[chunk.key] and chunk.key ~= rootKey then
-        excludedChunks[#excludedChunks + 1] = { mode = chunkMode, cx = chunk.cx, cz = chunk.cz }
-      end
+  local exclusions = {}
+  for _, exclusion in ipairs(payload.excludedChunks or {}) do
+    if type(exclusion) == "table" and tonumber(exclusion.cx) and tonumber(exclusion.cz) then
+      exclusions[#exclusions + 1] = {
+        mode = exclusion.mode == "world" and "world" or "local",
+        cx = math.floor(exclusion.cx),
+        cz = math.floor(exclusion.cz),
+      }
     end
   end
-  if #excludedChunks > 0 then
-    local plan, planError = quarry.buildChunkPlan({
-      width = draft.width, length = draft.length, depth = draft.depth,
-      chunkMode = chunkMode, excludedChunks = excludedChunks,
-    }, calibration)
-    if not plan then setNotice(planError, true); return end
+  if #exclusions > 512 then return nil, "Too many excluded chunks." end
+
+  local chunkMode = requestedChunkMode
+  if chunkMode == "world" and not gpsCalibration() then
+    return nil, "World-aligned chunk exclusion requires GPS calibration."
   end
-  local sent = sendCommand(draft.workerId, "start", {
-    width = draft.width,
-    length = draft.length,
-    depth = draft.depth,
+
+  if payload.assignmentChunks ~= nil then
+    return nil, "Multi-worker chunk partitioning is disabled in this release; dispatch independent jobs."
+  end
+  local assignmentTotal = tonumber(payload.assignmentTotal or payload.assignmentCount)
+  if assignmentTotal and assignmentTotal > 1 then
+    return nil, "Multi-worker assignments are disabled in this release; dispatch independent jobs."
+  end
+  if type(payload.assignment) == "table" and tonumber(payload.assignment.total or payload.assignment.count) and tonumber(payload.assignment.total or payload.assignment.count) > 1 then
+    return nil, "Multi-worker assignments are disabled in this release; dispatch independent jobs."
+  end
+
+  local profile = payload.profile
+  if profile ~= nil then
+    profile = tostring(profile)
+    if profile ~= "safe" and profile ~= "balanced" and profile ~= "turbo" then
+      return nil, "profile must be safe, balanced, or turbo."
+    end
+  end
+
+  local job = {
+    kind = "quarry",
+    id = tostring(payload.jobId or ("job-" .. common.nowMillis())),
+    name = tostring(payload.name or "Quarry"),
+    width = width,
+    length = length,
+    depth = depth,
+    cursor = 0,
+    startedAt = common.nowSeconds(),
+    excludedChunks = exclusions,
     chunkMode = chunkMode,
-    excludedChunks = excludedChunks,
-    name = ("Quarry %dx%dx%d%s"):format(
-      draft.width, draft.length, draft.depth, #excludedChunks > 0 and (" -" .. #excludedChunks .. " chunks") or ""
-    ),
-    jobId = ("q-%d-%d"):format(draft.workerId, common.nowMillis()),
-  })
-  if sent then mode, draft = "dashboard", nil end
-end
+    assignmentId = payload.assignmentId and tostring(payload.assignmentId) or nil,
+    profile = profile,
+    targetY = targetY,
+    lighting = type(payload.lighting) == "table" and common.copy(payload.lighting) or nil,
+    waterMode = payload.waterMode and tostring(payload.waterMode) or nil,
+    assignmentChunks = nil,
+    assignmentProvided = false,
+  }
 
-local function renderDimensions(target, key)
-  local width, height = target.getSize()
-  local id, worker = draftWorker()
-  common.writeAt(1, 1, common.center("NEW QUARRY - DIMENSIONS", width), colors and colors.black or nil, colors and colors.cyan or nil)
-]] },
-  { target = [[controller_parts/02.part]], content = [[  common.writeAt(2, 2, common.fit(("Worker #%s %s"):format(tostring(id or "-"), worker and workerLabel(worker, id) or "offline"), width - 2), colors and colors.lightGray or nil)
-  common.writeAt(2, 3, common.fit("Touch a field, then use keypad or +/-.", width - 2), colors and colors.lightGray or nil)
-
-  local fieldWidth = math.min(27, math.max(18, math.floor(width * 0.52)))
-  for index, field in ipairs(fieldOrder) do
-    local y = 4 + (index - 1) * 2
-    local active = draft.selectedField == field
-    local shown = active and draft.buffer or tostring(draft[field])
-    common.writeAt(2, y, common.fit(fieldLabels[field], fieldWidth - 2), active and (colors and colors.black or nil) or (colors and colors.white or nil), active and (colors and colors.yellow or nil) or (colors and colors.black or nil))
-    drawButton(key, 2, y + 1, 4, "-", function() adjustDraft(field, -1) end, true)
-    drawButton(key, 7, y + 1, math.max(7, fieldWidth - 12), shown, function() chooseDraftField(field) end, true, active)
-    drawButton(key, fieldWidth - 4, y + 1, 4, "+", function() adjustDraft(field, 1) end, true)
+  if job.waterMode ~= nil and job.waterMode ~= "ignore" and job.waterMode ~= "stop" and job.waterMode ~= "seal" then
+    return nil, "waterMode must be ignore, stop, or seal."
   end
-
-  local keypadX = fieldWidth + 2
-  local keypadWidth = math.max(15, width - keypadX)
-  local cellWidth = math.max(4, math.floor(keypadWidth / 3))
-  local labels = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "CLR", "0", "<" }
-  for index, label in ipairs(labels) do
-    local row = math.floor((index - 1) / 3)
-    local column = (index - 1) % 3
-    local x, y = keypadX + column * cellWidth, 4 + row * 2
-    local action
-    if label == "CLR" then action = function() draft.buffer = "0" end
-    elseif label == "<" then action = draftBackspace
-    else local digit = label; action = function() draftDigit(digit) end end
-    drawButton(key, x, y, cellWidth - 1, label, action, true)
-    if y + 1 <= height - 4 then
-      common.writeAt(x, y + 1, string.rep(" ", cellWidth - 1), colors and colors.white or nil, colors and colors.black or nil)
-      addHitbox(key, x, y, x + cellWidth - 2, y + 1, action)
+  if job.lighting and job.lighting.mode ~= nil then
+    local mode = tostring(job.lighting.mode)
+    if mode ~= "off" and mode ~= "safe" and mode ~= "custom" then
+      return nil, "lighting.mode must be off, safe, or custom."
+    end
+    job.lighting.mode = mode
+    if job.lighting.interval ~= nil then
+      local interval = tonumber(job.lighting.interval)
+      if not interval or interval < 1 then return nil, "lighting.interval must be positive." end
+      job.lighting.interval = math.floor(interval)
     end
   end
 
-  local volume = (tonumber(draft.width) or 1) * (tonumber(draft.length) or 1) * (tonumber(draft.depth) or 1)
-  common.writeAt(2, height - 3, common.fit("Full volume: " .. common.humanNumber(volume) .. " blocks", width - 2), colors and colors.lightGray or nil)
-  buttonRow(key, height - 2, width, {
-    { "CHUNK MASK", function() commitDraftField(); mode = "job_chunks"; draft.chunkPage = 1 end },
-    { "START ALL", function() startDraft(false) end },
-    { "CANCEL", function() mode, draft = "dashboard", nil end },
-  })
-  local noticeColor = noticeIsError and (colors and colors.red or nil) or (colors and colors.lime or nil)
-  common.writeAt(1, height, common.fit(notice, width), noticeColor)
+  if #exclusions > 0 then
+    local plan, planError = quarry.buildChunkPlan(job, gpsCalibration())
+    if not plan then return nil, planError end
+    job.strategy = "chunk_plan"
+    job.chunkPlan = plan
+    job.total = plan.columns * depth
+    job.route = { layer = 0, walkIndex = 1, phase = "travel", localCursor = 0 }
+  else
+    job.strategy = "serpentine"
+    job.total = fullVolume
+  end
+  if job.total <= 0 then return nil, "The exclusion mask leaves no blocks to mine." end
+  return job
 end
 
-local function renderChunks(target, key)
-  local width, height = target.getSize()
-  local catalog, catalogError, chunkMode, _, rootKey = buildDraftCatalog()
-  common.writeAt(1, 1, common.center("NEW QUARRY - CHUNK MASK", width), colors and colors.black or nil, colors and colors.cyan or nil)
-  if not catalog then
-    common.writeAt(2, 3, common.fit(tostring(catalogError), width - 2), colors and colors.red or nil)
-    drawButton(key, 1, height - 1, width, "BACK", function() mode = "job_dimensions" end, true)
-    return
+local function startJob(payload)
+  payload = payload or {}
+  local requestedId = payload.jobId and tostring(payload.jobId) or nil
+  if requestedId and state.job and tostring(state.job.id) == requestedId then
+    return true, "Job already accepted; existing state retained."
   end
-  common.writeAt(2, 2, common.fit(("Mode: %s chunks | touch rows to exclude | entrance is locked"):format(chunkMode), width - 2), colors and colors.lightGray or nil)
-  local rowsPerPage = math.max(1, height - 7)
-  local pages = math.max(1, math.ceil(#catalog / rowsPerPage))
-  draft.chunkPage = common.clamp(draft.chunkPage or 1, 1, pages)
-  local first = (draft.chunkPage - 1) * rowsPerPage + 1
-  for row = 1, rowsPerPage do
-    local chunk = catalog[first + row - 1]
-    if not chunk then break end
-    local locked = chunk.key == rootKey
-    local excluded = draft.excluded[chunk.key] == true and not locked
-    local marker = locked and "[ENTRY]" or excluded and "[EXCLUDE]" or "[ MINE ]"
-    local label = ("%-9s %s chunk %d,%d  local x=%d..%d z=%d..%d (%d cells)"):format(
-      marker, chunkMode, chunk.cx, chunk.cz, chunk.minX, chunk.maxX, chunk.minZ, chunk.maxZ, chunk.cells
-    )
-    local y = 3 + row
-    local foreground = locked and (colors and colors.yellow or nil) or excluded and (colors and colors.white or nil) or (colors and colors.lime or nil)
-    local background = excluded and (colors and colors.red or nil) or (colors and colors.black or nil)
-    common.writeAt(1, y, common.fit(label, width), foreground, background)
-    if not locked then
-      local chunkKeyValue = chunk.key
-      addHitbox(key, 1, y, width, y, function()
-        draft.excluded[chunkKeyValue] = not draft.excluded[chunkKeyValue]
-      end)
-    end
+  if state.job and state.status ~= "complete" and state.status ~= "aborted" then
+    return false, "An unfinished job already exists; resume, abort, or clear it first."
   end
-  local excludedCount = 0
-  for chunkKeyValue, excluded in pairs(draft.excluded) do if excluded and chunkKeyValue ~= rootKey then excludedCount = excludedCount + 1 end end
-  common.writeAt(2, height - 3, common.fit(("Page %d/%d | excluded %d/%d"):format(draft.chunkPage, pages, excludedCount, #catalog), width - 2), colors and colors.lightGray or nil)
-  buttonRow(key, height - 2, width, {
-    { "< PAGE", function() draft.chunkPage = math.max(1, draft.chunkPage - 1) end, draft.chunkPage > 1 },
-    { "PAGE >", function() draft.chunkPage = math.min(pages, draft.chunkPage + 1) end, draft.chunkPage < pages },
-    { "CLEAR MASK", function() draft.excluded = {} end },
-    { "BACK", function() mode = "job_dimensions" end },
-    { "START", function() startDraft(true) end },
-  })
-  local noticeColor = noticeIsError and (colors and colors.red or nil) or (colors and colors.lime or nil)
-  common.writeAt(1, height, common.fit(notice, width), noticeColor)
-end
-
-local function renderInfo(target, key)
-  local width, height = target.getSize()
-  local id, worker = selectedWorker()
-  local data = worker and worker.data or {}
+  if state.pendingAction then return false, "Recovery is required after an interrupted physical action." end
+  if not isHome() then return false, "Worker is not at home. Recall or physically recover it first." end
+  if tonumber(state.pose and state.pose.dir) ~= 0 then
+    return false, "Worker must face the quarry at home before starting a job. Use REHOME after physical recovery."
+  end
+  if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+    return false, "Worker is busy."
+  end
+  local job, err = validateJob(payload)
+  if not job then return false, err end
+  state.job = job
+  state.stats.jobsStarted = (state.stats.jobsStarted or 0) + 1
+  state.checkpoint = nil
+  state.service = {
+    resumeAfter = true,
+    finalStatus = "working",
+    preserveCheckpoint = false,
+    reason = "job_start",
+    startedAt = common.nowSeconds(),
+  }
+  state.request = nil
+  state.stagedStop = false
+  state.status = "working"
+  state.phase = "starting_service"
+  state.lastError = nil
+  state.completionReason = nil
+  state.report = nil
+  state.estimate = {
+    estimated = math.max(1, job.total or 1),
+    actual = 0,
+    variance = 0,
+    startedAt = common.nowSeconds(),
+  }
+  state.lighting.mode = (job.lighting and job.lighting.mode) or (config.lighting and config.lighting.mode) or "off"
+  state.lighting.interval = (job.lighting and job.lighting.interval) or (config.lighting and config.lighting.interval) or 32

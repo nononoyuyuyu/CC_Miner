@@ -1,3 +1,8 @@
+    if matches then found[#found + 1] = { name = name, device = peripheral.wrap(name) } end
+  end
+  table.sort(found, function(a, b) return a.name < b.name end)
+  return found
+end
 
 function M.findPeripheral(peripheralType, preferredName)
   local all = M.findPeripherals(peripheralType)
@@ -54,6 +59,10 @@ function M.statusColor(status)
     waiting_fuel = colors.orange,
     waiting_output = colors.orange,
     waiting_seal = colors.orange,
+    dormant = colors.gray,
+    waiting_torch = colors.orange,
+    waiting_water = colors.blue,
+    recovering = colors.lightBlue,
     blocked = colors.red,
     complete = colors.cyan,
     aborted = colors.red,
@@ -78,12 +87,19 @@ function M.defaultWorkerConfig()
     moveRetryDelay = 0.4,
     heartbeatSeconds = 2,
     attackEntities = false,
+    -- V3 operating profile.  These fields are additive so a V2 config can
+    -- still be loaded and merged with the defaults below.
+    profile = "balanced",
+    waterMode = "seal",
+    maxContinuousSeal = 32,
     maxWidth = 128,
     maxLength = 512,
     maxDepth = 128,
     maxVolume = 2000000,
     outputSide = "back",
     fuelSide = "top",
+    -- Keep the torch chest separate from the output/seal chest by default.
+    torchSide = "left",
     lavaMode = "seal",
     sealSide = "right",
     sealTarget = 64,
@@ -94,6 +110,52 @@ function M.defaultWorkerConfig()
       ["minecraft:stone"] = true,
       ["minecraft:netherrack"] = true,
       ["minecraft:dirt"] = true,
+    },
+    lighting = {
+      mode = "safe",
+      interval = 10,
+      temporaryFloor = true,
+      torchTarget = 64,
+      torchReserve = 8,
+      preferredSlots = { 15, 16 },
+      torchBlocks = {
+        ["minecraft:torch"] = true,
+      },
+      reserve = 8,
+      -- Runtime compatibility knobs.  The V3 planner primarily uses the
+      -- fields above; these make an explicitly configured side/slot safe for
+      -- older worker code as well.
+      slot = 16,
+      side = "left",
+    },
+    materials = {
+      sealSlots = { 13, 14 },
+      torchSlots = { 15, 16 },
+      fuelReserveSlots = { 12 },
+      compactEveryMoves = 32,
+      recycleMinedBlocks = true,
+      retainSealTarget = 64,
+    },
+    service = {
+      adaptive = true,
+      finishCurrentChunk = true,
+      stations = {},
+    },
+    journal = {
+      enabled = true,
+      checkpointEvery = 32,
+      maxEntries = 256,
+      path = M.ROOT .. "/data/state.journal",
+    },
+    alerts = {
+      enabled = true,
+      speaker = false,
+      redstone = false,
+      redstoneSide = "back",
+      cooldownSeconds = 10,
+      onWaiting = true,
+      onComplete = true,
+      onError = true,
     },
     gps = {
       enabled = true,
@@ -129,6 +191,50 @@ function M.defaultControllerConfig()
     monitorTextScale = 0.5,
     monitorName = "",
     touchEnabled = true,
+    historyLimit = 50,
+    queueEnabled = true,
+    overlapProtection = true,
+    adaptiveRefresh = true,
+    alerts = {
+      enabled = true,
+      speaker = true,
+      redstone = true,
+      redstoneSide = "back",
+      cooldownSeconds = 10,
+    },
+    presets = {
+      safe = {
+        profile = "safe",
+        waterMode = "stop",
+        maxContinuousSeal = 8,
+      },
+      balanced = {
+        profile = "balanced",
+        waterMode = "seal",
+        maxContinuousSeal = 32,
+      },
+      turbo = {
+        profile = "turbo",
+        waterMode = "seal",
+        maxContinuousSeal = 64,
+      },
+    },
+    sorting = {
+      enabled = false,
+      interval = 30,
+      source = "",
+      valuableTarget = "",
+      bulkTarget = "",
+      sealTarget = "",
+      valuableItems = {},
+      sealBlocks = {
+        ["minecraft:cobblestone"] = true,
+        ["minecraft:cobbled_deepslate"] = true,
+        ["minecraft:stone"] = true,
+        ["minecraft:netherrack"] = true,
+        ["minecraft:dirt"] = true,
+      },
+    },
   }
 end
 
@@ -162,6 +268,75 @@ function M.defaultState()
     checkpoint = nil,
     request = nil,
     service = nil,
+    stagedStop = false,
+    journal = {
+      enabled = true,
+      -- Compact runtime counters are retained alongside descriptive metadata.
+      seq = 0,
+      writes = 0,
+      checkpoints = 0,
+      sequence = 0,
+      entries = 0,
+      lastCheckpointAt = nil,
+      lastCheckpointMove = 0,
+      lastEntryAt = nil,
+      lastError = nil,
+      recovered = false,
+    },
+    lighting = {
+      mode = "safe",
+      interval = 10,
+      temporaryFloor = true,
+      placed = 0,
+      torchesPlaced = 0,
+      torchesRecovered = 0,
+      torchRefills = 0,
+      torchShortages = 0,
+      shortages = 0,
+      lastPlacedAt = nil,
+      lastError = nil,
+      lastAt = nil,
+      lastPose = nil,
+    },
+    water = {
+      mode = "seal",
+      detected = 0,
+      sealed = 0,
+      blocked = 0,
+      stopped = 0,
+      ignored = 0,
+      continuousSeals = 0,
+      lastAt = nil,
+      lastError = nil,
+      last = nil,
+      lastRun = 0,
+    },
+    recycle = {
+      enabled = true,
+      attempts = 0,
+      recycled = 0,
+      skipped = 0,
+      held = 0,
+      cap = 64,
+      overflow = 0,
+      compressed = 0,
+      byName = {},
+      lastAt = nil,
+      lastError = nil,
+    },
+    serviceStats = {
+      started = 0,
+      completed = 0,
+      interrupted = 0,
+      moves = 0,
+      adaptive = 0,
+    },
+    -- `report` is the current/last job report.  `jobReport` is kept as an
+    -- explicit alias for controllers written against the V3 draft API.
+    report = nil,
+    lastReport = nil,
+    jobReport = nil,
+    estimate = { estimated = 0, actual = 0, variance = 0 },
     lastError = nil,
     completionReason = nil,
     pendingAction = nil,
@@ -176,6 +351,30 @@ function M.defaultState()
       unloads = 0,
       refuels = 0,
       sealRefills = 0,
+      torchesPlaced = 0,
+      torchesRecovered = 0,
+      torchRefills = 0,
+      torchShortages = 0,
+      waterDetected = 0,
+      waterSealed = 0,
+      waterBlocked = 0,
+      waterStopped = 0,
+      waterIgnored = 0,
+      recycledBlocks = 0,
+      recycled = 0,
+      recycleRuns = 0,
+      sealOverflow = 0,
+      compressions = 0,
+      services = 0,
+      serviceReturns = 0,
+      serviceMoves = 0,
+      journalRecoveries = 0,
+      journalWrites = 0,
+      powerRecoveries = 0,
+      jobsStarted = 0,
+      jobsAborted = 0,
+      jobsFailed = 0,
+      jobReports = 0,
       jobsCompleted = 0,
       startedAt = M.nowSeconds(),
     },
@@ -183,201 +382,68 @@ function M.defaultState()
   }
 end
 
-function M.loadConfig()
-  local raw, err = M.loadTable(M.CONFIG_PATH, {})
-  if err then return nil, err end
-  local role = raw and raw.role or nil
-  if role == "worker" then return M.merge(M.defaultWorkerConfig(), raw), nil end
-  if role == "controller" then return M.merge(M.defaultControllerConfig(), raw), nil end
-  if role == "gps" then return M.merge(M.defaultGPSConfig(), raw), nil end
-  return raw, nil
+local function normalizeEnum(value, allowed, fallback)
+  value = string.lower(M.trim(value))
+  return allowed[value] and value or fallback
 end
 
-function M.saveConfig(config)
-  config.schema = M.SCHEMA
-  config.version = M.VERSION
-  return M.saveTable(M.CONFIG_PATH, config)
+local function normalizeInteger(value, minimum, maximum, fallback)
+  value = tonumber(value)
+  if not value or value ~= math.floor(value) then return fallback end
+  if minimum and value < minimum then return fallback end
+  if maximum and value > maximum then return fallback end
+  return value
 end
 
-return M
-]] },
-  { target = [[lib/protocol.lua]], content = [[-- CC Miner V2 - rednet protocol helpers
-
-local common = dofile("/ccminer/lib/common.lua")
-local M = {}
-
-local function makeId(prefix)
-  local millis = common.nowMillis()
-  local randomPart = math.random(100000, 999999)
-  return ("%s-%d-%d-%d"):format(prefix or "msg", os.getComputerID(), millis, randomPart)
+local function normalizeNumber(value, minimum, maximum, fallback)
+  value = tonumber(value)
+  if not value then return fallback end
+  if minimum and value < minimum then return fallback end
+  if maximum and value > maximum then return fallback end
+  return value
 end
 
-function M.message(kind, key, payload, target)
-  return {
-    magic = common.MAGIC,
-    schema = common.SCHEMA,
-    version = common.VERSION,
-    kind = kind,
-    key = key,
-    sender = os.getComputerID(),
-    target = target,
-    id = makeId(kind),
-    sentAt = common.nowSeconds(),
-    payload = payload or {},
-  }
+local function normalizeBoolean(value, fallback)
+  if type(value) == "boolean" then return value end
+  return fallback
 end
 
-function M.validate(message, expectedKey, expectedTarget, actualSender)
-  if type(message) ~= "table" then return false, "not_table" end
-  if message.magic ~= common.MAGIC then return false, "bad_magic" end
-  if tonumber(message.schema) ~= common.SCHEMA then return false, "bad_schema" end
-  if message.version ~= common.VERSION then return false, "bad_version" end
-  if type(message.kind) ~= "string" then return false, "bad_kind" end
-  if type(message.id) ~= "string" or message.id == "" then return false, "bad_id" end
-  if type(message.payload) ~= "table" then return false, "bad_payload" end
-  local claimedSender = tonumber(message.sender)
-  if not claimedSender then return false, "bad_sender" end
-  if actualSender and claimedSender ~= tonumber(actualSender) then return false, "sender_mismatch" end
-  if expectedKey and expectedKey ~= "" and message.key ~= expectedKey then return false, "bad_key" end
-  if expectedTarget and message.target and tonumber(message.target) ~= tonumber(expectedTarget) then
-    return false, "wrong_target"
+local function normalizeString(value, fallback, minimum, maximum)
+  if type(value) ~= "string" then return fallback end
+  if minimum and #value < minimum then return fallback end
+  if maximum and #value > maximum then return fallback end
+  return value
+end
+
+local function normalizePeripheralName(value, fallback)
+  value = normalizeString(value, fallback, 0, 64)
+  if type(value) ~= "string" then return "" end
+  if value:find("[%c]") then return fallback or "" end
+  return value
+end
+
+local function normalizeSlotList(value, fallback)
+  if type(value) ~= "table" then return M.copy(fallback) end
+  local out, seen = {}, {}
+  for index = 1, #value do
+    local slot = normalizeInteger(value[index], 1, 16, nil)
+    if not slot or seen[slot] then return M.copy(fallback) end
+    seen[slot] = true
+    out[#out + 1] = slot
   end
-  return true
+  if #out == 0 and #fallback > 0 then return M.copy(fallback) end
+  return out
 end
 
-function M.open()
-  local opened = common.openWirelessModems()
-  return #opened > 0, opened
-end
-
-function M.send(target, message)
-  if not rednet then return false, "rednet_unavailable" end
-  local ok, result = pcall(rednet.send, tonumber(target), message, common.PROTOCOL)
-  if not ok then return false, tostring(result) end
-  return result == true, result == true and nil or "send_failed"
-end
-
-function M.broadcast(message)
-  if not rednet then return false, "rednet_unavailable" end
-  local ok, result = pcall(rednet.broadcast, message, common.PROTOCOL)
-  if not ok then return false, tostring(result) end
-  return result ~= false, result == false and "broadcast_failed" or nil
-end
-
-function M.receive(timeout)
-  if not rednet then return nil, nil, "rednet_unavailable" end
-  local ok, sender, message, protocolName = pcall(rednet.receive, common.PROTOCOL, timeout)
-  if not ok then return nil, nil, tostring(sender) end
-  if not sender then return nil, nil, nil end
-  return sender, message, protocolName
-end
-
-function M.reply(target, key, request, kind, payload)
-  local message = M.message(kind, key, payload, target)
-  if request and request.id then message.replyTo = request.id end
-  return M.send(target, message)
-end
-
-return M
-]] },
-  { target = [[lib/geo.lua]], content = [[-- CC Miner V2 - GPS and coordinate transforms.
-
-local M = {}
-
-local function rounded(value)
-  if type(value) ~= "number" then return nil end
-  if value >= 0 then return math.floor(value + 0.5) end
-  return math.ceil(value - 0.5)
-end
-
-function M.integerFix(x, y, z, tolerance)
-  tolerance = tonumber(tolerance) or 0.35
-  local rx, ry, rz = rounded(x), rounded(y), rounded(z)
-  if not rx or not ry or not rz then return nil, "invalid_fix" end
-  if math.abs(x - rx) > tolerance or math.abs(y - ry) > tolerance or math.abs(z - rz) > tolerance then
-    return nil, "non_block_fix"
+local function normalizeBlockMap(value, fallback)
+  if type(value) ~= "table" then return M.copy(fallback) end
+  local out = {}
+  for name, enabled in pairs(value) do
+    if type(name) ~= "string" or type(enabled) ~= "boolean" then return M.copy(fallback) end
+    out[name] = enabled
   end
-  return { x = rx, y = ry, z = rz }
+  return out
 end
 
-function M.validCalibration(calibration)
-  if type(calibration) ~= "table" or type(calibration.home) ~= "table" or type(calibration.forward) ~= "table" then
-    return false
-  end
-  local fx, fz = tonumber(calibration.forward.x), tonumber(calibration.forward.z)
-  if not fx or not fz or math.abs(fx) + math.abs(fz) ~= 1 then return false end
-  return tonumber(calibration.home.x) ~= nil
-    and tonumber(calibration.home.y) ~= nil
-    and tonumber(calibration.home.z) ~= nil
-end
-
-function M.rightVector(calibration)
-  if not M.validCalibration(calibration) then return nil end
-  local forward = calibration.forward
-  return { x = -forward.z, z = forward.x }
-end
-
-function M.localToWorld(calibration, pose)
-  if not M.validCalibration(calibration) then return nil, "gps_not_calibrated" end
-  pose = pose or {}
-  local home, forward = calibration.home, calibration.forward
-  local right = M.rightVector(calibration)
-  local x, y, z = tonumber(pose.x) or 0, tonumber(pose.y) or 0, tonumber(pose.z) or 0
-  return {
-    x = home.x + right.x * x + forward.x * z,
-    y = home.y + y,
-    z = home.z + right.z * x + forward.z * z,
-  }
-end
-
-function M.worldToLocal(calibration, world, dir)
-  if not M.validCalibration(calibration) then return nil, "gps_not_calibrated" end
-  world = world or {}
-  local wx, wy, wz = tonumber(world.x), tonumber(world.y), tonumber(world.z)
-  if not wx or not wy or not wz then return nil, "invalid_world_position" end
-  local home, forward = calibration.home, calibration.forward
-  local right = M.rightVector(calibration)
-  local dx, dz = wx - home.x, wz - home.z
-  return {
-    x = dx * right.x + dz * right.z,
-    y = wy - home.y,
-    z = dx * forward.x + dz * forward.z,
-    dir = tonumber(dir) or 0,
-  }
-end
-
-function M.samePosition(a, b)
-  if type(a) ~= "table" or type(b) ~= "table" then return false end
-  return tonumber(a.x) == tonumber(b.x)
-    and tonumber(a.y) == tonumber(b.y)
-    and tonumber(a.z) == tonumber(b.z)
-end
-
-function M.poseAfterMove(pose, direction)
-  pose = {
-    x = tonumber(pose and pose.x) or 0,
-    y = tonumber(pose and pose.y) or 0,
-    z = tonumber(pose and pose.z) or 0,
-    dir = (tonumber(pose and pose.dir) or 0) % 4,
-  }
-  if direction == "up" then pose.y = pose.y + 1
-  elseif direction == "down" then pose.y = pose.y - 1
-  elseif direction == "forward" then
-    if pose.dir == 0 then pose.z = pose.z + 1
-    elseif pose.dir == 1 then pose.x = pose.x + 1
-    elseif pose.dir == 2 then pose.z = pose.z - 1
-    else pose.x = pose.x - 1 end
-  elseif direction == "back" then
-    if pose.dir == 0 then pose.z = pose.z - 1
-    elseif pose.dir == 1 then pose.x = pose.x - 1
-    elseif pose.dir == 2 then pose.z = pose.z + 1
-    else pose.x = pose.x + 1 end
-  end
-  return pose
-end
-
-function M.chunkCoord(value)
-  return math.floor((tonumber(value) or 0) / 16)
-end
-
-function M.chunkKey(cx, cz)
+local function normalizeTable(defaults, loaded)
+  if type(loaded) ~= "table" then return M.copy(defaults) end

@@ -1,14 +1,16 @@
--- CC Miner V2 - shared helpers
+-- CC Miner V3 - shared helpers
 -- Compatible with CC: Restitched / CC:Tweaked 1.100.x (Minecraft 1.18.2).
 
 local M = {}
 
-M.VERSION = "2.1.0"
+M.VERSION = "3.0.0"
 M.SCHEMA = 3
 M.ROOT = "/ccminer"
 M.CONFIG_PATH = M.ROOT .. "/config.db"
 M.STATE_PATH = M.ROOT .. "/data/state.db"
 M.LOG_PATH = M.ROOT .. "/data/ccminer.log"
+-- Keep the legacy wire identifiers stable; the release version is carried
+-- separately in each message and advances with the V3 release.
 M.PROTOCOL = "ccminer:v2"
 M.MAGIC = "CCMINER_V2"
 
@@ -403,6 +405,10 @@ function M.statusColor(status)
     waiting_fuel = colors.orange,
     waiting_output = colors.orange,
     waiting_seal = colors.orange,
+    dormant = colors.gray,
+    waiting_torch = colors.orange,
+    waiting_water = colors.blue,
+    recovering = colors.lightBlue,
     blocked = colors.red,
     complete = colors.cyan,
     aborted = colors.red,
@@ -427,12 +433,19 @@ function M.defaultWorkerConfig()
     moveRetryDelay = 0.4,
     heartbeatSeconds = 2,
     attackEntities = false,
+    -- V3 operating profile.  These fields are additive so a V2 config can
+    -- still be loaded and merged with the defaults below.
+    profile = "balanced",
+    waterMode = "seal",
+    maxContinuousSeal = 32,
     maxWidth = 128,
     maxLength = 512,
     maxDepth = 128,
     maxVolume = 2000000,
     outputSide = "back",
     fuelSide = "top",
+    -- Keep the torch chest separate from the output/seal chest by default.
+    torchSide = "left",
     lavaMode = "seal",
     sealSide = "right",
     sealTarget = 64,
@@ -443,6 +456,52 @@ function M.defaultWorkerConfig()
       ["minecraft:stone"] = true,
       ["minecraft:netherrack"] = true,
       ["minecraft:dirt"] = true,
+    },
+    lighting = {
+      mode = "safe",
+      interval = 10,
+      temporaryFloor = true,
+      torchTarget = 64,
+      torchReserve = 8,
+      preferredSlots = { 15, 16 },
+      torchBlocks = {
+        ["minecraft:torch"] = true,
+      },
+      reserve = 8,
+      -- Runtime compatibility knobs.  The V3 planner primarily uses the
+      -- fields above; these make an explicitly configured side/slot safe for
+      -- older worker code as well.
+      slot = 16,
+      side = "left",
+    },
+    materials = {
+      sealSlots = { 13, 14 },
+      torchSlots = { 15, 16 },
+      fuelReserveSlots = { 12 },
+      compactEveryMoves = 32,
+      recycleMinedBlocks = true,
+      retainSealTarget = 64,
+    },
+    service = {
+      adaptive = true,
+      finishCurrentChunk = true,
+      stations = {},
+    },
+    journal = {
+      enabled = true,
+      checkpointEvery = 32,
+      maxEntries = 256,
+      path = M.ROOT .. "/data/state.journal",
+    },
+    alerts = {
+      enabled = true,
+      speaker = false,
+      redstone = false,
+      redstoneSide = "back",
+      cooldownSeconds = 10,
+      onWaiting = true,
+      onComplete = true,
+      onError = true,
     },
     gps = {
       enabled = true,
@@ -478,6 +537,50 @@ function M.defaultControllerConfig()
     monitorTextScale = 0.5,
     monitorName = "",
     touchEnabled = true,
+    historyLimit = 50,
+    queueEnabled = true,
+    overlapProtection = true,
+    adaptiveRefresh = true,
+    alerts = {
+      enabled = true,
+      speaker = true,
+      redstone = true,
+      redstoneSide = "back",
+      cooldownSeconds = 10,
+    },
+    presets = {
+      safe = {
+        profile = "safe",
+        waterMode = "stop",
+        maxContinuousSeal = 8,
+      },
+      balanced = {
+        profile = "balanced",
+        waterMode = "seal",
+        maxContinuousSeal = 32,
+      },
+      turbo = {
+        profile = "turbo",
+        waterMode = "seal",
+        maxContinuousSeal = 64,
+      },
+    },
+    sorting = {
+      enabled = false,
+      interval = 30,
+      source = "",
+      valuableTarget = "",
+      bulkTarget = "",
+      sealTarget = "",
+      valuableItems = {},
+      sealBlocks = {
+        ["minecraft:cobblestone"] = true,
+        ["minecraft:cobbled_deepslate"] = true,
+        ["minecraft:stone"] = true,
+        ["minecraft:netherrack"] = true,
+        ["minecraft:dirt"] = true,
+      },
+    },
   }
 end
 
@@ -511,6 +614,75 @@ function M.defaultState()
     checkpoint = nil,
     request = nil,
     service = nil,
+    stagedStop = false,
+    journal = {
+      enabled = true,
+      -- Compact runtime counters are retained alongside descriptive metadata.
+      seq = 0,
+      writes = 0,
+      checkpoints = 0,
+      sequence = 0,
+      entries = 0,
+      lastCheckpointAt = nil,
+      lastCheckpointMove = 0,
+      lastEntryAt = nil,
+      lastError = nil,
+      recovered = false,
+    },
+    lighting = {
+      mode = "safe",
+      interval = 10,
+      temporaryFloor = true,
+      placed = 0,
+      torchesPlaced = 0,
+      torchesRecovered = 0,
+      torchRefills = 0,
+      torchShortages = 0,
+      shortages = 0,
+      lastPlacedAt = nil,
+      lastError = nil,
+      lastAt = nil,
+      lastPose = nil,
+    },
+    water = {
+      mode = "seal",
+      detected = 0,
+      sealed = 0,
+      blocked = 0,
+      stopped = 0,
+      ignored = 0,
+      continuousSeals = 0,
+      lastAt = nil,
+      lastError = nil,
+      last = nil,
+      lastRun = 0,
+    },
+    recycle = {
+      enabled = true,
+      attempts = 0,
+      recycled = 0,
+      skipped = 0,
+      held = 0,
+      cap = 64,
+      overflow = 0,
+      compressed = 0,
+      byName = {},
+      lastAt = nil,
+      lastError = nil,
+    },
+    serviceStats = {
+      started = 0,
+      completed = 0,
+      interrupted = 0,
+      moves = 0,
+      adaptive = 0,
+    },
+    -- `report` is the current/last job report.  `jobReport` is kept as an
+    -- explicit alias for controllers written against the V3 draft API.
+    report = nil,
+    lastReport = nil,
+    jobReport = nil,
+    estimate = { estimated = 0, actual = 0, variance = 0 },
     lastError = nil,
     completionReason = nil,
     pendingAction = nil,
@@ -525,6 +697,30 @@ function M.defaultState()
       unloads = 0,
       refuels = 0,
       sealRefills = 0,
+      torchesPlaced = 0,
+      torchesRecovered = 0,
+      torchRefills = 0,
+      torchShortages = 0,
+      waterDetected = 0,
+      waterSealed = 0,
+      waterBlocked = 0,
+      waterStopped = 0,
+      waterIgnored = 0,
+      recycledBlocks = 0,
+      recycled = 0,
+      recycleRuns = 0,
+      sealOverflow = 0,
+      compressions = 0,
+      services = 0,
+      serviceReturns = 0,
+      serviceMoves = 0,
+      journalRecoveries = 0,
+      journalWrites = 0,
+      powerRecoveries = 0,
+      jobsStarted = 0,
+      jobsAborted = 0,
+      jobsFailed = 0,
+      jobReports = 0,
       jobsCompleted = 0,
       startedAt = M.nowSeconds(),
     },
@@ -532,12 +728,220 @@ function M.defaultState()
   }
 end
 
+local function normalizeEnum(value, allowed, fallback)
+  value = string.lower(M.trim(value))
+  return allowed[value] and value or fallback
+end
+
+local function normalizeInteger(value, minimum, maximum, fallback)
+  value = tonumber(value)
+  if not value or value ~= math.floor(value) then return fallback end
+  if minimum and value < minimum then return fallback end
+  if maximum and value > maximum then return fallback end
+  return value
+end
+
+local function normalizeNumber(value, minimum, maximum, fallback)
+  value = tonumber(value)
+  if not value then return fallback end
+  if minimum and value < minimum then return fallback end
+  if maximum and value > maximum then return fallback end
+  return value
+end
+
+local function normalizeBoolean(value, fallback)
+  if type(value) == "boolean" then return value end
+  return fallback
+end
+
+local function normalizeString(value, fallback, minimum, maximum)
+  if type(value) ~= "string" then return fallback end
+  if minimum and #value < minimum then return fallback end
+  if maximum and #value > maximum then return fallback end
+  return value
+end
+
+local function normalizePeripheralName(value, fallback)
+  value = normalizeString(value, fallback, 0, 64)
+  if type(value) ~= "string" then return "" end
+  if value:find("[%c]") then return fallback or "" end
+  return value
+end
+
+local function normalizeSlotList(value, fallback)
+  if type(value) ~= "table" then return M.copy(fallback) end
+  local out, seen = {}, {}
+  for index = 1, #value do
+    local slot = normalizeInteger(value[index], 1, 16, nil)
+    if not slot or seen[slot] then return M.copy(fallback) end
+    seen[slot] = true
+    out[#out + 1] = slot
+  end
+  if #out == 0 and #fallback > 0 then return M.copy(fallback) end
+  return out
+end
+
+local function normalizeBlockMap(value, fallback)
+  if type(value) ~= "table" then return M.copy(fallback) end
+  local out = {}
+  for name, enabled in pairs(value) do
+    if type(name) ~= "string" or type(enabled) ~= "boolean" then return M.copy(fallback) end
+    out[name] = enabled
+  end
+  return out
+end
+
+local function normalizeTable(defaults, loaded)
+  if type(loaded) ~= "table" then return M.copy(defaults) end
+  return M.merge(defaults, loaded)
+end
+
+local function normalizeWorkerConfig(raw)
+  local defaults = M.defaultWorkerConfig()
+  local config = normalizeTable(defaults, raw)
+  config.role = "worker"
+
+  config.networkKey = normalizeString(config.networkKey, defaults.networkKey, 8, 40)
+  config.workerName = normalizeString(config.workerName, defaults.workerName, 1, 20)
+  config.profile = normalizeEnum(config.profile, { safe = true, balanced = true, turbo = true }, defaults.profile)
+  config.waterMode = normalizeEnum(config.waterMode, { ignore = true, stop = true, seal = true }, defaults.waterMode)
+  config.maxContinuousSeal = normalizeInteger(config.maxContinuousSeal, 1, 4096, defaults.maxContinuousSeal)
+  config.reserveEmptySlots = normalizeInteger(config.reserveEmptySlots, 1, 8, defaults.reserveEmptySlots)
+  config.fuelBuffer = normalizeInteger(config.fuelBuffer, 0, 100000, defaults.fuelBuffer)
+  config.fuelTarget = normalizeInteger(config.fuelTarget, 500, 100000, defaults.fuelTarget)
+  config.moveRetries = normalizeInteger(config.moveRetries, 0, 100, defaults.moveRetries)
+  config.moveRetryDelay = normalizeNumber(config.moveRetryDelay, 0, 10, defaults.moveRetryDelay)
+  config.heartbeatSeconds = normalizeNumber(config.heartbeatSeconds, 0.1, 60, defaults.heartbeatSeconds)
+  config.maxWidth = normalizeInteger(config.maxWidth, 1, 4096, defaults.maxWidth)
+  config.maxLength = normalizeInteger(config.maxLength, 1, 4096, defaults.maxLength)
+  config.maxDepth = normalizeInteger(config.maxDepth, 1, 4096, defaults.maxDepth)
+  config.maxVolume = normalizeInteger(config.maxVolume, 1, 100000000, defaults.maxVolume)
+  config.lavaMode = normalizeEnum(config.lavaMode, { seal = true, stop = true }, defaults.lavaMode)
+  config.sealSide = normalizeEnum(config.sealSide, { right = true, left = true }, defaults.sealSide)
+  config.outputSide = normalizeEnum(config.outputSide,
+    { front = true, back = true, left = true, right = true, top = true, bottom = true }, defaults.outputSide)
+  config.fuelSide = normalizeEnum(config.fuelSide,
+    { front = true, back = true, left = true, right = true, top = true, bottom = true }, defaults.fuelSide)
+  config.torchSide = normalizeEnum(config.torchSide,
+    { left = true, right = true }, defaults.torchSide)
+  config.sealTarget = normalizeInteger(config.sealTarget, 16, 512, defaults.sealTarget)
+  config.sealReserve = normalizeInteger(config.sealReserve, 1, math.max(1, config.sealTarget - 1), defaults.sealReserve)
+  config.attackEntities = normalizeBoolean(config.attackEntities, defaults.attackEntities)
+
+  config.lighting = normalizeTable(defaults.lighting, config.lighting)
+  config.lighting.mode = normalizeEnum(config.lighting.mode, { off = true, safe = true, custom = true }, defaults.lighting.mode)
+  config.lighting.interval = normalizeInteger(config.lighting.interval, 1, 4096, defaults.lighting.interval)
+  config.lighting.temporaryFloor = normalizeBoolean(config.lighting.temporaryFloor, defaults.lighting.temporaryFloor)
+  config.lighting.torchTarget = normalizeInteger(config.lighting.torchTarget, 1, 512, defaults.lighting.torchTarget)
+  config.lighting.torchReserve = normalizeInteger(config.lighting.torchReserve, 0, math.max(0, config.lighting.torchTarget - 1), defaults.lighting.torchReserve)
+  config.lighting.reserve = normalizeInteger(config.lighting.reserve, 0, 512, defaults.lighting.reserve)
+  config.lighting.preferredSlots = normalizeSlotList(config.lighting.preferredSlots, defaults.lighting.preferredSlots)
+  config.lighting.torchBlocks = normalizeBlockMap(config.lighting.torchBlocks, defaults.lighting.torchBlocks)
+  config.lighting.slot = normalizeInteger(config.lighting.slot, 1, 16, defaults.lighting.slot)
+  local loadedLighting = type(raw) == "table" and raw.lighting or nil
+  local requestedTorchSide = type(loadedLighting) == "table" and loadedLighting.side or nil
+  if requestedTorchSide == nil and type(raw) == "table" then requestedTorchSide = raw.torchSide end
+  config.lighting.side = normalizeEnum(requestedTorchSide or config.lighting.side,
+    { left = true, right = true }, defaults.lighting.side)
+  if config.lavaMode == "seal" and config.lighting.side == config.sealSide then
+    config.lighting.side = config.sealSide == "left" and "right" or "left"
+  end
+  -- V3 uses lighting.side; retain the flat alias for older draft configs.
+  config.torchSide = config.lighting.side
+
+  config.materials = normalizeTable(defaults.materials, config.materials)
+  for _, key in ipairs({ "sealSlots", "torchSlots", "fuelReserveSlots" }) do
+    config.materials[key] = normalizeSlotList(config.materials[key], defaults.materials[key])
+  end
+  config.materials.compactEveryMoves = normalizeInteger(config.materials.compactEveryMoves, 1, 100000, defaults.materials.compactEveryMoves)
+  config.materials.recycleMinedBlocks = normalizeBoolean(config.materials.recycleMinedBlocks, defaults.materials.recycleMinedBlocks)
+  config.materials.retainSealTarget = normalizeInteger(config.materials.retainSealTarget, 1, 512, defaults.materials.retainSealTarget)
+
+  config.service = normalizeTable(defaults.service, config.service)
+  config.service.adaptive = normalizeBoolean(config.service.adaptive, defaults.service.adaptive)
+  config.service.finishCurrentChunk = normalizeBoolean(config.service.finishCurrentChunk, defaults.service.finishCurrentChunk)
+  if type(config.service.stations) ~= "table" then config.service.stations = M.copy(defaults.service.stations) end
+
+  config.journal = normalizeTable(defaults.journal, config.journal)
+  config.journal.enabled = normalizeBoolean(config.journal.enabled, defaults.journal.enabled)
+  config.journal.checkpointEvery = normalizeInteger(config.journal.checkpointEvery, 1, 100000, defaults.journal.checkpointEvery)
+  config.journal.maxEntries = normalizeInteger(config.journal.maxEntries, 1, 10000, defaults.journal.maxEntries)
+  if type(config.journal.path) ~= "string" or M.trim(config.journal.path) == "" then config.journal.path = defaults.journal.path end
+
+  config.alerts = normalizeTable(defaults.alerts, config.alerts)
+  config.alerts.enabled = normalizeBoolean(config.alerts.enabled, defaults.alerts.enabled)
+  config.alerts.speaker = normalizeBoolean(config.alerts.speaker, defaults.alerts.speaker)
+  config.alerts.redstone = normalizeBoolean(config.alerts.redstone, defaults.alerts.redstone)
+  config.alerts.redstoneSide = normalizeEnum(config.alerts.redstoneSide,
+    { front = true, back = true, left = true, right = true, top = true, bottom = true }, defaults.alerts.redstoneSide)
+  config.alerts.cooldownSeconds = normalizeInteger(config.alerts.cooldownSeconds, 0, 3600, defaults.alerts.cooldownSeconds)
+  config.alerts.onWaiting = normalizeBoolean(config.alerts.onWaiting, defaults.alerts.onWaiting)
+  config.alerts.onComplete = normalizeBoolean(config.alerts.onComplete, defaults.alerts.onComplete)
+  config.alerts.onError = normalizeBoolean(config.alerts.onError, defaults.alerts.onError)
+
+  config.gps = normalizeTable(defaults.gps, config.gps)
+  config.gps.enabled = normalizeBoolean(config.gps.enabled, defaults.gps.enabled)
+  config.gps.required = normalizeBoolean(config.gps.required, defaults.gps.required)
+  config.gps.timeout = normalizeNumber(config.gps.timeout, 0.1, 60, defaults.gps.timeout)
+  config.gps.verifyEveryMoves = normalizeInteger(config.gps.verifyEveryMoves, 1, 100000, defaults.gps.verifyEveryMoves)
+  config.gps.autoResolvePending = normalizeBoolean(config.gps.autoResolvePending, defaults.gps.autoResolvePending)
+  if config.gps.calibration ~= nil and type(config.gps.calibration) ~= "table" then config.gps.calibration = nil end
+  if type(config.protectedBlocks) ~= "table" then config.protectedBlocks = M.copy(defaults.protectedBlocks) end
+  if type(config.sealBlocks) ~= "table" then config.sealBlocks = M.copy(defaults.sealBlocks) end
+  return config
+end
+
+local function normalizeControllerConfig(raw)
+  local defaults = M.defaultControllerConfig()
+  local config = normalizeTable(defaults, raw)
+  config.role = "controller"
+  config.networkKey = normalizeString(config.networkKey, defaults.networkKey, 8, 40)
+  config.controllerName = normalizeString(config.controllerName, defaults.controllerName, 1, 20)
+  config.monitorName = normalizePeripheralName(config.monitorName, defaults.monitorName)
+  config.workerTimeoutSeconds = normalizeInteger(config.workerTimeoutSeconds, 1, 3600, defaults.workerTimeoutSeconds)
+  config.discoverySeconds = normalizeInteger(config.discoverySeconds, 1, 3600, defaults.discoverySeconds)
+  config.monitorTextScale = normalizeNumber(config.monitorTextScale, 0.5, 5, defaults.monitorTextScale)
+  if config.monitorTextScale * 2 ~= math.floor(config.monitorTextScale * 2) then config.monitorTextScale = defaults.monitorTextScale end
+  config.touchEnabled = normalizeBoolean(config.touchEnabled, defaults.touchEnabled)
+  config.historyLimit = normalizeInteger(config.historyLimit, 1, 1000, defaults.historyLimit)
+  config.queueEnabled = normalizeBoolean(config.queueEnabled, defaults.queueEnabled)
+  config.overlapProtection = normalizeBoolean(config.overlapProtection, defaults.overlapProtection)
+  config.adaptiveRefresh = normalizeBoolean(config.adaptiveRefresh, defaults.adaptiveRefresh)
+  config.alerts = normalizeTable(defaults.alerts, config.alerts)
+  config.alerts.enabled = normalizeBoolean(config.alerts.enabled, defaults.alerts.enabled)
+  config.alerts.speaker = normalizeBoolean(config.alerts.speaker, defaults.alerts.speaker)
+  config.alerts.redstone = normalizeBoolean(config.alerts.redstone, defaults.alerts.redstone)
+  config.alerts.redstoneSide = normalizeEnum(config.alerts.redstoneSide,
+    { front = true, back = true, left = true, right = true, top = true, bottom = true }, defaults.alerts.redstoneSide)
+  config.alerts.cooldownSeconds = normalizeInteger(config.alerts.cooldownSeconds, 0, 3600, defaults.alerts.cooldownSeconds)
+  config.presets = normalizeTable(defaults.presets, config.presets)
+  for _, name in ipairs({ "safe", "balanced", "turbo" }) do
+    config.presets[name] = normalizeTable(defaults.presets[name], config.presets[name])
+    config.presets[name].profile = normalizeEnum(config.presets[name].profile,
+      { safe = true, balanced = true, turbo = true }, defaults.presets[name].profile)
+    config.presets[name].waterMode = normalizeEnum(config.presets[name].waterMode,
+      { ignore = true, stop = true, seal = true }, defaults.presets[name].waterMode)
+    config.presets[name].maxContinuousSeal = normalizeInteger(config.presets[name].maxContinuousSeal, 1, 4096,
+      defaults.presets[name].maxContinuousSeal)
+  end
+  config.sorting = normalizeTable(defaults.sorting, config.sorting)
+  config.sorting.enabled = normalizeBoolean(config.sorting.enabled, defaults.sorting.enabled)
+  config.sorting.interval = normalizeInteger(config.sorting.interval, 1, 86400, defaults.sorting.interval)
+  config.sorting.source = normalizePeripheralName(config.sorting.source, defaults.sorting.source)
+  config.sorting.valuableTarget = normalizePeripheralName(config.sorting.valuableTarget, defaults.sorting.valuableTarget)
+  config.sorting.bulkTarget = normalizePeripheralName(config.sorting.bulkTarget, defaults.sorting.bulkTarget)
+  config.sorting.sealTarget = normalizePeripheralName(config.sorting.sealTarget, defaults.sorting.sealTarget)
+  config.sorting.valuableItems = normalizeBlockMap(config.sorting.valuableItems, defaults.sorting.valuableItems)
+  config.sorting.sealBlocks = normalizeBlockMap(config.sorting.sealBlocks, defaults.sorting.sealBlocks)
+  return config
+end
+
 function M.loadConfig()
   local raw, err = M.loadTable(M.CONFIG_PATH, {})
   if err then return nil, err end
   local role = raw and raw.role or nil
-  if role == "worker" then return M.merge(M.defaultWorkerConfig(), raw), nil end
-  if role == "controller" then return M.merge(M.defaultControllerConfig(), raw), nil end
+  if role == "worker" then return normalizeWorkerConfig(raw), nil end
+  if role == "controller" then return normalizeControllerConfig(raw), nil end
   if role == "gps" then return M.merge(M.defaultGPSConfig(), raw), nil end
   return raw, nil
 end

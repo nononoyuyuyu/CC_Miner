@@ -1,4 +1,4 @@
--- CC Miner V2 - generated worker source loader.
+-- CC Miner V3 - generated worker source loader.
 local parts = {
   "/ccminer/worker_parts/01.part",
   "/ccminer/worker_parts/02.part",

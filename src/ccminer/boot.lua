@@ -1,4 +1,4 @@
--- CC Miner V2 boot dispatcher
+-- CC Miner V3 boot dispatcher
 
 local common = dofile("/ccminer/lib/common.lua")
 local config, err = common.loadConfig()

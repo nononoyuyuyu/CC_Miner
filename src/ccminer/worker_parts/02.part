@@ -68,23 +68,65 @@ end
 
 local function applyControlCommand(command, payload)
   payload = payload or {}
-  if state.pendingAction and command ~= "rehome" and command ~= "ping" and command ~= "status" then
+  if command == "pause_now" or command == "finish_row" or command == "finish_layer" or command == "return_home" then
+    payload.mode = command
+    command = "stop"
+  end
+  if state.pendingAction and command ~= "rehome" and command ~= "ping" and command ~= "status" and command ~= "gps_fix" then
     return false, "Recovery required: return the turtle to its dock and use REHOME, or reboot with working GPS recovery."
   end
   if command == "start" then
     return startJob(payload)
+  elseif command == "stop" then
+    if not state.job then return false, "No active job." end
+    local mode = tostring(payload.mode or "pause_now")
+    local allowed = {
+      pause_now = true, finish_row = true, finish_layer = true,
+      return_home = true, abort = true,
+    }
+    if not allowed[mode] then return false, "Unknown staged stop mode: " .. mode end
+    state.stagedStop = {
+      mode = mode,
+      requestedAt = common.nowSeconds(),
+      requestedBy = payload.requestedBy and tostring(payload.requestedBy) or nil,
+      source = "stop",
+    }
+    if mode == "pause_now" then
+      state.request = "pause_now"
+      if state.status ~= "working" then state.status = "working" end
+    elseif mode == "return_home" or mode == "abort" then
+      state.request = mode
+      if mode == "abort" then state.completionReason = "aborted" end
+      if state.status ~= "working" then state.status = "working" end
+    elseif state.status ~= "working" then
+      state.status = "working"
+    end
+    saveState("stop_" .. mode)
+    return true, "Staged stop accepted: " .. mode
   elseif command == "pause" then
-    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
-      state.status = "paused"
-      state.phase = state.service and "service_paused" or "paused"
-      state.request = nil
-      saveState()
-      return true, "Pause accepted. Current route state was preserved."
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+      state.stagedStop = { mode = "pause_now", requestedAt = common.nowSeconds(), source = "pause" }
+      state.request = "pause_now"
+      if state.status ~= "working" then state.status = "working" end
+      saveState("pause")
+      return true, "Pause accepted; stopping at the next safe boundary."
     end
     return false, "Worker is not running."
   elseif command == "resume" then
     if state.status == "paused" or state.status == "blocked" then
+      if state.status == "blocked" then
+        local criticalPhase = {
+          state_corrupt = true,
+          gps_drift = true,
+          recovery_required = true,
+          gps_error = true,
+        }
+        if criticalPhase[tostring(state.phase or "")] then
+          return false, "Cannot resume from " .. tostring(state.phase) .. "; resolve GPS/state recovery or use REHOME first."
+        end
+      end
       state.lastError = nil
+      state.stagedStop = false
       if state.service then
         state.status, state.phase = "working", "service_requested"
       elseif isHome() and state.checkpoint and state.job then
@@ -96,7 +138,7 @@ local function applyControlCommand(command, payload)
       state.request = nil
       saveState()
       return true, "Resume accepted."
-    elseif state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
+    elseif state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
       state.status = "working"
       saveState()
       return true, "Service retry accepted."
@@ -105,6 +147,7 @@ local function applyControlCommand(command, payload)
   elseif command == "recall" then
     if not state.job then return false, "No active job." end
     state.request = "recall"
+    state.stagedStop = { mode = "return_home", requestedAt = common.nowSeconds(), source = "recall" }
     if state.status ~= "working" then state.status = "working" end
     saveState()
     return true, "Recall accepted. Worker will return and pause."
@@ -117,16 +160,28 @@ local function applyControlCommand(command, payload)
   elseif command == "abort" then
     if not state.job then return false, "No job to abort." end
     state.request = "abort"
+    state.completionReason = "aborted"
+    state.stagedStop = { mode = "abort", requestedAt = common.nowSeconds(), source = "abort" }
     if state.status ~= "working" then state.status = "working" end
     saveState()
     return true, "Abort accepted. Worker will return home."
   elseif command == "clear" then
     if state.pendingAction then return false, "Cannot clear while physical position is uncertain." end
     if not isHome() then return false, "Worker must be at home." end
-    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
+    if state.job and state.status ~= "complete" and state.status ~= "aborted" then
+      return false, "Cannot clear an unfinished job; ABORT it first."
+    end
+    if not state.job and state.status ~= "idle" then
+      return false, "No clearable job record exists in the current state."
+    end
+    if state.service or state.request then
+      return false, "Cannot clear while service or a control request is pending."
+    end
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
       return false, "Worker is busy."
     end
     state.job, state.checkpoint, state.service, state.request = nil, nil, nil, nil
+    state.stagedStop = false
     state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
     saveState()
     return true, "Job record cleared."
@@ -141,7 +196,7 @@ local function applyControlCommand(command, payload)
     return true, ("GPS fix: %d,%d,%d"):format(fix.x, fix.y, fix.z)
   elseif command == "rehome" then
     if payload.confirm ~= "RESET" then return false, "Rehome requires confirm=RESET." end
-    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
+    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
       return false, "Stop the worker before rehoming."
     end
     local calibration = gpsCalibration()
@@ -277,6 +332,23 @@ local function isLava(data)
   return string.lower(blockName(data)):find("lava", 1, true) ~= nil
 end
 
+local function isWater(data)
+  local name = string.lower(blockName(data))
+  return name:find("water", 1, true) ~= nil
+end
+
+local function waterMode()
+  local mode = state.job and state.job.waterMode
+  if not mode then mode = config.waterMode or (config.water and config.water.mode) or state.water.mode end
+  mode = tostring(mode or "ignore")
+  if mode ~= "ignore" and mode ~= "stop" and mode ~= "seal" then mode = "ignore" end
+  return mode
+end
+
+local function maxContinuousSeal()
+  return profileMaxContinuousSeal()
+end
+
 local function isInventoryBlock(side, data)
   if peripheral and peripheral.hasType then
     local ok, result = pcall(peripheral.hasType, side, "inventory")
@@ -294,7 +366,12 @@ end
 local function movementInterrupted(context)
   if context ~= "mining" and context ~= "service" then return false end
   if state.status ~= "working" then return true end
-  return state.request ~= nil
+  -- Only an immediate pause/return/abort interrupts an in-flight move.  A
+  -- finish_row/finish_layer request is evaluated by the route boundary logic.
+  if state.request == "pause_now" or state.request == "return_home" or state.request == "abort" or state.request == "recall" or state.request == "service" then
+    return true
+  end
+  return false
 end
 
 local function updatePoseAfterMove(direction)
@@ -302,9 +379,23 @@ local function updatePoseAfterMove(direction)
   state.stats.moves = (state.stats.moves or 0) + 1
 end
 
-local function sealLava(action, direction, data)
-  if (config.lavaMode or "seal") ~= "seal" then
-    return false, "lava:" .. blockName(data)
+local function sealFluid(action, direction, data, fluidKind)
+  fluidKind = fluidKind or (isWater(data) and "water" or "lava")
+  local mode = fluidKind == "water" and waterMode() or (config.lavaMode or "seal")
+  if mode ~= "seal" then
+    if fluidKind == "water" and mode == "stop" then
+      state.stats.waterBlocked = (state.stats.waterBlocked or 0) + 1
+      state.stats.waterStopped = (state.stats.waterStopped or 0) + 1
+      state.water.blocked = (state.water.blocked or 0) + 1
+      state.water.stopped = (state.water.stopped or 0) + 1
+      state.water.last = { kind = "water", name = blockName(data), pose = poseCopy() }
+    end
+    return false, fluidKind .. ":" .. blockName(data)
+  end
+  local continuous = tonumber(state.fluidSealRun) or 0
+  if continuous >= maxContinuousSeal() then
+    if fluidKind == "water" then state.stats.waterBlocked = (state.stats.waterBlocked or 0) + 1 end
+    return false, fluidKind == "water" and "water_seal_limit" or "lava_seal_limit"
   end
   local originalSlot = turtle.getSelectedSlot()
   local slot = selectSealMaterial()
@@ -313,8 +404,8 @@ local function sealLava(action, direction, data)
     return false, "seal_material"
   end
   local material = itemName(slot)
-  local prepared, prepareError = beginPhysicalAction("seal_" .. direction, {
-    fluid = blockName(data), material = material,
+  local prepared, prepareError = beginPhysicalAction("seal_" .. fluidKind .. "_" .. direction, {
+    fluid = blockName(data), material = material, fluidKind = fluidKind,
   }, poseCopy())
   if not prepared then turtle.select(originalSlot); return false, prepareError end
   local placed, placeReason = action.place()
@@ -323,10 +414,215 @@ local function sealLava(action, direction, data)
     cancelPhysicalAction()
     return false, "lava_seal_failed:" .. tostring(placeReason or blockName(data))
   end
-  state.stats.lavaSealed = (state.stats.lavaSealed or 0) + 1
+  if fluidKind == "water" then
+    state.stats.waterSealed = (state.stats.waterSealed or 0) + 1
+    state.water.sealed = (state.water.sealed or 0) + 1
+    state.water.lastRun = continuous + 1
+  else
+    state.stats.lavaSealed = (state.stats.lavaSealed or 0) + 1
+  end
+  state.fluidSealRun = continuous + 1
+  state.water.continuousSeals = state.fluidSealRun
+  state.fluidSealMarker = {
+    kind = fluidKind,
+    direction = direction,
+    material = material,
+    pose = poseCopy(),
+    at = common.nowSeconds(),
+  }
   commitPhysicalAction()
   sleep(0.15)
   return true
+end
+
+local function sealLava(action, direction, data)
+  return sealFluid(action, direction, data, "lava")
+end
+
+local function effectiveLighting()
+  -- lighting.mode is an explicit safety choice and is never changed by a
+  -- profile.  Profiles only adjust the requested placement cadence.
+  return effectiveLightingValues()
+end
+
+local function noteMinedMaterial(name)
+  if not isSealItemName(name) then return end
+  local materials, recycle = materialsConfig()
+  local enabled = materials.recycleMinedBlocks
+  if enabled == nil then enabled = recycle.enabled end
+  if enabled == false then return end
+  state.recycle = state.recycle or { byName = {}, held = 0, cap = 64, overflow = 0 }
+  state.recycle.byName = state.recycle.byName or {}
+  state.recycle.byName[name] = (state.recycle.byName[name] or 0) + 1
+  state.recycle.held = (state.recycle.held or 0) + 1
+  state.recycle.cap = math.max(0, math.floor(tonumber(materials.retainSealTarget or recycle.maxHeld or config.retainSealTarget or config.sealTarget or state.recycle.cap or 64) or 64))
+  if state.recycle.held > state.recycle.cap then
+    state.recycle.overflow = state.recycle.held - state.recycle.cap
+  end
+  state.stats.recycledBlocks = (state.stats.recycledBlocks or 0) + 1
+  state.stats.recycled = (state.stats.recycled or 0) + 1
+end
+
+local function isGravityBlock(data)
+  local name = string.lower(blockName(data))
+  for _, marker in ipairs({ "sand", "gravel", "concrete_powder", "anvil", "dragon_egg", "scaffolding" }) do
+    if name:find(marker, 1, true) then return true end
+  end
+  return false
+end
+
+local function tryPlaceTorchWall(relativeDir)
+  local originalDir = state.pose.dir
+  local originalSlot = turtle.getSelectedSlot()
+  local targetDir = (originalDir + relativeDir) % 4
+  local turned, turnError = turnTo(targetDir)
+  if not turned then return false, turnError end
+
+  local function restoreContext(reason)
+    turtle.select(originalSlot)
+    local restored, restoreError = turnTo(originalDir)
+    if not restored then return false, restoreError end
+    return false, reason
+  end
+
+  local present, data = turtle.inspect()
+  if present then
+    if relativeDir ~= 1 and relativeDir ~= 3 then return restoreContext("occupied") end
+    local protected, name = isProtected(data)
+    if protected or isInventoryBlock("front", data) or isLava(data) or isWater(data) or isGravityBlock(data) then
+      return restoreContext("occupied")
+    end
+    local _, emptySlots = inventoryStats()
+    if emptySlots <= 0 then return restoreContext("inventory_full") end
+    -- In a normal 1x1 tunnel, carve a one-block niche only from an ordinary
+    -- solid side block.  The dig and subsequent place are separately journaled
+    -- so a power loss can be re-inspected idempotently.
+    turtle.select(originalSlot)
+    local prepared, prepareError = beginPhysicalAction("dig_torch_niche_forward", {
+      block = name, side = relativeDir,
+    }, poseCopy())
+    if not prepared then return restoreContext(prepareError) end
+    local dug, digError = turtle.dig()
+    if not dug then
+      cancelPhysicalAction()
+      return restoreContext(digError or "torch_niche_dig_failed")
+    end
+    state.stats.blocksDug = (state.stats.blocksDug or 0) + 1
+    noteMinedMaterial(name)
+    state.fluidSealRun = 0
+    state.fluidSealMarker = nil
+    commitPhysicalAction()
+    local slot = selectTorchMaterial()
+    if not slot then return restoreContext("torch_material") end
+    local placedPrepared, placedPrepareError = beginPhysicalAction("torch_niche_forward", {
+      side = relativeDir, material = itemName(slot),
+    }, poseCopy())
+    if not placedPrepared then return restoreContext(placedPrepareError) end
+    local placed, placeError = turtle.place()
+    if not placed then
+      cancelPhysicalAction()
+      return restoreContext(placeError or "torch_niche_place_failed")
+    end
+    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
+    state.lighting.placed = (state.lighting.placed or 0) + 1
+    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
+    commitPhysicalAction()
+    turtle.select(originalSlot)
+    local restored, restoreError = turnTo(originalDir)
+    if not restored then return false, restoreError end
+    state.lighting.lastAt = common.nowSeconds()
+    state.lighting.lastPose = poseCopy()
+    return true
+  end
+
+  local slot = selectTorchMaterial()
+  if not slot then return restoreContext("torch_material") end
+  local prepared, prepareError = beginPhysicalAction("torch_wall", {
+    side = relativeDir, material = itemName(slot), pose = poseCopy(),
+  }, poseCopy())
+  if not prepared then return restoreContext(prepareError) end
+  local placed, placeError = turtle.place()
+  if placed then
+    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
+    state.lighting.placed = (state.lighting.placed or 0) + 1
+    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
+    commitPhysicalAction()
+  else
+    cancelPhysicalAction()
+  end
+  turtle.select(originalSlot)
+  local restored, restoreError = turnTo(originalDir)
+  if not restored then return false, restoreError end
+  if not placed then return false, placeError or "torch_wall_failed" end
+  state.lighting.lastAt = common.nowSeconds()
+  state.lighting.lastPose = poseCopy()
+  return true
+end
+
+local function tryPlaceTorchFloor()
+  local originalSlot = turtle.getSelectedSlot()
+  local slot = selectTorchMaterial()
+  if not slot then turtle.select(originalSlot); return false, "torch_material" end
+  -- placeDown is used only when the adjacent block is empty; this avoids
+  -- replacing a floor block and makes the fallback deterministic.
+  local hasBlock = turtle.inspectDown()
+  if hasBlock then turtle.select(originalSlot); return false, "occupied" end
+  local prepared, prepareError = beginPhysicalAction("torch_floor", {
+    side = "bottom", material = itemName(slot), pose = poseCopy(),
+  }, poseCopy())
+  if not prepared then turtle.select(originalSlot); return false, prepareError end
+  local placed, placeError = turtle.placeDown()
+  if placed then
+    state.stats.torchesPlaced = (state.stats.torchesPlaced or 0) + 1
+    state.lighting.placed = (state.lighting.placed or 0) + 1
+    state.lighting.torchesPlaced = (state.lighting.torchesPlaced or 0) + 1
+    commitPhysicalAction()
+  else
+    cancelPhysicalAction()
+  end
+  turtle.select(originalSlot)
+  if not placed then return false, placeError or "torch_floor_failed" end
+  state.lighting.lastAt = common.nowSeconds()
+  state.lighting.lastPose = poseCopy()
+  return true
+end
+
+local function maybePlaceTorch(context)
+  if context ~= "mining" then return true end
+  if isHome() then return true end
+  local mode, interval = effectiveLighting()
+  if mode == "off" then return true end
+  local moves = tonumber(state.stats.moves) or 0
+  if moves <= 0 or moves % interval ~= 0 then return true end
+  if torchMaterialCount() <= 0 then
+    state.stats.torchShortages = (state.stats.torchShortages or 0) + 1
+    state.lighting.shortages = (state.lighting.shortages or 0) + 1
+    return false, "torch_material"
+  end
+  -- Deterministic wall order: right, left, front, then floor.  Safe mode
+  -- omits the floor fallback; custom mode permits it when walls are absent.
+  local failureReason = nil
+  for _, relativeDir in ipairs({ 1, 3, 0 }) do
+    local placed, reason = tryPlaceTorchWall(relativeDir)
+    if placed then return true end
+    failureReason = reason or failureReason
+    if reason ~= "occupied" and reason ~= "torch_wall_failed" then
+      if reason == "torch_material" or reason == "inventory_full" then return false, reason end
+    end
+  end
+  local lighting = config.lighting or {}
+  if mode == "custom" and lighting.temporaryFloor == true then
+    local placed, reason = tryPlaceTorchFloor()
+    if placed then return true end
+    if reason == "torch_material" then return false, reason end
+    -- Floor placement is an optional custom fallback; inability to place it
+    -- must not turn a navigable route into a hard failure.
+    return true
+  end
+  if failureReason == "occupied" or failureReason == "torch_wall_failed" then
+    return false, "torch_surface_unavailable"
+  end
+  return false, failureReason or "torch_surface_unavailable"
 end
 
 local function moveOne(direction, context)
@@ -340,18 +636,52 @@ local function moveOne(direction, context)
     drainNetwork(3)
     if movementInterrupted(context) then return false, "control_request" end
 
+    local lit, lightError = maybePlaceTorch(context)
+    if not lit then return false, lightError end
+
     local level = fuelLevel()
     if level ~= "unlimited" and tonumber(level or 0) <= 0 then return false, "out_of_fuel" end
 
     local hasBlock, data = action.inspect()
+    local preserveSealMarker = false
     if hasBlock then
       local protected, name = isProtected(data)
       if protected then return false, "protected:" .. name, data end
       if isInventoryBlock(action.side, data) then return false, "protected_inventory:" .. name, data end
-      if isLava(data) then
+      if isWater(data) then
+        state.stats.waterDetected = (state.stats.waterDetected or 0) + 1
+        state.water.detected = (state.water.detected or 0) + 1
+        state.water.last = { kind = "water", name = name, direction = direction, pose = poseCopy() }
+        local mode = waterMode()
+        if mode == "ignore" then
+          -- Water is intentionally left to the turtle's normal movement/dig
+          -- retry path.  This preserves legacy behaviour for worlds where
+          -- water can be traversed without placing a seal.
+          state.water.lastRun = 0
+          state.fluidSealRun = 0
+          state.water.continuousSeals = 0
+          state.stats.waterIgnored = (state.stats.waterIgnored or 0) + 1
+          state.water.ignored = (state.water.ignored or 0) + 1
+        else
+          local sealed, sealError = sealFluid(action, direction, data, "water")
+          if not sealed then return false, sealError, data end
+        end
+      elseif isLava(data) then
+        state.water.lastRun = 0
         local sealed, sealError = sealLava(action, direction, data)
         if not sealed then return false, sealError, data end
       else
+        local marker = state.fluidSealMarker
+        preserveSealMarker = marker and (tonumber(state.fluidSealRun) or 0) > 0
+          and marker.direction == direction
+          and marker.material == name
+          and samePosePosition(marker.pose, state.pose)
+        state.water.lastRun = 0
+        if not preserveSealMarker then
+          state.fluidSealRun = 0
+          state.water.continuousSeals = 0
+          state.fluidSealMarker = nil
+        end
         local _, emptySlots = inventoryStats()
         if emptySlots <= 0 then return false, "inventory_full" end
         local prepared, prepareError = beginPhysicalAction("dig_" .. direction, { block = name }, poseCopy())

@@ -1,4 +1,4 @@
--- CC Miner V2 split offline installer loader
+-- CC Miner V3 split offline installer loader
 -- Keep the adjacent ccminer-offline.parts directory when transferring this file.
 local partNames = {
   "01.part",
@@ -14,6 +14,23 @@ local partNames = {
   "11.part",
   "12.part",
   "13.part",
+  "14.part",
+  "15.part",
+  "16.part",
+  "17.part",
+  "18.part",
+  "19.part",
+  "20.part",
+  "21.part",
+  "22.part",
+  "23.part",
+  "24.part",
+  "25.part",
+  "26.part",
+  "27.part",
+  "28.part",
+  "29.part",
+  "30.part",
 }
 local running = shell and shell.getRunningProgram and shell.getRunningProgram() or "ccminer-offline.lua"
 local base = fs.getDir(running)

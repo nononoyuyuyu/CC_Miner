@@ -1,33 +1,33 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="680" viewBox="0 0 1200 680" role="img" aria-labelledby="title desc">
-  <title id="title">CC Miner V2.1 システム全体図</title>
-  <desc id="desc">タッチコントローラー、GPSホスト、採掘タートル、燃料・封鎖材・搬出の3系統のチェスト、チャンク除外対応採掘領域</desc>
+  <title id="title">CC Miner V3.0.0 システム全体図</title>
+  <desc id="desc">タッチ式チャンクグリッド、GPSホスト、採掘タートル、燃料・Seal材・反対側専用Torch・搬出ドック、連結範囲を示す V3 構成</desc>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#334155"/></marker>
     <style>.box{fill:#f8fafc;stroke:#334155;stroke-width:3}.title{font:700 28px sans-serif;fill:#0f172a}.label{font:600 21px sans-serif;fill:#0f172a}.small{font:17px sans-serif;fill:#334155}.arrow{stroke:#334155;stroke-width:4;fill:none;marker-end:url(#arrow)}.wireless{stroke:#7c3aed;stroke-width:4;fill:none;stroke-dasharray:12 9;marker-end:url(#arrow)}.gps{stroke:#0891b2;stroke-width:4;fill:none;stroke-dasharray:8 7;marker-end:url(#arrow)}</style>
   </defs>
   <rect width="1200" height="680" fill="#fff"/>
-  <text x="600" y="45" text-anchor="middle" class="title">CC Miner V2.1 — システム全体図</text>
+  <text x="600" y="45" text-anchor="middle" class="title">CC Miner V3.0.0 — システム全体図</text>
 
   <rect class="box" x="40" y="135" width="270" height="195" rx="16"/>
   <text x="175" y="178" text-anchor="middle" class="label">タッチコントローラー</text>
   <text x="175" y="218" text-anchor="middle" class="small">Advanced Computer</text>
   <text x="175" y="251" text-anchor="middle" class="small">Wireless Modem</text>
-  <text x="175" y="284" text-anchor="middle" class="small">Advanced Monitor / Mouse</text>
+  <text x="175" y="284" text-anchor="middle" class="small">チャンク GRID / preflight / キュー</text>
 
   <rect class="box" x="40" y="395" width="270" height="170" rx="16"/>
   <text x="175" y="437" text-anchor="middle" class="label">GPSホスト ×4以上</text>
-  <text x="175" y="477" text-anchor="middle" class="small">3D配置・常時チャンクロード</text>
-  <text x="175" y="510" text-anchor="middle" class="small">ワールド座標を配信</text>
+  <text x="175" y="477" text-anchor="middle" class="small">3D配置・ワールド座標を配信</text>
+  <text x="175" y="510" text-anchor="middle" class="small">ロード管理は外部設定（取得・自動化なし）</text>
 
   <rect class="box" x="455" y="235" width="270" height="155" rx="16"/>
   <text x="590" y="278" text-anchor="middle" class="label">採掘タートル</text>
   <text x="590" y="318" text-anchor="middle" class="small">Advanced Mining Turtle</text>
-  <text x="590" y="351" text-anchor="middle" class="small">Wireless Modem + GPS補正</text>
+  <text x="590" y="351" text-anchor="middle" class="small">Wireless Modem + journal / 補給</text>
 
   <rect class="box" x="400" y="70" width="180" height="90" rx="12"/>
   <text x="490" y="108" text-anchor="middle" class="label">燃料</text><text x="490" y="138" text-anchor="middle" class="small">上</text>
   <rect class="box" x="600" y="70" width="180" height="90" rx="12"/>
-  <text x="690" y="108" text-anchor="middle" class="label">封鎖材</text><text x="690" y="138" text-anchor="middle" class="small">右</text>
+  <text x="690" y="108" text-anchor="middle" class="label">Seal 材（右）</text><text x="690" y="128" text-anchor="middle" class="small">専用 Torch は</text><text x="690" y="149" text-anchor="middle" class="small">反対側（左）</text>
   <rect class="box" x="500" y="470" width="180" height="90" rx="12"/>
   <text x="590" y="508" text-anchor="middle" class="label">搬出</text><text x="590" y="538" text-anchor="middle" class="small">後ろ</text>
 
@@ -35,13 +35,13 @@
   <text x="1012" y="228" text-anchor="middle" class="label">採掘領域</text>
   <text x="1012" y="269" text-anchor="middle" class="small">幅W × 長さL × 深さD</text>
   <text x="1012" y="302" text-anchor="middle" class="small">通常時: 高速蛇行経路</text>
-  <text x="1012" y="335" text-anchor="middle" class="small">除外時: 連結チャンクDFS</text>
-  <text x="1012" y="368" text-anchor="middle" class="small">溶岩: 固体ブロックで封鎖</text>
-  <text x="1012" y="401" text-anchor="middle" class="small">補給後: 安全経路で復帰</text>
+  <text x="1012" y="335" text-anchor="middle" class="small">除外時: 連結チャンク DFS</text>
+  <text x="1012" y="368" text-anchor="middle" class="small">水／溶岩: 設定に応じ封鎖／停止</text>
+  <text x="1012" y="401" text-anchor="middle" class="small">preflight・見積・復旧 wizard</text>
 
   <path class="wireless" d="M310 230 C365 205,400 220,455 280"/>
   <path class="gps" d="M310 480 C395 475,405 390,455 350"/>
   <path class="arrow" d="M490 160 L540 235"/><path class="arrow" d="M690 160 L645 235"/>
   <path class="arrow" d="M590 390 L590 470"/><path class="arrow" d="M725 312 L870 312"/>
-  <text x="600" y="635" text-anchor="middle" class="small">GPSは任意。未設置時もローカル座標と相対16×16区画で運用できます。</text>
+  <text x="600" y="635" text-anchor="middle" class="small">GPSは任意。未設置時はローカル座標と相対16×16区画で運用します。</text>
 </svg>

@@ -1,0 +1,223 @@
+      if fuel == nil then finding("FAIL", "fuel.api", "turtle fuel API unavailable")
+      elseif fuel == "unlimited" then finding("PASS", "fuel", "unlimited")
+      else
+        local target = tonumber(config.fuelTarget) or 0
+        local buffer = tonumber(config.fuelBuffer) or 0
+        if tonumber(fuel) and target > 0 and fuel < math.min(target, buffer > 0 and buffer or target) then
+          finding("WARN", "fuel", ("%s / %s (below configured reserve)"):format(tostring(fuel), tostring(fuelLimit or "-")))
+        else finding("PASS", "fuel", ("%s / %s"):format(tostring(fuel), tostring(fuelLimit or "-"))) end
+      end
+      local used, empty = countInventorySlots()
+      if used == nil then finding("FAIL", "inventory.slots", "turtle inventory API unavailable")
+      else
+        local reserve = tonumber(config.reserveEmptySlots) or 0
+        if empty < reserve then finding("WARN", "inventory.reserve", ("%d empty (target %d)"):format(empty, reserve))
+        else finding("PASS", "inventory.reserve", ("%d empty (target %d)"):format(empty, reserve)) end
+        local reserved = configuredReservedSlots(config)
+        if #reserved == 0 then finding("WARN", "inventory.reservedSlots", "no explicit material slots")
+        else
+          local present = {}
+          for _, slot in ipairs(reserved) do
+            local ok, count = pcall(turtle.getItemCount, slot)
+            present[#present + 1] = tostring(slot) .. "=" .. tostring(ok and count or 0)
+          end
+          finding("PASS", "inventory.reservedSlots", table.concat(present, ", "))
+        end
+      end
+    end
+  end
+
+  local rawState, stateError = readTableNoWrite(common.STATE_PATH)
+  if role == "worker" then
+    if not rawState then
+      finding(stateError == "missing" and "WARN" or "FAIL", "state.file", "state is " .. tostring(stateError or "missing"))
+    else
+      finding("PASS", "state.file", "readable")
+      local state = rawState
+      if tonumber(state.schema) ~= tonumber(common.SCHEMA) then finding("FAIL", "state.schema", "schema mismatch")
+      else finding("PASS", "state.schema", tostring(state.schema)) end
+      local statuses = { idle = true, working = true, paused = true, blocked = true, complete = true, aborted = true,
+        waiting_fuel = true, waiting_output = true, waiting_seal = true, waiting_torch = true, waiting_water = true,
+        recovering = true, dormant = true, calibrating = true }
+      if statuses[state.status] then finding("PASS", "state.status", tostring(state.status))
+      else finding("WARN", "state.status", "unknown status: " .. tostring(state.status)) end
+      if state.pendingAction ~= nil then
+        if type(state.pendingAction) ~= "table" or not state.pendingAction.kind then finding("FAIL", "state.pending", "malformed pendingAction")
+        elseif state.status ~= "blocked" and state.phase ~= "recovery_required" then finding("WARN", "state.pending", "pending action exists while state is not blocked")
+        else finding("PASS", "state.pending", tostring(state.pendingAction.kind)) end
+      else finding("PASS", "state.pending", "none") end
+      local active = state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output"
+        or state.status == "waiting_seal" or state.status == "waiting_torch"
+      if active and type(state.job) ~= "table" and type(state.service) ~= "table" then
+        finding("FAIL", "state.job", "active state has no job or service")
+      elseif type(state.job) == "table" then
+        local cursor, total = tonumber(state.job.cursor), tonumber(state.job.total)
+        if not cursor or not total or cursor < 0 or total <= 0 or cursor > total then
+          finding("FAIL", "state.job", "cursor/total is inconsistent")
+        else finding("PASS", "state.job", ("%d/%d"):format(cursor, total)) end
+      else finding("PASS", "state.job", "none") end
+      if state.request ~= nil and type(state.request) ~= "string" then finding("WARN", "state.request", "request is not a string") end
+      if state.stagedStop ~= nil and type(state.stagedStop) ~= "table" and type(state.stagedStop) ~= "boolean" then
+        finding("FAIL", "state.stagedStop", "malformed staged stop")
+      elseif type(state.stagedStop) == "table" then
+        finding("PASS", "state.stagedStop", valueString(state.stagedStop))
+      else
+        finding("PASS", "state.stagedStop", "none")
+      end
+    end
+  elseif stateError and stateError ~= "missing" then
+    finding("WARN", "state.file", "not applicable; read error " .. tostring(stateError))
+  end
+
+  if role == "controller" then
+    local found = false
+    for _, path in ipairs(controllerDbCandidates(config)) do
+      local db, dbError = readTableNoWrite(path)
+      if db then
+        found = true
+        local history = historyFromDb(db)
+        if history then
+          local historyCount = 0
+          for _ in pairs(history) do historyCount = historyCount + 1 end
+          finding("PASS", "controller.db", tostring(path) .. " entries=" .. tostring(historyCount))
+        else finding("WARN", "controller.db", tostring(path) .. " has no history table") end
+        break
+      elseif dbError and dbError ~= "missing" then finding("WARN", "controller.db", tostring(path) .. ": " .. tostring(dbError)) end
+    end
+    if not found then finding("WARN", "controller.db", "history database not found") end
+  end
+
+  print("")
+  print(("Doctor summary: PASS=%d WARN=%d FAIL=%d"):format(counts.PASS, counts.WARN, counts.FAIL))
+  if counts.FAIL > 0 then print("Doctor result: FAIL")
+  elseif counts.WARN > 0 then print("Doctor result: WARN")
+  else print("Doctor result: PASS") end
+end
+
+if command == "help" or command == "?" then
+  printHelp()
+elseif command == "version" then
+  print("CC Miner " .. tostring(common.VERSION or ""))
+elseif command == "setup" then
+  shell.run("/ccminer/setup.lua", args[2])
+elseif command == "dashboard" then
+  shell.run("/ccminer/controller.lua")
+elseif command == "discover" then
+  shell.run("/ccminer/controller.lua", "discover")
+elseif command == "doctor" then
+  runDoctor()
+elseif command == "report" then
+  runReport()
+elseif command == "rehome" then
+  local config, configError = common.loadConfig()
+  if not config then
+    reportError(configError or "Not configured.")
+  elseif config.role == "worker" then
+    if args[2] ~= "RESET" then
+      reportError("Place the turtle in its dock facing the quarry, then run: ccm rehome RESET")
+    else
+      local calibration = config.gps and config.gps.calibration or nil
+      if calibration and gps and gps.locate then
+        local x, y, z = gps.locate(2, false)
+        if not x then
+          reportError("A GPS fix is required to verify the calibrated dock. Rehome was cancelled.")
+          return
+        end
+        if common.round(x) ~= calibration.home.x or common.round(y) ~= calibration.home.y or common.round(z) ~= calibration.home.z then
+          reportError("GPS position does not match the calibrated dock. Rehome was cancelled.")
+          return
+        end
+      elseif calibration then
+        reportError("GPS is unavailable, so the calibrated dock cannot be verified. Rehome was cancelled.")
+        return
+      end
+      local previous = common.loadTable(common.STATE_PATH, common.defaultState())
+      local reset = common.defaultState()
+      if previous and previous.stats then reset.stats = previous.stats end
+      local ok, err = common.saveTable(common.STATE_PATH, reset)
+      if not ok then reportError("Cannot reset worker state: " .. tostring(err))
+      else print("Worker coordinates and job were reset to home. Run: reboot") end
+    end
+  elseif config.role == "controller" then
+    if not tonumber(args[2]) or args[3] ~= "RESET" then reportError("Usage: ccm rehome <id> RESET") else forwardController() end
+  else
+    reportError("Rehome is not available for role " .. tostring(config.role))
+  end
+elseif command == "start" or command == "pause" or command == "resume" or command == "recall"
+  or command == "service" or command == "abort" or command == "clear" or command == "gps" or command == "calibrate"
+  or command == "queue" or command == "preset" or command == "presets" or command == "stop" then
+  local config = loadConfigForCommand()
+  if config and config.role ~= "controller" then reportError("Run this command on the controller computer.")
+  elseif config then
+    if command == "stop" then
+      local mode = string.lower(tostring(args[3] or ""))
+      local stopModes = {
+        now = "pause_now", row = "finish_row", layer = "finish_layer", home = "return_home",
+        pause_now = "pause_now", finish_row = "finish_row", finish_layer = "finish_layer",
+        return_home = "return_home", abort = "abort",
+      }
+      local controllerMode = stopModes[mode]
+      local valid = controllerMode ~= nil
+      if not tonumber(args[2]) or not valid then
+        reportError("Usage: ccm stop <id> <now|row|layer|home|abort>")
+      else
+        local forwarded = {}
+        for index = 1, #args do forwarded[index] = args[index] end
+        forwarded[3] = controllerMode
+        forwardController(forwarded)
+      end
+    else
+      forwardController()
+    end
+  end
+elseif command == "status" then
+  local config, configError = common.loadConfig()
+  if not config then reportError(configError or "Not configured."); return end
+  print("CC Miner " .. tostring(common.VERSION or ""))
+  print("Role: " .. tostring(config.role))
+  print("Computer ID: " .. tostring(os.getComputerID()))
+  print("Label: " .. tostring(os.getComputerLabel and os.getComputerLabel() or "-"))
+  if type(config.networkKey) == "string" and config.networkKey ~= "" then print("Network key: configured (masked)") else print("Network key: not configured") end
+  printStatusFeature("Profile", config.profile)
+  printStatusFeature("Lighting", config.lighting, config.lightMode)
+  printStatusFeature("Water", config.water, config.waterMode)
+  printStatusFeature("Materials", config.materials)
+  printStatusFeature("Staged stop", config.stagedStop)
+  if config.role == "worker" then
+    local state, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
+    if stateError then reportError(stateError) end
+    print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
+    if state.pose then print(("Pose: x=%s y=%s z=%s dir=%s"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir)) end
+    print("GPS calibrated: " .. tostring(config.gps and config.gps.calibration ~= nil))
+    print("Lava mode: " .. tostring(config.lavaMode))
+    printStatusFeature("Lighting", state.lighting, config.lighting or config.lightMode)
+    printStatusFeature("Water", state.water, config.water or config.waterMode)
+    printStatusFeature("Profile", state.profile, config.profile)
+    printStatusFeature("Materials", state.materials, config.materials)
+    printStatusFeature("Staged stop", state.stagedStop, config.stagedStop)
+    if state.job then print(("Job: %s %s/%s [%s]"):format(tostring(state.job.name), tostring(state.job.cursor), tostring(state.job.total), tostring(state.job.strategy))) end
+    if state.lastError then print("Error: " .. tostring(state.lastError)) end
+  elseif config.role == "gps" then
+    print(("Coordinates: %s, %s, %s"):format(config.x, config.y, config.z))
+  end
+elseif command == "logs" then
+  if not fs.exists(common.LOG_PATH) then print("No log file yet."); return end
+  local handle = fs.open(common.LOG_PATH, "r")
+  local lines = {}
+  while true do
+    local line = handle.readLine()
+    if not line then break end
+    lines[#lines + 1] = line
+    if #lines > 30 then table.remove(lines, 1) end
+  end
+  handle.close()
+  for _, line in ipairs(lines) do print(line) end
+elseif command == "update" then
+  if not http then reportError("HTTP API is disabled."); return end
+  shell.run("wget", "run", "https://raw.githubusercontent.com/nononoyuyuyu/CC_Miner/main/install.lua", "update")
+else
+  reportError("Unknown command: " .. command)
+  printHelp()
+end
+]] },
+}

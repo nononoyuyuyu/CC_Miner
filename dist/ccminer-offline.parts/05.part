@@ -1,294 +1,317 @@
-  if not job then return false, err end
-  state.job = job
-  state.checkpoint = nil
-  state.service = {
-    resumeAfter = true,
-    finalStatus = "working",
-    preserveCheckpoint = false,
-    reason = "job_start",
-    startedAt = common.nowSeconds(),
+  local homeX, homeZ = numberValue(calibration.home.x), numberValue(calibration.home.z)
+  local rightX, rightZ = -forward.z, forward.x
+  return homeX + rightX * x + forward.x * z,
+    homeZ + rightZ * x + forward.z * z
+end
+
+local function chunkKey(mode, cx, cz)
+  return (mode == "world" and "W:" or "L:") .. tostring(cx) .. ":" .. tostring(cz)
+end
+
+M.chunkKey = chunkKey
+
+function M.chunkForCell(mode, calibration, x, z)
+  x, z = numberValue(x), numberValue(z)
+  if not x or not z then return nil, nil, "invalid_position" end
+  if mode == "world" then
+    if not validCalibration(calibration) then return nil, nil, "gps_not_calibrated" end
+    local wx, wz = localToWorld(calibration, x, z)
+    return math.floor(wx / 16), math.floor(wz / 16)
+  end
+  return math.floor(x / 16), math.floor((z - 1) / 16)
+end
+
+local function chunkComparator(a, b)
+  if a.cz ~= b.cz then return a.cz < b.cz end
+  if a.cx ~= b.cx then return a.cx < b.cx end
+  return tostring(a.key) < tostring(b.key)
+end
+
+function M.buildCatalog(width, length, mode, calibration)
+  local validWidth, validLength, _, columns = dimensions(width, length)
+  if not validWidth then return nil, validLength end
+  mode = mode == "world" and "world" or "local"
+  if mode == "world" and not validCalibration(calibration) then return nil, "gps_not_calibrated" end
+
+  local byKey, catalogSize = {}, 0
+  for x = 0, validWidth - 1 do
+    for z = 1, validLength do
+      local cx, cz, err = M.chunkForCell(mode, calibration, x, z)
+      if not cx then return nil, err end
+      local key = chunkKey(mode, cx, cz)
+      local chunk = byKey[key]
+      if not chunk then
+        catalogSize = catalogSize + 1
+        if catalogSize > MAX_CHUNKS then return nil, "too_many_chunks" end
+        chunk = {
+          key = key,
+          mode = mode,
+          cx = cx,
+          cz = cz,
+          minX = x,
+          maxX = x,
+          minZ = z,
+          maxZ = z,
+          cells = 0,
+        }
+        byKey[key] = chunk
+      end
+      if x < chunk.minX then chunk.minX = x end
+      if x > chunk.maxX then chunk.maxX = x end
+      if z < chunk.minZ then chunk.minZ = z end
+      if z > chunk.maxZ then chunk.maxZ = z end
+      chunk.cells = chunk.cells + 1
+    end
+  end
+
+  local catalog = {}
+  for _, chunk in pairs(byKey) do catalog[#catalog + 1] = chunk end
+  table.sort(catalog, chunkComparator)
+  return catalog
+end
+
+local function exclusionSet(exclusions, mode)
+  local set = {}
+  if exclusions == nil then return set end
+  if type(exclusions) ~= "table" then return nil, "invalid_exclusions" end
+  local seen = 0
+  for _, item in ipairs(exclusions) do
+    seen = seen + 1
+    if seen > MAX_CHUNKS then return nil, "too_many_exclusions" end
+    if type(item) == "string" then
+      if item ~= "" then set[item] = true end
+    elseif type(item) == "table" then
+      local itemMode = item.mode == "world" and "world" or item.mode == "local" and "local" or mode
+      local cx, cz = numberValue(item.cx), numberValue(item.cz)
+      if cx and cz and cx % 1 == 0 and cz % 1 == 0 then
+        set[chunkKey(itemMode, cx, cz)] = true
+      elseif item.key and tostring(item.key) ~= "" then
+        set[tostring(item.key)] = true
+      end
+    end
+  end
+  return set
+end
+
+local function overlaps(a1, a2, b1, b2)
+  return a1 <= b2 and b1 <= a2
+end
+
+local function adjacent(a, b)
+  if a.maxX + 1 == b.minX or b.maxX + 1 == a.minX then
+    return overlaps(a.minZ, a.maxZ, b.minZ, b.maxZ)
+  end
+  if a.maxZ + 1 == b.minZ or b.maxZ + 1 == a.minZ then
+    return overlaps(a.minX, a.maxX, b.minX, b.maxX)
+  end
+  return false
+end
+
+local function contains(chunk, x, z)
+  return x >= chunk.minX and x <= chunk.maxX and z >= chunk.minZ and z <= chunk.maxZ
+end
+
+local function appendIndex(index, value, key)
+  local list = index[value]
+  if not list then list = {}; index[value] = list end
+  list[#list + 1] = key
+end
+
+-- Build an edge-indexed graph.  The previous implementation compared every
+-- chunk with every other chunk; boundary indexes make normal rectangular jobs
+-- proportional to the number of chunks and their immediate candidates.
+local function buildNeighborGraph(chunks, keys)
+  local byMinX, byMaxX, byMinZ, byMaxZ = {}, {}, {}, {}
+  for _, key in ipairs(keys) do
+    local chunk = chunks[key]
+    appendIndex(byMinX, chunk.minX, key)
+    appendIndex(byMaxX, chunk.maxX, key)
+    appendIndex(byMinZ, chunk.minZ, key)
+    appendIndex(byMaxZ, chunk.maxZ, key)
+    chunk.neighbors = {}
+  end
+  local order = {}
+  for index, key in ipairs(keys) do order[key] = index end
+  local function addPair(leftKey, rightKey)
+    if leftKey == rightKey or order[leftKey] > order[rightKey] then return end
+    local left, right = chunks[leftKey], chunks[rightKey]
+    if not adjacent(left, right) then return end
+    left.neighbors[#left.neighbors + 1] = rightKey
+    right.neighbors[#right.neighbors + 1] = leftKey
+  end
+  for _, key in ipairs(keys) do
+    local chunk = chunks[key]
+    local candidates, seen = {}, {}
+    local function collect(list)
+      for _, candidate in ipairs(list or {}) do
+        if not seen[candidate] then seen[candidate] = true; candidates[#candidates + 1] = candidate end
+      end
+    end
+    collect(byMinX[chunk.maxX + 1])
+    collect(byMaxX[chunk.minX - 1])
+    collect(byMinZ[chunk.maxZ + 1])
+    collect(byMaxZ[chunk.minZ - 1])
+    table.sort(candidates, function(a, b) return order[a] < order[b] end)
+    for _, candidate in ipairs(candidates) do addPair(key, candidate) end
+  end
+  for _, key in ipairs(keys) do
+    table.sort(chunks[key].neighbors, function(left, right)
+      return order[left] < order[right]
+    end)
+  end
+end
+
+local function copyChunk(source)
+  local copy = {}
+  for key, value in pairs(source) do copy[key] = value end
+  copy.neighbors = {}
+  copy.parent = nil
+  copy.anchor = { x = copy.minX, z = copy.minZ }
+  return copy
+end
+
+-- Return a deterministic boundary cell on `chunk` closest to `previous`.
+-- `previous` may be a chunk, an anchor, or a point containing x/z.
+function M.chunkAnchor(chunk, previous)
+  if type(chunk) ~= "table" or not numberValue(chunk.minX) or not numberValue(chunk.maxX)
+      or not numberValue(chunk.minZ) or not numberValue(chunk.maxZ) then
+    return nil, "invalid_chunk"
+  end
+  local minX, maxX = chunk.minX, chunk.maxX
+  local minZ, maxZ = chunk.minZ, chunk.maxZ
+  local px, pz
+  if type(previous) == "table" then
+    px, pz = numberValue(previous.x), numberValue(previous.z)
+    if (not px or not pz) and previous.anchor then
+      px, pz = numberValue(previous.anchor.x), numberValue(previous.anchor.z)
+    end
+    if (not px or not pz) and previous.minX and previous.minZ then
+      px, pz = numberValue(previous.minX), numberValue(previous.minZ)
+    end
+  end
+  if not px or not pz then return { x = minX, z = minZ } end
+
+  local function clamp(value, low, high)
+    if value < low then return low end
+    if value > high then return high end
+    return value
+  end
+  local previousMinX, previousMaxX = numberValue(previous and previous.minX), numberValue(previous and previous.maxX)
+  local previousMinZ, previousMaxZ = numberValue(previous and previous.minZ), numberValue(previous and previous.maxZ)
+  if previousMinX and previousMaxX and previousMinZ and previousMaxZ then
+    if previousMaxX + 1 == minX and overlaps(minZ, maxZ, previousMinZ, previousMaxZ) then
+      return { x = minX, z = clamp(pz, math.max(minZ, previousMinZ), math.min(maxZ, previousMaxZ)) }
+    elseif maxX + 1 == previousMinX and overlaps(minZ, maxZ, previousMinZ, previousMaxZ) then
+      return { x = maxX, z = clamp(pz, math.max(minZ, previousMinZ), math.min(maxZ, previousMaxZ)) }
+    elseif previousMaxZ + 1 == minZ and overlaps(minX, maxX, previousMinX, previousMaxX) then
+      return { x = clamp(px, math.max(minX, previousMinX), math.min(maxX, previousMaxX)), z = minZ }
+    elseif maxZ + 1 == previousMinZ and overlaps(minX, maxX, previousMinX, previousMaxX) then
+      return { x = clamp(px, math.max(minX, previousMinX), math.min(maxX, previousMaxX)), z = maxZ }
+    end
+  end
+
+  -- For a non-adjacent reference, choose the closest point on the rectangle
+  -- perimeter, with a stable x-then-z tie break.
+  local candidates = {
+    { x = minX, z = clamp(pz, minZ, maxZ) },
+    { x = maxX, z = clamp(pz, minZ, maxZ) },
+    { x = clamp(px, minX, maxX), z = minZ },
+    { x = clamp(px, minX, maxX), z = maxZ },
   }
-  state.request = nil
-  state.status = "working"
-  state.phase = "starting_service"
-  state.lastError = nil
-  state.completionReason = nil
-  state.pose = { x = 0, y = 0, z = 0, dir = state.pose.dir or 0 }
-  saveState()
-  common.log("INFO", ("Job started: %s %dx%dx%d strategy=%s exclusions=%d"):format(
-    job.id, job.width, job.length, job.depth, job.strategy, #job.excludedChunks
-  ))
-  return true, "Job accepted."
+  local best, bestDistance
+  for _, candidate in ipairs(candidates) do
+    local distance = math.abs(candidate.x - px) + math.abs(candidate.z - pz)
+    if not best or distance < bestDistance or (distance == bestDistance and (candidate.x < best.x or (candidate.x == best.x and candidate.z < best.z))) then
+      best, bestDistance = candidate, distance
+    end
+  end
+  return best
 end
 
-local function calibrateGPS()
-  if state.pendingAction then return false, "Resolve the pending physical action first." end
-  if not isHome() or state.pose.dir ~= 0 then return false, "Place the turtle at home facing the quarry before GPS calibration." end
-  if state.job then return false, "Clear the active job before GPS calibration." end
-  if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
-    return false, "Worker must be stopped before GPS calibration."
-  end
-  if fuelLevel() ~= "unlimited" and tonumber(fuelLevel() or 0) < 2 then return false, "At least 2 fuel is required." end
-]] },
-  { target = [[worker_parts/02.part]], content = [[  local blocked = turtle.inspect()
-  if blocked then return false, "The block directly in front of the dock must be empty for calibration." end
+M.selectChunkAnchor = M.chunkAnchor
+M.chooseChunkAnchor = M.chunkAnchor
+M.chunkEntry = M.chunkAnchor
+M.chunkEntrance = M.chunkAnchor
 
-  state.status, state.phase, state.lastError = "calibrating", "gps_calibration", nil
-  saveState()
-  local homeFix, homeError = locateGPS()
-  if not homeFix then
-    state.status, state.phase = "blocked", "gps_error"
-    state.lastError = homeError
-    saveState()
-    return false, homeError
-  end
-
-  local prepared, prepareError = beginPhysicalAction("gps_calibration", { home = homeFix })
-  if not prepared then return false, prepareError end
-  local moved, moveError = turtle.forward()
-  if not moved then
-    cancelPhysicalAction()
-    state.status, state.phase, state.lastError = "blocked", "gps_error", moveError or "Calibration move failed."
-    saveState()
-    return false, state.lastError
-  end
-  sleep(0.15)
-  local forwardFix, forwardError = locateGPS()
-  local returned, returnError = turtle.back()
-  if not returned then
-    state.status, state.phase = "blocked", "recovery_required"
-    state.lastError = "GPS calibration moved forward but could not return: " .. tostring(returnError)
-    saveState()
-    return false, state.lastError
-  end
-  if not forwardFix then
-    cancelPhysicalAction()
-    state.status, state.phase, state.lastError = "blocked", "gps_error", forwardError
-    saveState()
-    return false, forwardError
-  end
-
-  local calibration, calibrationError = geo.calibrationFromFixes(homeFix, forwardFix)
-  if not calibration then
-    cancelPhysicalAction()
-    state.status, state.phase, state.lastError = "blocked", "gps_error", calibrationError
-    saveState()
-    return false, calibrationError
-  end
-  config.gps = config.gps or {}
-  config.gps.enabled = true
-  config.gps.calibration = calibration
-  local saved, saveError = common.saveConfig(config)
-  if not saved then
-    cancelPhysicalAction()
-    state.status, state.phase = "blocked", "gps_error"
-    state.lastError = "Could not save GPS calibration: " .. tostring(saveError)
-    saveState()
-    return false, state.lastError
-  end
-  state.gps.available = true
-  state.gps.lastFix = homeFix
-  state.gps.lastFixAt = common.nowSeconds()
-  state.gps.lastError = nil
-  state.status, state.phase, state.lastError = "idle", "home", nil
-  commitPhysicalAction()
-  common.log("INFO", ("GPS calibrated at %d,%d,%d forward=%d,%d"):format(
-    homeFix.x, homeFix.y, homeFix.z, calibration.forward.x, calibration.forward.z
-  ))
-  return true, "GPS calibrated."
-end
-
-local function applyControlCommand(command, payload)
-  payload = payload or {}
-  if state.pendingAction and command ~= "rehome" and command ~= "ping" and command ~= "status" then
-    return false, "Recovery required: return the turtle to its dock and use REHOME, or reboot with working GPS recovery."
-  end
-  if command == "start" then
-    return startJob(payload)
-  elseif command == "pause" then
-    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
-      state.status = "paused"
-      state.phase = state.service and "service_paused" or "paused"
-      state.request = nil
-      saveState()
-      return true, "Pause accepted. Current route state was preserved."
-    end
-    return false, "Worker is not running."
-  elseif command == "resume" then
-    if state.status == "paused" or state.status == "blocked" then
-      state.lastError = nil
-      if state.service then
-        state.status, state.phase = "working", "service_requested"
-      elseif isHome() and state.checkpoint and state.job then
-        state.service = { resumeAfter = true, finalStatus = "working", preserveCheckpoint = false, reason = "resume" }
-        state.status, state.phase = "working", "resume_service"
-      else
-        state.status, state.phase = "working", "mining"
-      end
-      state.request = nil
-      saveState()
-      return true, "Resume accepted."
-    elseif state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
-      state.status = "working"
-      saveState()
-      return true, "Service retry accepted."
-    end
-    return false, "Worker is not paused or blocked."
-  elseif command == "recall" then
-    if not state.job then return false, "No active job." end
-    state.request = "recall"
-    if state.status ~= "working" then state.status = "working" end
-    saveState()
-    return true, "Recall accepted. Worker will return and pause."
-  elseif command == "service" then
-    if not state.job then return false, "No active job." end
-    state.request = "service"
-    if state.status ~= "working" then state.status = "working" end
-    saveState()
-    return true, "Service return accepted."
-  elseif command == "abort" then
-    if not state.job then return false, "No job to abort." end
-    state.request = "abort"
-    if state.status ~= "working" then state.status = "working" end
-    saveState()
-    return true, "Abort accepted. Worker will return home."
-  elseif command == "clear" then
-    if state.pendingAction then return false, "Cannot clear while physical position is uncertain." end
-    if not isHome() then return false, "Worker must be at home." end
-    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
-      return false, "Worker is busy."
-    end
-    state.job, state.checkpoint, state.service, state.request = nil, nil, nil, nil
-    state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
-    saveState()
-    return true, "Job record cleared."
-  elseif command == "calibrate_gps" then
-    return calibrateGPS()
-  elseif command == "gps_fix" then
-    local fix, err = locateGPS()
-    saveState()
-    if not fix then return false, err end
-    local verified, verifyError = verifyGPS(true)
-    if not verified then return false, verifyError end
-    return true, ("GPS fix: %d,%d,%d"):format(fix.x, fix.y, fix.z)
-  elseif command == "rehome" then
-    if payload.confirm ~= "RESET" then return false, "Rehome requires confirm=RESET." end
-    if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
-      return false, "Stop the worker before rehoming."
-    end
-    local calibration = gpsCalibration()
-    if calibration then
-      local fix, fixError = locateGPS()
-      if not fix then
-        return false, "GPS fix is required to verify the calibrated dock before REHOME: " .. tostring(fixError)
-      end
-      local expected = geo.localToWorld(calibration, { x = 0, y = 0, z = 0 })
-      if not geo.samePosition(fix, expected) then
-        return false, ("GPS says the turtle is at %d,%d,%d, not the calibrated dock %d,%d,%d."):format(
-          fix.x, fix.y, fix.z, expected.x, expected.y, expected.z
-        )
+local function shortestPathInternal(chunks, fromKey, toKey)
+  if not chunks or not chunks[fromKey] then return nil, "unknown_chunk:" .. tostring(fromKey) end
+  if not chunks[toKey] then return nil, "unknown_chunk:" .. tostring(toKey) end
+  if fromKey == toKey then return { fromKey } end
+  local queue, head, tail = { fromKey }, 1, 1
+  local previous, seen = {}, { [fromKey] = true }
+  while head <= tail do
+    local key = queue[head]; head = head + 1
+    for _, neighbor in ipairs(chunks[key].neighbors or {}) do
+      if not seen[neighbor] then
+        seen[neighbor] = true
+        previous[neighbor] = key
+        if neighbor == toKey then
+          local path, current = { toKey }, toKey
+          while current ~= fromKey do
+            current = previous[current]
+            path[#path + 1] = current
+          end
+          local reversed = {}
+          for index = #path, 1, -1 do reversed[#reversed + 1] = path[index] end
+          return reversed
+        end
+        tail = tail + 1; queue[tail] = neighbor
       end
     end
-    state.pose = { x = 0, y = 0, z = 0, dir = 0 }
-    state.job, state.checkpoint, state.service, state.request, state.pendingAction = nil, nil, nil, nil, nil
-    state.status, state.phase, state.lastError, state.completionReason = "idle", "home", nil, nil
-    saveState()
-    return true, "Local position reset to home."
-  elseif command == "ping" or command == "status" then
-    return true, "Status sent."
   end
-  return false, "Unknown command: " .. tostring(command)
+  return nil, "chunks_disconnected"
 end
 
-local function handleMessage(sender, message)
-  local valid = protocol.validate(message, config.networkKey, os.getComputerID(), sender)
-  if not valid then return end
-  if tonumber(config.controllerId or 0) > 0 and tonumber(sender) ~= tonumber(config.controllerId) then return end
-  if message.kind == "discover" then sendStatus(sender, message); return end
-  if message.kind ~= "command" then return end
-  if tonumber(message.target) ~= tonumber(os.getComputerID()) then return end
-  if commandSeen(message.id) then
-    sendAck(sender, message, true, "Duplicate command ignored; previous result retained.")
-    return
+function M.shortestChunkPath(plan, fromKey, toKey)
+  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
+  local function normalizeKey(value)
+    if type(value) == "table" then
+      if value.key ~= nil then return tostring(value.key) end
+      local cx, cz = integerValue(value.cx), integerValue(value.cz)
+      if cx and cz then return chunkKey(plan.mode, cx, cz) end
+      return nil
+    end
+    return value == nil and nil or tostring(value)
   end
-  local payload = message.payload
-  local command = tostring(payload.command or "")
-  local ok, text = applyControlCommand(command, payload)
-  sendAck(sender, message, ok, text)
-  if command == "status" or command == "ping" or command == "gps_fix" then sendStatus(sender, message) end
+  fromKey, toKey = normalizeKey(fromKey), normalizeKey(toKey)
+  if fromKey == nil or toKey == nil then return nil, "invalid_chunk" end
+  return shortestPathInternal(plan.chunks, tostring(fromKey), tostring(toKey))
 end
 
-pollNetwork = function(timeout)
-  if not networkReady then return false end
-  local sender, message = protocol.receive(timeout)
-  if not sender then return false end
-  handleMessage(sender, message)
-  return true
-end
+M.shortestPath = M.shortestChunkPath
 
-local function drainNetwork(limit)
-  for _ = 1, limit or 8 do if not pollNetwork(0) then break end end
-end
-
-local function heartbeat(force)
-  local now = common.nowSeconds()
-  if force or now - lastHeartbeat >= (config.heartbeatSeconds or 2) then
-    sendStatus()
-    lastHeartbeat = now
+local function nearestUnvisitedPath(chunks, startKey, visited)
+  local queue, head, tail = { startKey }, 1, 1
+  local previous, seen = {}, { [startKey] = true }
+  while head <= tail do
+    local key = queue[head]; head = head + 1
+    for _, neighbor in ipairs(chunks[key].neighbors or {}) do
+      if not seen[neighbor] then
+        seen[neighbor] = true
+        previous[neighbor] = key
+        if not visited[neighbor] then
+          local path, current = { neighbor }, neighbor
+          while current ~= startKey do
+            current = previous[current]
+            path[#path + 1] = current
+          end
+          local reversed = {}
+          for index = #path, 1, -1 do reversed[#reversed + 1] = path[index] end
+          return reversed
+        end
+        tail = tail + 1; queue[tail] = neighbor
+      end
+    end
   end
+  return nil
 end
 
-local function turnRight()
-  local after = poseCopy()
-  after.dir = (after.dir + 1) % 4
-  local prepared, prepareError = beginPhysicalAction("turn_right", nil, after)
-  if not prepared then return false, prepareError end
-  local ok, err = turtle.turnRight()
-  if not ok then cancelPhysicalAction(); return false, err or "Turn right failed." end
-  state.pose.dir = after.dir
-  state.stats.turns = (state.stats.turns or 0) + 1
-  commitPhysicalAction()
-  heartbeat(false)
-  drainNetwork(2)
-  return true
-end
-
-local function turnLeft()
-  local after = poseCopy()
-  after.dir = (after.dir + 3) % 4
-  local prepared, prepareError = beginPhysicalAction("turn_left", nil, after)
-  if not prepared then return false, prepareError end
-  local ok, err = turtle.turnLeft()
-  if not ok then cancelPhysicalAction(); return false, err or "Turn left failed." end
-  state.pose.dir = after.dir
-  state.stats.turns = (state.stats.turns or 0) + 1
-  commitPhysicalAction()
-  heartbeat(false)
-  drainNetwork(2)
-  return true
-end
-
-local function turnTo(targetDir)
-  targetDir = targetDir % 4
-  local diff = (targetDir - state.pose.dir) % 4
-  if diff == 1 then return turnRight() end
-  if diff == 2 then
-    local ok, err = turnRight()
-    if not ok then return false, err end
-    return turnRight()
-  end
-  if diff == 3 then return turnLeft() end
-  return true
-end
-
-local movement = {
-  forward = {
-    move = turtle.forward, inspect = turtle.inspect, dig = turtle.dig,
-    place = turtle.place, attack = turtle.attack, side = "front",
-  },
-  up = {
-    move = turtle.up, inspect = turtle.inspectUp, dig = turtle.digUp,
-    place = turtle.placeUp, attack = turtle.attackUp, side = "top",
-  },
-  down = {
-    move = turtle.down, inspect = turtle.inspectDown, dig = turtle.digDown,
+local function optimizedWalk(chunks, keys, rootKey)
+  local walk, order, visited = {}, {}, { [rootKey] = true }
+  local current = rootKey
+  chunks[rootKey].optimizedAnchor = chunks[rootKey].anchor
+  walk[1] = { key = rootKey, first = true, anchor = chunks[rootKey].anchor }
+  order[1] = rootKey
+  while #order < #keys do
+    local nextKey
+    for _, neighbor in ipairs(chunks[current].neighbors or {}) do

@@ -1,30 +1,222 @@
-      print(("#%s %-16s %-14s %s GPS=%s seal=%s"):format(
-        id, workerLabel(workers[id], id), statusOf(workers[id]), progressText(data),
-        data.gps and data.gps.calibrated and "ready" or "no", data.seal and data.seal.count or "-"
-      ))
+-- CC Miner V3 - keyboard/CLI compatibility and event loop.
+
+local function processChar(character)
+  character = string.lower(character or "")
+  if mode == "job_dimensions" then
+    if character:match("%d") or character == "-" then draftDigit(character) end
+    return
+  elseif mode == "confirm" then
+    if character == "y" then
+      if confirmState and confirmState.twoStep and not confirmState.armed then
+        confirmState.armed = true; confirmState.message = "FINAL confirmation: press Y again to send REHOME RESET."; invalidate(); return
+      end
+      local id = selectedWorker()
+      if confirmState and id then
+        if confirmState.command == "stop" then stageStop(id, (confirmState.payload or {}).mode or "abort") else sendCommand(id, confirmState.command, confirmState.payload) end
+      end
+      confirmState, mode = nil, "dashboard"
+    elseif character == "n" then confirmState, mode = nil, "dashboard"; setNotice("Cancelled.", false) end
+    return
+  elseif mode == "job_grid" then
+    if character == "a" then allGrid(true) elseif character == "c" then allGrid(false) elseif character == "i" then invertGrid() elseif character == "r" then draft.rectMode = not draft.rectMode; draft.rectStart = nil; invalidate() end
+    return
+  end
+  if mode ~= "dashboard" then return end
+  local id = selectedWorker()
+  if character == "d" then discover()
+  elseif character == "n" then dashboardAction("new")()
+  elseif character == "p" then sendCommand(id, "pause")
+  elseif character == "r" then sendCommand(id, "resume")
+  elseif character == "h" then sendCommand(id, "recall")
+  elseif character == "s" then dashboardAction("stop")()
+  elseif character == "x" then dashboardAction("abort")()
+  elseif character == "c" then dashboardAction("clear")()
+  elseif character == "i" then dashboardAction("info")()
+  elseif character == "g" then dashboardAction("progress")()
+  elseif character == "e" then dashboardAction("recovery")()
+  elseif character == "t" then dashboardAction("report")()
+  elseif character == "l" then dashboardAction("gps")()
+  elseif character == "q" then running = false end
+end
+
+local function processKey(keyCode)
+  if keys and keyCode == keys.escape then
+    if mode == "dashboard" then
+      running = false
+    else
+      mode, draft, confirmState = "dashboard", nil, nil
+      invalidate()
+    end
+    return
+  end
+  if mode == "dashboard" then
+    local ids = orderedIds()
+    if keys and keyCode == keys.up then
+      selected = math.max(1, selected - 1)
+      invalidate()
+    elseif keys and keyCode == keys.down then
+      selected = math.min(math.max(1, #ids), selected + 1)
+      invalidate()
+    elseif keys and keyCode == keys.enter then
+      mode = "info"
+      invalidate()
+    end
+  elseif mode == "job_dimensions" then
+    if keys and keyCode == keys.backspace then
+      draftBackspace()
+      invalidate()
+    elseif keys and keyCode == keys.tab then
+      local position = 1
+      local fields = currentFieldOrder()
+      for index, field in ipairs(fields) do
+        if field == draft.selectedField then position = index end
+      end
+      chooseDraftField(fields[position % #fields + 1])
+      invalidate()
+    elseif keys and keyCode == keys.enter then
+      commitDraftField()
+      mode = "job_grid"
+      invalidate()
+    elseif keys and keyCode == keys.left then
+      adjustDraft(draft.selectedField or "width", -1)
+      invalidate()
+    elseif keys and keyCode == keys.right then
+      adjustDraft(draft.selectedField or "width", 1)
+      invalidate()
+    end
+  elseif mode == "job_grid" or mode == "job_chunks" then
+    if keys and keyCode == keys.left then
+      draft.gridPageX = math.max(1, (draft.gridPageX or 1) - 1)
+      invalidate()
+    elseif keys and keyCode == keys.right then
+      draft.gridPageX = (draft.gridPageX or 1) + 1
+      invalidate()
+    elseif keys and keyCode == keys.up then
+      draft.gridPageZ = math.max(1, (draft.gridPageZ or 1) - 1)
+      invalidate()
+    elseif keys and keyCode == keys.down then
+      draft.gridPageZ = (draft.gridPageZ or 1) + 1
+      invalidate()
+    elseif keys and keyCode == keys.enter then
+      local result = computePreflight()
+      if result then mode = "preflight" end
+      invalidate()
+    end
+  elseif mode == "preflight" then
+    if keys and keyCode == keys.enter and draft and draft.preflight and not draft.preflight.fatal then
+      startDraft()
+    elseif keys and keyCode == keys.q then
+      queueDraft()
+    end
+  elseif mode == "progress" or mode == "recovery" or mode == "report" or mode == "info" or mode == "stop_menu" then
+    if keys and (keyCode == keys.enter or keyCode == keys.backspace) then
+      mode = "dashboard"
+      invalidate()
+    end
+  elseif mode == "confirm" and keys and keyCode == keys.y then
+    processChar("y")
+  end
+end
+
+local function pumpFor(seconds)
+  local deadline = common.nowSeconds() + (seconds or 1)
+  while common.nowSeconds() <= deadline do
+    local sender, message = protocol.receive(0.25)
+    if sender then handleMessage(sender, message) end
+  end
+end
+
+local function makeCliDraft(id, width, length, depth)
+  local previous = db.lastDraft or {}
+  local calibration = draftCalibration(id)
+  local targetY = calibration and calibration.home and tonumber(calibration.home.y) and (tonumber(calibration.home.y) - depth + 1) or nil
+  return {
+    workerId = id, width = width, length = length, depth = depth,
+    targetY = targetY,
+    lighting = normalizedLighting(previous.lighting),
+    waterMode = normalizedWaterMode(previous.waterMode), profile = normalizedProfile(previous.profile),
+    selectedField = "width", buffer = tostring(width), excluded = {},
+    gridPageX = 1, gridPageZ = 1, rectMode = false, autoAssign = false,
+    name = "CLI Quarry",
+  }
+end
+
+local function printQueue()
+  if #db.queue == 0 then print("Queue empty."); return end
+  for index, item in ipairs(db.queue) do print(("%d: #%s %dx%dx%d profile=%s queued=%s"):format(index, tostring(item.workerId or "-"), tonumber(item.width) or 0, tonumber(item.length) or 0, tonumber(item.depth) or 0, tostring(item.profile or "balanced"), tostring(item.queuedAt or "-"))) end
+end
+
+local function printHistory()
+  if #db.history == 0 then print("No history."); return end
+  for index = #db.history, 1, -1 do
+    local item = db.history[index]
+    print(("%s %-8s worker=%s job=%s reason=%s"):format(tostring(item.finishedAt or "-"), tostring(item.status or "-"), tostring(item.workerId or "-"), tostring(item.jobId or item.id or "-"), tostring(item.reason or "-")))
+  end
+end
+
+local function commandLineMode()
+  local command = string.lower(args[1] or "")
+  if command == "discover" or command == "status" then
+    discover(); pumpFor(3)
+    local ids = orderedIds()
+    if #ids == 0 then print("No workers found."); return true end
+    for _, id in ipairs(ids) do
+      local data = workers[id].data or {}
+      print(("#%s %-16s %-14s %s GPS=%s seal=%s"):format(id, workerLabel(workers[id], id), statusOf(workers[id]), progressText(data), data.gps and data.gps.calibrated and "ready" or "no", data.seal and data.seal.count or "-"))
     end
     return true
   elseif command == "start" then
     local id, width, length, depth = tonumber(args[2]), tonumber(args[3]), tonumber(args[4]), tonumber(args[5])
-    if not id or not width or not length or not depth then
-      print("Usage: controller.lua start <id> <width> <length> <depth>")
-      return true
-    end
-    sendCommand(id, "start", { width = width, length = length, depth = depth, name = "CLI Quarry", chunkMode = "local", excludedChunks = {} })
-    pumpFor(2); print(notice); return true
+    if not id or not width or not length or not depth then print("Usage: controller.lua start <id> <width> <length> <depth>"); return true end
+    discover(); pumpFor(1)
+    draft = makeCliDraft(id, width, length, depth)
+    local result = computePreflight()
+    if result and not result.fatal then startDraft() else print("Preflight blocked: " .. tostring(result and result.planError or "unavailable")) end
+    pumpFor(2); print(notice); draft = nil; mode = "dashboard"; return true
+  elseif command == "stop" then
+    local id, stopMode = tonumber(args[2]), string.lower(args[3] or "pause_now")
+    local validModes = { pause_now = true, finish_row = true, finish_layer = true, return_home = true, abort = true }
+    if not id or not validModes[stopMode] then print("Usage: controller.lua stop <id> pause_now|finish_row|finish_layer|return_home|abort"); return true end
+    stageStop(id, stopMode); pumpFor(2); print(notice); return true
   elseif command == "pause" or command == "resume" or command == "recall" or command == "service" or command == "abort" or command == "clear" then
-    local id = tonumber(args[2])
-    if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
+    local id = tonumber(args[2]); if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
     sendCommand(id, command); pumpFor(2); print(notice); return true
   elseif command == "gps" or command == "calibrate" then
-    local id = tonumber(args[2])
-    if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
-    sendCommand(id, command == "gps" and "gps_fix" or "calibrate_gps")
-    pumpFor(3); print(notice); return true
+    local id = tonumber(args[2]); if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
+    sendCommand(id, command == "gps" and "gps_fix" or "calibrate_gps"); pumpFor(3); print(notice); return true
   elseif command == "rehome" then
-    local id = tonumber(args[2])
-    if not id or args[3] ~= "RESET" then print("Usage: controller.lua rehome <id> RESET"); return true end
+    local id = tonumber(args[2]); if not id or args[3] ~= "RESET" then print("Usage: controller.lua rehome <id> RESET"); return true end
     sendCommand(id, "rehome", { confirm = "RESET" }); pumpFor(2); print(notice); return true
+  elseif command == "queue" then
+    local sub = string.lower(args[2] or "list")
+    if sub == "list" then printQueue()
+    elseif config.queueEnabled == false then print("Queue is disabled by controller configuration.")
+    elseif sub == "clear" then db.queue = {}; saveControllerDb(); print("Queue cleared.")
+    elseif sub == "remove" or sub == "delete" then local index = tonumber(args[3]); if index and db.queue[index] then table.remove(db.queue, index); saveControllerDb(); print("Queue item removed.") else print("Usage: queue remove <index>") end
+    elseif sub == "add" then
+      local id, width, length, depth = tonumber(args[3]), tonumber(args[4]), tonumber(args[5]), tonumber(args[6])
+      if not id or not width or not length or not depth then print("Usage: queue add <id> <width> <length> <depth>") else discover(); pumpFor(1); local item = makeCliDraft(id, width, length, depth); item.queuedAt = common.nowSeconds(); draft = item; local ok = queueDraft(); draft = nil; print(ok and "Queued." or notice) end
+    elseif sub == "run" then
+      local index = tonumber(args[3]) or 1; local item = db.queue[index]
+      if not item then print("Queue item not found.") else item.retryAt = common.nowSeconds(); item.awaiting = nil; saveControllerDb(); lastQueueDispatch = 0; dispatchQueue(); print(notice) end
+    else print("Usage: queue list|add|run|remove|clear") end
+    return true
+  elseif command == "preset" or command == "presets" then
+    local sub = string.lower(args[2] or "list")
+    if sub == "list" then for _, preset in ipairs(db.presets) do print(tostring(preset.name)) end
+    elseif sub == "save" then local ok, err = savePreset(args[3], db.lastDraft or draft); print(ok and "Preset saved." or ("Preset error: " .. tostring(err)))
+    elseif sub == "use" or sub == "load" then print(applyPreset(args[3]) and "Preset selected." or "Preset not found.")
+    elseif sub == "delete" or sub == "remove" then local keep = {}; for _, preset in ipairs(db.presets) do if tostring(preset.name) ~= tostring(args[3]) then keep[#keep + 1] = preset end end; db.presets = keep; saveControllerDb(); print("Preset removed.")
+    else print("Usage: preset list|save|use|delete <name>") end
+    return true
+  elseif command == "report" or command == "history" then printHistory(); return true
+  elseif command == "doctor" then
+    print("CC Miner controller doctor")
+    print("network=" .. tostring(networkReady) .. " modems=" .. tostring(#(modemNames or {})))
+    print("db=" .. tostring(dbError and ("WARN " .. dbError) or "ok") .. " path=" .. DB_PATH)
+    print("workers=" .. tostring(#orderedIds()) .. " leases=" .. tostring(#(db.leases or {})) .. " queue=" .. tostring(#db.queue))
+    print("sorting=" .. tostring(config.sorting and config.sorting.enabled == true and "enabled" or "off"))
+    return true
   end
   return false
 end
@@ -46,14 +238,25 @@ while running do
     handlePointer("term", b, c)
   elseif event == "monitor_touch" then
     if config.touchEnabled ~= false then handlePointer(a, b, c) end
-  elseif event == "timer" and a == refreshTimer then
-    if common.nowSeconds() - lastDiscovery >= (config.discoverySeconds or 5) then discover() end
-    refreshTimer = os.startTimer(1)
+  elseif event == "timer" then
+    if alertTimers[a] then
+      local alertOutput = alertTimers[a]; alertTimers[a] = nil
+      if alertOutput.global and redstone and redstone.setOutput then pcall(redstone.setOutput, alertOutput.side or "back", false) end
+      if alertOutput.relay and alertOutput.relay.setOutput then pcall(alertOutput.relay.setOutput, alertOutput.side or "back", false) end
+      for _, relay in ipairs(alertOutput.relays or {}) do if relay and relay.setOutput then pcall(relay.setOutput, alertOutput.side or "back", false) end end
+    elseif a == refreshTimer then
+      dispatchQueue()
+      sortingTick()
+      if common.nowSeconds() - lastDiscovery >= (config.discoverySeconds or 5) then discover() end
+      dirty = true
+      refreshTimer = os.startTimer(1)
+    end
   elseif event == "term_resize" or event == "monitor_resize" or event == "peripheral" or event == "peripheral_detach" then
     monitors = common.findPeripherals("monitor")
-    for _, entry in ipairs(monitors) do
-      if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end
-    end
+    speakers = common.findPeripherals("speaker")
+    redstoneDevices = common.findPeripherals("redstoneIntegrator")
+    for _, entry in ipairs(monitors) do if entry.device and entry.device.setTextScale then pcall(entry.device.setTextScale, config.monitorTextScale or 0.5) end end
+    renderCache = {}; dirty = true
   end
 end
 

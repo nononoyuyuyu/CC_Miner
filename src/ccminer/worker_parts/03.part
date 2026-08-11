@@ -1,6 +1,7 @@
         local dug, digReason = action.dig()
         if dug then
           state.stats.blocksDug = (state.stats.blocksDug or 0) + 1
+          if not preserveSealMarker then noteMinedMaterial(name) end
           commitPhysicalAction()
           sleep(0.1)
         else
@@ -17,6 +18,16 @@
     local moved, moveReason = action.move()
     if moved then
       updatePoseAfterMove(direction)
+      -- A successful move normally ends a fluid-seal run.  When the moved
+      -- block was the seal marker we just carved, preserve the run so a
+      -- contiguous fluid column reaches maxContinuousSeal across cells.
+      if preserveSealMarker then
+        state.fluidSealMarker = nil
+      else
+        state.fluidSealRun = 0
+        state.water.continuousSeals = 0
+        state.fluidSealMarker = nil
+      end
       local gpsOK, gpsError = verifyGPS(false)
       if not gpsOK then return false, gpsError end
       commitPhysicalAction()
@@ -172,7 +183,22 @@ local function estimatedReturnDistance(pose)
 end
 
 local function firstEmptySlot()
-  for slot = 1, 16 do if turtle.getItemCount(slot) == 0 then return slot end end
+  for slot = 1, 16 do if not isReservedSlot(slot) and turtle.getItemCount(slot) == 0 then return slot end end
+  return nil
+end
+
+local function firstFuelSlot()
+  local materials = materialsConfig()
+  local preferred = materials.fuelReserveSlots or config.fuelReserveSlots
+  if type(preferred) == "table" then
+    for _, candidate in ipairs(preferred) do
+      local slot = tonumber(candidate)
+      if slot and not isReservedSlot(slot, "fuel") and turtle.getItemCount(slot) == 0 then return slot end
+    end
+  end
+  for slot = 1, 16 do
+    if not isReservedSlot(slot, "fuel") and turtle.getItemCount(slot) == 0 then return slot end
+  end
   return nil
 end
 
@@ -180,6 +206,66 @@ local function looksLikeInventoryBlock(data)
   local name = string.lower(blockName(data))
   if name == "minecraft:chest" or name == "minecraft:trapped_chest" or name == "minecraft:barrel" then return true end
   return name:match("^minecraft:[%w_]+shulker_box$") ~= nil
+end
+
+local function recycleRetainTarget()
+  local materials, recycle = materialsConfig()
+  local target = materials.retainSealTarget
+    or recycle.maxHeld
+    or recycle.retainSealTarget
+    or config.retainSealTarget
+    or config.sealTarget
+    or 64
+  return math.max(0, math.floor(tonumber(target) or 64))
+end
+
+local function compressSealStacks()
+  local moved = 0
+  for destination = 1, 16 do
+    if not isReservedSlot(destination, "seal") and turtle.getItemCount(destination) > 0 and isSealItemName(itemName(destination)) then
+      local name = itemName(destination)
+      local space = turtle.getItemSpace(destination)
+      if space > 0 then
+        for source = 1, 16 do
+          if source ~= destination and not isReservedSlot(source, "seal")
+            and turtle.getItemCount(source) > 0 and itemName(source) == name then
+            turtle.select(source)
+            local before = turtle.getItemCount(source)
+            local ok = turtle.transferTo(destination, math.min(space, before))
+            local after = turtle.getItemCount(source)
+            if ok and after < before then
+              local amount = before - after
+              moved = moved + amount
+              space = turtle.getItemSpace(destination)
+              if space <= 0 then break end
+            end
+          end
+        end
+      end
+    end
+  end
+  if moved > 0 then
+    state.stats.compressions = (state.stats.compressions or 0) + 1
+    state.recycle.compressed = (state.recycle.compressed or 0) + moved
+  end
+  return moved
+end
+
+local function updateRecycleInventoryState()
+  local held, byName = 0, {}
+  for slot = 1, 16 do
+    local name = itemName(slot)
+    if name and isSealItemName(name) then
+      local count = turtle.getItemCount(slot)
+      held = held + count
+      byName[name] = (byName[name] or 0) + count
+    end
+  end
+  state.recycle = state.recycle or {}
+  state.recycle.held, state.recycle.byName = held, byName
+  state.recycle.cap = recycleRetainTarget()
+  state.recycle.overflow = math.max(0, held - state.recycle.cap)
+  return held
 end
 
 local function inventoryPresent(side, inspectFunction)
@@ -239,18 +325,49 @@ local function unloadAtHome()
     return false, "Output inventory missing on configured side " .. outputSide .. "."
   end
 
+  -- Reuse permitted seal blocks first.  Consolidation happens before the
+  -- ordinary unload pass so stack space is deterministic and reserved slots
+  -- are never used as transient output slots.
+  compressSealStacks()
+  local retainedTarget = recycleRetainTarget()
+  local retainedCount = updateRecycleInventoryState()
+  local overflow = math.max(0, retainedCount - retainedTarget)
   local allDropped = true
   for slot = 1, 16 do
-    if turtle.getItemCount(slot) > 0 and not isSealItemName(itemName(slot)) then
+    local name = itemName(slot)
+    local keepReserved = isSealItemName(name) or isTorchItemName(name)
+      or (slotRoleContains(slot, "fuel") and isFuelItem(slot))
+    if turtle.getItemCount(slot) > 0 and not keepReserved then
       turtle.select(slot)
       dropFunction()
       if turtle.getItemCount(slot) > 0 then allDropped = false end
     end
   end
+  if overflow > 0 then
+    for slot = 1, 16 do
+      if overflow <= 0 then break end
+      if turtle.getItemCount(slot) > 0 and isSealItemName(itemName(slot))
+        and (not isReservedSlot(slot, "seal") or not slotRoleContains(slot, "seal")) then
+        turtle.select(slot)
+        local before = turtle.getItemCount(slot)
+        local dropped = dropFunction(math.min(before, overflow))
+        local after = turtle.getItemCount(slot)
+        local amount = before - after
+        if dropped and amount > 0 then
+          overflow = overflow - amount
+          state.stats.sealOverflow = (state.stats.sealOverflow or 0) + amount
+          state.recycle.overflow = (state.recycle.overflow or 0) + amount
+        elseif after > 0 then
+          allDropped = false
+        end
+      end
+    end
+  end
   local restored, restoreError = restoreSideDirection(outputSide, restoreDir)
   turtle.select(originalSlot)
   if not restored then return false, restoreError end
-  if not allDropped then return false, "Output inventory is full." end
+  if not allDropped or overflow > 0 then return false, "Output inventory is full or retained seal slots are reserved." end
+  updateRecycleInventoryState()
   state.stats.unloads = (state.stats.unloads or 0) + 1
   saveState()
   return true
@@ -263,7 +380,7 @@ local function targetFuelForService()
     if not checkpointDistance then
       checkpointDistance = distance({ x = 0, y = 0, z = 0 }, state.checkpoint)
     end
-    target = math.max(target, checkpointDistance * 2 + (tonumber(config.fuelBuffer) or 256))
+    target = math.max(target, checkpointDistance * 2 + profileFuelBuffer())
   end
   local limit = fuelLimit()
   if limit == "unlimited" then return "unlimited" end
@@ -305,7 +422,7 @@ local function refuelAtHome()
       turtle.select(originalSlot)
       return false, "Fuel loading safety limit reached."
     end
-    local slot = firstEmptySlot()
+    local slot = firstFuelSlot()
     if not slot then
       restoreSideDirection(fuelSide, restoreDir)
       turtle.select(originalSlot)
@@ -346,10 +463,23 @@ local function refuelAtHome()
 end
 
 local function refillSlotForSeal()
-  for slot = 1, 16 do
-    if isSealItemName(itemName(slot)) and turtle.getItemSpace(slot) > 0 then return slot end
+  local materials, recycle = materialsConfig()
+  local preferred = materials.sealSlots or recycle.sealSlots or config.sealSlots
+  if type(preferred) == "table" then
+    for _, candidate in ipairs(preferred) do
+      local slot = tonumber(candidate)
+      if slot and not isReservedSlot(slot, "seal") and turtle.getItemCount(slot) > 0 and isSealItemName(itemName(slot)) and turtle.getItemSpace(slot) > 0 then return slot end
+    end
+    for _, candidate in ipairs(preferred) do
+      local slot = tonumber(candidate)
+      if slot and not isReservedSlot(slot, "seal") and turtle.getItemCount(slot) == 0 then return slot end
+    end
   end
-  return firstEmptySlot()
+  for slot = 1, 16 do
+    if not isReservedSlot(slot, "seal") and isSealItemName(itemName(slot)) and turtle.getItemSpace(slot) > 0 then return slot end
+  end
+  for slot = 1, 16 do if not isReservedSlot(slot, "seal") and turtle.getItemCount(slot) == 0 then return slot end end
+  return nil
 end
 
 local function refillSealAtHome()
@@ -357,6 +487,10 @@ local function refillSealAtHome()
   state.phase, state.status = "refilling_seal", "working"
   saveState()
   local target = math.max(1, tonumber(config.sealTarget) or 64)
+  local materials, recycle = materialsConfig()
+  target = math.max(1, tonumber(materials.retainSealTarget or recycle.maxHeld or config.retainSealTarget) or target)
+  compressSealStacks()
+  updateRecycleInventoryState()
   if sealMaterialCount() >= target then return true end
   local side = config.sealSide or "right"
   local inspectFunction, suckFunction, dropFunction, restoreDir, sideError = sideFunctions(side)
