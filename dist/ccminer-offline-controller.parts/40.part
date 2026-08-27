@@ -1,3 +1,26 @@
+    { "LIGHT " .. tostring(draft.lighting and draft.lighting.mode or "safe"), function() local modes = { "off", "safe", "custom" }; local now = draft.lighting and draft.lighting.mode or "safe"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; draft.lighting.mode = modes[n % #modes + 1]; invalidate() end },
+    { "WATER " .. tostring(draft.waterMode or "seal"), function() local modes = { "ignore", "stop", "seal" }; local now = draft.waterMode or "seal"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; draft.waterMode = modes[n % #modes + 1]; invalidate() end },
+    { "PROFILE " .. tostring(draft.profile or "balanced"), function() local modes = { "safe", "balanced", "turbo" }; local now = draft.profile or "balanced"; local n = 1; for i, value in ipairs(modes) do if value == now then n = i end end; draft.profile = modes[n % #modes + 1]; invalidate() end },
+    { "AUTO: QUEUE", function() draft.autoAssign = false; setNotice("Single footprint is sent to the selected worker; queue dispatch handles parallel jobs.", false) end },
+  })
+  buttonRow(key, math.max(1, height - 2), width, {
+    { "GRID", function() commitDraftField(); mode = "job_grid"; draft.gridPageX, draft.gridPageZ = 1, 1; invalidate() end },
+    { "PREFLIGHT", function() commitDraftField(); local result = computePreflight(); if result then mode = "preflight" end; invalidate() end },
+    { "QUEUE", function() commitDraftField(); queueDraft() end, config.queueEnabled ~= false },
+    { "CANCEL", function() mode, draft = "dashboard", nil; invalidate() end },
+  })
+  noticeLine(target, height)
+end
+
+local function gridCatalog()
+  local catalog, err, chunkMode, calibration, rootKey = buildDraftCatalog()
+  if not catalog then return nil, err end
+  return catalog, nil, chunkMode, calibration, rootKey
+end
+
+local function chunkGrid(catalog)
+  local byCoordinate, xSeen, zSeen, xValues, zValues = {}, {}, {}, {}, {}
+  for _, chunk in ipairs(catalog or {}) do
     local cx, cz = tonumber(chunk.cx), tonumber(chunk.cz)
     if cx and cz then
       byCoordinate[tostring(cx) .. ":" .. tostring(cz)] = chunk
@@ -157,36 +180,3 @@ local function progressChunkState(data, chunk, index, excludedSet)
   if data.status == "blocked" then return "blocked" end
   if data.status == "waiting_fuel" or data.status == "waiting_output" or data.status == "waiting_seal" or data.phase == "service_requested" then return "service" end
   local current = progress.currentChunk or job.currentChunk
-  if current and tostring(current) == tostring(chunk.key) then return data.status == "blocked" and "blocked" or "working" end
-  local completed = tonumber(progress.completedChunks or job.completedChunks)
-  if completed and index <= completed then return "complete" end
-  if not completed then
-    local cursor = tonumber(progress.cursor or job.cursor)
-    local depth = math.max(1, tonumber(job.depth) or 1)
-    if cursor then
-      local startBlock = (index - 1) * math.max(1, tonumber(chunk.cells) or 1) * depth
-      local endBlock = startBlock + math.max(1, tonumber(chunk.cells) or 1) * depth
-      if cursor >= endBlock then return "complete" elseif cursor > startBlock then return "working" end
-    end
-  end
-  if progress.cursor == nil and job.cursor == nil then return "unknown" end
-  return "queued"
-end
-
-local progressColors = { unknown = "gray", queued = "blue", working = "yellow", complete = "green", excluded = "red", blocked = "red", service = "orange" }
-local function renderProgress(target, key)
-  local width, height = target.getSize()
-  local id, worker = selectedWorker()
-  local data = worker and worker.data or {}
-  writeHeader("WORK PROGRESS MAP", target)
-  common.writeAt(1, 2, common.fit(("#%s %s %s"):format(tostring(id or "-"), worker and workerLabel(worker, id) or "-", progressText(data)), width), colors and colors.lightGray or nil)
-  local job = data.job
-  if not job then
-    common.writeAt(1, 4, common.fit("No active job (old worker may only expose status).", width), colors and colors.yellow or nil)
-  else
-    local chunkMode = job.chunkMode == "world" and "world" or "local"
-    local calibration = data.gps and data.gps.calibration
-    local catalog, catalogError = quarry.buildCatalog(job.width, job.length, chunkMode, calibration)
-    if not catalog then
-      common.writeAt(1, 4, common.fit("Chunk map unavailable: " .. tostring(catalogError), width), colors and colors.yellow or nil)
-      buttonRow(key, math.max(1, height - 2), width, { { "BACK", function() mode = "dashboard" end } })

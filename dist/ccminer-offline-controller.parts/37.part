@@ -1,3 +1,34 @@
+  if #lines > maxLines then common.writeAt(2, height - 2, common.fit("The message continues; use ccm report if needed.", math.max(1, width - 2)), colors and colors.yellow or nil) end
+  buttonRow(key, height, width, { { "OK - RETURN", noticeState.dismiss, true } })
+end
+
+local function statusGlyph(state)
+  return ({ ok = "OK", warn = "!!", bad = "XX" })[state] or "??"
+end
+
+local function renderDashboard(target, key)
+  local width, height = target.getSize()
+  writeHeader("CC MINER V4 TOUCH CONTROL", target)
+  local ids = orderedIds()
+  local online = 0
+  for _, id in ipairs(ids) do if statusOf(workers[id]) ~= "offline" then online = online + 1 end end
+  local id, worker = selectedWorker()
+  local data = worker and worker.data or {}
+  common.writeAt(1, 2, common.fit(("Controller #%d | Workers %d/%d | selected #%s"):format(os.getComputerID(), online, #ids, tostring(id or "-")), width), colors and colors.lightGray or nil)
+  local secondRow = math.max(7, height - 1)
+  local firstRow = secondRow - 3
+  local cardBottom = firstRow - 2
+  if cardBottom >= 3 then
+    local lines = {}
+    if id then
+      local progress = data.progress or {}
+      local materials = data.materials or {}
+      local gps = data.gps or {}
+      lines = {
+        { ("SELECTED WORKER  #%s  %s"):format(tostring(id), workerLabel(worker, id)), colors and colors.yellow or nil },
+        { ("Status: %s  |  Phase: %s  |  Profile: %s"):format(statusOf(worker), tostring(data.phase or "-"), tostring(data.effectiveProfile or data.profile or "-")), colors and colors.white or nil },
+        { "Progress: " .. progressText(data), colors and colors.lime or nil },
+        { ("Fuel: %s / %s"):format(tostring(data.fuel or "-"), tostring(data.fuelLimit or "-")), colors and colors.white or nil },
         { ("Inventory: %s used / %s empty / %s items"):format(tostring(data.inventoryUsed or "-"), tostring(data.inventoryEmpty or "-"), tostring(data.inventoryItems or "-")), colors and colors.white or nil },
         { ("Materials: seal %s  |  torches %s"):format(tostring(materials.sealCount or data.seal and data.seal.count or "-"), tostring(materials.torchCount or data.lighting and data.lighting.torchCount or "-")), colors and colors.lightGray or nil },
         { ("GPS: %s  |  Home: %s"):format(gps.calibrated and "calibrated" or "not used", data.atHome and "yes" or "no"), colors and colors.lightGray or nil },
@@ -158,46 +189,3 @@ noticeState.renderMore = function(target, key)
   if noticeState.morePage == 1 then
     buttonRow(key, firstRow, width, {
       { "INFO", dashboardAction("info") }, { "ITEMS", dashboardAction("items") },
-      { "REPORT", dashboardAction("report") }, { "RECOVERY", dashboardAction("recovery") },
-    }, true)
-    buttonRow(key, secondRow, width, {
-      { "GROUPS", dashboardAction("groups") }, { "REMOTE", dashboardAction("remote") },
-      { "GPS", dashboardAction("gps") }, { "NEXT", function() noticeState.morePage = 2; invalidate() end },
-    }, true)
-  else
-    buttonRow(key, firstRow, width, {
-      { "SERVICE", dashboardAction("service") }, { "CLEAR", dashboardAction("clear") },
-      { "REHOME", dashboardAction("rehome") }, { "LAST ERR", dashboardAction("last_error") },
-    }, true)
-    buttonRow(key, secondRow, width, {
-      { "PREV", function() noticeState.morePage = 1; invalidate() end },
-      { "WORKERS", dashboardAction("workers") }, { "BACK", function() mode = "dashboard"; invalidate() end },
-    }, true)
-  end
-  noticeLine(target, height)
-end
-
-noticeState.openItems = function()
-  local id, worker = selectedWorker()
-  if not id or not worker then setNotice("No worker selected.", true); return end
-  local data = worker.data or {}
-  local current = data.discard or {}
-  local selectedItems = {}
-  for _, name in ipairs(current.allowlist or {}) do selectedItems[tostring(name)] = true end
-  noticeState.discardDraft = {
-    workerId = id,
-    mode = tostring(current.mode or "KEEP_ALL"),
-    selected = selectedItems,
-    page = 1,
-  }
-  mode = "items"
-  invalidate()
-end
-
-noticeState.renderItems = function(target, key)
-  local width, height = target.getSize()
-  local id, worker = selectedWorker()
-  local data = worker and worker.data or {}
-  local form = noticeState.discardDraft
-  writeHeader("AUTO DISCARD ITEMS", target)
-  if not id or not form or tonumber(form.workerId) ~= tonumber(id) then

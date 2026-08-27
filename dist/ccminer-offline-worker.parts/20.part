@@ -1,3 +1,49 @@
+    if anyBay then
+      for index = 1, #workers do if not positions[index] then return nil end end
+    end
+    return candidateLevels, positions, anyBay
+  end
+
+  local levels, bayPositions, bayAware = levelData(axis)
+  if not levels and not explicitAxis then
+    axis = axis == "x" and "z" or "x"
+    levels, bayPositions, bayAware = levelData(axis)
+  end
+  if not levels then return nil, "stripe_partition_unavailable" end
+
+  local weights, levelPositions = {}, {}
+  for index, level in ipairs(levels) do
+    levelPositions[level] = index
+    local weight = 0
+    for _, key in ipairs(keys) do
+      local chunk = chunks[key]
+      if (axis == "x" and chunk.cx == level) or (axis == "z" and chunk.cz == level) then weight = weight + chunk.cells end
+    end
+    weights[index] = weight
+  end
+  local workerOrder = {}
+  for index = 1, #workers do workerOrder[index] = index end
+  if bayAware then
+    table.sort(workerOrder, function(left, right)
+      if bayPositions[left] ~= bayPositions[right] then return bayPositions[left] < bayPositions[right] end
+      return workers[left].key < workers[right].key
+    end)
+  end
+
+  local owner, owned, loads = {}, {}, {}
+  for index = 1, #workers do owned[index], loads[index] = {}, 0 end
+  local cuts = {}
+  if bayAware then
+    -- Choose each cut at the nearest weighted midpoint while constraining it
+    -- between adjacent bay levels.  This keeps every stripe contiguous and
+    -- guarantees the worker whose bay is on a level owns that level.
+    local prefix, total = { [0] = 0 }, 0
+    for index, weight in ipairs(weights) do total = total + weight; prefix[index] = total end
+    local previousCut = 0
+    for rank = 1, #workers - 1 do
+      local workerIndex = workerOrder[rank]
+      local nextWorkerIndex = workerOrder[rank + 1]
+      local minimum = math.max(previousCut + 1, bayPositions[workerIndex])
       local maximum = math.min(bayPositions[nextWorkerIndex] - 1, #levels - (#workers - rank))
       if minimum > maximum then return nil, "stripe_bay_alignment_unavailable" end
       local target = total * rank / #workers
@@ -232,43 +278,3 @@ function M.partitionGroup(catalog, workersInput, options)
   if bottomY == nil then bottomY = options.targetY end
   if bottomY == nil then bottomY = options.bottom end
   if bottomY ~= nil then
-    bottomY = integerValue(bottomY)
-    if not bottomY then return nil, "invalid_bottom_y" end
-  end
-  local homeYMap = options.workerHomeY or options.homeYs
-  if type(homeYMap) == "table" then
-    for _, worker in ipairs(workers) do
-      if worker.homeY == nil then
-        local candidate = homeYMap[worker.id] or homeYMap[worker.key]
-        if candidate ~= nil then
-          worker.homeY = integerValue(candidate)
-          if worker.homeY == nil then return nil, "invalid_home_y" end
-        end
-      end
-    end
-  end
-  local defaultLayers = options.layers
-  if defaultLayers ~= nil then
-    defaultLayers = integerValue(defaultLayers, 1, MAX_DIMENSION)
-    if not defaultLayers then return nil, "invalid_layers" end
-  end
-  local groupJobId = options.groupJobId or options.jobId or "group"
-  if (type(groupJobId) ~= "string" and type(groupJobId) ~= "number") or tostring(groupJobId) == "" then
-    return nil, "invalid_group_job_id"
-  end
-  local strategy = options.strategy
-  -- Older controller settings called graph growth "round_robin".  Keep that
-  -- spelling accepted while retaining connected ownership guarantees.
-  if strategy == "round_robin" then strategy = "graph" end
-  if strategy ~= nil and strategy ~= "stripe" and strategy ~= "graph" and strategy ~= "growth" then
-    return nil, "invalid_partition_strategy"
-  end
-  if options.stripeAxis ~= nil and options.stripeAxis ~= "x" and options.stripeAxis ~= "z" then
-    return nil, "invalid_stripe_axis"
-  end
-  local distanceWeight = options.distanceWeight
-  if distanceWeight == nil then distanceWeight = 0.25 end
-  distanceWeight = numberValue(distanceWeight)
-  if not distanceWeight or distanceWeight < 0 or distanceWeight > MAX_DIMENSION then return nil, "invalid_distance_weight" end
-
-  local owner, owned, loads, strategyUsed, seeds, stripeAxisUsed

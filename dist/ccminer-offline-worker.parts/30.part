@@ -1,3 +1,56 @@
+    return nil, "Group assignment keys are required; refusing full-footprint fallback."
+  end
+  if assignmentPlanRequested then
+    local assignedSet, transitSet = {}, {}
+    local function collectAssignmentKeys(value, target)
+      if type(value) ~= "table" then return end
+      if #value > 0 then
+        for _, item in ipairs(value) do
+          local key = assignmentChunkKey(item, requestedChunkMode) or tostring(item)
+          target[key] = true
+        end
+      else
+        for item, enabled in pairs(value) do
+          if enabled then
+            local key = assignmentChunkKey(item, requestedChunkMode) or tostring(item)
+            target[key] = true
+          end
+        end
+      end
+    end
+    collectAssignmentKeys(assignmentChunks, assignedSet)
+    collectAssignmentKeys(job.assignmentTransitChunks, transitSet)
+    job.assignmentSet, job.transitSet = assignedSet, transitSet
+    -- The authoritative assigned planner receives the full catalog and
+    -- emits only mine/transit chunks.  Do not manufacture a giant exclusion
+    -- complement here: it is redundant, can exceed legacy exclusion limits,
+    -- and risks using the worker's local calibration as a world partition.
+    job.assignmentCatalog = assignmentCatalog and common.copy(assignmentCatalog) or nil
+  end
+
+  if job.waterMode ~= nil and job.waterMode ~= "ignore" and job.waterMode ~= "stop" and job.waterMode ~= "seal" then
+    return nil, "waterMode must be ignore, stop, or seal."
+  end
+  if job.lighting and job.lighting.mode ~= nil then
+    local mode = tostring(job.lighting.mode)
+    if mode ~= "off" and mode ~= "safe" and mode ~= "custom" then
+      return nil, "lighting.mode must be off, safe, or custom."
+    end
+    job.lighting.mode = mode
+    if job.lighting.interval ~= nil then
+      local interval = tonumber(job.lighting.interval)
+      if not interval or interval < 1 then return nil, "lighting.interval must be positive." end
+      job.lighting.interval = math.floor(interval)
+    end
+  end
+
+  if #exclusions > 0 or assignmentPlanRequested then
+    local planCalibration = (assignmentCatalog and assignmentCatalog.calibrationSeed) or gpsCalibration()
+    local plan, planError
+    if assignmentPlanRequested then
+      -- The assigned planner owns world-catalog validation, connectivity,
+      -- transit leases, and the dock-to-seed service route.  Keep this call
+      -- to its single canonical signature; broad compatibility attempts can
       -- silently reinterpret the catalog as a job and mine the full region.
       local assignment = job.assignment or {}
       local assignmentOptions = {
@@ -193,49 +246,3 @@ local function startJob(payload)
     startedAt = common.nowSeconds(),
   }
   state.lighting.mode = (job.lighting and job.lighting.mode) or (config.lighting and config.lighting.mode) or "off"
-  state.lighting.interval = (job.lighting and job.lighting.interval) or (config.lighting and config.lighting.interval) or 32
-  state.water.mode = job.waterMode or config.waterMode or (config.water and config.water.mode) or "ignore"
-  state.pose = { x = 0, y = 0, z = 0, dir = state.pose.dir or 0 }
-  saveState()
-  common.log("INFO", ("Job started: %s %dx%dx%d strategy=%s exclusions=%d"):format(
-    job.id, job.width, job.length, job.depth, job.strategy, #job.excludedChunks
-  ))
-  return true, "Job accepted."
-end
-
-local function calibrateGPS()
-  if state.pendingAction then return false, "Resolve the pending physical action first." end
-  if not isHome() or state.pose.dir ~= 0 then return false, "Place the turtle at home facing the quarry before GPS calibration." end
-  if state.job then return false, "Clear the active job before GPS calibration." end
-  if state.status == "working" or state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" then
-    return false, "Worker must be stopped before GPS calibration."
-  end
-  if fuelLevel() ~= "unlimited" and tonumber(fuelLevel() or 0) < 2 then return false, "At least 2 fuel is required." end
-]] },
-  { source = [[src/ccminer/worker_parts/02.part]], target = [[worker_parts/02.part]], digest = [[411ecbd29950440ec96808a7a93ffd0668a38b498f5f29679c855491231148ee]], content = [[  local blocked = turtle.inspect()
-  if blocked then return false, "The block directly in front of the dock must be empty for calibration." end
-
-  state.status, state.phase, state.lastError = "calibrating", "gps_calibration", nil
-  saveState()
-  local homeFix, homeError = locateGPS()
-  if not homeFix then
-    state.status, state.phase = "blocked", "gps_error"
-    state.lastError = homeError
-    saveState()
-    return false, homeError
-  end
-
-  local prepared, prepareError = beginPhysicalAction("gps_calibration", { home = homeFix })
-  if not prepared then return false, prepareError end
-  local moved, moveError = turtle.forward()
-  if not moved then
-    cancelPhysicalAction()
-    state.status, state.phase, state.lastError = "blocked", "gps_error", moveError or "Calibration move failed."
-    saveState()
-    return false, state.lastError
-  end
-  sleep(0.15)
-  local forwardFix, forwardError = locateGPS()
-  local returned, returnError = turtle.back()
-  if not returned then
-    state.status, state.phase = "blocked", "recovery_required"

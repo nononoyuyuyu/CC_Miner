@@ -1,3 +1,57 @@
+  if type(value) ~= "table" then return nil, "invalid_assigned_keys" end
+  local list, seen = {}, {}
+  if #value > 0 then
+    for index = 1, #value do
+      local key = value[index]
+      if type(key) == "table" then key = key.key or key.chunkKey end
+      if key == nil or tostring(key) == "" then return nil, "invalid_assigned_key" end
+      key = tostring(key)
+      if seen[key] then return nil, "duplicate_assigned_key:" .. key end
+      seen[key] = true; list[#list + 1] = key
+    end
+  else
+    for key, enabled in pairs(value) do
+      if enabled then
+        key = tostring(key)
+        if key == "" or seen[key] then return nil, "duplicate_assigned_key:" .. key end
+        seen[key] = true; list[#list + 1] = key
+      end
+    end
+  end
+  table.sort(list)
+  if #list == 0 then return nil, "no_assigned_chunks" end
+  return list
+end
+
+local function assignedConnected(chunks, keys)
+  if #keys == 0 then return false end
+  local allowed, seen, queue = {}, {}, { keys[1] }
+  for _, key in ipairs(keys) do allowed[key] = true end
+  seen[keys[1]] = true
+  local head = 1
+  while queue[head] do
+    local key = queue[head]; head = head + 1
+    for _, neighbor in ipairs(chunks[key].neighbors or {}) do
+      if allowed[neighbor] and not seen[neighbor] then seen[neighbor] = true; queue[#queue + 1] = neighbor end
+    end
+  end
+  for _, key in ipairs(keys) do if not seen[key] then return false end end
+  return true
+end
+
+local function assignedWalk(chunks, keys, rootKey, assignedSet)
+  local visited, walk = {}, {}
+  visited[rootKey] = true
+  chunks[rootKey].parent = nil
+  walk[1] = {
+    key = rootKey,
+    first = true,
+    anchor = { x = chunks[rootKey].anchor.x, z = chunks[rootKey].anchor.z },
+  }
+  local stack = { { key = rootKey, next = 1 } }
+  while #stack > 0 do
+    local frame = stack[#stack]
+    local chunk = chunks[frame.key]
     local nextKey
     while frame.next <= #chunk.neighbors do
       local candidate = chunk.neighbors[frame.next]
@@ -191,42 +245,3 @@ function M.buildAssignedChunkPlan(catalog, assignedKeys, options)
   -- assigned DFS walk.
   for _, key in ipairs(allKeys) do
     local chunk = chunks[key]
-    local anchor = M.chunkAnchor(chunk) or { x = chunk.minX, z = chunk.minZ }
-    chunk.anchor = { x = anchor.x, z = anchor.z }
-  end
-  if chunks[seedKey] then
-    local entranceAnchor = contains(chunks[seedKey], 0, 1)
-      and { x = 0, z = 1 }
-      or M.chunkAnchor(chunks[seedKey], { x = 0, z = 1 })
-    if entranceAnchor then chunks[seedKey].anchor = { x = entranceAnchor.x, z = entranceAnchor.z } end
-  end
-  if chunks[dockKey] then
-    local dockAnchor = contains(chunks[dockKey], 0, 1)
-      and { x = 0, z = 1 }
-      or M.chunkAnchor(chunks[dockKey], { x = 0, z = 1 })
-    if dockAnchor then chunks[dockKey].anchor = { x = dockAnchor.x, z = dockAnchor.z } end
-  end
-  for index = 2, #servicePath do
-    local previousKey, currentKey = servicePath[index - 1], servicePath[index]
-    local boundary = M.chunkAnchor(chunks[currentKey], chunks[previousKey])
-    if boundary and currentKey ~= seedKey then chunks[currentKey].anchor = { x = boundary.x, z = boundary.z } end
-  end
-
-  local walk, visited = assignedWalk(chunks, mineKeys, seedKey, mineSet)
-  for _, key in ipairs(mineKeys) do
-    if not visited[key] then return nil, "assigned_chunks_disconnected" end
-  end
-  local mineCopies = {}
-  for _, key in ipairs(mineKeys) do mineCopies[key] = cloneValue(chunks[key]); mineCopies[key].neighbors = {} end
-  buildNeighborGraph(mineCopies, mineKeys)
-  local optimized, optimizedOrder = optimizedWalk(mineCopies, mineKeys, seedKey)
-  for _, key in ipairs(mineKeys) do
-    if mineCopies[key].optimizedAnchor then
-      chunks[key].optimizedAnchor = { x = mineCopies[key].optimizedAnchor.x, z = mineCopies[key].optimizedAnchor.z }
-    end
-  end
-  local routeCopy = {}
-  for index, key in ipairs(optimizedOrder) do routeCopy[index] = key end
-  local assignedColumns = 0
-  local assignedBounds
-  for _, key in ipairs(mineKeys) do assignedColumns = assignedColumns + chunks[key].cells end

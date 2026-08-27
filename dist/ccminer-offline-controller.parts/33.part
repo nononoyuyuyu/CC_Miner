@@ -1,3 +1,39 @@
+    if tostring(lease.groupJobId or "") ~= tostring(job.groupJobId or "") or (onlyPending and job.started and job.started[tostring(lease.workerId)]) then keptGroup[#keptGroup + 1] = lease end
+  end
+  db.leases, db.groupLeases = kept, keptGroup
+  db.activeLeases = common.copy(kept)
+  saveControllerDb()
+  return #removed
+end
+
+groupSafeStop = function(job, workerId, reason)
+  local payload = { scope = "group", group = true, groupId = job.groupId, groupJobId = job.groupJobId, groupCommand = "RETURN", mode = "return_home", safeStop = true, reason = reason or "partial_start" }
+  payload.targetWorkerId, payload.workerId = tonumber(workerId) or workerId, tonumber(workerId) or workerId
+  sendCommand(workerId, "stop", payload)
+end
+
+sortedJobAssignments = function(job)
+  local out = {}
+  for key, value in pairs(job and job.assignments or {}) do if type(value) == "table" then out[#out + 1] = value end end
+  table.sort(out, function(a, b) return tostring(a.workerId) < tostring(b.workerId) end)
+  return out
+end
+
+local function dispatchGroupJob(job, force)
+  if type(job) ~= "table" or (job.status ~= "starting" and job.status ~= "queued") then return false end
+  job.pending = job.pending or {}
+  job.started = job.started or {}
+  job.failed = job.failed or {}
+  job.awaitingAck = job.awaitingAck or {}
+  job.acks = job.acks or {}
+  for _ in pairs(job.awaitingAck) do return true end
+  local now = common.nowSeconds()
+  local stagger = math.max(0, tonumber(job.staggerSeconds) or 0)
+  for _, assignment in ipairs(sortedJobAssignments(job)) do
+    local key = tostring(assignment.workerId)
+    if not job.started[key] and not job.failed[key] and (force or not job.pending[key] or now >= (job.nextDispatchAt or 0)) then
+      local payload = {
+        scope = "group", group = true, groupId = tostring(job.groupId), groupJobId = tostring(job.groupJobId), parentGroupJobId = tostring(job.groupJobId), groupCommand = "START", requestedCommand = "start", assignmentCatalog = common.copy(job.catalog),
         assignmentId = assignment.assignmentId, assignmentTotal = #sortedJobAssignments(job), assignmentChunks = common.copy(assignment.chunkKeys or {}), chunkKeys = common.copy(assignment.chunkKeys or {}), transitKeys = common.copy(assignment.transitKeys or {}), seedKey = assignment.seedKey, bayChunkKey = assignment.bayChunkKey,
         homeY = assignment.homeY, bottomY = assignment.bottomY, targetY = assignment.bottomY, layers = assignment.layers, width = job.width, length = job.length, depth = assignment.layers or job.depth,
         chunkMode = job.chunkMode, name = job.name, profile = job.profile, waterMode = job.waterMode, lighting = common.copy(job.lighting or {}), workerId = assignment.workerId, targetWorkerId = assignment.workerId,
@@ -127,25 +163,3 @@ local function validateSourceResumeToken(job, source, sourceData, stoppedWorkerI
   if type(worldPose) ~= "table" or tonumber(worldPose.x) == nil or tonumber(worldPose.y) == nil or tonumber(worldPose.z) == nil then return nil, "assignment_resume_token_world_pose_required" end
   return common.copy(token), nil
 end
-
-local function reassignGroupAssignment(groupJobId, stoppedWorkerId, targetWorkerId)
-  local job = db.groupJobs and db.groupJobs[tostring(groupJobId)]
-  if not job then setNotice("Group job not found.", true); return false end
-  local source = job.assignments and (job.assignments[tostring(stoppedWorkerId)] or job.assignments[stoppedWorkerId])
-  if not source then setNotice("Stopped worker assignment not found.", true); return false end
-  if type(source.chunkKeys) ~= "table" or #source.chunkKeys == 0 then setNotice("No residual chunks to reassign.", true); return false end
-  local sourceData = workerData(stoppedWorkerId) or {}
-  local sourceToken, sourceTokenError = validateSourceResumeToken(job, source, sourceData, stoppedWorkerId)
-  if sourceTokenError then setNotice("Reassign source rejected: " .. tostring(sourceTokenError), true); return false end
-  if job.pendingReassignment then setNotice("A reassignment is already awaiting ACK.", true); return false end
-  targetWorkerId = targetWorkerId or nil
-  if not targetWorkerId then
-    for _, candidate in ipairs(groupWorkerIds(groupRecord(job.groupId))) do
-      local candidateData = workerData(candidate) or {}
-      local candidateStatus = statusOf(workers[candidate])
-      if tonumber(candidate) ~= tonumber(stoppedWorkerId) and (candidateStatus == "idle" or candidateStatus == "complete" or candidateStatus == "aborted") and candidateData.atHome == true then targetWorkerId = candidate; break end
-    end
-  end
-  if not targetWorkerId then setNotice("No online target for residual range.", true); return false end
-  local targetData, targetStatus = workerData(targetWorkerId) or {}, statusOf(workers[targetWorkerId])
-  if not ((targetStatus == "idle" or targetStatus == "complete" or targetStatus == "aborted") and targetData.atHome == true) then setNotice("Reassign target must be idle/terminal and at home.", true); return false end

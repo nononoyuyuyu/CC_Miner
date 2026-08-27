@@ -1,3 +1,44 @@
+        -- Registry validation and coordinate normalization stay in the
+        -- controller.  Preserve every argument so legacy and extended
+        -- register forms remain compatible.
+        forwardController()
+      end
+    elseif command == "stop" then
+      local mode = string.lower(tostring(args[3] or ""))
+      local stopModes = {
+        now = "pause_now", row = "finish_row", layer = "finish_layer", home = "return_home",
+        pause_now = "pause_now", finish_row = "finish_row", finish_layer = "finish_layer",
+        return_home = "return_home", abort = "abort",
+      }
+      local controllerMode = stopModes[mode]
+      local valid = controllerMode ~= nil
+      if not tonumber(args[2]) or not valid then
+        reportError("Usage: ccm stop <id> <now|row|layer|home|abort>")
+      else
+        local forwarded = {}
+        for index = 1, #args do forwarded[index] = args[index] end
+        forwarded[3] = controllerMode
+        forwardController(forwarded)
+      end
+    else
+      forwardController()
+    end
+  end
+elseif command == "status" then
+  local config, configError = common.loadConfig()
+  if not config then reportError(configError or "Not configured."); return end
+  print("CC Miner " .. tostring(common.VERSION or ""))
+  print("Role: " .. tostring(config.role))
+  print("Computer ID: " .. tostring(os.getComputerID()))
+  print("Label: " .. tostring(os.getComputerLabel and os.getComputerLabel() or "-"))
+  if type(config.networkKey) == "string" and config.networkKey ~= "" then print("Network key: configured (masked)") else print("Network key: not configured") end
+  printStatusFeature("Profile", config.profile)
+  printStatusFeature("Lighting", config.lighting, config.lightMode)
+  printStatusFeature("Water", config.water, config.waterMode)
+  printStatusFeature("Materials", config.materials)
+  printStatusFeature("Staged stop", config.stagedStop)
+  if config.role == "worker" then
+    local state, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
     if stateError then reportError(stateError) end
     print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
     if state.pose then print(("Pose: x=%s y=%s z=%s dir=%s"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir)) end
@@ -237,60 +278,3 @@ local function exclusionSet(exclusions, mode)
     seen = seen + 1
     if seen > MAX_CHUNKS then return nil, "too_many_exclusions" end
     if type(item) == "string" then
-      if item ~= "" then set[item] = true end
-    elseif type(item) == "table" then
-      local itemMode = item.mode == "world" and "world" or item.mode == "local" and "local" or mode
-      local cx, cz = numberValue(item.cx), numberValue(item.cz)
-      if cx and cz and cx % 1 == 0 and cz % 1 == 0 then
-        set[chunkKey(itemMode, cx, cz)] = true
-      elseif item.key and tostring(item.key) ~= "" then
-        set[tostring(item.key)] = true
-      end
-    end
-  end
-  return set
-end
-
-local function overlaps(a1, a2, b1, b2)
-  return a1 <= b2 and b1 <= a2
-end
-
-local function adjacent(a, b)
-  if a.maxX + 1 == b.minX or b.maxX + 1 == a.minX then
-    return overlaps(a.minZ, a.maxZ, b.minZ, b.maxZ)
-  end
-  if a.maxZ + 1 == b.minZ or b.maxZ + 1 == a.minZ then
-    return overlaps(a.minX, a.maxX, b.minX, b.maxX)
-  end
-  return false
-end
-
-local function contains(chunk, x, z)
-  return x >= chunk.minX and x <= chunk.maxX and z >= chunk.minZ and z <= chunk.maxZ
-end
-
-local function appendIndex(index, value, key)
-  local list = index[value]
-  if not list then list = {}; index[value] = list end
-  list[#list + 1] = key
-end
-
--- Build an edge-indexed graph.  The previous implementation compared every
--- chunk with every other chunk; boundary indexes make normal rectangular jobs
--- proportional to the number of chunks and their immediate candidates.
-local function buildNeighborGraph(chunks, keys)
-  local byMinX, byMaxX, byMinZ, byMaxZ = {}, {}, {}, {}
-  for _, key in ipairs(keys) do
-    local chunk = chunks[key]
-    appendIndex(byMinX, chunk.minX, key)
-    appendIndex(byMaxX, chunk.maxX, key)
-    appendIndex(byMinZ, chunk.minZ, key)
-    appendIndex(byMaxZ, chunk.maxZ, key)
-    chunk.neighbors = {}
-  end
-  local order = {}
-  for index, key in ipairs(keys) do order[key] = index end
-  local function addPair(leftKey, rightKey)
-    if leftKey == rightKey or order[leftKey] > order[rightKey] then return end
-    local left, right = chunks[leftKey], chunks[rightKey]
-    if not adjacent(left, right) then return end

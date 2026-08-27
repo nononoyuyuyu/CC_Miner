@@ -1,3 +1,53 @@
+          return false, "Cannot resume from " .. tostring(state.phase) .. "; resolve GPS/state recovery or use REHOME first."
+        end
+      end
+      state.lastError = nil
+      state.stagedStop = false
+      if state.service then
+        state.status, state.phase = "working", "service_requested"
+      elseif isHome() and state.checkpoint and state.job then
+        state.service = { resumeAfter = true, finalStatus = "working", preserveCheckpoint = false, reason = "resume" }
+        state.status, state.phase = "working", "resume_service"
+      else
+        state.status, state.phase = "working", "mining"
+      end
+      state.request = nil
+      saveState("resume", true)
+      return true, "Resume accepted."
+    elseif state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
+      state.status = "working"
+      saveState()
+      return true, "Service retry accepted."
+    end
+    return false, "Worker is not paused or blocked."
+  elseif command == "recall" then
+    if not state.job then return false, "No active job." end
+    state.request = "recall"
+    state.stagedStop = { mode = "return_home", requestedAt = common.nowSeconds(), source = "recall" }
+    if state.status ~= "working" then state.status = "working" end
+    saveState()
+    return true, "Recall accepted. Worker will return and pause."
+  elseif command == "service" then
+    if not state.job then return false, "No active job." end
+    state.request = "service"
+    if state.status ~= "working" then state.status = "working" end
+    saveState()
+    return true, "Service return accepted."
+  elseif command == "abort" then
+    if not state.job then return false, "No job to abort." end
+    state.request = "abort"
+    state.completionReason = "aborted"
+    state.stagedStop = { mode = "abort", requestedAt = common.nowSeconds(), source = "abort" }
+    if state.status ~= "working" then state.status = "working" end
+    saveState()
+    return true, "Abort accepted. Worker will return home."
+  elseif command == "clear" then
+    if state.pendingAction then return false, "Cannot clear while physical position is uncertain." end
+    if not isHome() then return false, "Worker must be at home." end
+    if state.job and state.status ~= "complete" and state.status ~= "aborted" then
+      return false, "Cannot clear an unfinished job; ABORT it first."
+    end
+    if not state.job and state.status ~= "idle" then
       return false, "No clearable job record exists in the current state."
     end
     if state.service or state.request then
@@ -230,65 +280,3 @@ local function sealFluid(action, direction, data, fluidKind)
   local continuous = tonumber(state.fluidSealRun) or 0
   if continuous >= maxContinuousSeal() then
     if fluidKind == "water" then state.stats.waterBlocked = (state.stats.waterBlocked or 0) + 1 end
-    return false, fluidKind == "water" and "water_seal_limit" or "lava_seal_limit"
-  end
-  local originalSlot = turtle.getSelectedSlot()
-  local slot = selectSealMaterial()
-  if not slot then
-    turtle.select(originalSlot)
-    return false, "seal_material"
-  end
-  local material = itemName(slot)
-  local prepared, prepareError = beginPhysicalAction("seal_" .. fluidKind .. "_" .. direction, {
-    fluid = blockName(data), material = material, fluidKind = fluidKind,
-  }, poseCopy())
-  if not prepared then turtle.select(originalSlot); return false, prepareError end
-  local placed, placeReason = action.place()
-  turtle.select(originalSlot)
-  if not placed then
-    cancelPhysicalAction()
-    return false, "lava_seal_failed:" .. tostring(placeReason or blockName(data))
-  end
-  if fluidKind == "water" then
-    state.stats.waterSealed = (state.stats.waterSealed or 0) + 1
-    state.water.sealed = (state.water.sealed or 0) + 1
-    state.water.lastRun = continuous + 1
-  else
-    state.stats.lavaSealed = (state.stats.lavaSealed or 0) + 1
-  end
-  state.fluidSealRun = continuous + 1
-  state.water.continuousSeals = state.fluidSealRun
-  state.fluidSealMarker = {
-    kind = fluidKind,
-    direction = direction,
-    material = material,
-    pose = poseCopy(),
-    at = common.nowSeconds(),
-  }
-  commitPhysicalAction()
-  sleep(0.15)
-  return true
-end
-
-local function sealLava(action, direction, data)
-  return sealFluid(action, direction, data, "lava")
-end
-
-local function effectiveLighting()
-  -- lighting.mode is an explicit safety choice and is never changed by a
-  -- profile.  Profiles only adjust the requested placement cadence.
-  return effectiveLightingValues()
-end
-
-local function noteMinedMaterial(name)
-  if not isSealItemName(name) then return end
-  local materials, recycle = materialsConfig()
-  local enabled = materials.recycleMinedBlocks
-  if enabled == nil then enabled = recycle.enabled end
-  if enabled == false then return end
-  state.recycle = state.recycle or { byName = {}, held = 0, cap = 64, overflow = 0 }
-  state.recycle.byName = state.recycle.byName or {}
-  state.recycle.byName[name] = (state.recycle.byName[name] or 0) + 1
-  state.recycle.held = (state.recycle.held or 0) + 1
-  state.recycle.cap = math.max(0, math.floor(tonumber(materials.retainSealTarget or recycle.maxHeld or config.retainSealTarget or config.sealTarget or state.recycle.cap or 64) or 64))
-  if state.recycle.held > state.recycle.cap then

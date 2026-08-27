@@ -97,10 +97,13 @@ local function doctorJournal(config, state, finding)
   local path = journalConfig.path or journalState.path or journalState.journalPath or "/ccminer/data/state.journal"
   local text, readError = readTextNoWrite(path)
   local seqValue, sequenceValue = tonumber(journalState.seq), tonumber(journalState.sequence)
-  local expectedSeq = seqValue or sequenceValue
+  local expectedSeq = math.max(seqValue or 0, sequenceValue or 0)
   local writes = tonumber(journalState.writes)
   local entries = tonumber(journalState.entries)
-  if seqValue and sequenceValue and seqValue ~= sequenceValue then
+  -- A zero alias is a known V4.0 migration state: the writer advanced `seq`
+  -- but not `sequence`.  The worker now synchronizes them on load.  Continue
+  -- to reject two independently advanced, conflicting positive counters.
+  if seqValue and sequenceValue and seqValue > 0 and sequenceValue > 0 and seqValue ~= sequenceValue then
     finding("FAIL", "journal", "state seq/sequence counters disagree")
   elseif writes and entries and (writes < 0 or entries < 0 or entries > writes) then
     finding("FAIL", "journal", "state writes/entries counters are inconsistent")
@@ -115,24 +118,40 @@ local function doctorJournal(config, state, finding)
     end
   else
     local count, malformed, previousSeq, lastSeq = 0, 0, nil, nil
+    local pendingLines = {}
+    local function inspectDecoded(decoded)
+      count = count + 1
+      local sequence = decoded and tonumber(decoded.seq or decoded.sequence) or nil
+      if not decoded or sequence == nil then
+        malformed = malformed + 1
+      elseif previousSeq and sequence <= previousSeq then
+        malformed = malformed + 1
+      else
+        previousSeq, lastSeq = sequence, sequence
+      end
+    end
     for line in (text .. "\n"):gmatch("([^\r\n]*)\r?\n") do
       if line ~= "" then
-        count = count + 1
-        local decoded
-        if type(textutils) == "table" and type(textutils.unserialize) == "function" then
-          local ok, value = pcall(textutils.unserialize, line)
-          if ok and type(value) == "table" then decoded = value end
-        end
-        local sequence = decoded and tonumber(decoded.seq or decoded.sequence) or nil
-        if not decoded or sequence == nil then
-          malformed = malformed + 1
-        elseif previousSeq and sequence <= previousSeq then
+        if #pendingLines == 0 and not line:match("^%s*{") then
           malformed = malformed + 1
         else
-          previousSeq, lastSeq = sequence, sequence
+          pendingLines[#pendingLines + 1] = line
+          local decoded
+          if type(textutils) == "table" and type(textutils.unserialize) == "function" then
+            local ok, value = pcall(textutils.unserialize, table.concat(pendingLines, "\n"))
+            if ok and type(value) == "table" then decoded = value end
+          end
+          if decoded then
+            inspectDecoded(decoded)
+            pendingLines = {}
+          elseif #pendingLines > 128 then
+            malformed = malformed + 1
+            pendingLines = {}
+          end
         end
       end
     end
+    if #pendingLines > 0 then malformed = malformed + 1 end
     if malformed > 0 then
       finding("FAIL", "journal", ("%s malformed/non-monotonic entries=%d"):format(path, malformed))
     elseif expectedSeq and lastSeq and lastSeq > expectedSeq then
@@ -232,20 +251,3 @@ local function runDoctor()
     finding("PASS", "config.schema", tostring(config.schema))
   end
   if role ~= "worker" and role ~= "controller" and role ~= "gps" then
-    finding("FAIL", "config.role", "unknown role: " .. (role == "" and "missing" or role))
-  else
-    finding("PASS", "config.role", role)
-  end
-  if config.version == nil then finding("WARN", "config.version", "missing") else finding("PASS", "config.version", tostring(config.version)) end
-
-  local networkKey = config.networkKey
-  if role ~= "gps" then
-    if type(networkKey) ~= "string" or networkKey == "" or networkKey == "CHANGE_ME" then
-      finding("FAIL", "config.networkKey", "missing or still CHANGE_ME")
-    else
-      finding("PASS", "config.networkKey", "configured (masked)")
-    end
-  end
-  if role == "worker" then
-    local numericChecks = {
-      { "config.maxWidth", config.maxWidth, 1 }, { "config.maxLength", config.maxLength, 1 },

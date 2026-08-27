@@ -1,3 +1,57 @@
+      if not seen[neighbor] then
+        seen[neighbor] = true
+        previous[neighbor] = key
+        if neighbor == toKey then
+          local path, current = { toKey }, toKey
+          while current ~= fromKey do
+            current = previous[current]
+            path[#path + 1] = current
+          end
+          local reversed = {}
+          for index = #path, 1, -1 do reversed[#reversed + 1] = path[index] end
+          return reversed
+        end
+        tail = tail + 1; queue[tail] = neighbor
+      end
+    end
+  end
+  return nil, "chunks_disconnected"
+end
+
+function M.shortestChunkPath(plan, fromKey, toKey)
+  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
+  local function normalizeKey(value)
+    if type(value) == "table" then
+      if value.key ~= nil then return tostring(value.key) end
+      local cx, cz = integerValue(value.cx), integerValue(value.cz)
+      if cx and cz then return chunkKey(plan.mode, cx, cz) end
+      return nil
+    end
+    return value == nil and nil or tostring(value)
+  end
+  fromKey, toKey = normalizeKey(fromKey), normalizeKey(toKey)
+  if fromKey == nil or toKey == nil then return nil, "invalid_chunk" end
+  return shortestPathInternal(plan.chunks, tostring(fromKey), tostring(toKey))
+end
+
+M.shortestPath = M.shortestChunkPath
+
+local function nearestUnvisitedPath(chunks, startKey, visited)
+  local queue, head, tail = { startKey }, 1, 1
+  local previous, seen = {}, { [startKey] = true }
+  while head <= tail do
+    local key = queue[head]; head = head + 1
+    for _, neighbor in ipairs(chunks[key].neighbors or {}) do
+      if not seen[neighbor] then
+        seen[neighbor] = true
+        previous[neighbor] = key
+        if not visited[neighbor] then
+          local path, current = { neighbor }, neighbor
+          while current ~= startKey do
+            current = previous[current]
+            path[#path + 1] = current
+          end
+          local reversed = {}
           for index = #path, 1, -1 do reversed[#reversed + 1] = path[index] end
           return reversed
         end
@@ -250,49 +304,3 @@ local function normalizePlanKey(plan, value)
     key = value.chunkKey or value.chunk or value.key
     if key == nil and value.cx ~= nil and value.cz ~= nil then
       local cx, cz = integerValue(value.cx), integerValue(value.cz)
-      if cx and cz then key = chunkKey(plan.mode, cx, cz) end
-    end
-  else
-    key = value
-  end
-  if key == nil then return nil, "invalid_chunk" end
-  key = tostring(key)
-  if not plan.chunks[key] then return nil, "unknown_chunk:" .. key end
-  return key
-end
-
-function M.edgeTransition(plan, fromKey, toKey, y)
-  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
-  local from, fromError = normalizePlanKey(plan, fromKey)
-  if not from then return nil, fromError end
-  local to, toError = normalizePlanKey(plan, toKey)
-  if not to then return nil, toError end
-  local pointY = numberValue(y)
-  if y ~= nil and not pointY then return nil, "invalid_y" end
-  if from == to then return nil, "chunks_not_adjacent" end
-  local left, right = plan.chunks[from], plan.chunks[to]
-  local fromPoint, toPoint = edgeTransitionPoints(left, right, pointY or 0)
-  if not fromPoint then return nil, "chunks_not_adjacent" end
-  return {
-    from = { x = fromPoint.x, y = fromPoint.y, z = fromPoint.z },
-    to = { x = toPoint.x, y = toPoint.y, z = toPoint.z },
-    -- Numeric entries keep older worker adapters (which consumed a waypoint
-    -- array) compatible.  They are independent point tables, never aliases of
-    -- the named fields.
-    [1] = { x = fromPoint.x, y = fromPoint.y, z = fromPoint.z, kind = "from" },
-    [2] = { x = toPoint.x, y = toPoint.y, z = toPoint.z, kind = "to" },
-    fromKey = from,
-    toKey = to,
-    distance = math.abs(toPoint.x - fromPoint.x) + math.abs(toPoint.y - fromPoint.y) + math.abs(toPoint.z - fromPoint.z),
-  }
-end
-
-M.chunkTransition = M.edgeTransition
-M.neighborTransition = M.edgeTransition
-M.transitionPoint = M.edgeTransition
-
-local function routePointForChunk(chunk, y)
-  local pointY = numberValue(y) or 0
-  -- Integer midpoint keeps a route interior to the chunk for both odd and
-  -- even dimensions.  It is deliberately not the historical min corner.
-  return {

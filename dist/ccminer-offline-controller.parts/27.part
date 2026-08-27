@@ -1,3 +1,47 @@
+      pcall(redstone.setOutput, side, true)
+      if timer then alertTimers[timer] = { global = true, side = side } end
+    else
+      local relays = {}
+      for _, entry in ipairs(redstoneDevices) do
+        local relay = entry.device
+        if relay and relay.setOutput then
+          pcall(relay.setOutput, side, true)
+          relays[#relays + 1] = relay
+        end
+      end
+      if timer and #relays > 0 then alertTimers[timer] = { relays = relays, side = side } end
+    end
+  end
+  if text and text ~= "" then setNotice(text, kind == "blocked") end
+end
+
+local function clearAlert(id, kind)
+  alertLedger[tostring(id) .. ":" .. tostring(kind)] = nil
+end
+
+-- Remote-console ACKs are correlated independently from the normal command
+-- notice/last-error path.  A worker may include the correlation fields either
+-- at the ACK root or inside `result`; accept both forms while rejecting a
+-- delayed response from another session or sequence.
+do
+local function remoteAckField(payload, result, key)
+  if type(payload) == "table" and payload[key] ~= nil then return payload[key] end
+  if type(result) == "table" and result[key] ~= nil then return result[key] end
+  if type(payload) == "table" and type(payload.session) == "table" and payload.session[key] ~= nil then
+    return payload.session[key]
+  end
+  return nil
+end
+
+noticeState.remoteApi.ackMatches = function(sender, message, payload)
+  local session = noticeState.remoteSession
+  local pending = session and session.pending
+  if type(pending) ~= "table" or type(payload) ~= "table" then return false end
+  if tonumber(sender) ~= tonumber(session.workerId) then return false end
+  -- A same-worker ACK for another command must never consume the remote wait.
+  -- Supported workers always set replyTo, so a missing value fails closed.
+  if pending.messageId and (not message
+    or tostring(message.replyTo or "") ~= tostring(pending.messageId)) then return false end
   local result = type(payload.result) == "table" and payload.result or nil
   local wireCommand = payload.command
   if tostring(wireCommand or ""):lower() ~= "remote_console" then return false end
@@ -161,54 +205,3 @@ local function handleMessage(sender, message)
       end
       acknowledgeQueuedStart(id, workers[id].data)
       local st = workers[id].data.status
-      if (st == "complete" or st == "aborted") and previous and previous.status ~= st then
-        addHistory(id, workers[id].data, workers[id].data.completionReason or st)
-        releaseLeasesForWorker(id, activeJobId(previous))
-      end
-    end
-    return true
-  end
-  return false
-end
-
-local function discover()
-  protocol.broadcast(protocol.message("discover", config.networkKey, { controllerName = config.controllerName, v3 = true }))
-  lastDiscovery = common.nowSeconds()
-  setNotice("Discovery broadcast sent.", false)
-end
-
-local function sendCommand(id, command, payload)
-  if not id then setNotice("No worker selected.", true); return false end
-  payload = payload or {}
-  payload.command = command
-  local wireMessage = protocol.message("command", config.networkKey, payload, id)
-  local ok, err = protocol.send(id, wireMessage)
-  if ok then setNotice(("Command '%s' sent to #%s."):format(command, tostring(id)), false)
-  else setNotice("Send failed: " .. tostring(err), true) end
-  return ok, err, wireMessage.id
-end
-
-do
-local function remoteToken(prefix)
-  local millis = common.nowMillis and common.nowMillis() or math.floor(common.nowSeconds() * 1000)
-  return ("%s-%d-%d-%d"):format(tostring(prefix or "remote"), os.getComputerID(), millis, math.random(100000, 999999))
-end
-
-local function remoteRedactText(value)
-  local text = tostring(value or "")
-  local key = type(config.networkKey) == "string" and config.networkKey or ""
-  -- Replace the configured key using plain-string searches.  Network keys may
-  -- contain Lua pattern characters, and they must never appear in CLI output.
-  if key ~= "" then
-    local output, cursor = {}, 1
-    while true do
-      local startAt, endAt = text:find(key, cursor, true)
-      if not startAt then output[#output + 1] = text:sub(cursor); break end
-      output[#output + 1] = text:sub(cursor, startAt - 1)
-      output[#output + 1] = "[REDACTED]"
-      cursor = endAt + 1
-    end
-    text = table.concat(output)
-  end
-  return text
-end

@@ -1,3 +1,52 @@
+    minimumFuel = minimumFuel,
+    minFuel = minimumFuel,
+    torchInterval = interval,
+    estimatedTorches = estimatedTorches,
+    estimatedTorchCount = estimatedTorches,
+    torchCount = estimatedTorches,
+    torches = estimatedTorches,
+    selectedChunks = selectedChunks,
+    selectedChunkCount = selectedChunks,
+    selectedCount = selectedChunks,
+    excludedChunks = plan.excludedCount or 0,
+    excludedChunkCount = plan.excludedCount or 0,
+    excludedCount = plan.excludedCount or 0,
+    catalogChunks = plan.catalogCount or 0,
+    plan = plan,
+  }
+end
+
+M.jobEstimate = M.estimateJob
+M.estimate = M.estimateJob
+M.estimateJobCost = M.estimateJob
+M.estimateQuarry = M.estimateJob
+
+local function catalogGraph(catalog)
+  local chunks, keys = {}, {}
+  local entries = catalog.chunks and type(catalog.chunks) == "table" and catalog.chunks or catalog
+  local sources = {}
+  if entries == catalog and #entries > 0 then
+    for index = 1, #entries do sources[#sources + 1] = entries[index] end
+  else
+    -- Map catalogs commonly use the global chunk key as the map key and omit
+    -- the duplicated `entry.key` field.  Normalize that form before
+    -- validation; never mutate the caller's table (the descriptor may be
+    -- shared with another worker/controller).
+    for mapKey, source in pairs(entries) do
+      if type(source) == "table" and (source.key == nil or tostring(source.key) == "") then
+        local copy = {}
+        for field, value in pairs(source) do copy[field] = value end
+        copy.key = tostring(mapKey)
+        sources[#sources + 1] = copy
+      else
+        sources[#sources + 1] = source
+      end
+    end
+  end
+  if #sources > MAX_CHUNKS then return nil, "too_many_chunks" end
+  for _, source in ipairs(sources) do
+    if type(source) ~= "table" then return nil, "invalid_chunk_catalog" end
+    local key = source.key and tostring(source.key) or nil
     if not key or key == "" then return nil, "invalid_chunk_key" end
     if source.mode ~= "world" or key:sub(1, 2) ~= "W:" then return nil, "gps_required_world_catalog" end
     local cx, cz = integerValue(source.cx), integerValue(source.cz)
@@ -230,39 +279,3 @@ function M.buildWorldCatalog(width, length, worldSeed, options)
     if descriptor == nil then
       local calibration = options.calibration or worldSeedCalibration(worldSeed, options)
       if not calibration then return nil, "gps_not_calibrated" end
-      local catalog, catalogError = M.buildCatalog(width, length, "world", calibration)
-      if not catalog then return nil, catalogError end
-      catalog.referenceCalibration = {
-        home = { x = calibration.home.x, y = calibration.home.y, z = calibration.home.z },
-        forward = { x = calibration.forward.x, z = calibration.forward.z },
-      }
-      catalog.calibrationSeed = {
-        home = { x = calibration.home.x, y = calibration.home.y, z = calibration.home.z },
-        forward = { x = calibration.forward.x, z = calibration.forward.z },
-      }
-      local bounds
-      for _, chunk in ipairs(catalog) do
-        if contains(chunk, 0, 1) then catalog.rootKey = chunk.key; break end
-      end
-      for _, chunk in ipairs(catalog) do
-        bounds = bounds or { minX = chunk.minX, maxX = chunk.maxX, minZ = chunk.minZ, maxZ = chunk.maxZ }
-        bounds.minX, bounds.maxX = math.min(bounds.minX, chunk.minX), math.max(bounds.maxX, chunk.maxX)
-        bounds.minZ, bounds.maxZ = math.min(bounds.minZ, chunk.minZ), math.max(bounds.maxZ, chunk.maxZ)
-      end
-      catalog.bounds = bounds
-      return catalog
-    end
-    options = type(length) == "table" and length or options
-    width, length = descriptor.width, descriptor.length
-    worldSeed = descriptor.worldSeed or descriptor.seed or descriptor.calibration or options.worldSeed or worldSeed
-    if descriptor.options and type(descriptor.options) == "table" then
-      local merged = {}
-      for key, value in pairs(descriptor.options) do merged[key] = value end
-      for key, value in pairs(options) do merged[key] = value end
-      options = merged
-      if worldSeed == nil then worldSeed = options.worldSeed end
-    end
-  end
-  local calibration = options.calibration
-  if not calibration then calibration = worldSeedCalibration(worldSeed, options) end
-  if not calibration then return nil, "gps_not_calibrated" end

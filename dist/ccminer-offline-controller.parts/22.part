@@ -1,3 +1,36 @@
+  -- Rebase every catalog rectangle through world coordinates before building
+  -- the worker-local graph; this handles both offsets and cardinal rotations.
+  local referenceCalibration = options.referenceCalibration
+  if not referenceCalibration and type(catalog) == "table" then
+    referenceCalibration = catalog.referenceCalibration or catalog.calibrationSeed or catalog.calibration
+    if not referenceCalibration and type(catalog.catalog) == "table" then
+      referenceCalibration = catalog.catalog.referenceCalibration or catalog.catalog.calibrationSeed or catalog.catalog.calibration
+    end
+  end
+  local workerCalibration = options.workerCalibration or options.calibration
+  if workerCalibration and not referenceCalibration then return nil, "reference_calibration_required" end
+  if referenceCalibration and not validCalibration(referenceCalibration) then return nil, "invalid_reference_calibration" end
+  if workerCalibration and not validCalibration(workerCalibration) then return nil, "invalid_worker_calibration" end
+  local referenceRootKey = options.referenceRootKey or (type(catalog) == "table" and catalog.rootKey)
+  if not referenceRootKey and type(catalog) == "table" and type(catalog.catalog) == "table" then
+    referenceRootKey = catalog.catalog.rootKey
+  end
+  if referenceRootKey ~= nil then referenceRootKey = tostring(referenceRootKey) end
+  if not referenceRootKey then
+    for _, key in ipairs(sourceKeys) do
+      if contains(sourceChunks[key], 0, 1) then referenceRootKey = key; break end
+    end
+  end
+  local function rebaseBounds(chunk)
+    if not workerCalibration then return true end
+    local minX, maxX, minZ, maxZ = chunk.minX, chunk.maxX, chunk.minZ, chunk.maxZ
+    local corners = {
+      { x = minX, z = minZ }, { x = minX, z = maxZ },
+      { x = maxX, z = minZ }, { x = maxX, z = maxZ },
+    }
+    local rebasedMinX, rebasedMaxX, rebasedMinZ, rebasedMaxZ
+    for _, corner in ipairs(corners) do
+      local worldX, worldZ = localToWorld(referenceCalibration, corner.x, corner.z)
       local localX, localZ, rebaseError = worldToLocalXZ(workerCalibration, worldX, worldZ)
       if not localX or not localZ then return nil, rebaseError or "invalid_rebase" end
       if localX % 1 ~= 0 or localZ % 1 ~= 0 then return nil, "non_integral_rebase" end
@@ -194,46 +227,3 @@ local function boundsFrom(value, length, options)
       minZ, maxZ = integerValue(value.minZ), integerValue(value.maxZ)
     elseif value.width ~= nil and value.length ~= nil then
       local width, validLength = integerValue(value.width, 1, MAX_DIMENSION), integerValue(value.length, 1, MAX_DIMENSION)
-      if not width or not validLength or width * validLength > MAX_COLUMNS then return nil, "invalid_bounds" end
-      local originX = integerValue(value.originX ~= nil and value.originX or options.originX or 0)
-      local originZ = integerValue(value.originZ ~= nil and value.originZ or options.originZ or 1)
-      if not originX or not originZ then return nil, "invalid_bounds" end
-      minX, maxX = originX, originX + width - 1
-      minZ, maxZ = originZ, originZ + validLength - 1
-    elseif value.plan then
-      return boundsFrom(value.plan, nil, options)
-    elseif value.chunks then
-      for _, chunk in pairs(value.chunks) do
-        if not minX or chunk.minX < minX then minX = chunk.minX end
-        if not maxX or chunk.maxX > maxX then maxX = chunk.maxX end
-        if not minZ or chunk.minZ < minZ then minZ = chunk.minZ end
-        if not maxZ or chunk.maxZ > maxZ then maxZ = chunk.maxZ end
-      end
-    end
-  else
-    local width = integerValue(value, 1, MAX_DIMENSION)
-    local validLength = integerValue(length, 1, MAX_DIMENSION)
-    if width and validLength and width * validLength <= MAX_COLUMNS then
-      local originX = integerValue(options.originX ~= nil and options.originX or 0)
-      local originZ = integerValue(options.originZ ~= nil and options.originZ or 1)
-      if originX and originZ then
-        minX, maxX = originX, originX + width - 1
-        minZ, maxZ = originZ, originZ + validLength - 1
-      end
-    end
-  end
-  if not minX or not maxX or not minZ or not maxZ or maxX < minX or maxZ < minZ then return nil, "invalid_bounds" end
-  if (maxX - minX + 1) * (maxZ - minZ + 1) > MAX_COLUMNS then return nil, "bounds_too_large" end
-  return {
-    minX = minX, maxX = maxX, minZ = minZ, maxZ = maxZ,
-    width = maxX - minX + 1, length = maxZ - minZ + 1,
-    cells = (maxX - minX + 1) * (maxZ - minZ + 1),
-  }
-end
-
-function M.gridBounds(value, length, options)
-  return boundsFrom(value, length, options)
-end
-
-M.getGridBounds = M.gridBounds
-M.bounds = M.gridBounds

@@ -1,3 +1,36 @@
+  if current and tostring(current) == tostring(chunk.key) then return data.status == "blocked" and "blocked" or "working" end
+  local completed = tonumber(progress.completedChunks or job.completedChunks)
+  if completed and index <= completed then return "complete" end
+  if not completed then
+    local cursor = tonumber(progress.cursor or job.cursor)
+    local depth = math.max(1, tonumber(job.depth) or 1)
+    if cursor then
+      local startBlock = (index - 1) * math.max(1, tonumber(chunk.cells) or 1) * depth
+      local endBlock = startBlock + math.max(1, tonumber(chunk.cells) or 1) * depth
+      if cursor >= endBlock then return "complete" elseif cursor > startBlock then return "working" end
+    end
+  end
+  if progress.cursor == nil and job.cursor == nil then return "unknown" end
+  return "queued"
+end
+
+local progressColors = { unknown = "gray", queued = "blue", working = "yellow", complete = "green", excluded = "red", blocked = "red", service = "orange" }
+local function renderProgress(target, key)
+  local width, height = target.getSize()
+  local id, worker = selectedWorker()
+  local data = worker and worker.data or {}
+  writeHeader("WORK PROGRESS MAP", target)
+  common.writeAt(1, 2, common.fit(("#%s %s %s"):format(tostring(id or "-"), worker and workerLabel(worker, id) or "-", progressText(data)), width), colors and colors.lightGray or nil)
+  local job = data.job
+  if not job then
+    common.writeAt(1, 4, common.fit("No active job (old worker may only expose status).", width), colors and colors.yellow or nil)
+  else
+    local chunkMode = job.chunkMode == "world" and "world" or "local"
+    local calibration = data.gps and data.gps.calibration
+    local catalog, catalogError = quarry.buildCatalog(job.width, job.length, chunkMode, calibration)
+    if not catalog then
+      common.writeAt(1, 4, common.fit("Chunk map unavailable: " .. tostring(catalogError), width), colors and colors.yellow or nil)
+      buttonRow(key, math.max(1, height - 2), width, { { "BACK", function() mode = "dashboard" end } })
       noticeLine(target, height)
       return
     end
@@ -143,35 +176,3 @@ local function screenSignature(target, key)
   local data = worker and worker.data or {}
   local gid, group = selectedGroupRecord()
   local groupJob = gid and activeGroupJob(gid) or nil
-  return table.concat({ tostring(mode), tostring(key), tostring(width), tostring(height), tostring(id or ""), tostring(data.updatedAt or data.status or ""), tostring(noticeState.workerPage or ""), tostring(noticeState.morePage or ""), tostring(gid or ""), tostring(group and group.updatedAt or ""), tostring(groupJob and groupJob.updatedAt or ""), tostring(groupDraft and groupDraft.updatedAt or ""), tostring(groupDraft and groupDraft.preflight and groupDraft.preflight.computedAt or ""), tostring(draft and draft.gridPageX or ""), tostring(draft and draft.gridPageZ or ""), tostring(dirty) }, "|")
-end
-
-local function renderOne(target, key)
-  local singleDraftMode = mode == "job_dimensions" or mode == "job_grid"
-    or mode == "job_chunks" or mode == "preflight"
-  local groupDraftMode = mode == "group_dimensions" or mode == "group_job"
-  if (singleDraftMode and type(draft) ~= "table")
-    or (groupDraftMode and type(groupDraft) ~= "table") then
-    mode = "dashboard"
-    setNotice("The unfinished job form was reset safely. Open NEW JOB again.", true)
-  end
-  resetHitboxes(key)
-  local signature = screenSignature(target, key)
-  if renderCache[key] == signature and not dirty then return end
-  common.withTerm(target, function()
-    common.clear(colors and colors.black or nil, colors and colors.white or nil)
-    if mode == "dashboard" then renderDashboard(target, key)
-    elseif mode == "workers" then noticeState.renderWorkers(target, key)
-    elseif mode == "more" then noticeState.renderMore(target, key)
-    elseif mode == "items" then noticeState.renderItems(target, key)
-    elseif mode == "groups" then renderGroups(target, key)
-    elseif mode == "group_info" then renderGroupInfo(target, key)
-    elseif mode == "group_dimensions" or mode == "group_job" then renderGroupDimensions(target, key)
-    elseif mode == "job_dimensions" then renderDimensions(target, key)
-    elseif mode == "job_grid" or mode == "job_chunks" then renderGrid(target, key)
-    elseif mode == "preflight" then renderPreflight(target, key)
-    elseif mode == "progress" then renderProgress(target, key)
-    elseif mode == "stop_menu" then renderStopMenu(target, key)
-    elseif mode == "recovery" then renderRecovery(target, key)
-    elseif mode == "info" then renderInfo(target, key)
-    elseif mode == "report" then renderReport(target, key)

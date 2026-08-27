@@ -1098,6 +1098,7 @@ def main() -> None:
         "tests/test_remote_console.lua",
         "tests/test_worker_remote_console.lua",
         "tests/test_worker_v4_contract.lua",
+        "tests/test_journal_v4.lua",
         "tests/test_controller_v4_contract.lua",
         "tests/test_distribution_v4.lua",
         "tests/test_startup.lua",

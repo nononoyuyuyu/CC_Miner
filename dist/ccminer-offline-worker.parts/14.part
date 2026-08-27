@@ -1,3 +1,44 @@
+        -- Registry validation and coordinate normalization stay in the
+        -- controller.  Preserve every argument so legacy and extended
+        -- register forms remain compatible.
+        forwardController()
+      end
+    elseif command == "stop" then
+      local mode = string.lower(tostring(args[3] or ""))
+      local stopModes = {
+        now = "pause_now", row = "finish_row", layer = "finish_layer", home = "return_home",
+        pause_now = "pause_now", finish_row = "finish_row", finish_layer = "finish_layer",
+        return_home = "return_home", abort = "abort",
+      }
+      local controllerMode = stopModes[mode]
+      local valid = controllerMode ~= nil
+      if not tonumber(args[2]) or not valid then
+        reportError("Usage: ccm stop <id> <now|row|layer|home|abort>")
+      else
+        local forwarded = {}
+        for index = 1, #args do forwarded[index] = args[index] end
+        forwarded[3] = controllerMode
+        forwardController(forwarded)
+      end
+    else
+      forwardController()
+    end
+  end
+elseif command == "status" then
+  local config, configError = common.loadConfig()
+  if not config then reportError(configError or "Not configured."); return end
+  print("CC Miner " .. tostring(common.VERSION or ""))
+  print("Role: " .. tostring(config.role))
+  print("Computer ID: " .. tostring(os.getComputerID()))
+  print("Label: " .. tostring(os.getComputerLabel and os.getComputerLabel() or "-"))
+  if type(config.networkKey) == "string" and config.networkKey ~= "" then print("Network key: configured (masked)") else print("Network key: not configured") end
+  printStatusFeature("Profile", config.profile)
+  printStatusFeature("Lighting", config.lighting, config.lightMode)
+  printStatusFeature("Water", config.water, config.waterMode)
+  printStatusFeature("Materials", config.materials)
+  printStatusFeature("Staged stop", config.stagedStop)
+  if config.role == "worker" then
+    local state, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
     if stateError then reportError(stateError) end
     print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
     if state.pose then print(("Pose: x=%s y=%s z=%s dir=%s"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir)) end
@@ -248,43 +289,3 @@ function M.cell(width, length, depth, index)
   local layer = math.floor(index / perLayer)
   local offset = index % perLayer
   if layer % 2 == 1 then offset = perLayer - 1 - offset end
-  local row = math.floor(offset / validLength)
-  local column = offset % validLength
-  local z = row % 2 == 0 and (column + 1) or (validLength - column)
-  return { x = row, y = -layer, z = z }
-end
-
-function M.cellForJob(job, index)
-  if type(job) ~= "table" then return nil, "invalid_job" end
-  return M.cell(job.width, job.length, job.depth, index)
-end
-
-local function validCalibration(calibration)
-  if type(calibration) ~= "table" or type(calibration.home) ~= "table" or type(calibration.forward) ~= "table" then
-    return false
-  end
-  local fx, fz = numberValue(calibration.forward.x), numberValue(calibration.forward.z)
-  local hx, hy, hz = numberValue(calibration.home.x), numberValue(calibration.home.y), numberValue(calibration.home.z)
-  return fx ~= nil and fz ~= nil and hx ~= nil and hy ~= nil and hz ~= nil
-    and math.abs(fx) + math.abs(fz) == 1
-end
-
-local function localToWorld(calibration, x, z)
-  local forward = { x = numberValue(calibration.forward.x), z = numberValue(calibration.forward.z) }
-  local homeX, homeZ = numberValue(calibration.home.x), numberValue(calibration.home.z)
-  local rightX, rightZ = -forward.z, forward.x
-  return homeX + rightX * x + forward.x * z,
-    homeZ + rightZ * x + forward.z * z
-end
-
--- Inverse of localToWorld for worker-local rebasing.  GPS calibrations are
--- cardinal (one-block forward/right vectors), so the result remains integral
--- for integral world positions while still accepting numeric coordinates for
--- diagnostics.
-local function worldToLocalXZ(calibration, worldX, worldZ)
-  if not validCalibration(calibration) then return nil, nil, "gps_not_calibrated" end
-  worldX, worldZ = numberValue(worldX), numberValue(worldZ)
-  if not worldX or not worldZ then return nil, nil, "invalid_world_position" end
-  local forwardX, forwardZ = numberValue(calibration.forward.x), numberValue(calibration.forward.z)
-  local homeX, homeZ = numberValue(calibration.home.x), numberValue(calibration.home.z)
-  local dx, dz = worldX - homeX, worldZ - homeZ

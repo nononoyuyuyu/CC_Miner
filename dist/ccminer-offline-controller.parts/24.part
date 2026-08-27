@@ -1,3 +1,38 @@
+  -- Keep the compatibility field, but never point it at `leases`: CC's
+  -- serializer rejects repeated table references.
+  db.activeLeases = common.copy(db.leases or {})
+  -- Group tables may have been assembled from live worker payloads.  Copy
+  -- each top-level value independently so `groups`/`groupJobs`/leases never
+  -- share a table reference in the serialized database.
+  local persistedGroups, persistedDocks, persistedBays, persistedJobs, persistedGroupLeases = {}, {}, {}, {}, {}
+  for key, value in pairs(db.groups or {}) do persistedGroups[key] = persistentGroupValue(value) end
+  for key, value in pairs(db.docks or {}) do persistedDocks[key] = persistentGroupValue(value) end
+  for key, value in pairs(db.bays or {}) do persistedBays[key] = persistentGroupValue(value) end
+  for key, value in pairs(db.groupJobs or {}) do persistedJobs[key] = persistentGroupValue(value) end
+  for key, value in pairs(db.groupLeases or {}) do persistedGroupLeases[key] = persistentGroupValue(value) end
+  -- Do not replace the live tables with sanitized copies: callers may hold a
+  -- reference to a group job while saving an ACK or scheduler transition.
+  -- Build a detached root exclusively for serialization instead.
+  local persistedDb = {}
+  for key, value in pairs(db) do persistedDb[key] = common.copy(value) end
+  persistedDb.groups, persistedDb.docks, persistedDb.bays = persistedGroups, persistedDocks, persistedBays
+  persistedDb.groupJobs, persistedDb.groupLeases = persistedJobs, persistedGroupLeases
+  persistedDb.groupScheduler = persistentDraft(db.groupScheduler or {})
+  persistedDb.activeLeases = common.copy(db.leases or {})
+  local ok, err = common.saveTable(DB_PATH, persistedDb)
+  if not ok then dbError = err end
+  return ok, err
+end
+
+loadControllerDb()
+
+local workers = {}
+local selected = 1
+local selectedGroup = 1
+local groupMode = false
+local groupDraft = nil
+local groupCommandAcks = {}
+local groupSchedulerLast = 0
 local normalizedProfile, normalizedWaterMode, normalizedLighting
 local releaseGroupLeases
 local finalizePendingReassignment
@@ -255,34 +290,3 @@ local function registerGroup(groupId, workerIds, options)
   options = type(options) == "table" and options or {}
   local ids, seen = {}, {}
   for _, value in ipairs(workerIds or {}) do
-    local id = tonumber(value) or value
-    if tostring(id) ~= "" and not seen[tostring(id)] then seen[tostring(id)] = true; ids[#ids + 1] = id end
-  end
-  if #ids == 0 then return false, "group_workers_required" end
-  local maxWorkers = tonumber(config.group and config.group.maxWorkers)
-  if maxWorkers and #ids > maxWorkers then return false, "group_max_workers_exceeded:" .. tostring(maxWorkers) end
-  table.sort(ids, function(a, b) return tostring(a) < tostring(b) end)
-  local previous = groupRecord(groupId) or {}
-  local mode = tostring(options.mode or previous.mode or "world"):lower()
-  if mode ~= "world" and mode ~= "local" then return false, "group_mode_unsupported:" .. mode end
-  local partition = tostring(options.partition or previous.partition or (config.group and config.group.partitionMode) or "stripe"):lower()
-  if partition ~= "stripe" and partition ~= "round_robin" then return false, "partition_mode_unsupported:" .. partition end
-  local allowedWorkers = {}
-  for _, id in ipairs(ids) do allowedWorkers[tostring(id)] = true end
-  local function validateResourceMap(source, name)
-    if source == nil then return true end
-    if type(source) ~= "table" then return false, name .. "_map_invalid" end
-    for key, raw in pairs(source) do
-      local id = tostring(key)
-      if not allowedWorkers[id] then return false, name .. "_worker_unknown:" .. id end
-      local value = raw
-      if type(value) == "table" then value = value.id or value.bayId or value.dockId end
-      if value == nil or common.trim(value) == "" then return false, name .. "_value_empty:" .. id end
-    end
-    return true
-  end
-  local mapOK, mapError = validateResourceMap(options.workerBays or previous.workerBays, "worker_bay")
-  if not mapOK then return false, mapError end
-  mapOK, mapError = validateResourceMap(options.workerDocks or previous.workerDocks, "worker_dock")
-  if not mapOK then return false, mapError end
-  local group = {

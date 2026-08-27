@@ -1,3 +1,26 @@
+        if not catalogWorldSet[tostring(homeKey)] then check("bay footprint:#" .. tostring(id), "bad", "worker bay entrance is outside common world footprint", true) end
+        local forwardX, forwardZ = tonumber(gps.home.x) + tonumber(gps.forward.x), tonumber(gps.home.z) + tonumber(gps.forward.z)
+        local forwardKey = quarry.chunkKey("world", math.floor(forwardX / 16), math.floor(forwardZ / 16))
+        if not catalogWorldSet[tostring(forwardKey)] then check("forward footprint:#" .. tostring(id), "bad", "worker bay forward entrance is outside common footprint", true) end
+        if tostring(homeKey) ~= tostring(forwardKey) then check("bay chunk:#" .. tostring(id), "bad", "worker home and forward entrance must share one bay chunk", true) end
+        if homeChunkOwners[tostring(homeKey)] then
+          check("bay chunk unique:#" .. tostring(id), "bad", "bay chunk already owned by worker #" .. tostring(homeChunkOwners[tostring(homeKey)]), true)
+        else
+          homeChunkOwners[tostring(homeKey)] = id
+        end
+        if type(quarry.inverseWorldToLocal) == "function" and referenceCalibration then
+          local okInverse, localForward = pcall(quarry.inverseWorldToLocal, referenceCalibration, forwardX, forwardZ)
+          if not okInverse or type(localForward) ~= "table" then
+            check("bay cell:#" .. tostring(id), "bad", "cannot rebase worker forward entrance to common catalog", true)
+          else
+            local forwardCell = false
+            for _, chunk in ipairs(catalog or {}) do
+              if tonumber(localForward.x) >= tonumber(chunk.minX) and tonumber(localForward.x) <= tonumber(chunk.maxX)
+                and tonumber(localForward.z) >= tonumber(chunk.minZ) and tonumber(localForward.z) <= tonumber(chunk.maxZ) then
+                forwardCell = tostring(chunk.key) == tostring(homeKey) or forwardCell
+              end
+            end
+            if not forwardCell then check("bay cell:#" .. tostring(id), "bad", "worker forward entrance is outside its bay chunk cells", true)
             else check("bay cell:#" .. tostring(id), "ok", "forward entrance is inside its bay chunk", false) end
           end
         end
@@ -129,39 +152,3 @@ releaseGroupLeases = function(job, onlyPending)
   local kept, keptGroup = {}, {}
   for _, lease in ipairs(db.leases or {}) do if keep(lease) then kept[#kept + 1] = lease end end
   for _, lease in ipairs(db.groupLeases or {}) do
-    if tostring(lease.groupJobId or "") ~= tostring(job.groupJobId or "") or (onlyPending and job.started and job.started[tostring(lease.workerId)]) then keptGroup[#keptGroup + 1] = lease end
-  end
-  db.leases, db.groupLeases = kept, keptGroup
-  db.activeLeases = common.copy(kept)
-  saveControllerDb()
-  return #removed
-end
-
-groupSafeStop = function(job, workerId, reason)
-  local payload = { scope = "group", group = true, groupId = job.groupId, groupJobId = job.groupJobId, groupCommand = "RETURN", mode = "return_home", safeStop = true, reason = reason or "partial_start" }
-  payload.targetWorkerId, payload.workerId = tonumber(workerId) or workerId, tonumber(workerId) or workerId
-  sendCommand(workerId, "stop", payload)
-end
-
-sortedJobAssignments = function(job)
-  local out = {}
-  for key, value in pairs(job and job.assignments or {}) do if type(value) == "table" then out[#out + 1] = value end end
-  table.sort(out, function(a, b) return tostring(a.workerId) < tostring(b.workerId) end)
-  return out
-end
-
-local function dispatchGroupJob(job, force)
-  if type(job) ~= "table" or (job.status ~= "starting" and job.status ~= "queued") then return false end
-  job.pending = job.pending or {}
-  job.started = job.started or {}
-  job.failed = job.failed or {}
-  job.awaitingAck = job.awaitingAck or {}
-  job.acks = job.acks or {}
-  for _ in pairs(job.awaitingAck) do return true end
-  local now = common.nowSeconds()
-  local stagger = math.max(0, tonumber(job.staggerSeconds) or 0)
-  for _, assignment in ipairs(sortedJobAssignments(job)) do
-    local key = tostring(assignment.workerId)
-    if not job.started[key] and not job.failed[key] and (force or not job.pending[key] or now >= (job.nextDispatchAt or 0)) then
-      local payload = {
-        scope = "group", group = true, groupId = tostring(job.groupId), groupJobId = tostring(job.groupJobId), parentGroupJobId = tostring(job.groupJobId), groupCommand = "START", requestedCommand = "start", assignmentCatalog = common.copy(job.catalog),

@@ -1,3 +1,63 @@
+    if slotRoleContains(slot, "fuel") and isFuelItem(slot) then keep[slot] = turtle.getItemCount(slot)
+    elseif slotRoleContains(slot, "generic") then keep[slot] = turtle.getItemCount(slot) end
+  end
+  return keep
+end
+
+local function compressSealStacks()
+  local originalSlot = turtle.getSelectedSlot()
+  local moved = 0
+  local function compactRole(role, predicate)
+    local sets = materialSlotSets()
+    local order, seen = {}, {}
+    for slot = 1, 16 do
+      if sets[role] and sets[role][slot] and not isReservedSlot(slot, role) then
+        order[#order + 1], seen[slot] = slot, true
+      end
+    end
+    for slot = 1, 16 do
+      if not seen[slot] and not isReservedSlot(slot, role) then order[#order + 1] = slot end
+    end
+    for _, destination in ipairs(order) do
+      -- Empty designated slots are filled first.  Older code only merged into
+      -- occupied slots, so the documented material slots often stayed empty.
+      if turtle.getItemCount(destination) == 0 and sets[role] and sets[role][destination] then
+        for source = 1, 16 do
+          if source ~= destination and not isReservedSlot(source, role)
+            and turtle.getItemCount(source) > 0 and predicate(itemName(source)) then
+            turtle.select(source)
+            local before = turtle.getItemCount(source)
+            if turtle.transferTo(destination) then moved = moved + before - turtle.getItemCount(source) end
+            break
+          end
+        end
+      end
+      local name = itemName(destination)
+      if name and predicate(name) then
+        local space = turtle.getItemSpace(destination)
+        for source = 1, 16 do
+          if space <= 0 then break end
+          if source ~= destination and not isReservedSlot(source, role)
+            and turtle.getItemCount(source) > 0 and itemName(source) == name then
+            turtle.select(source)
+            local before = turtle.getItemCount(source)
+            if turtle.transferTo(destination, math.min(space, before)) then
+              moved = moved + before - turtle.getItemCount(source)
+              space = turtle.getItemSpace(destination)
+            end
+          end
+        end
+      end
+    end
+  end
+  compactRole("seal", isSealItemName)
+  compactRole("torch", isTorchItemName)
+  turtle.select(originalSlot)
+  return moved
+end
+
+local function compressInventoryAtField()
+  -- compactEvery is a local inventory operation.  It must never create a
   -- service/return merely to consolidate stacks, and it must not touch
   -- protected reserve slots or split a stack while moving items.
   local originalSlot = turtle.getSelectedSlot()
@@ -213,59 +273,3 @@ local function unloadAtHome()
         local prepared, prepareError = beginPhysicalAction("unload_home", {
           slot = slot, item = name, count = removable, direction = outputSide,
         }, poseCopy())
-        if not prepared then
-          allDropped = false
-          discardStats.lastError = prepareError or "Could not journal output action."
-          break
-        end
-        local dropped = outDrop(removable)
-        local removed = before - turtle.getItemCount(slot)
-        if dropped and removed > 0 then commitPhysicalAction(); if removed < removable then allDropped = false end
-        else cancelPhysicalAction(); allDropped = false end
-      end
-    end
-  end
-  discardStats.passes = (discardStats.passes or 0) + (discardEnabled and 1 or 0)
-  discardStats.enabled = mode ~= "KEEP_ALL"
-  discardStats.triggered = discardEnabled
-  discardStats.mode = mode
-  local _, _, heldItems = inventoryStats()
-  discardStats.held = heldItems
-  if discardEnabled then discardStats.lastError = nil end
-
-  local restored, restoreError = turnTo(outRestore)
-  turtle.select(originalSlot)
-  if not restored then return false, restoreError end
-  if not allDropped then
-    return false, "Output/discard inventory is full or a protected stack could not be retained safely."
-  end
-  updateRecycleInventoryState()
-  state.stats.unloads = (state.stats.unloads or 0) + 1
-  saveState("unload_done")
-  return true
-end
-
-local function discardAtField()
-  local policy, mode = discardPolicy()
-  if mode == "KEEP_ALL" then return true end
-  local _, emptySlots = inventoryStats()
-  local trigger = tonumber(policy.triggerEmptySlots) or 3
-  if emptySlots > trigger then return true end
-
-  local discardStats = discardStatsTable()
-  discardStats.lastError = nil
-  local side = policy.direction or "back"
-  if side == "up" then side = "top" end
-  if side == "down" then side = "bottom" end
-  local originalSlot = turtle.getSelectedSlot()
-  local inspectFunction, _, dropFunction, restoreDir, sideError = sideFunctions(side)
-  if not inspectFunction then
-    discardStats.lastError = sideError or "Discard direction is invalid."
-    turtle.select(originalSlot)
-    return false, discardStats.lastError
-  end
-  local checkSide = (side == "top" and "top") or (side == "bottom" and "bottom") or "front"
-  -- A configured inventory at the field direction is an explicit safety
-  -- boundary: never accidentally inject a discard stack into it.
-  if inventoryPresent(checkSide, inspectFunction) then
-    discardStats.skipped = (discardStats.skipped or 0) + 1

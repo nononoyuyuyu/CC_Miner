@@ -1,3 +1,56 @@
+    route.breadcrumbs[#route.breadcrumbs + 1] = route.currentKey
+    while #route.breadcrumbs > 128 do table.remove(route.breadcrumbs, 1) end
+  end
+
+  if route.walkIndex > #plan.walk then
+    if route.layer + 1 >= job.depth then completeJob("completed"); return end
+    local ok, err = moveOne("down", "mining")
+    if not ok then
+      if handleMoveFailure("Cannot descend to the next layer", err, true) then return end
+      markBlocked("Cannot descend to the next layer: " .. tostring(err))
+      return
+    end
+    route.layer = route.layer + 1
+    route.walkIndex, route.localCursor, route.phase = 1, 0, "travel"
+    route.currentKey = plan.rootKey
+    local layerGPS, layerGPSError = verifyGPS(true)
+    if not layerGPS then markBlocked("GPS verification after layer change failed: " .. tostring(layerGPSError)); return end
+    saveState()
+    return
+  end
+
+  local walkStep = plan.walk[route.walkIndex]
+  local chunk = plan.chunks[walkStep.key]
+  if not chunk then markBlocked("Chunk plan references an unknown chunk: " .. tostring(walkStep.key)); return end
+  local y = -route.layer
+  local anchor = { x = chunk.anchor.x, y = y, z = chunk.anchor.z }
+
+  if route.phase == "travel" then
+    local ok, err
+    if not quarry.findChunk(plan, state.pose.x, state.pose.z) then
+      -- The physical dock (0,0) is outside the quarry footprint.  The first
+      -- trip must bridge home -> dock and then follow the assigned
+      -- dock/transit BFS route, never a direct home -> seed shortcut.
+      ok, err = navigateChunkPlanWork(anchor, "mining")
+    elseif samePosePosition(state.pose, anchor) then
+      ok = true
+    elseif route.currentKey and route.currentKey ~= walkStep.key then
+      ok, err = moveBetweenChunkAnchors(plan, route.currentKey, walkStep.key, y, "mining")
+    else
+      ok, err = navigateTo(anchor, "inside", "mining")
+    end
+    if not ok then
+      if handleMoveFailure("Chunk transit failed", err, false) then return end
+      markBlocked("Chunk transit failed: " .. tostring(err)); return
+    end
+    route.currentKey = walkStep.key
+    if route.breadcrumbs[#route.breadcrumbs] ~= walkStep.key then
+      route.breadcrumbs[#route.breadcrumbs + 1] = walkStep.key
+      while #route.breadcrumbs > 128 do table.remove(route.breadcrumbs, 1) end
+    end
+    if walkStep.first then
+      route.phase, route.localCursor = "mine", 0
+    else
       route.walkIndex = route.walkIndex + 1
     end
     saveState()
@@ -211,53 +264,3 @@ local function resolveNonMovementPending(pending)
   if common.startsWith(kind, "torch_") then
     if common.startsWith(kind, "torch_wall") and tonumber(pending.details and pending.details.side or 0) ~= 0 then
       return false, "Pending wall torch requires orientation recovery before re-inspection."
-    end
-    local present, data = inspectPendingSide(kind)
-    if present and isTorchItemName(blockName(data)) then return true end
-    if not present then return true end
-    return false, "Pending torch target is occupied by " .. blockName(data) .. "."
-  end
-  return nil
-end
-
-local function tryResolvePendingAction()
-  local pending = state.pendingAction
-  if not pending then return true end
-  local kind = tostring(pending.kind or "")
-  if common.startsWith(kind, "turn_") or kind == "gps_calibration" then return false, "GPS cannot determine the result of " .. kind end
-  local nonMovement, nonMovementError = resolveNonMovementPending(pending)
-  if nonMovement ~= nil then
-    if not nonMovement then return false, nonMovementError end
-    state.pendingAction = nil
-    state.stats.journalRecoveries = (state.stats.journalRecoveries or 0) + 1
-    if common.startsWith(kind, "torch_") then
-      state.stats.torchesRecovered = (state.stats.torchesRecovered or 0) + 1
-      state.lighting.torchesRecovered = (state.lighting.torchesRecovered or 0) + 1
-    end
-    state.stats.powerRecoveries = (state.stats.powerRecoveries or 0) + 1
-    common.log("WARN", "Re-inspected pending action " .. kind .. " as resolved")
-    saveState("pending_recovered_" .. kind)
-    return true
-  end
-  if gpsConfig().autoResolvePending == false or not gpsCalibration() then return false, "GPS pending-action recovery is unavailable." end
-  local fix, fixError = locateGPS()
-  if not fix then return false, fixError end
-  local resolved, resolveError = geo.resolvePending(pending, fix, gpsCalibration())
-  if not resolved then return false, resolveError end
-  state.pose = poseCopy(resolved.pose)
-  state.pendingAction = nil
-  if resolved.outcome == "after" and common.startsWith(kind, "move_") then
-    state.stats.moves = (state.stats.moves or 0) + 1
-  end
-  state.stats.gpsRecoveries = (state.stats.gpsRecoveries or 0) + 1
-  state.stats.powerRecoveries = (state.stats.powerRecoveries or 0) + 1
-  state.gps.corrections = (state.gps.corrections or 0) + 1
-  common.log("WARN", "GPS resolved pending action " .. kind .. " as " .. resolved.outcome)
-  saveState()
-  return true
-end
-
-local function preflight()
-  if not os.getComputerLabel or not os.getComputerLabel() then
-    if os.setComputerLabel then os.setComputerLabel(config.workerName) end
-  end

@@ -1,3 +1,38 @@
+    local chunkKeys = uniqueSortedKeys(owned[index], chunks)
+    if #chunkKeys == 0 then return nil, "empty_worker_assignment" end
+    local seedKey = worker.bayChunkKey
+      or (worker.seedKey and chunks[worker.seedKey] and worker.seedKey)
+      or (seeds and seeds[index]) or chunkKeys[1]
+    if not owner[seedKey] or owner[seedKey] ~= index then seedKey = chunkKeys[1] end
+    local transitSet, originKey = {}, workerBayChunk(worker, chunks, keys) or rootKey
+    if not chunks[originKey] then originKey = rootKey end
+    -- A bay-aligned stripe is itself connected and starts at the worker's own
+    -- bay seed, so it needs no transit lease at all.  For graph growth keep
+    -- the explicit shortest paths, but include only keys outside this
+    -- worker's mine assignment.
+    if not (strategyUsed == "stripe" and bayAware) then
+      local originTree = graphBreadthTree(chunks, originKey)
+      for _, targetKey in ipairs(chunkKeys) do
+        local path = pathFromBreadthTree(originTree, originKey, targetKey)
+        if path then
+          for _, transitKey in ipairs(path) do
+            if owner[transitKey] ~= index then transitSet[transitKey] = true end
+          end
+        end
+      end
+    end
+    for _, targetKey in ipairs(chunkKeys) do assignedSet[targetKey] = true end
+    local transitKeys = {}
+    for transitKey in pairs(transitSet) do transitKeys[#transitKeys + 1] = transitKey end
+    table.sort(transitKeys, function(a, b) return chunkComparator(chunks[a], chunks[b]) end)
+    local layers = defaultLayers
+    if layers == nil and worker.homeY ~= nil and bottomY ~= nil then layers = worker.homeY - bottomY + 1 end
+    if layers == nil then layers = 1 end
+    if layers < 1 or layers > MAX_DIMENSION then return nil, "invalid_worker_layers" end
+    local volume = loads[index] * layers
+    if volume > MAX_BLOCKS then return nil, "group_too_large" end
+    local distance = #transitKeys + math.max(0, #chunkKeys - 1)
+    if worker.bay then
       local seedChunk = chunks[seedKey]
       distance = distance + math.abs(worker.bay.x - (seedChunk.cx * 16 + 8))
         + math.abs(worker.bay.z - (seedChunk.cz * 16 + 8))
@@ -244,36 +279,3 @@ function M.buildAssignedChunkPlan(catalog, assignedKeys, options)
   end
 
   -- Shared catalogs are expressed in the reference worker's local frame.
-  -- Rebase every catalog rectangle through world coordinates before building
-  -- the worker-local graph; this handles both offsets and cardinal rotations.
-  local referenceCalibration = options.referenceCalibration
-  if not referenceCalibration and type(catalog) == "table" then
-    referenceCalibration = catalog.referenceCalibration or catalog.calibrationSeed or catalog.calibration
-    if not referenceCalibration and type(catalog.catalog) == "table" then
-      referenceCalibration = catalog.catalog.referenceCalibration or catalog.catalog.calibrationSeed or catalog.catalog.calibration
-    end
-  end
-  local workerCalibration = options.workerCalibration or options.calibration
-  if workerCalibration and not referenceCalibration then return nil, "reference_calibration_required" end
-  if referenceCalibration and not validCalibration(referenceCalibration) then return nil, "invalid_reference_calibration" end
-  if workerCalibration and not validCalibration(workerCalibration) then return nil, "invalid_worker_calibration" end
-  local referenceRootKey = options.referenceRootKey or (type(catalog) == "table" and catalog.rootKey)
-  if not referenceRootKey and type(catalog) == "table" and type(catalog.catalog) == "table" then
-    referenceRootKey = catalog.catalog.rootKey
-  end
-  if referenceRootKey ~= nil then referenceRootKey = tostring(referenceRootKey) end
-  if not referenceRootKey then
-    for _, key in ipairs(sourceKeys) do
-      if contains(sourceChunks[key], 0, 1) then referenceRootKey = key; break end
-    end
-  end
-  local function rebaseBounds(chunk)
-    if not workerCalibration then return true end
-    local minX, maxX, minZ, maxZ = chunk.minX, chunk.maxX, chunk.minZ, chunk.maxZ
-    local corners = {
-      { x = minX, z = minZ }, { x = minX, z = maxZ },
-      { x = maxX, z = minZ }, { x = maxX, z = maxZ },
-    }
-    local rebasedMinX, rebasedMaxX, rebasedMinZ, rebasedMaxZ
-    for _, corner in ipairs(corners) do
-      local worldX, worldZ = localToWorld(referenceCalibration, corner.x, corner.z)

@@ -617,10 +617,13 @@ local function doctorJournal(config, state, finding)
   local path = journalConfig.path or journalState.path or journalState.journalPath or "/ccminer/data/state.journal"
   local text, readError = readTextNoWrite(path)
   local seqValue, sequenceValue = tonumber(journalState.seq), tonumber(journalState.sequence)
-  local expectedSeq = seqValue or sequenceValue
+  local expectedSeq = math.max(seqValue or 0, sequenceValue or 0)
   local writes = tonumber(journalState.writes)
   local entries = tonumber(journalState.entries)
-  if seqValue and sequenceValue and seqValue ~= sequenceValue then
+  -- A zero alias is a known V4.0 migration state: the writer advanced `seq`
+  -- but not `sequence`.  The worker now synchronizes them on load.  Continue
+  -- to reject two independently advanced, conflicting positive counters.
+  if seqValue and sequenceValue and seqValue > 0 and sequenceValue > 0 and seqValue ~= sequenceValue then
     finding("FAIL", "journal", "state seq/sequence counters disagree")
   elseif writes and entries and (writes < 0 or entries < 0 or entries > writes) then
     finding("FAIL", "journal", "state writes/entries counters are inconsistent")
@@ -635,24 +638,40 @@ local function doctorJournal(config, state, finding)
     end
   else
     local count, malformed, previousSeq, lastSeq = 0, 0, nil, nil
+    local pendingLines = {}
+    local function inspectDecoded(decoded)
+      count = count + 1
+      local sequence = decoded and tonumber(decoded.seq or decoded.sequence) or nil
+      if not decoded or sequence == nil then
+        malformed = malformed + 1
+      elseif previousSeq and sequence <= previousSeq then
+        malformed = malformed + 1
+      else
+        previousSeq, lastSeq = sequence, sequence
+      end
+    end
     for line in (text .. "\n"):gmatch("([^\r\n]*)\r?\n") do
       if line ~= "" then
-        count = count + 1
-        local decoded
-        if type(textutils) == "table" and type(textutils.unserialize) == "function" then
-          local ok, value = pcall(textutils.unserialize, line)
-          if ok and type(value) == "table" then decoded = value end
-        end
-        local sequence = decoded and tonumber(decoded.seq or decoded.sequence) or nil
-        if not decoded or sequence == nil then
-          malformed = malformed + 1
-        elseif previousSeq and sequence <= previousSeq then
+        if #pendingLines == 0 and not line:match("^%s*{") then
           malformed = malformed + 1
         else
-          previousSeq, lastSeq = sequence, sequence
+          pendingLines[#pendingLines + 1] = line
+          local decoded
+          if type(textutils) == "table" and type(textutils.unserialize) == "function" then
+            local ok, value = pcall(textutils.unserialize, table.concat(pendingLines, "\n"))
+            if ok and type(value) == "table" then decoded = value end
+          end
+          if decoded then
+            inspectDecoded(decoded)
+            pendingLines = {}
+          elseif #pendingLines > 128 then
+            malformed = malformed + 1
+            pendingLines = {}
+          end
         end
       end
     end
+    if #pendingLines > 0 then malformed = malformed + 1 end
     if malformed > 0 then
       finding("FAIL", "journal", ("%s malformed/non-monotonic entries=%d"):format(path, malformed))
     elseif expectedSeq and lastSeq and lastSeq > expectedSeq then
@@ -1107,7 +1126,33 @@ elseif command == "rehome" then
       if previous and previous.stats then reset.stats = previous.stats end
       local ok, err = common.saveTable(common.STATE_PATH, reset)
       if not ok then reportError("Cannot reset worker state: " .. tostring(err))
-      else print("Worker coordinates and job were reset to home. Run: reboot") end
+      else
+        -- RESET intentionally abandons the old job.  Its auxiliary recovery
+        -- files must be removed with the authoritative state or a reboot can
+        -- replay an old pending action and Doctor sees an old sequence ahead
+        -- of the fresh state.  User-created *.before-reset backups are never
+        -- touched.
+        local journal = type(config.journal) == "table" and config.journal or {}
+        local cleanup = {
+          journal.path or "/ccminer/data/state.journal",
+          (journal.path or "/ccminer/data/state.journal") .. ".1",
+          journal.checkpointPath or "/ccminer/data/state.checkpoint.db",
+          journal.pendingPath or "/ccminer/data/state.pending",
+        }
+        local cleanupErrors = {}
+        for _, path in ipairs(cleanup) do
+          if fs.exists(path) then
+            local removed, removeError = pcall(fs.delete, path)
+            if not removed or fs.exists(path) then cleanupErrors[#cleanupErrors + 1] = tostring(removeError or path) end
+          end
+        end
+        if #cleanupErrors > 0 then
+          reportError("State was reset, but recovery-file cleanup failed: " .. table.concat(cleanupErrors, "; "))
+          reportError("Do not reboot until those files are removed.")
+        else
+          print("Worker coordinates, job, journal and recovery files were reset to home. Run: reboot")
+        end
+      end
     end
   elseif config.role == "controller" then
     if not tonumber(args[2]) or args[3] ~= "RESET" then reportError("Usage: ccm rehome <id> RESET") else forwardController() end

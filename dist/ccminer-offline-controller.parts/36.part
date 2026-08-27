@@ -1,3 +1,35 @@
+      if statusOf(worker) == "offline" then setNotice("Selected worker is offline.", true); return end
+      local previous = db.lastDraft or {}
+      local previousLighting = normalizedLighting(previous.lighting)
+      local previousWater = normalizedWaterMode(previous.waterMode)
+      local previousProfile = normalizedProfile(previous.profile)
+      local previousDepth = tonumber(previous.depth) or 16
+      local calibration = draftCalibration(workerId)
+      local previousTarget = tonumber(previous.targetY)
+      if calibration and calibration.home and tonumber(calibration.home.y) then
+        previousTarget = previousTarget or (tonumber(calibration.home.y) - previousDepth + 1)
+      else
+        previousTarget = nil
+      end
+      draft = {
+        workerId = workerId, width = tonumber(previous.width) or 8, length = tonumber(previous.length) or 32,
+        depth = previousDepth, targetY = previousTarget,
+        lighting = previousLighting, waterMode = previousWater, profile = previousProfile,
+        selectedField = "width", buffer = tostring(previous.width or 8), excluded = common.copy(previous.excluded or {}),
+        partialMask = previous.partialMask == true, chunkPage = 1, gridPageX = 1, gridPageZ = 1,
+        rectMode = false, rectStart = nil, autoAssign = false, name = previous.name,
+      }
+      db.lastDraft = persistentDraft(draft)
+      mode = "job_dimensions"
+      invalidate()
+    elseif name == "info" then
+      if id then mode = "info" else setNotice("No worker selected.", true) end
+    elseif name == "workers" then
+      mode, noticeState.workerPage = "workers", 1
+      noticeState.groupSelectMode, noticeState.groupSelection = false, {}
+    elseif name == "more" then mode = "more"; noticeState.morePage = 1
+    elseif name == "items" then
+      if id and noticeState.openItems then noticeState.openItems()
       else setNotice("Select a worker before opening item settings.", true) end
     elseif name == "remote" then
       if id then
@@ -207,34 +239,3 @@ local function renderErrorDetail(target, key)
   for index = 1, math.min(#lines, maxLines) do
     common.writeAt(2, 2 + index, common.fit(lines[index], math.max(1, width - 2)), colors and colors.white or nil)
   end
-  if #lines > maxLines then common.writeAt(2, height - 2, common.fit("The message continues; use ccm report if needed.", math.max(1, width - 2)), colors and colors.yellow or nil) end
-  buttonRow(key, height, width, { { "OK - RETURN", noticeState.dismiss, true } })
-end
-
-local function statusGlyph(state)
-  return ({ ok = "OK", warn = "!!", bad = "XX" })[state] or "??"
-end
-
-local function renderDashboard(target, key)
-  local width, height = target.getSize()
-  writeHeader("CC MINER V4 TOUCH CONTROL", target)
-  local ids = orderedIds()
-  local online = 0
-  for _, id in ipairs(ids) do if statusOf(workers[id]) ~= "offline" then online = online + 1 end end
-  local id, worker = selectedWorker()
-  local data = worker and worker.data or {}
-  common.writeAt(1, 2, common.fit(("Controller #%d | Workers %d/%d | selected #%s"):format(os.getComputerID(), online, #ids, tostring(id or "-")), width), colors and colors.lightGray or nil)
-  local secondRow = math.max(7, height - 1)
-  local firstRow = secondRow - 3
-  local cardBottom = firstRow - 2
-  if cardBottom >= 3 then
-    local lines = {}
-    if id then
-      local progress = data.progress or {}
-      local materials = data.materials or {}
-      local gps = data.gps or {}
-      lines = {
-        { ("SELECTED WORKER  #%s  %s"):format(tostring(id), workerLabel(worker, id)), colors and colors.yellow or nil },
-        { ("Status: %s  |  Phase: %s  |  Profile: %s"):format(statusOf(worker), tostring(data.phase or "-"), tostring(data.effectiveProfile or data.profile or "-")), colors and colors.white or nil },
-        { "Progress: " .. progressText(data), colors and colors.lime or nil },
-        { ("Fuel: %s / %s"):format(tostring(data.fuel or "-"), tostring(data.fuelLimit or "-")), colors and colors.white or nil },

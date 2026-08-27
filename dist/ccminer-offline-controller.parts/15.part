@@ -1,3 +1,60 @@
+      if item ~= "" then set[item] = true end
+    elseif type(item) == "table" then
+      local itemMode = item.mode == "world" and "world" or item.mode == "local" and "local" or mode
+      local cx, cz = numberValue(item.cx), numberValue(item.cz)
+      if cx and cz and cx % 1 == 0 and cz % 1 == 0 then
+        set[chunkKey(itemMode, cx, cz)] = true
+      elseif item.key and tostring(item.key) ~= "" then
+        set[tostring(item.key)] = true
+      end
+    end
+  end
+  return set
+end
+
+local function overlaps(a1, a2, b1, b2)
+  return a1 <= b2 and b1 <= a2
+end
+
+local function adjacent(a, b)
+  if a.maxX + 1 == b.minX or b.maxX + 1 == a.minX then
+    return overlaps(a.minZ, a.maxZ, b.minZ, b.maxZ)
+  end
+  if a.maxZ + 1 == b.minZ or b.maxZ + 1 == a.minZ then
+    return overlaps(a.minX, a.maxX, b.minX, b.maxX)
+  end
+  return false
+end
+
+local function contains(chunk, x, z)
+  return x >= chunk.minX and x <= chunk.maxX and z >= chunk.minZ and z <= chunk.maxZ
+end
+
+local function appendIndex(index, value, key)
+  local list = index[value]
+  if not list then list = {}; index[value] = list end
+  list[#list + 1] = key
+end
+
+-- Build an edge-indexed graph.  The previous implementation compared every
+-- chunk with every other chunk; boundary indexes make normal rectangular jobs
+-- proportional to the number of chunks and their immediate candidates.
+local function buildNeighborGraph(chunks, keys)
+  local byMinX, byMaxX, byMinZ, byMaxZ = {}, {}, {}, {}
+  for _, key in ipairs(keys) do
+    local chunk = chunks[key]
+    appendIndex(byMinX, chunk.minX, key)
+    appendIndex(byMaxX, chunk.maxX, key)
+    appendIndex(byMinZ, chunk.minZ, key)
+    appendIndex(byMaxZ, chunk.maxZ, key)
+    chunk.neighbors = {}
+  end
+  local order = {}
+  for index, key in ipairs(keys) do order[key] = index end
+  local function addPair(leftKey, rightKey)
+    if leftKey == rightKey or order[leftKey] > order[rightKey] then return end
+    local left, right = chunks[leftKey], chunks[rightKey]
+    if not adjacent(left, right) then return end
     left.neighbors[#left.neighbors + 1] = rightKey
     right.neighbors[#right.neighbors + 1] = leftKey
   end
@@ -245,54 +302,3 @@ function M.buildChunkPlan(job, calibration)
   buildNeighborGraph(chunks, keys)
 
   -- Keep the original DFS parent tree and walk for recovery/checkpoint
-  -- compatibility.  The explicit stack avoids recursive overflow on large jobs.
-  local visited, walk = {}, {}
-  visited[rootKey] = true
-  chunks[rootKey].parent = nil
-  walk[1] = { key = rootKey, first = true }
-  local stack = { { key = rootKey, next = 1 } }
-  while #stack > 0 do
-    local frame = stack[#stack]
-    local chunk = chunks[frame.key]
-    local neighbor
-    while frame.next <= #chunk.neighbors do
-      local candidate = chunk.neighbors[frame.next]
-      frame.next = frame.next + 1
-      if not visited[candidate] then neighbor = candidate; break end
-    end
-    if neighbor then
-      visited[neighbor] = true
-      chunks[neighbor].parent = frame.key
-      walk[#walk + 1] = { key = neighbor, first = true }
-      stack[#stack + 1] = { key = neighbor, next = 1 }
-    else
-      stack[#stack] = nil
-      if #stack > 0 then walk[#walk + 1] = { key = stack[#stack].key, first = false } end
-    end
-  end
-
-  local visitedCount = 0
-  for _ in pairs(visited) do visitedCount = visitedCount + 1 end
-  if visitedCount ~= #keys then
-    local unreachable = {}
-    for _, key in ipairs(keys) do if not visited[key] then unreachable[#unreachable + 1] = key end end
-    return nil, "Excluded chunks split the quarry into disconnected regions: " .. table.concat(unreachable, ", ")
-  end
-
-  if contains(chunks[rootKey], 0, 1) then chunks[rootKey].anchor = { x = 0, z = 1 } end
-  local optimized, optimizedOrder = optimizedWalk(chunks, keys, rootKey)
-  return {
-    mode = mode,
-    width = validWidth,
-    length = validLength,
-    depth = validDepth,
-    rootKey = rootKey,
-    chunks = chunks,
-    walk = walk,
-    -- optimizedWalk is deliberately separate: worker recovery still uses the
-    -- DFS parent/walk representation above.
-    optimizedWalk = optimized,
-    optimizedRoute = optimizedOrder,
-    -- `route` is a legacy alias.  It must be a separate array because the
-    -- runtime state is saved with textutils.serialize, which rejects shared
-    -- table references even when the values are otherwise valid.

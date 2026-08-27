@@ -1,3 +1,39 @@
+      local catalog, catalogError = M.buildCatalog(width, length, "world", calibration)
+      if not catalog then return nil, catalogError end
+      catalog.referenceCalibration = {
+        home = { x = calibration.home.x, y = calibration.home.y, z = calibration.home.z },
+        forward = { x = calibration.forward.x, z = calibration.forward.z },
+      }
+      catalog.calibrationSeed = {
+        home = { x = calibration.home.x, y = calibration.home.y, z = calibration.home.z },
+        forward = { x = calibration.forward.x, z = calibration.forward.z },
+      }
+      local bounds
+      for _, chunk in ipairs(catalog) do
+        if contains(chunk, 0, 1) then catalog.rootKey = chunk.key; break end
+      end
+      for _, chunk in ipairs(catalog) do
+        bounds = bounds or { minX = chunk.minX, maxX = chunk.maxX, minZ = chunk.minZ, maxZ = chunk.maxZ }
+        bounds.minX, bounds.maxX = math.min(bounds.minX, chunk.minX), math.max(bounds.maxX, chunk.maxX)
+        bounds.minZ, bounds.maxZ = math.min(bounds.minZ, chunk.minZ), math.max(bounds.maxZ, chunk.maxZ)
+      end
+      catalog.bounds = bounds
+      return catalog
+    end
+    options = type(length) == "table" and length or options
+    width, length = descriptor.width, descriptor.length
+    worldSeed = descriptor.worldSeed or descriptor.seed or descriptor.calibration or options.worldSeed or worldSeed
+    if descriptor.options and type(descriptor.options) == "table" then
+      local merged = {}
+      for key, value in pairs(descriptor.options) do merged[key] = value end
+      for key, value in pairs(options) do merged[key] = value end
+      options = merged
+      if worldSeed == nil then worldSeed = options.worldSeed end
+    end
+  end
+  local calibration = options.calibration
+  if not calibration then calibration = worldSeedCalibration(worldSeed, options) end
+  if not calibration then return nil, "gps_not_calibrated" end
   local catalog, catalogError = M.buildCatalog(width, length, "world", calibration)
   if not catalog then return nil, catalogError end
   -- Arrays may carry metadata fields in Lua.  Keep the reference GPS seed and
@@ -232,49 +268,3 @@ local function stripeOwner(chunks, keys, workers, options)
         positions[index] = position
       end
     end
-    if anyBay then
-      for index = 1, #workers do if not positions[index] then return nil end end
-    end
-    return candidateLevels, positions, anyBay
-  end
-
-  local levels, bayPositions, bayAware = levelData(axis)
-  if not levels and not explicitAxis then
-    axis = axis == "x" and "z" or "x"
-    levels, bayPositions, bayAware = levelData(axis)
-  end
-  if not levels then return nil, "stripe_partition_unavailable" end
-
-  local weights, levelPositions = {}, {}
-  for index, level in ipairs(levels) do
-    levelPositions[level] = index
-    local weight = 0
-    for _, key in ipairs(keys) do
-      local chunk = chunks[key]
-      if (axis == "x" and chunk.cx == level) or (axis == "z" and chunk.cz == level) then weight = weight + chunk.cells end
-    end
-    weights[index] = weight
-  end
-  local workerOrder = {}
-  for index = 1, #workers do workerOrder[index] = index end
-  if bayAware then
-    table.sort(workerOrder, function(left, right)
-      if bayPositions[left] ~= bayPositions[right] then return bayPositions[left] < bayPositions[right] end
-      return workers[left].key < workers[right].key
-    end)
-  end
-
-  local owner, owned, loads = {}, {}, {}
-  for index = 1, #workers do owned[index], loads[index] = {}, 0 end
-  local cuts = {}
-  if bayAware then
-    -- Choose each cut at the nearest weighted midpoint while constraining it
-    -- between adjacent bay levels.  This keeps every stripe contiguous and
-    -- guarantees the worker whose bay is on a level owns that level.
-    local prefix, total = { [0] = 0 }, 0
-    for index, weight in ipairs(weights) do total = total + weight; prefix[index] = total end
-    local previousCut = 0
-    for rank = 1, #workers - 1 do
-      local workerIndex = workerOrder[rank]
-      local nextWorkerIndex = workerOrder[rank + 1]
-      local minimum = math.max(previousCut + 1, bayPositions[workerIndex])

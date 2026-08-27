@@ -1,3 +1,36 @@
+      for _, assignment in pairs(groupJob.assignments or {}) do
+        if type(assignment) == "table" and tonumber(assignment.workerId) == tonumber(id) and (not job.id or tostring(assignment.jobId or "") == tostring(job.id or "") or tostring(assignment.assignmentId or "") == tostring(job.assignmentId or "")) then
+          return tostring(groupJob.groupJobId or groupJob.id or key)
+        end
+      end
+    end
+  end
+  return nil
+end
+
+local function groupStatusLabel(status)
+  status = tostring(status or "unknown")
+  if status == "completed" then return "complete" end
+  if status == "waiting" or status == "service_requested" then return "service" end
+  return status
+end
+
+local function updateGroupAggregate(groupJob)
+  if type(groupJob) ~= "table" then return nil end
+  local group = groupRecord(groupJob.groupId)
+  local ids = groupWorkerIds(group)
+  local aggregate = { total = #ids, online = 0, active = 0, complete = 0, blocked = 0, waiting = 0, percent = 0, minFuel = nil, warnings = {}, acks = 0, ackTotal = #ids }
+  local weightedDone, weightedTotal = 0, 0
+  local seenWarning = {}
+  for _, id in ipairs(ids) do
+    local worker = workers[id]
+    local data = worker and worker.data or nil
+    local status = statusOf(worker)
+    if status ~= "offline" then aggregate.online = aggregate.online + 1 else aggregate.warnings[#aggregate.warnings + 1] = "offline:#" .. tostring(id) end
+    if status == "complete" or status == "completed" then aggregate.complete = aggregate.complete + 1 end
+    if status == "blocked" then aggregate.blocked = aggregate.blocked + 1 end
+    if status == "waiting_fuel" or status == "waiting_output" or status == "waiting_seal" or status == "waiting_torch" or status == "waiting_water" or status == "service" then aggregate.waiting = aggregate.waiting + 1 end
+    if status == "working" or status == "mining" or status == "starting" then aggregate.active = aggregate.active + 1 end
     local fuel = data and tonumber(data.fuel or data.materials and data.materials.fuel)
     if fuel and (aggregate.minFuel == nil or fuel < aggregate.minFuel) then aggregate.minFuel = fuel end
     local progress = data and data.progress or {}
@@ -201,47 +234,3 @@ local function alert(kind, id, text)
     local side = tostring(settings.redstoneSide or "back")
     local timer = os.startTimer and os.startTimer(0.25)
     if redstone and redstone.setOutput then
-      pcall(redstone.setOutput, side, true)
-      if timer then alertTimers[timer] = { global = true, side = side } end
-    else
-      local relays = {}
-      for _, entry in ipairs(redstoneDevices) do
-        local relay = entry.device
-        if relay and relay.setOutput then
-          pcall(relay.setOutput, side, true)
-          relays[#relays + 1] = relay
-        end
-      end
-      if timer and #relays > 0 then alertTimers[timer] = { relays = relays, side = side } end
-    end
-  end
-  if text and text ~= "" then setNotice(text, kind == "blocked") end
-end
-
-local function clearAlert(id, kind)
-  alertLedger[tostring(id) .. ":" .. tostring(kind)] = nil
-end
-
--- Remote-console ACKs are correlated independently from the normal command
--- notice/last-error path.  A worker may include the correlation fields either
--- at the ACK root or inside `result`; accept both forms while rejecting a
--- delayed response from another session or sequence.
-do
-local function remoteAckField(payload, result, key)
-  if type(payload) == "table" and payload[key] ~= nil then return payload[key] end
-  if type(result) == "table" and result[key] ~= nil then return result[key] end
-  if type(payload) == "table" and type(payload.session) == "table" and payload.session[key] ~= nil then
-    return payload.session[key]
-  end
-  return nil
-end
-
-noticeState.remoteApi.ackMatches = function(sender, message, payload)
-  local session = noticeState.remoteSession
-  local pending = session and session.pending
-  if type(pending) ~= "table" or type(payload) ~= "table" then return false end
-  if tonumber(sender) ~= tonumber(session.workerId) then return false end
-  -- A same-worker ACK for another command must never consume the remote wait.
-  -- Supported workers always set replyTo, so a missing value fails closed.
-  if pending.messageId and (not message
-    or tostring(message.replyTo or "") ~= tostring(pending.messageId)) then return false end

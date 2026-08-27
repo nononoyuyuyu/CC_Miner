@@ -1,3 +1,26 @@
+    check("torches", "warn", tostring(torchNeed) .. " estimated @" .. tostring(profileInfo.effectiveInterval), false)
+  end
+  check("exclusions", #excludedChunks > 0 and "warn" or "ok", tostring(#excludedChunks), false)
+  if plan then check("connectivity", "ok", "connected", false) else check("connectivity", "bad", tostring(planError), true) end
+  if partialMask then check("selection", "bad", "partial cell mask cannot be sent; select whole chunks", true) end
+  if chunkMode == "world" then
+    local gpsData = type(data.gps) == "table" and data.gps or {}
+    local calibrated = gpsData.calibrated == true and calibration ~= nil
+    local available = gpsData.available == true and type(gpsData.lastFix) == "table"
+    check("GPS calibration", calibrated and "ok" or "bad", calibrated and "calibrated" or "run GPS CAL at the dock", not calibrated)
+    check("GPS fix", available and "ok" or "bad", available and "current position available" or tostring(gpsData.lastError or "GPS hosts are not reachable"), not available)
+  else
+    check("GPS", "ok", "local mode (world features unavailable)", false)
+  end
+  local workerStatus = worker and statusOf(worker) or "offline"
+  if id and worker and workerStatus ~= "offline" then check("worker", "ok", workerLabel(worker, id), false)
+  else check("worker", "bad", "offline or not selected", true) end
+  local startableStatus = workerStatus == "idle" or workerStatus == "complete" or workerStatus == "completed" or workerStatus == "aborted"
+  check("start state", startableStatus and "ok" or "bad", workerStatus, not startableStatus)
+  check("home", data.atHome == true and "ok" or "bad", data.atHome == true and "at home" or "worker is not at home", data.atHome ~= true)
+  local poseDir = tonumber(data.pose and data.pose.dir)
+  check("facing", poseDir == 0 and "ok" or "bad", poseDir == 0 and "facing quarry" or (poseDir and ("direction=" .. tostring(poseDir)) or "direction unknown"), poseDir ~= 0)
+  local recoveryRequired = data.recoveryRequired == true or data.pendingAction ~= nil
   check("recovery", recoveryRequired and "bad" or "ok", recoveryRequired and "pending physical recovery" or "ready", recoveryRequired)
   local unfinished = data.job ~= nil and workerStatus ~= "complete" and workerStatus ~= "completed" and workerStatus ~= "aborted"
   check("existing job", unfinished and "bad" or "ok", unfinished and "abort or clear the unfinished job first" or "clear", unfinished)
@@ -167,44 +190,3 @@ local function partitionGroupCatalog(catalog, group, options, workerSpecs)
   if #specs == 0 then return nil, "group_workers_required" end
   options = type(options) == "table" and options or {}
   options.strategy = options.strategy or (group and group.partition) or "stripe"
-  options.stripeFirst = options.stripeFirst ~= false
-  options.connected = true
-  options.balanced = true
-  options.requireConnected = true
-  if type(quarry.partitionGroup) == "function" then
-    local ok, raw, err = pcall(quarry.partitionGroup, catalog, specs, options)
-    if ok and raw then
-      local normalized, count = normalizeGroupAssignments(raw, specs)
-      local unassigned = raw and raw.unassigned
-      local hasUnassigned = type(unassigned) == "table" and ((#unassigned > 0) or next(unassigned) ~= nil)
-      if normalized and count == #specs and not hasUnassigned then return normalized, nil, raw end
-      if not err then err = count end
-    end
-  end
-  local mode = options.chunkMode == "world" and "world" or "local"
-  if mode ~= "world" and #specs > 1 then return nil, "local_group_partition_disabled" end
-  if #specs > 1 then return nil, "partitionGroup_required_for_multi_worker" end
-  if type(quarry.partitionChunks) ~= "function" then return nil, "group_partition_api_unavailable" end
-  local ids = {}
-  for _, spec in ipairs(specs) do ids[#ids + 1] = spec.workerId end
-  local ok, legacy = pcall(quarry.partitionChunks, catalog, ids)
-  if not ok or not legacy then return nil, tostring(legacy or "group_partition_api_unavailable") end
-  local normalized = {}
-  for _, spec in ipairs(specs) do
-    local value = legacy[spec.workerId] or legacy[tostring(spec.workerId)]
-    if type(value) ~= "table" then return nil, "legacy_partition_missing_worker_" .. tostring(spec.workerId) end
-    normalized[tostring(spec.workerId)] = {
-      workerId = spec.workerId,
-      chunkKeys = common.copy(value.chunkKeys or value.chunks or {}),
-      transitKeys = common.copy(value.transitKeys or {}),
-      seedKey = value.seedKey,
-      estimatedCost = tonumber(value.estimatedCost or value.cost or value.cells) or 0,
-      homeY = spec.homeY,
-    }
-  end
-  return normalized, nil, legacy
-end
-
-local function groupDraftDefaults(group)
-  local previous = db.lastDraft or {}
-  local workerIds = groupWorkerIds(group)

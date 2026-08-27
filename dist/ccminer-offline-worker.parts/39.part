@@ -1,3 +1,59 @@
+      return false, "Lava-seal block inventory is empty."
+    end
+    if not isSealItemName(itemName(slot)) then
+      runInventoryPhysicalAction("refill_seal_reject", {
+        slot = slot, item = itemName(slot), direction = side,
+      }, dropFunction)
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Seal inventory contains an unsupported item. Use configured solid blocks only."
+    end
+    state.stats.sealRefills = (state.stats.sealRefills or 0) + 1
+  end
+  local restored, restoreError = restoreSideDirection(side, restoreDir)
+  turtle.select(originalSlot)
+  if not restored then return false, restoreError end
+  saveState()
+  return true
+end
+
+local function refillTorchAtHome()
+  local mode = effectiveLighting()
+  if mode == "off" then return true end
+  state.phase, state.status = "refilling_torch", "working"
+  saveState("refill_torch")
+  local materials = materialsConfig()
+  local lighting = config.lighting or {}
+  local target = tonumber(lighting.target or lighting.torchTarget or materials.torchTarget or config.torchTarget) or 32
+  target = math.max(1, math.floor(target))
+  if torchMaterialCount() >= target then return true end
+  local side = lighting.side or config.torchSide or "left"
+  local inspectFunction, suckFunction, dropFunction, restoreDir, sideError = sideFunctions(side)
+  if not inspectFunction then return false, sideError end
+  local checkSide = (side == "top" and "top") or (side == "bottom" and "bottom") or "front"
+  if not inventoryPresent(checkSide, inspectFunction) then
+    restoreSideDirection(side, restoreDir)
+    return false, "Torch inventory missing on configured side " .. side .. "."
+  end
+  local originalSlot = turtle.getSelectedSlot()
+  local attempts = 0
+  while torchMaterialCount() < target do
+    drainNetwork(3)
+    if movementInterrupted("service") then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "control_request"
+    end
+    attempts = attempts + 1
+    if attempts > 64 then
+      restoreSideDirection(side, restoreDir)
+      turtle.select(originalSlot)
+      return false, "Torch loading safety limit reached."
+    end
+    local slot = nil
+    local preferred = preferredTorchSlots()
+    if type(preferred) == "table" then
+      for _, candidate in ipairs(preferred) do
         local candidateSlot = tonumber(candidate)
         if candidateSlot and not isReservedSlot(candidateSlot, "torch") and turtle.getItemCount(candidateSlot) == 0 then
           slot = candidateSlot
@@ -198,55 +254,3 @@ local function continueService()
 
   ok, err = unloadAtHome()
   if not ok then
-    if err == "control_request" then return false end
-    state.status, state.phase, state.lastError = "waiting_output", "waiting_output", err
-    saveState(); heartbeat(true); return false
-  end
-  if movementInterrupted("service") then return false end
-
-  ok, err = refuelAtHome()
-  if not ok then
-    if err == "control_request" then return false end
-    state.status, state.phase, state.lastError = "waiting_fuel", "waiting_fuel", err
-    saveState(); heartbeat(true); return false
-  end
-  if movementInterrupted("service") then return false end
-
-  ok, err = refillSealAtHome()
-  if not ok then
-    if err == "control_request" then return false end
-    state.status, state.phase, state.lastError = "waiting_seal", "waiting_seal", err
-    saveState(); heartbeat(true); return false
-  end
-  if movementInterrupted("service") then return false end
-
-  ok, err = refillTorchAtHome()
-  if not ok then
-    if err == "control_request" then return false end
-    state.status, state.phase, state.lastError = "waiting_torch", "waiting_torch", err
-    saveState("waiting_torch"); heartbeat(true); return false
-  end
-  if movementInterrupted("service") then return false end
-
-  if state.service.resumeAfter and (state.resumeToken or state.checkpoint) then
-    local token = state.resumeToken or state.checkpoint
-    local checkpoint = poseCopy(token)
-    checkpoint.dir = tonumber(token.dir) or checkpoint.dir
-    state.phase, state.status, state.lastError = "going_back", "working", nil
-    saveState("service_resume_start", true)
-    local preResumeGPS, preResumeError = verifyGPS(true)
-    if not preResumeGPS then markBlocked("GPS verification before resume failed: " .. tostring(preResumeError)); return false end
-    if state.job and state.job.strategy == "chunk_plan" then
-      ok, err = navigateChunkPlanWork(checkpoint, "service")
-    else
-      ok, err = navigateTo(checkpoint, "work", "service")
-    end
-    if not ok then
-      if err == "control_request" then return false end
-      markBlocked("Return to work point failed: " .. tostring(err))
-      return false
-    end
-    ok, err = turnTo(checkpoint.dir)
-    if not ok then markBlocked("Cannot restore work direction: " .. tostring(err)); return false end
-    if movementInterrupted("service") then return false end
-    local arrivedGPS, arrivedGPSError = verifyGPS(true)

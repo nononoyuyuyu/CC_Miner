@@ -1,3 +1,59 @@
+        if not prepared then
+          allDropped = false
+          discardStats.lastError = prepareError or "Could not journal output action."
+          break
+        end
+        local dropped = outDrop(removable)
+        local removed = before - turtle.getItemCount(slot)
+        if dropped and removed > 0 then commitPhysicalAction(); if removed < removable then allDropped = false end
+        else cancelPhysicalAction(); allDropped = false end
+      end
+    end
+  end
+  discardStats.passes = (discardStats.passes or 0) + (discardEnabled and 1 or 0)
+  discardStats.enabled = mode ~= "KEEP_ALL"
+  discardStats.triggered = discardEnabled
+  discardStats.mode = mode
+  local _, _, heldItems = inventoryStats()
+  discardStats.held = heldItems
+  if discardEnabled then discardStats.lastError = nil end
+
+  local restored, restoreError = turnTo(outRestore)
+  turtle.select(originalSlot)
+  if not restored then return false, restoreError end
+  if not allDropped then
+    return false, "Output/discard inventory is full or a protected stack could not be retained safely."
+  end
+  updateRecycleInventoryState()
+  state.stats.unloads = (state.stats.unloads or 0) + 1
+  saveState("unload_done")
+  return true
+end
+
+local function discardAtField()
+  local policy, mode = discardPolicy()
+  if mode == "KEEP_ALL" then return true end
+  local _, emptySlots = inventoryStats()
+  local trigger = tonumber(policy.triggerEmptySlots) or 3
+  if emptySlots > trigger then return true end
+
+  local discardStats = discardStatsTable()
+  discardStats.lastError = nil
+  local side = policy.direction or "back"
+  if side == "up" then side = "top" end
+  if side == "down" then side = "bottom" end
+  local originalSlot = turtle.getSelectedSlot()
+  local inspectFunction, _, dropFunction, restoreDir, sideError = sideFunctions(side)
+  if not inspectFunction then
+    discardStats.lastError = sideError or "Discard direction is invalid."
+    turtle.select(originalSlot)
+    return false, discardStats.lastError
+  end
+  local checkSide = (side == "top" and "top") or (side == "bottom" and "bottom") or "front"
+  -- A configured inventory at the field direction is an explicit safety
+  -- boundary: never accidentally inject a discard stack into it.
+  if inventoryPresent(checkSide, inspectFunction) then
+    discardStats.skipped = (discardStats.skipped or 0) + 1
     discardStats.lastError = "Field discard skipped because the configured direction contains an inventory."
     state.stats.discardSkipped = (state.stats.discardSkipped or 0) + 1
     restoreSideDirection(side, restoreDir)
@@ -224,59 +280,3 @@ local function refillSealAtHome()
     if not sucked then
       restoreSideDirection(side, restoreDir)
       turtle.select(originalSlot)
-      return false, "Lava-seal block inventory is empty."
-    end
-    if not isSealItemName(itemName(slot)) then
-      runInventoryPhysicalAction("refill_seal_reject", {
-        slot = slot, item = itemName(slot), direction = side,
-      }, dropFunction)
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Seal inventory contains an unsupported item. Use configured solid blocks only."
-    end
-    state.stats.sealRefills = (state.stats.sealRefills or 0) + 1
-  end
-  local restored, restoreError = restoreSideDirection(side, restoreDir)
-  turtle.select(originalSlot)
-  if not restored then return false, restoreError end
-  saveState()
-  return true
-end
-
-local function refillTorchAtHome()
-  local mode = effectiveLighting()
-  if mode == "off" then return true end
-  state.phase, state.status = "refilling_torch", "working"
-  saveState("refill_torch")
-  local materials = materialsConfig()
-  local lighting = config.lighting or {}
-  local target = tonumber(lighting.target or lighting.torchTarget or materials.torchTarget or config.torchTarget) or 32
-  target = math.max(1, math.floor(target))
-  if torchMaterialCount() >= target then return true end
-  local side = lighting.side or config.torchSide or "left"
-  local inspectFunction, suckFunction, dropFunction, restoreDir, sideError = sideFunctions(side)
-  if not inspectFunction then return false, sideError end
-  local checkSide = (side == "top" and "top") or (side == "bottom" and "bottom") or "front"
-  if not inventoryPresent(checkSide, inspectFunction) then
-    restoreSideDirection(side, restoreDir)
-    return false, "Torch inventory missing on configured side " .. side .. "."
-  end
-  local originalSlot = turtle.getSelectedSlot()
-  local attempts = 0
-  while torchMaterialCount() < target do
-    drainNetwork(3)
-    if movementInterrupted("service") then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "control_request"
-    end
-    attempts = attempts + 1
-    if attempts > 64 then
-      restoreSideDirection(side, restoreDir)
-      turtle.select(originalSlot)
-      return false, "Torch loading safety limit reached."
-    end
-    local slot = nil
-    local preferred = preferredTorchSlots()
-    if type(preferred) == "table" then
-      for _, candidate in ipairs(preferred) do

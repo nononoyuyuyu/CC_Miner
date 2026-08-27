@@ -48,7 +48,7 @@ while true do
   sleep(5)
 end
 ]] },
-  { source = [[src/ccminer/command.lua]], target = [[command.lua]], digest = [[70737b4c18ac75172eb963e17276a4d630ab262c7a319ca6cbeaa92ce21262c8]], content = [[-- CC Miner command launcher (V2/V4 compatible)
+  { source = [[src/ccminer/command.lua]], target = [[command.lua]], digest = [[57cc4df828854a05d84b0be648fced2869d09405e16f43fd306a77c93fff1c26]], content = [[-- CC Miner command launcher (V2/V4 compatible)
 
 local args = { ... }
 local common = dofile("/ccminer/lib/common.lua")

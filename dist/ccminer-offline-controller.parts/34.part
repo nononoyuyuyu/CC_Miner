@@ -1,3 +1,25 @@
+
+local function reassignGroupAssignment(groupJobId, stoppedWorkerId, targetWorkerId)
+  local job = db.groupJobs and db.groupJobs[tostring(groupJobId)]
+  if not job then setNotice("Group job not found.", true); return false end
+  local source = job.assignments and (job.assignments[tostring(stoppedWorkerId)] or job.assignments[stoppedWorkerId])
+  if not source then setNotice("Stopped worker assignment not found.", true); return false end
+  if type(source.chunkKeys) ~= "table" or #source.chunkKeys == 0 then setNotice("No residual chunks to reassign.", true); return false end
+  local sourceData = workerData(stoppedWorkerId) or {}
+  local sourceToken, sourceTokenError = validateSourceResumeToken(job, source, sourceData, stoppedWorkerId)
+  if sourceTokenError then setNotice("Reassign source rejected: " .. tostring(sourceTokenError), true); return false end
+  if job.pendingReassignment then setNotice("A reassignment is already awaiting ACK.", true); return false end
+  targetWorkerId = targetWorkerId or nil
+  if not targetWorkerId then
+    for _, candidate in ipairs(groupWorkerIds(groupRecord(job.groupId))) do
+      local candidateData = workerData(candidate) or {}
+      local candidateStatus = statusOf(workers[candidate])
+      if tonumber(candidate) ~= tonumber(stoppedWorkerId) and (candidateStatus == "idle" or candidateStatus == "complete" or candidateStatus == "aborted") and candidateData.atHome == true then targetWorkerId = candidate; break end
+    end
+  end
+  if not targetWorkerId then setNotice("No online target for residual range.", true); return false end
+  local targetData, targetStatus = workerData(targetWorkerId) or {}, statusOf(workers[targetWorkerId])
+  if not ((targetStatus == "idle" or targetStatus == "complete" or targetStatus == "aborted") and targetData.atHome == true) then setNotice("Reassign target must be idle/terminal and at home.", true); return false end
   if job.chunkMode == "world" and not (targetData.gps and targetData.gps.calibration) then setNotice("Reassign target requires GPS calibration.", true); return false end
   local group = groupRecord(job.groupId)
   local bayId, bay = groupWorkerResource(group, targetWorkerId, "bay")
@@ -147,36 +169,3 @@ local function startDraft()
   if not result then setNotice("Preflight failed.", true); return false end
   if result.fatal then setNotice("Start blocked by a fatal preflight item.", true); return false end
   local assignments, assignmentError = buildAssignments(result)
-  if not assignments then setNotice(assignmentError, true); return false end
-  local leases = {}
-  for _, assignment in ipairs(assignments) do
-    local lease, err = reserveLease(assignment.jobId, assignment.workerId, result.chunkMode, assignment.chunks, assignment.assignmentId)
-    if not lease then
-      for _, prior in ipairs(leases) do releaseLeasesForWorker(prior.workerId, prior.jobId) end
-      setNotice(err, true)
-      return false
-    end
-    leases[#leases + 1] = lease
-  end
-  local sent, sentAssignments = true, {}
-  for _, assignment in ipairs(assignments) do
-    local payloadDepth = result.jobDepth or draft.depth
-    local payloadLighting = common.copy(draft.lighting)
-    if type(payloadLighting) ~= "table" then payloadLighting = { mode = "safe" } end
-    if result.effectiveInterval == 0 then payloadLighting.interval = nil else payloadLighting.interval = result.effectiveInterval end
-    local payload = {
-      width = draft.width, length = draft.length, depth = payloadDepth,
-      chunkMode = result.chunkMode, excludedChunks = result.excludedChunks,
-      lighting = payloadLighting, waterMode = draft.waterMode, profile = draft.profile,
-      name = draft.name or ("Quarry %dx%dx%d"):format(draft.width, draft.length, payloadDepth),
-      -- assignmentId is group-only wire metadata. Sending it for an ordinary
-      -- one-worker quarry makes the worker correctly demand assignmentChunks
-      -- and reject the otherwise valid full-footprint job.
-      jobId = assignment.jobId,
-    }
-    if result.chunkMode == "world" then payload.targetY = result.targetY end
-    local sentOK, _, messageId = sendCommand(assignment.workerId, "start", payload)
-    if not sentOK then sent = false; break end
-    db.pendingStarts[tostring(assignment.workerId)] = {
-      workerId = assignment.workerId, jobId = assignment.jobId,
-      assignmentId = assignment.assignmentId, messageId = messageId,

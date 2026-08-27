@@ -1,3 +1,49 @@
+      if cx and cz then key = chunkKey(plan.mode, cx, cz) end
+    end
+  else
+    key = value
+  end
+  if key == nil then return nil, "invalid_chunk" end
+  key = tostring(key)
+  if not plan.chunks[key] then return nil, "unknown_chunk:" .. key end
+  return key
+end
+
+function M.edgeTransition(plan, fromKey, toKey, y)
+  if type(plan) ~= "table" or type(plan.chunks) ~= "table" then return nil, "invalid_chunk_plan" end
+  local from, fromError = normalizePlanKey(plan, fromKey)
+  if not from then return nil, fromError end
+  local to, toError = normalizePlanKey(plan, toKey)
+  if not to then return nil, toError end
+  local pointY = numberValue(y)
+  if y ~= nil and not pointY then return nil, "invalid_y" end
+  if from == to then return nil, "chunks_not_adjacent" end
+  local left, right = plan.chunks[from], plan.chunks[to]
+  local fromPoint, toPoint = edgeTransitionPoints(left, right, pointY or 0)
+  if not fromPoint then return nil, "chunks_not_adjacent" end
+  return {
+    from = { x = fromPoint.x, y = fromPoint.y, z = fromPoint.z },
+    to = { x = toPoint.x, y = toPoint.y, z = toPoint.z },
+    -- Numeric entries keep older worker adapters (which consumed a waypoint
+    -- array) compatible.  They are independent point tables, never aliases of
+    -- the named fields.
+    [1] = { x = fromPoint.x, y = fromPoint.y, z = fromPoint.z, kind = "from" },
+    [2] = { x = toPoint.x, y = toPoint.y, z = toPoint.z, kind = "to" },
+    fromKey = from,
+    toKey = to,
+    distance = math.abs(toPoint.x - fromPoint.x) + math.abs(toPoint.y - fromPoint.y) + math.abs(toPoint.z - fromPoint.z),
+  }
+end
+
+M.chunkTransition = M.edgeTransition
+M.neighborTransition = M.edgeTransition
+M.transitionPoint = M.edgeTransition
+
+local function routePointForChunk(chunk, y)
+  local pointY = numberValue(y) or 0
+  -- Integer midpoint keeps a route interior to the chunk for both odd and
+  -- even dimensions.  It is deliberately not the historical min corner.
+  return {
     x = math.floor((chunk.minX + chunk.maxX) / 2),
     y = pointY,
     z = math.floor((chunk.minZ + chunk.maxZ) / 2),
@@ -226,52 +272,3 @@ function M.estimateJob(job, calibration, options)
     estimatedMovement = baseMovement,
     transitionMovement = transitionMovement,
     returnMovement = returnMovement,
-    minimumFuel = minimumFuel,
-    minFuel = minimumFuel,
-    torchInterval = interval,
-    estimatedTorches = estimatedTorches,
-    estimatedTorchCount = estimatedTorches,
-    torchCount = estimatedTorches,
-    torches = estimatedTorches,
-    selectedChunks = selectedChunks,
-    selectedChunkCount = selectedChunks,
-    selectedCount = selectedChunks,
-    excludedChunks = plan.excludedCount or 0,
-    excludedChunkCount = plan.excludedCount or 0,
-    excludedCount = plan.excludedCount or 0,
-    catalogChunks = plan.catalogCount or 0,
-    plan = plan,
-  }
-end
-
-M.jobEstimate = M.estimateJob
-M.estimate = M.estimateJob
-M.estimateJobCost = M.estimateJob
-M.estimateQuarry = M.estimateJob
-
-local function catalogGraph(catalog)
-  local chunks, keys = {}, {}
-  local entries = catalog.chunks and type(catalog.chunks) == "table" and catalog.chunks or catalog
-  local sources = {}
-  if entries == catalog and #entries > 0 then
-    for index = 1, #entries do sources[#sources + 1] = entries[index] end
-  else
-    -- Map catalogs commonly use the global chunk key as the map key and omit
-    -- the duplicated `entry.key` field.  Normalize that form before
-    -- validation; never mutate the caller's table (the descriptor may be
-    -- shared with another worker/controller).
-    for mapKey, source in pairs(entries) do
-      if type(source) == "table" and (source.key == nil or tostring(source.key) == "") then
-        local copy = {}
-        for field, value in pairs(source) do copy[field] = value end
-        copy.key = tostring(mapKey)
-        sources[#sources + 1] = copy
-      else
-        sources[#sources + 1] = source
-      end
-    end
-  end
-  if #sources > MAX_CHUNKS then return nil, "too_many_chunks" end
-  for _, source in ipairs(sources) do
-    if type(source) ~= "table" then return nil, "invalid_chunk_catalog" end
-    local key = source.key and tostring(source.key) or nil

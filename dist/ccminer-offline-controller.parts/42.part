@@ -1,3 +1,35 @@
+  return table.concat({ tostring(mode), tostring(key), tostring(width), tostring(height), tostring(id or ""), tostring(data.updatedAt or data.status or ""), tostring(noticeState.workerPage or ""), tostring(noticeState.morePage or ""), tostring(gid or ""), tostring(group and group.updatedAt or ""), tostring(groupJob and groupJob.updatedAt or ""), tostring(groupDraft and groupDraft.updatedAt or ""), tostring(groupDraft and groupDraft.preflight and groupDraft.preflight.computedAt or ""), tostring(draft and draft.gridPageX or ""), tostring(draft and draft.gridPageZ or ""), tostring(dirty) }, "|")
+end
+
+local function renderOne(target, key)
+  local singleDraftMode = mode == "job_dimensions" or mode == "job_grid"
+    or mode == "job_chunks" or mode == "preflight"
+  local groupDraftMode = mode == "group_dimensions" or mode == "group_job"
+  if (singleDraftMode and type(draft) ~= "table")
+    or (groupDraftMode and type(groupDraft) ~= "table") then
+    mode = "dashboard"
+    setNotice("The unfinished job form was reset safely. Open NEW JOB again.", true)
+  end
+  resetHitboxes(key)
+  local signature = screenSignature(target, key)
+  if renderCache[key] == signature and not dirty then return end
+  common.withTerm(target, function()
+    common.clear(colors and colors.black or nil, colors and colors.white or nil)
+    if mode == "dashboard" then renderDashboard(target, key)
+    elseif mode == "workers" then noticeState.renderWorkers(target, key)
+    elseif mode == "more" then noticeState.renderMore(target, key)
+    elseif mode == "items" then noticeState.renderItems(target, key)
+    elseif mode == "groups" then renderGroups(target, key)
+    elseif mode == "group_info" then renderGroupInfo(target, key)
+    elseif mode == "group_dimensions" or mode == "group_job" then renderGroupDimensions(target, key)
+    elseif mode == "job_dimensions" then renderDimensions(target, key)
+    elseif mode == "job_grid" or mode == "job_chunks" then renderGrid(target, key)
+    elseif mode == "preflight" then renderPreflight(target, key)
+    elseif mode == "progress" then renderProgress(target, key)
+    elseif mode == "stop_menu" then renderStopMenu(target, key)
+    elseif mode == "recovery" then renderRecovery(target, key)
+    elseif mode == "info" then renderInfo(target, key)
+    elseif mode == "report" then renderReport(target, key)
     elseif mode == "confirm" then renderConfirm(target, key)
     elseif mode == "error_detail" then renderErrorDetail(target, key)
     else mode = "dashboard"; renderDashboard(target, key) end
@@ -178,66 +210,3 @@ local function processKey(keyCode)
       local fields = currentFieldOrder()
       for index, field in ipairs(fields) do
         if field == draft.selectedField then position = index end
-      end
-      chooseDraftField(fields[position % #fields + 1])
-      invalidate()
-    elseif keys and keyCode == keys.enter then
-      commitDraftField()
-      mode = "job_grid"
-      invalidate()
-    elseif keys and keyCode == keys.left then
-      adjustDraft(draft.selectedField or "width", -1)
-      invalidate()
-    elseif keys and keyCode == keys.right then
-      adjustDraft(draft.selectedField or "width", 1)
-      invalidate()
-    end
-  elseif mode == "job_grid" or mode == "job_chunks" then
-    if keys and keyCode == keys.left then
-      draft.gridPageX = math.max(1, (draft.gridPageX or 1) - 1)
-      invalidate()
-    elseif keys and keyCode == keys.right then
-      draft.gridPageX = (draft.gridPageX or 1) + 1
-      invalidate()
-    elseif keys and keyCode == keys.up then
-      draft.gridPageZ = math.max(1, (draft.gridPageZ or 1) - 1)
-      invalidate()
-    elseif keys and keyCode == keys.down then
-      draft.gridPageZ = (draft.gridPageZ or 1) + 1
-      invalidate()
-    elseif keys and keyCode == keys.enter then
-      local result = computePreflight()
-      if result then mode = "preflight" end
-      invalidate()
-    end
-  elseif mode == "preflight" then
-    if keys and keyCode == keys.enter and draft and draft.preflight and not draft.preflight.fatal then
-      startDraft()
-    elseif keys and keyCode == keys.q then
-      queueDraft()
-    end
-  elseif mode == "progress" or mode == "recovery" or mode == "report" or mode == "info" or mode == "stop_menu" then
-    if keys and (keyCode == keys.enter or keyCode == keys.backspace) then
-      mode = "dashboard"
-      invalidate()
-    end
-  elseif mode == "confirm" and keys and keyCode == keys.y then
-    processChar("y")
-  end
-end
-
-local function pumpFor(seconds)
-  local deadline = common.nowSeconds() + (seconds or 1)
-  while common.nowSeconds() <= deadline do
-    local sender, message = protocol.receive(0.25)
-    if sender then handleMessage(sender, message) end
-    groupSchedulerTick()
-  end
-end
-
-local function makeCliDraft(id, width, length, depth)
-  local previous = db.lastDraft or {}
-  local calibration = draftCalibration(id)
-  local targetY = calibration and calibration.home and tonumber(calibration.home.y) and (tonumber(calibration.home.y) - depth + 1) or nil
-  return {
-    workerId = id, width = width, length = length, depth = depth,

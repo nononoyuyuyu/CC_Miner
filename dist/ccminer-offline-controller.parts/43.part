@@ -1,3 +1,66 @@
+      end
+      chooseDraftField(fields[position % #fields + 1])
+      invalidate()
+    elseif keys and keyCode == keys.enter then
+      commitDraftField()
+      mode = "job_grid"
+      invalidate()
+    elseif keys and keyCode == keys.left then
+      adjustDraft(draft.selectedField or "width", -1)
+      invalidate()
+    elseif keys and keyCode == keys.right then
+      adjustDraft(draft.selectedField or "width", 1)
+      invalidate()
+    end
+  elseif mode == "job_grid" or mode == "job_chunks" then
+    if keys and keyCode == keys.left then
+      draft.gridPageX = math.max(1, (draft.gridPageX or 1) - 1)
+      invalidate()
+    elseif keys and keyCode == keys.right then
+      draft.gridPageX = (draft.gridPageX or 1) + 1
+      invalidate()
+    elseif keys and keyCode == keys.up then
+      draft.gridPageZ = math.max(1, (draft.gridPageZ or 1) - 1)
+      invalidate()
+    elseif keys and keyCode == keys.down then
+      draft.gridPageZ = (draft.gridPageZ or 1) + 1
+      invalidate()
+    elseif keys and keyCode == keys.enter then
+      local result = computePreflight()
+      if result then mode = "preflight" end
+      invalidate()
+    end
+  elseif mode == "preflight" then
+    if keys and keyCode == keys.enter and draft and draft.preflight and not draft.preflight.fatal then
+      startDraft()
+    elseif keys and keyCode == keys.q then
+      queueDraft()
+    end
+  elseif mode == "progress" or mode == "recovery" or mode == "report" or mode == "info" or mode == "stop_menu" then
+    if keys and (keyCode == keys.enter or keyCode == keys.backspace) then
+      mode = "dashboard"
+      invalidate()
+    end
+  elseif mode == "confirm" and keys and keyCode == keys.y then
+    processChar("y")
+  end
+end
+
+local function pumpFor(seconds)
+  local deadline = common.nowSeconds() + (seconds or 1)
+  while common.nowSeconds() <= deadline do
+    local sender, message = protocol.receive(0.25)
+    if sender then handleMessage(sender, message) end
+    groupSchedulerTick()
+  end
+end
+
+local function makeCliDraft(id, width, length, depth)
+  local previous = db.lastDraft or {}
+  local calibration = draftCalibration(id)
+  local targetY = calibration and calibration.home and tonumber(calibration.home.y) and (tonumber(calibration.home.y) - depth + 1) or nil
+  return {
+    workerId = id, width = width, length = length, depth = depth,
     targetY = targetY,
     lighting = normalizedLighting(previous.lighting),
     waterMode = normalizedWaterMode(previous.waterMode), profile = normalizedProfile(previous.profile),
@@ -153,24 +216,3 @@ local function commandLineMode()
     local id = tonumber(args[2]); if not id then print("Usage: controller.lua " .. command .. " <id>"); return true end
     sendCommand(id, command == "gps" and "gps_fix" or "calibrate_gps"); pumpFor(3); print(notice); return true
   elseif command == "rehome" then
-    local id = tonumber(args[2]); if not id or args[3] ~= "RESET" then print("Usage: controller.lua rehome <id> RESET"); return true end
-    sendCommand(id, "rehome", { confirm = "RESET" }); pumpFor(2); print(notice); return true
-  elseif command == "queue" then
-    local sub = string.lower(args[2] or "list")
-    if sub == "list" then printQueue()
-    elseif config.queueEnabled == false then print("Queue is disabled by controller configuration.")
-    elseif sub == "clear" then db.queue = {}; saveControllerDb(); print("Queue cleared.")
-    elseif sub == "remove" or sub == "delete" then local index = tonumber(args[3]); if index and db.queue[index] then table.remove(db.queue, index); saveControllerDb(); print("Queue item removed.") else print("Usage: queue remove <index>") end
-    elseif sub == "add" then
-      local id, width, length, depth = tonumber(args[3]), tonumber(args[4]), tonumber(args[5]), tonumber(args[6])
-      if not id or not width or not length or not depth then print("Usage: queue add <id> <width> <length> <depth>") else discover(); pumpFor(1); local item = makeCliDraft(id, width, length, depth); item.queuedAt = common.nowSeconds(); draft = item; local ok = queueDraft(); draft = nil; print(ok and "Queued." or notice) end
-    elseif sub == "run" then
-      local index = tonumber(args[3]) or 1; local item = db.queue[index]
-      if not item then print("Queue item not found.") else item.retryAt = common.nowSeconds(); item.awaiting = nil; saveControllerDb(); lastQueueDispatch = 0; dispatchQueue(); print(notice) end
-    else print("Usage: queue list|add|run|remove|clear") end
-    return true
-  elseif command == "preset" or command == "presets" then
-    local sub = string.lower(args[2] or "list")
-    if sub == "list" then for _, preset in ipairs(db.presets) do print(tostring(preset.name)) end
-    elseif sub == "save" then local ok, err = savePreset(args[3], db.lastDraft or draft); print(ok and "Preset saved." or ("Preset error: " .. tostring(err)))
-    elseif sub == "use" or sub == "load" then print(applyPreset(args[3]) and "Preset selected." or "Preset not found.")

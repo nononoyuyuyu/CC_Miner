@@ -1,3 +1,51 @@
+      individual.assignment = common.copy(assignment)
+      individual.assignmentChunks = common.copy(assignment.chunkKeys or assignment.chunks or {})
+    end
+    if sendCommand(id, individual.command, individual) then
+      sent = sent + 1
+      if groupJob then groupJob.acks[tostring(id)] = { ok = nil, command = individual.groupCommand, sentAt = common.nowSeconds() } end
+    end
+  end
+  if groupJob then updateGroupAggregate(groupJob); saveControllerDb() end
+  if groupJob and (command == "clear" or command == "abort") then
+    groupJob.status = command == "clear" and "clear_requested" or "aborting"
+    if command == "abort" then
+      -- Assignments that were never sent cannot later race an ABORT.  Keep
+      -- awaiting ACK entries until their worker confirms/returns, since the
+      -- START packet may already be in flight.
+      groupJob.pending = {}
+    end
+    groupJob.returnReason = groupJob.returnReason or (command == "abort" and "group_abort" or "group_clear")
+    maybeFinalizeGroup(groupJob)
+    saveControllerDb()
+  end
+  if sent < attempted then setNotice(("Group %s: %d/%d commands sent."):format(payload.groupCommand, sent, attempted), true) else setNotice(("Group %s sent to %d workers."):format(payload.groupCommand, sent), false) end
+  return sent == attempted and attempted > 0, sent
+end
+
+local function groupCommandBySelected(command)
+  local id = selectedGroupRecord()
+  if not id then setNotice("No group selected.", true); return false end
+  return groupCommand(id, command)
+end
+
+local function progressText(data)
+  if not data or not data.job then return "-" end
+  local p = data.progress or {}
+  return ("%3d%% %s/%s"):format(
+    tonumber(p.percent or data.job.percent) or 0,
+    common.humanNumber(p.cursor or data.job.cursor or 0),
+    common.humanNumber(p.total or data.job.total or 0)
+  )
+end
+
+local function resetHitboxes(key)
+  hitboxes[key] = {}
+end
+
+local function addHitbox(key, x1, y1, x2, y2, action)
+  hitboxes[key] = hitboxes[key] or {}
+  hitboxes[key][#hitboxes[key] + 1] = {
     x1 = math.floor(x1), y1 = math.floor(y1), x2 = math.floor(x2), y2 = math.floor(y2), action = action,
   }
 end
@@ -208,26 +256,3 @@ local function computePreflight()
   if profileInfo.effectiveInterval == 0 then
     check("torches", "ok", "0 (lighting off)", false)
   else
-    check("torches", "warn", tostring(torchNeed) .. " estimated @" .. tostring(profileInfo.effectiveInterval), false)
-  end
-  check("exclusions", #excludedChunks > 0 and "warn" or "ok", tostring(#excludedChunks), false)
-  if plan then check("connectivity", "ok", "connected", false) else check("connectivity", "bad", tostring(planError), true) end
-  if partialMask then check("selection", "bad", "partial cell mask cannot be sent; select whole chunks", true) end
-  if chunkMode == "world" then
-    local gpsData = type(data.gps) == "table" and data.gps or {}
-    local calibrated = gpsData.calibrated == true and calibration ~= nil
-    local available = gpsData.available == true and type(gpsData.lastFix) == "table"
-    check("GPS calibration", calibrated and "ok" or "bad", calibrated and "calibrated" or "run GPS CAL at the dock", not calibrated)
-    check("GPS fix", available and "ok" or "bad", available and "current position available" or tostring(gpsData.lastError or "GPS hosts are not reachable"), not available)
-  else
-    check("GPS", "ok", "local mode (world features unavailable)", false)
-  end
-  local workerStatus = worker and statusOf(worker) or "offline"
-  if id and worker and workerStatus ~= "offline" then check("worker", "ok", workerLabel(worker, id), false)
-  else check("worker", "bad", "offline or not selected", true) end
-  local startableStatus = workerStatus == "idle" or workerStatus == "complete" or workerStatus == "completed" or workerStatus == "aborted"
-  check("start state", startableStatus and "ok" or "bad", workerStatus, not startableStatus)
-  check("home", data.atHome == true and "ok" or "bad", data.atHome == true and "at home" or "worker is not at home", data.atHome ~= true)
-  local poseDir = tonumber(data.pose and data.pose.dir)
-  check("facing", poseDir == 0 and "ok" or "bad", poseDir == 0 and "facing quarry" or (poseDir and ("direction=" .. tostring(poseDir)) or "direction unknown"), poseDir ~= 0)
-  local recoveryRequired = data.recoveryRequired == true or data.pendingAction ~= nil

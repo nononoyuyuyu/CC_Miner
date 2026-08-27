@@ -1,3 +1,24 @@
+    local id = tonumber(args[2]); if not id or args[3] ~= "RESET" then print("Usage: controller.lua rehome <id> RESET"); return true end
+    sendCommand(id, "rehome", { confirm = "RESET" }); pumpFor(2); print(notice); return true
+  elseif command == "queue" then
+    local sub = string.lower(args[2] or "list")
+    if sub == "list" then printQueue()
+    elseif config.queueEnabled == false then print("Queue is disabled by controller configuration.")
+    elseif sub == "clear" then db.queue = {}; saveControllerDb(); print("Queue cleared.")
+    elseif sub == "remove" or sub == "delete" then local index = tonumber(args[3]); if index and db.queue[index] then table.remove(db.queue, index); saveControllerDb(); print("Queue item removed.") else print("Usage: queue remove <index>") end
+    elseif sub == "add" then
+      local id, width, length, depth = tonumber(args[3]), tonumber(args[4]), tonumber(args[5]), tonumber(args[6])
+      if not id or not width or not length or not depth then print("Usage: queue add <id> <width> <length> <depth>") else discover(); pumpFor(1); local item = makeCliDraft(id, width, length, depth); item.queuedAt = common.nowSeconds(); draft = item; local ok = queueDraft(); draft = nil; print(ok and "Queued." or notice) end
+    elseif sub == "run" then
+      local index = tonumber(args[3]) or 1; local item = db.queue[index]
+      if not item then print("Queue item not found.") else item.retryAt = common.nowSeconds(); item.awaiting = nil; saveControllerDb(); lastQueueDispatch = 0; dispatchQueue(); print(notice) end
+    else print("Usage: queue list|add|run|remove|clear") end
+    return true
+  elseif command == "preset" or command == "presets" then
+    local sub = string.lower(args[2] or "list")
+    if sub == "list" then for _, preset in ipairs(db.presets) do print(tostring(preset.name)) end
+    elseif sub == "save" then local ok, err = savePreset(args[3], db.lastDraft or draft); print(ok and "Preset saved." or ("Preset error: " .. tostring(err)))
+    elseif sub == "use" or sub == "load" then print(applyPreset(args[3]) and "Preset selected." or "Preset not found.")
     elseif sub == "delete" or sub == "remove" then local keep = {}; for _, preset in ipairs(db.presets) do if tostring(preset.name) ~= tostring(args[3]) then keep[#keep + 1] = preset end end; db.presets = keep; saveControllerDb(); print("Preset removed.")
     else print("Usage: preset list|save|use|delete <name>") end
     return true
@@ -224,46 +245,3 @@ local function atomicWrite(path, text)
 end
 local function readConfigRole()
   local text = readFile(ROOT .. "/config.db")
-  if not text then return nil, "No existing installation found." end
-  if not textutils or type(textutils.unserialize) ~= "function" then return nil, "Cannot decode config.db." end
-  local ok, value = pcall(textutils.unserialize, text)
-  if not ok or type(value) ~= "table" then return nil, "Existing config.db is invalid." end
-  return tostring(value.role or ""), nil
-end
-local function validateAction()
-  local action = requested
-  if action == "" then action = ROLE end
-  if action ~= ROLE and action ~= "update" and action ~= "update-low-space" then
-    fail("This offline bundle is fixed to role " .. ROLE .. "; refusing action " .. tostring(action))
-  end
-  if action == "worker" and not turtle then fail("Worker installation requires a turtle.") end
-  if (action == "update" or action == "update-low-space") then
-    local configRole, configError = readConfigRole()
-    if not configRole then fail(configError) end
-    if configRole ~= ROLE then
-      fail("Refusing " .. action .. ": existing config role is " .. tostring(configRole)
-        .. ", but this bundle is fixed to " .. ROLE .. ".")
-    end
-  end
-  if action == "update" and fs.exists(LOW_SPACE_MARKER) then
-    fail("A low-space update is incomplete. Re-transfer the original "
-      .. "ccminer-offline-" .. ROLE .. ".lua and parts, then run update-low-space.")
-  end
-  return action
-end
-local function usage()
-  print("CC Miner V4 offline " .. ROLE .. " installer " .. VERSION .. " (schema " .. SCHEMA .. ")")
-  print("  ccminer-offline-" .. ROLE .. ".lua " .. ROLE)
-  print("  ccminer-offline-" .. ROLE .. ".lua update")
-  print("  ccminer-offline-" .. ROLE .. ".lua update-low-space")
-end
-
-local action = validateAction()
-if action == "" then usage(); return end
-if action == "update" then
-  term.clear(); term.setCursorPos(1, 1)
-  print("CC MINER V4 OFFLINE " .. string.upper(action) .. " / " .. ROLE); print("")
-  if fs.exists(TEMP) then fs.delete(TEMP) end
-  ensureDir(TEMP)
-  for index, file in ipairs(files) do
-    write(("[%d/%d] %s ... "):format(index, #files, file.target))

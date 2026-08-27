@@ -1,3 +1,43 @@
+
+  local chunkKeys, pathError = shortestPathInternal(plan.chunks, fromKey, toKey)
+  local fallback = false
+  if not chunkKeys and options.allowFallback ~= false then
+    chunkKeys, pathError = parentFallbackPath(plan, fromKey, toKey)
+    fallback = chunkKeys ~= nil
+  end
+  if not chunkKeys then return nil, pathError or "chunks_disconnected" end
+
+  local waypoints, distance = {}, 0
+  local previousPoint = { x = fromPoint.x, y = fromPoint.y, z = fromPoint.z }
+  appendRouteWaypoint(waypoints, fromKey, previousPoint, "start")
+  for index = 1, #chunkKeys - 1 do
+    local leftKey, rightKey = chunkKeys[index], chunkKeys[index + 1]
+    local transition, transitionError = M.edgeTransition(plan, leftKey, rightKey, routeY)
+    if not transition then return nil, transitionError end
+    distance = distance + math.abs(previousPoint.x - transition.from.x)
+      + math.abs(previousPoint.y - transition.from.y)
+      + math.abs(previousPoint.z - transition.from.z)
+    appendRouteWaypoint(waypoints, leftKey, transition.from, "transition_from")
+    distance = distance + math.abs(transition.to.x - transition.from.x)
+      + math.abs(transition.to.y - transition.from.y)
+      + math.abs(transition.to.z - transition.from.z)
+    appendRouteWaypoint(waypoints, rightKey, transition.to, "transition_to")
+    previousPoint = { x = transition.to.x, y = transition.to.y, z = transition.to.z }
+  end
+  distance = distance + math.abs(previousPoint.x - toPoint.x)
+    + math.abs(previousPoint.y - toPoint.y)
+    + math.abs(previousPoint.z - toPoint.z)
+  appendRouteWaypoint(waypoints, toKey, toPoint, "target")
+  local normalizedKeys = (function()
+    local copy = {}; for i, key in ipairs(chunkKeys) do copy[i] = tostring(key) end; return copy
+  end)()
+  local function copyKeys()
+    local copy = {}; for i, key in ipairs(normalizedKeys) do copy[i] = key end; return copy
+  end
+  return {
+    chunkKeys = normalizedKeys,
+    -- Compatibility names are independent arrays; never alias chunkKeys in a
+    -- table persisted through CC's serializer.
     keys = copyKeys(),
     path = copyKeys(),
     transitKeys = copyKeys(),
@@ -241,51 +281,3 @@ end
 local function workerList(workerIds)
   if type(workerIds) ~= "table" then return nil, "invalid_worker_ids" end
   local workers, seen = {}, {}
-  for _, id in ipairs(workerIds) do
-    if #workers >= MAX_WORKERS then return nil, "too_many_workers" end
-    if id == nil or (type(id) ~= "string" and type(id) ~= "number") or tostring(id) == "" then
-      return nil, "invalid_worker_id"
-    end
-    local key = tostring(id)
-    if seen[key] then return nil, "duplicate_worker_id" end
-    seen[key] = true
-    workers[#workers + 1] = { id = id, key = key }
-  end
-  if #workers == 0 then return nil, "no_workers" end
-  table.sort(workers, function(a, b) return a.key < b.key end)
-  return workers
-end
-
-local function partitionChunks(catalog, workerIds)
-  if type(catalog) ~= "table" then return nil, "invalid_chunk_catalog" end
-  local workers, workerError = workerList(workerIds)
-  if not workers then return nil, workerError end
-  local chunks, keys = catalogGraph(catalog)
-  if not chunks then return nil, keys end
-  if #workers > #keys then return nil, "more_workers_than_chunks" end
-  if not graphConnected(chunks, keys) then return nil, "chunk_catalog_disconnected" end
-
-  local owner, loads, owned = {}, {}, {}
-  for index, worker in ipairs(workers) do loads[index], owned[index] = 0, {} end
-  local seeds = { keys[1] }
-  local seedSet = { [keys[1]] = true }
-  -- Farthest-point seeds spread workers over the world graph while keeping
-  -- every later region reachable through an adjacent frontier.
-  for index = 2, #workers do
-    local distances = {}
-    for _, seed in ipairs(seeds) do
-      local fromSeed = graphDistances(chunks, seed)
-      for key, distance in pairs(fromSeed) do
-        if distances[key] == nil or distance < distances[key] then distances[key] = distance end
-      end
-    end
-    local selected
-    for _, key in ipairs(keys) do
-      if not seedSet[key] and (not selected or distances[key] > distances[selected] or (distances[key] == distances[selected] and chunkComparator(chunks[key], chunks[selected]))) then
-        selected = key
-      end
-    end
-    if not selected then return nil, "worker_seed_failed" end
-    seeds[#seeds + 1] = selected
-    seedSet[selected] = true
-  end

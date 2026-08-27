@@ -1,3 +1,39 @@
+  if not localCursor or localCursor ~= math.floor(localCursor) or localCursor < 0 then return nil, "assignmentResumeToken localCursor is invalid." end
+  local currentKey = route.currentKey and tostring(route.currentKey) or job.chunkPlan.rootKey
+  if not ((job.assignmentSet and job.assignmentSet[currentKey]) or (job.transitSet and job.transitSet[currentKey])) then
+    return nil, "assignmentResumeToken currentKey is outside the assignment."
+  end
+  local walkStep = job.chunkPlan.walk and job.chunkPlan.walk[walkIndex]
+  local terminalWalk = walkIndex == walkCount + 1
+  local walkKey = walkStep and tostring(walkStep.key) or (terminalWalk and tostring(job.chunkPlan.walk[walkCount] and job.chunkPlan.walk[walkCount].key) or nil)
+  if not walkKey then return nil, "assignmentResumeToken walk step is missing." end
+  local phase = tostring(route.phase or "travel")
+  if terminalWalk and (phase ~= "travel" or currentKey ~= walkKey) then
+    return nil, "assignmentResumeToken terminal walk state is inconsistent."
+  end
+  if phase ~= "travel" and currentKey ~= walkKey then
+    return nil, "assignmentResumeToken currentKey does not match route walk step."
+  end
+  if phase == "travel" and currentKey ~= walkKey then
+    local previous = walkIndex > 1 and job.chunkPlan.walk[walkIndex - 1]
+    if not previous or tostring(previous.key) ~= currentKey then
+      return nil, "assignmentResumeToken travel key does not match route walk step."
+    end
+  end
+  local foundKey = quarry.findChunk(job.chunkPlan, localPose.x, localPose.z)
+  if foundKey ~= currentKey then return nil, "assignmentResumeToken worldPose is outside current assignment chunk." end
+  if localPose.y ~= -layer then return nil, "assignmentResumeToken worldPose layer does not match route." end
+  local currentChunk = job.chunkPlan.chunks[currentKey]
+  local count = currentChunk and quarry.chunkCellCount(currentChunk) or 0
+  if localCursor > (tonumber(count) or 0) then return nil, "assignmentResumeToken localCursor is outside chunk." end
+  local cursor = tonumber(value.cursor)
+  if not cursor or cursor ~= math.floor(cursor) or cursor < 0 or cursor > (tonumber(job.total) or 0) then
+    return nil, "assignmentResumeToken cursor is invalid."
+  end
+  if phase ~= "travel" and phase ~= "mine" and phase ~= "return" then return nil, "assignmentResumeToken phase is invalid." end
+  return {
+    pose = localPose,
+    x = localPose.x, y = localPose.y, z = localPose.z, dir = localPose.dir,
     layer = layer, walkIndex = walkIndex, localCursor = localCursor,
     phase = phase, currentKey = currentKey, cursor = cursor,
     route = {
@@ -165,56 +201,3 @@ local function validateJob(payload)
     return nil, "Assigned chunk planning API unavailable; refusing unsafe group job."
   end
   if (job.groupJobId or job.assignmentId or assignment ~= nil) and not assignmentPlanRequested then
-    return nil, "Group assignment keys are required; refusing full-footprint fallback."
-  end
-  if assignmentPlanRequested then
-    local assignedSet, transitSet = {}, {}
-    local function collectAssignmentKeys(value, target)
-      if type(value) ~= "table" then return end
-      if #value > 0 then
-        for _, item in ipairs(value) do
-          local key = assignmentChunkKey(item, requestedChunkMode) or tostring(item)
-          target[key] = true
-        end
-      else
-        for item, enabled in pairs(value) do
-          if enabled then
-            local key = assignmentChunkKey(item, requestedChunkMode) or tostring(item)
-            target[key] = true
-          end
-        end
-      end
-    end
-    collectAssignmentKeys(assignmentChunks, assignedSet)
-    collectAssignmentKeys(job.assignmentTransitChunks, transitSet)
-    job.assignmentSet, job.transitSet = assignedSet, transitSet
-    -- The authoritative assigned planner receives the full catalog and
-    -- emits only mine/transit chunks.  Do not manufacture a giant exclusion
-    -- complement here: it is redundant, can exceed legacy exclusion limits,
-    -- and risks using the worker's local calibration as a world partition.
-    job.assignmentCatalog = assignmentCatalog and common.copy(assignmentCatalog) or nil
-  end
-
-  if job.waterMode ~= nil and job.waterMode ~= "ignore" and job.waterMode ~= "stop" and job.waterMode ~= "seal" then
-    return nil, "waterMode must be ignore, stop, or seal."
-  end
-  if job.lighting and job.lighting.mode ~= nil then
-    local mode = tostring(job.lighting.mode)
-    if mode ~= "off" and mode ~= "safe" and mode ~= "custom" then
-      return nil, "lighting.mode must be off, safe, or custom."
-    end
-    job.lighting.mode = mode
-    if job.lighting.interval ~= nil then
-      local interval = tonumber(job.lighting.interval)
-      if not interval or interval < 1 then return nil, "lighting.interval must be positive." end
-      job.lighting.interval = math.floor(interval)
-    end
-  end
-
-  if #exclusions > 0 or assignmentPlanRequested then
-    local planCalibration = (assignmentCatalog and assignmentCatalog.calibrationSeed) or gpsCalibration()
-    local plan, planError
-    if assignmentPlanRequested then
-      -- The assigned planner owns world-catalog validation, connectivity,
-      -- transit leases, and the dock-to-seed service route.  Keep this call
-      -- to its single canonical signature; broad compatibility attempts can

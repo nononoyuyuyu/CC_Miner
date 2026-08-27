@@ -1,3 +1,51 @@
+    scroll = function(lines) append(string.rep("\n", math.max(0, tonumber(lines) or 0))) end,
+    setTextColor = function(value) textColor = value end,
+    getTextColor = function() return textColor end,
+    setBackgroundColor = function(value) backgroundColor = value end,
+    getBackgroundColor = function() return backgroundColor end,
+    setPaletteColor = function(index, ...) palettes[index] = { ... } end,
+    setPaletteColour = function(index, ...) palettes[index] = { ... } end,
+    getPaletteColor = function(index) local p = palettes[index]; return p and table.unpack(p) or 0, 0, 0 end,
+    getPaletteColour = function(index) local p = palettes[index]; return p and table.unpack(p) or 0, 0, 0 end,
+  }
+  return terminal, function() return table.concat(chunks), overflow end
+end
+
+local function runRemoteShell(command)
+  local maxBytes = math.max(1, math.floor(tonumber(config.remoteConsole.maxOutputBytes) or 8192))
+  if not shell or type(shell.run) ~= "function" then
+    return false, "Shell API is unavailable.", { output = "", truncated = false }
+  end
+  if not term or type(term.redirect) ~= "function" then
+    return false, "Terminal redirect is unavailable.", { output = "", truncated = false }
+  end
+  local memory, readOutput = remoteMemoryTerminal(maxBytes)
+  local previous = type(term.current) == "function" and term.current() or nil
+  local redirected, oldTerm = pcall(term.redirect, memory)
+  if not redirected then return false, tostring(oldTerm), { output = "", truncated = false } end
+  oldTerm = oldTerm or previous
+  local ran, exitCode = pcall(shell.run, command)
+  local restored, restoreError = pcall(term.redirect, oldTerm)
+  local output, truncated = readOutput()
+  if not restored then return false, tostring(restoreError), {
+    output = output, truncated = truncated,
+  } end
+  if not ran then
+    -- Ctrl+T is a local operator stop and must propagate through the remote
+    -- path exactly as it does through GPS/rednet receive.
+    if remoteIsTerminated(exitCode) then error(exitCode, 0) end
+    return false, tostring(exitCode), { output = output, truncated = truncated }
+  end
+  local success = exitCode == true or (type(exitCode) == "number" and exitCode == 0)
+  return success, success and "Remote command completed." or "Remote command failed.", {
+    output = output,
+    exitCode = exitCode,
+    truncated = truncated,
+  }
+end
+
+local function remoteConsoleAction(sender, payload)
+  payload = payload or {}
   if config.remoteConsole.enabled ~= true then
     return false, "Remote console is disabled.", nil, nil
   end
@@ -201,53 +249,3 @@ local function applyControlCommand(command, payload, sender)
           gps_error = true,
         }
         if criticalPhase[tostring(state.phase or "")] then
-          return false, "Cannot resume from " .. tostring(state.phase) .. "; resolve GPS/state recovery or use REHOME first."
-        end
-      end
-      state.lastError = nil
-      state.stagedStop = false
-      if state.service then
-        state.status, state.phase = "working", "service_requested"
-      elseif isHome() and state.checkpoint and state.job then
-        state.service = { resumeAfter = true, finalStatus = "working", preserveCheckpoint = false, reason = "resume" }
-        state.status, state.phase = "working", "resume_service"
-      else
-        state.status, state.phase = "working", "mining"
-      end
-      state.request = nil
-      saveState("resume", true)
-      return true, "Resume accepted."
-    elseif state.status == "waiting_fuel" or state.status == "waiting_output" or state.status == "waiting_seal" or state.status == "waiting_torch" then
-      state.status = "working"
-      saveState()
-      return true, "Service retry accepted."
-    end
-    return false, "Worker is not paused or blocked."
-  elseif command == "recall" then
-    if not state.job then return false, "No active job." end
-    state.request = "recall"
-    state.stagedStop = { mode = "return_home", requestedAt = common.nowSeconds(), source = "recall" }
-    if state.status ~= "working" then state.status = "working" end
-    saveState()
-    return true, "Recall accepted. Worker will return and pause."
-  elseif command == "service" then
-    if not state.job then return false, "No active job." end
-    state.request = "service"
-    if state.status ~= "working" then state.status = "working" end
-    saveState()
-    return true, "Service return accepted."
-  elseif command == "abort" then
-    if not state.job then return false, "No job to abort." end
-    state.request = "abort"
-    state.completionReason = "aborted"
-    state.stagedStop = { mode = "abort", requestedAt = common.nowSeconds(), source = "abort" }
-    if state.status ~= "working" then state.status = "working" end
-    saveState()
-    return true, "Abort accepted. Worker will return home."
-  elseif command == "clear" then
-    if state.pendingAction then return false, "Cannot clear while physical position is uncertain." end
-    if not isHome() then return false, "Worker must be at home." end
-    if state.job and state.status ~= "complete" and state.status ~= "aborted" then
-      return false, "Cannot clear an unfinished job; ABORT it first."
-    end
-    if not state.job and state.status ~= "idle" then

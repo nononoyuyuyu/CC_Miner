@@ -1,3 +1,73 @@
+
+local function gpsConfig()
+  config.gps = config.gps or {}
+  return config.gps
+end
+
+local function gpsCalibration()
+  local gpsSettings = gpsConfig()
+  if geo.validCalibration(gpsSettings.calibration) then return gpsSettings.calibration end
+  return nil
+end
+
+local function gpsSummary()
+  local calibration = gpsCalibration()
+  return {
+    enabled = gpsConfig().enabled ~= false,
+    required = gpsConfig().required == true,
+    available = state.gps and state.gps.available == true,
+    calibrated = calibration ~= nil,
+    calibration = calibration and common.copy(calibration) or nil,
+    lastFix = state.gps and common.copy(state.gps.lastFix) or nil,
+    lastFixAt = state.gps and state.gps.lastFixAt or nil,
+    lastError = state.gps and state.gps.lastError or nil,
+    corrections = state.gps and state.gps.corrections or 0,
+  }
+end
+
+local function jobSnapshot()
+  if not state.job then return nil end
+  local route = state.job.route
+  local layer, row, currentChunk
+  if state.job.strategy == "chunk_plan" and route then
+    layer = (tonumber(route.layer) or 0) + 1
+    currentChunk = route.currentKey
+  else
+    local cursor = tonumber(state.job.cursor) or 0
+    local rowWidth = math.max(1, tonumber(state.job.length) or 1)
+    local rowVolume = rowWidth * math.max(1, tonumber(state.job.width) or 1)
+    layer = math.floor(cursor / rowVolume) + 1
+    row = math.floor((cursor % rowVolume) / rowWidth) + 1
+  end
+  return {
+    id = state.job.id,
+    assignmentId = state.job.assignmentId,
+    groupJobId = state.job.groupJobId,
+    groupId = state.job.groupId,
+    bay = state.job.bay or state.job.bayId,
+    dock = state.job.dock and common.copy(state.job.dock) or nil,
+    seedKey = state.job.seedKey,
+    dockKey = state.job.dockKey,
+    lease = state.job.lease and common.copy(state.job.lease) or nil,
+    profile = state.job.profile,
+    name = state.job.name,
+    kind = state.job.kind,
+    strategy = state.job.strategy,
+    width = state.job.width,
+    length = state.job.length,
+    depth = state.job.depth,
+    targetY = state.job.targetY,
+    cursor = state.job.cursor or 0,
+    total = state.job.total or 0,
+    percent = common.percent(state.job.cursor or 0, state.job.total or 0),
+    startedAt = state.job.startedAt,
+    chunkMode = state.job.chunkMode,
+    excludedChunks = state.job.excludedChunks and #state.job.excludedChunks or 0,
+    currentLayer = layer,
+    currentRow = row,
+    currentChunk = currentChunk,
+    completedChunks = state.job.completedChunks or 0,
+    assignmentChunks = state.job.assignmentChunks and #state.job.assignmentChunks or 0,
     assignmentChunkKeys = state.job.assignmentChunks and common.copy(state.job.assignmentChunks) or nil,
     transitChunkKeys = state.job.assignmentTransitChunks and common.copy(state.job.assignmentTransitChunks) or nil,
     assignmentCatalog = state.job.assignmentCatalog and {
@@ -207,63 +277,3 @@ local function statusPayload()
     remoteConsole = {
       enabled = config.remoteConsole.enabled == true,
       allowShell = config.remoteConsole.allowShell == true,
-      active = remoteActive == true,
-      expiresAt = remoteActive and remoteSession.expiresAt or nil,
-      auditCount = #remoteAudit,
-      lastAuditAt = remoteAudit[#remoteAudit] and remoteAudit[#remoteAudit].at or nil,
-    },
-    lastError = state.lastError,
-    completionReason = state.completionReason,
-    recoveryRequired = state.pendingAction ~= nil,
-    pendingAction = state.pendingAction and {
-      kind = state.pendingAction.kind,
-      startedAt = state.pendingAction.startedAt,
-    } or nil,
-    request = state.request,
-    stats = common.copy(state.stats),
-    version = common.VERSION,
-    updatedAt = state.updatedAt,
-  }
-end
-
-local function sendStatus(target, request)
-  if not networkReady then return false end
-  local message = protocol.message("status", config.networkKey, statusPayload(), target)
-  if request and request.id then message.replyTo = request.id end
-  if target then return protocol.send(target, message) end
-  return protocol.broadcast(message)
-end
-
-local function sendAck(target, request, ok, text, result, session)
-  local payload = request and type(request.payload) == "table" and request.payload or {}
-  local ack = {
-    ok = ok == true,
-    message = tostring(text or ""),
-    status = statusPayload(),
-    -- Echo only sanitized assignment identity fields so a controller can
-    -- correlate negative/duplicate ACKs with the intended group dispatch.
-    command = payload.command and tostring(payload.command) or nil,
-    groupJobId = payload.groupJobId and tostring(payload.groupJobId) or nil,
-    assignmentId = payload.assignmentId and tostring(payload.assignmentId) or nil,
-    groupId = payload.groupId and tostring(payload.groupId) or nil,
-    -- Remote-console actions return bounded tables without changing the
-    -- existing ACK fields.  Copy the values so no mutable session object (or
-    -- network key) can leak through the response contract.
-    result = type(result) == "table" and common.copy(result) or nil,
-    session = type(session) == "table" and common.copy(session) or nil,
-  }
-  return protocol.reply(target, config.networkKey, request, "ack", ack)
-end
-
-local function markBlocked(message)
-  state.status = "blocked"
-  state.phase = state.pendingAction and "recovery_required" or "blocked"
-  state.lastError = tostring(message or "Unknown error")
-  common.log("ERROR", state.lastError)
-  saveState()
-  sendStatus()
-end
-
-local function commandSeen(id)
-  if not id then return false end
-  state.recentCommands = state.recentCommands or {}

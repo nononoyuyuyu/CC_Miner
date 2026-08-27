@@ -1,3 +1,42 @@
+    local anchor = M.chunkAnchor(chunk) or { x = chunk.minX, z = chunk.minZ }
+    chunk.anchor = { x = anchor.x, z = anchor.z }
+  end
+  if chunks[seedKey] then
+    local entranceAnchor = contains(chunks[seedKey], 0, 1)
+      and { x = 0, z = 1 }
+      or M.chunkAnchor(chunks[seedKey], { x = 0, z = 1 })
+    if entranceAnchor then chunks[seedKey].anchor = { x = entranceAnchor.x, z = entranceAnchor.z } end
+  end
+  if chunks[dockKey] then
+    local dockAnchor = contains(chunks[dockKey], 0, 1)
+      and { x = 0, z = 1 }
+      or M.chunkAnchor(chunks[dockKey], { x = 0, z = 1 })
+    if dockAnchor then chunks[dockKey].anchor = { x = dockAnchor.x, z = dockAnchor.z } end
+  end
+  for index = 2, #servicePath do
+    local previousKey, currentKey = servicePath[index - 1], servicePath[index]
+    local boundary = M.chunkAnchor(chunks[currentKey], chunks[previousKey])
+    if boundary and currentKey ~= seedKey then chunks[currentKey].anchor = { x = boundary.x, z = boundary.z } end
+  end
+
+  local walk, visited = assignedWalk(chunks, mineKeys, seedKey, mineSet)
+  for _, key in ipairs(mineKeys) do
+    if not visited[key] then return nil, "assigned_chunks_disconnected" end
+  end
+  local mineCopies = {}
+  for _, key in ipairs(mineKeys) do mineCopies[key] = cloneValue(chunks[key]); mineCopies[key].neighbors = {} end
+  buildNeighborGraph(mineCopies, mineKeys)
+  local optimized, optimizedOrder = optimizedWalk(mineCopies, mineKeys, seedKey)
+  for _, key in ipairs(mineKeys) do
+    if mineCopies[key].optimizedAnchor then
+      chunks[key].optimizedAnchor = { x = mineCopies[key].optimizedAnchor.x, z = mineCopies[key].optimizedAnchor.z }
+    end
+  end
+  local routeCopy = {}
+  for index, key in ipairs(optimizedOrder) do routeCopy[index] = key end
+  local assignedColumns = 0
+  local assignedBounds
+  for _, key in ipairs(mineKeys) do assignedColumns = assignedColumns + chunks[key].cells end
   for _, key in ipairs(mineKeys) do
     local chunk = chunks[key]
     assignedBounds = assignedBounds or { minX = chunk.minX, maxX = chunk.maxX, minZ = chunk.minZ, maxZ = chunk.maxZ }
@@ -225,47 +264,3 @@ return M
   { source = [[src/ccminer/worker.lua]], target = [[worker.lua]], digest = [[86fccf7d92a52fb66c9569efb0654f7b4cbfb808c7044984eeeca99f3a370425]], content = [[-- CC Miner V4 - generated worker source loader.
 local parts = {
   "/ccminer/worker_parts/01.part",
-  "/ccminer/worker_parts/02.part",
-  "/ccminer/worker_parts/03.part",
-  "/ccminer/worker_parts/04.part",
-  "/ccminer/worker_parts/05.part",
-}
-local source = {}
-for index, path in ipairs(parts) do
-  local handle = fs.open(path, "r")
-  if not handle then error("Missing runtime part: " .. path, 0) end
-  source[index] = handle.readAll()
-  handle.close()
-end
-local loader = loadstring or load
-local program, compileError = loader(table.concat(source), "@/ccminer/worker.assembled.lua")
-if not program then error("Cannot assemble worker: " .. tostring(compileError), 0) end
-return program(...)
-]] },
-  { source = [[src/ccminer/worker_parts/01.part]], target = [[worker_parts/01.part]], digest = [[5bebd121836dd78d5635c1d65c2c1e4963244d3283135c3e4256667d0feb704d]], content = [[-- CC Miner V4 - autonomous quarry worker
--- Home=(0,0,0), forward=+Z, right=+X, down=-Y.
-
-local common = dofile("/ccminer/lib/common.lua")
-local protocol = dofile("/ccminer/lib/protocol.lua")
-local quarry = dofile("/ccminer/lib/quarry.lua")
-local geo = dofile("/ccminer/lib/geo.lua")
-
-if not turtle then error("worker.lua must run on a turtle", 0) end
-
-local config, configError = common.loadConfig()
-if not config or config.role ~= "worker" then
-  error(configError or "Worker configuration not found. Run: ccm setup worker", 0)
-end
-
--- Forward declaration: statusPayload is defined before the assignment resume
--- helpers below, but Lua lexical scope otherwise resolves that call globally.
-local assignmentResumeSnapshot
-
--- Accept both the V4 nested defaults and older flat V2 settings.  This is
--- intentionally in-memory so an old config remains readable by V2 tooling.
-config.materials = config.materials or {}
-config.lighting = config.lighting or {}
-config.water = config.water or {}
-config.journal = config.journal or {}
-config.performance = config.performance or {}
-config.gps = config.gps or {}

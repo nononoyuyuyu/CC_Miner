@@ -1,3 +1,54 @@
+      if (st == "complete" or st == "aborted") and previous and previous.status ~= st then
+        addHistory(id, workers[id].data, workers[id].data.completionReason or st)
+        releaseLeasesForWorker(id, activeJobId(previous))
+      end
+    end
+    return true
+  end
+  return false
+end
+
+local function discover()
+  protocol.broadcast(protocol.message("discover", config.networkKey, { controllerName = config.controllerName, v3 = true }))
+  lastDiscovery = common.nowSeconds()
+  setNotice("Discovery broadcast sent.", false)
+end
+
+local function sendCommand(id, command, payload)
+  if not id then setNotice("No worker selected.", true); return false end
+  payload = payload or {}
+  payload.command = command
+  local wireMessage = protocol.message("command", config.networkKey, payload, id)
+  local ok, err = protocol.send(id, wireMessage)
+  if ok then setNotice(("Command '%s' sent to #%s."):format(command, tostring(id)), false)
+  else setNotice("Send failed: " .. tostring(err), true) end
+  return ok, err, wireMessage.id
+end
+
+do
+local function remoteToken(prefix)
+  local millis = common.nowMillis and common.nowMillis() or math.floor(common.nowSeconds() * 1000)
+  return ("%s-%d-%d-%d"):format(tostring(prefix or "remote"), os.getComputerID(), millis, math.random(100000, 999999))
+end
+
+local function remoteRedactText(value)
+  local text = tostring(value or "")
+  local key = type(config.networkKey) == "string" and config.networkKey or ""
+  -- Replace the configured key using plain-string searches.  Network keys may
+  -- contain Lua pattern characters, and they must never appear in CLI output.
+  if key ~= "" then
+    local output, cursor = {}, 1
+    while true do
+      local startAt, endAt = text:find(key, cursor, true)
+      if not startAt then output[#output + 1] = text:sub(cursor); break end
+      output[#output + 1] = text:sub(cursor, startAt - 1)
+      output[#output + 1] = "[REDACTED]"
+      cursor = endAt + 1
+    end
+    text = table.concat(output)
+  end
+  return text
+end
 
 local function remoteSensitiveKey(key)
   local name = tostring(key or ""):lower():gsub("[^%a%d]", "")
@@ -211,51 +262,3 @@ local function groupCommand(groupId, command, payload)
     local assignment = groupJob and groupJob.assignments and (groupJob.assignments[tostring(id)] or groupJob.assignments[id])
     if assignment and command == "start" then
       individual.assignmentId = assignment.assignmentId
-      individual.assignment = common.copy(assignment)
-      individual.assignmentChunks = common.copy(assignment.chunkKeys or assignment.chunks or {})
-    end
-    if sendCommand(id, individual.command, individual) then
-      sent = sent + 1
-      if groupJob then groupJob.acks[tostring(id)] = { ok = nil, command = individual.groupCommand, sentAt = common.nowSeconds() } end
-    end
-  end
-  if groupJob then updateGroupAggregate(groupJob); saveControllerDb() end
-  if groupJob and (command == "clear" or command == "abort") then
-    groupJob.status = command == "clear" and "clear_requested" or "aborting"
-    if command == "abort" then
-      -- Assignments that were never sent cannot later race an ABORT.  Keep
-      -- awaiting ACK entries until their worker confirms/returns, since the
-      -- START packet may already be in flight.
-      groupJob.pending = {}
-    end
-    groupJob.returnReason = groupJob.returnReason or (command == "abort" and "group_abort" or "group_clear")
-    maybeFinalizeGroup(groupJob)
-    saveControllerDb()
-  end
-  if sent < attempted then setNotice(("Group %s: %d/%d commands sent."):format(payload.groupCommand, sent, attempted), true) else setNotice(("Group %s sent to %d workers."):format(payload.groupCommand, sent), false) end
-  return sent == attempted and attempted > 0, sent
-end
-
-local function groupCommandBySelected(command)
-  local id = selectedGroupRecord()
-  if not id then setNotice("No group selected.", true); return false end
-  return groupCommand(id, command)
-end
-
-local function progressText(data)
-  if not data or not data.job then return "-" end
-  local p = data.progress or {}
-  return ("%3d%% %s/%s"):format(
-    tonumber(p.percent or data.job.percent) or 0,
-    common.humanNumber(p.cursor or data.job.cursor or 0),
-    common.humanNumber(p.total or data.job.total or 0)
-  )
-end
-
-local function resetHitboxes(key)
-  hitboxes[key] = {}
-end
-
-local function addHitbox(key, x1, y1, x2, y2, action)
-  hitboxes[key] = hitboxes[key] or {}
-  hitboxes[key][#hitboxes[key] + 1] = {

@@ -1,3 +1,67 @@
+        state.water.lastRun = 0
+        if not preserveSealMarker then
+          state.fluidSealRun = 0
+          state.water.continuousSeals = 0
+          state.fluidSealMarker = nil
+        end
+        local _, emptySlots = inventoryStats()
+        if emptySlots <= 0 then return false, "inventory_full" end
+        local prepared, prepareError = beginPhysicalAction("dig_" .. direction, { block = name }, poseCopy())
+        if not prepared then return false, prepareError end
+]] },
+  { source = [[src/ccminer/worker_parts/03.part]], target = [[worker_parts/03.part]], digest = [[090bb2620b59f88f9880507add1162707af7633b668c92a97f6833df9badbab2]], content = [=[        local dug, digReason = action.dig()
+        if dug then
+          state.stats.blocksDug = (state.stats.blocksDug or 0) + 1
+          if not preserveSealMarker then noteMinedMaterial(name) end
+          commitPhysicalAction()
+          sleep(0.1)
+        else
+          cancelPhysicalAction()
+          lastReason = digReason or ("Cannot dig " .. name)
+          sleep(retryDelay)
+        end
+      end
+    end
+
+    local after = geo.poseAfterMove(state.pose, direction)
+    local prepared, prepareError = beginPhysicalAction("move_" .. direction, nil, after)
+    if not prepared then return false, prepareError end
+    local moved, moveReason = action.move()
+    if moved then
+      updatePoseAfterMove(direction)
+      -- A successful move normally ends a fluid-seal run.  When the moved
+      -- block was the seal marker we just carved, preserve the run so a
+      -- contiguous fluid column reaches maxContinuousSeal across cells.
+      if preserveSealMarker then
+        state.fluidSealMarker = nil
+      else
+        state.fluidSealRun = 0
+        state.water.continuousSeals = 0
+        state.fluidSealMarker = nil
+      end
+      local gpsOK, gpsError = verifyGPS(false)
+      if not gpsOK then return false, gpsError end
+      commitPhysicalAction()
+      heartbeat(false)
+      return true
+    end
+    cancelPhysicalAction()
+    lastReason = moveReason or lastReason
+    local blockedNow = action.inspect()
+    if not blockedNow then
+      if config.attackEntities and action.attack then pcall(action.attack) end
+      sleep(retryDelay)
+    else
+      sleep(0.1)
+    end
+  end
+  return false, lastReason
+end
+
+local function moveX(targetX, context)
+  while state.pose.x ~= targetX do
+    local targetDir = state.pose.x < targetX and 1 or 3
+    local ok, err = turnTo(targetDir)
     if not ok then return false, err end
     ok, err = moveOne("forward", context)
     if not ok then return false, err end
@@ -224,55 +288,3 @@ local function navigateServiceRoute(plan, fromPose, toPose, context, mode)
         for _, waypoint in ipairs(edge) do
           local ok, err = navigateTo(waypoint, "inside", context)
           if not ok then return false, err end
-        end
-      else
-        local ok, err = moveBetweenChunkAnchors(plan, keys[index - 1], keys[index], fromPose.y, context)
-        if not ok then return false, err end
-      end
-    end
-    state.routeMetrics = state.routeMetrics or {}
-    state.routeMetrics.lastRoute = { kind = routeKind or "fallback", chunkKeys = common.copy(keys) }
-    return navigateTo(toPose, "inside", context)
-  end
-  return false, "No safe chunk service route."
-end
-
-local function navigateChunkPlanHome(context)
-  local plan = state.job and state.job.chunkPlan
-  if not plan then return navigateTo({ x = 0, y = 0, z = 0 }, "home", context) end
-  if isHome() then return true end
-  local currentKey = quarry.findChunk(plan, state.pose.x, state.pose.z)
-  if not currentKey then return false, "Current position is outside every allowed chunk." end
-  local dock, dockError = serviceDockAnchor(plan, state.pose.y)
-  if not dock then return false, dockError end
-  local ok, err = navigateServiceRoute(plan, state.pose, dock, context, "home")
-  if not ok then return false, err end
-  return navigateTo({ x = 0, y = 0, z = 0 }, "home", context)
-end
-
-local function navigateChunkPlanWork(checkpoint, context)
-  local plan = state.job and state.job.chunkPlan
-  if not plan then return navigateTo(checkpoint, "work", context) end
-  local targetKey = quarry.findChunk(plan, checkpoint.x, checkpoint.z)
-  if not targetKey then return false, "Checkpoint is outside every allowed chunk." end
-  local fromKey = quarry.findChunk(plan, state.pose.x, state.pose.z)
-  if not fromKey then
-    local dock, dockError = serviceDockAnchor(plan, state.pose.y)
-    if not dock then return false, dockError end
-    local bridged, bridgeError = navigateTo(dock, "home", context)
-    if not bridged then return false, bridgeError end
-    return navigateServiceRoute(plan, dock, checkpoint, context, "work")
-  end
-  return navigateServiceRoute(plan, state.pose, checkpoint, context, "work")
-end
-
-local function estimatedReturnDistance(pose)
-  pose = pose or state.pose
-  if tonumber(pose.x) == 0 and tonumber(pose.y) == 0 and tonumber(pose.z) == 0 then return 0 end
-  if not state.job or state.job.strategy ~= "chunk_plan" or not state.job.chunkPlan then
-    return distance(pose, { x = 0, y = 0, z = 0 })
-  end
-
-  local plan = state.job.chunkPlan
-  local currentKey = quarry.findChunk(plan, pose.x, pose.z)
-  if not currentKey then return nil, "Current position is outside every allowed chunk." end

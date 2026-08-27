@@ -1,3 +1,14 @@
+        local expectedDepth = numericBottom and math.floor(homeY - numericBottom + 1) or nil
+        if not numericBottom or numericBottom ~= math.floor(numericBottom) or numericBottom > homeY then
+          finding("FAIL", "gps.absoluteY", "BOTTOM Y is above calibrated home Y")
+        elseif depth and expectedDepth ~= depth then
+          finding("FAIL", "gps.absoluteY", ("BOTTOM Y/depth mismatch (derived %d, depth %s)"):format(expectedDepth, tostring(depth)))
+        else finding("PASS", "gps.absoluteY", ("homeY=%s bottomY=%s"):format(tostring(homeY), tostring(bottomY))) end
+      else
+        finding("PASS", "gps.absoluteY", "homeY=" .. tostring(homeY))
+      end
+      doctorJournal(config, state, finding)
+    end
   elseif stateError and stateError ~= "missing" then
     finding("WARN", "state.file", "not applicable; read error " .. tostring(stateError))
   end
@@ -147,7 +158,33 @@ elseif command == "rehome" then
       if previous and previous.stats then reset.stats = previous.stats end
       local ok, err = common.saveTable(common.STATE_PATH, reset)
       if not ok then reportError("Cannot reset worker state: " .. tostring(err))
-      else print("Worker coordinates and job were reset to home. Run: reboot") end
+      else
+        -- RESET intentionally abandons the old job.  Its auxiliary recovery
+        -- files must be removed with the authoritative state or a reboot can
+        -- replay an old pending action and Doctor sees an old sequence ahead
+        -- of the fresh state.  User-created *.before-reset backups are never
+        -- touched.
+        local journal = type(config.journal) == "table" and config.journal or {}
+        local cleanup = {
+          journal.path or "/ccminer/data/state.journal",
+          (journal.path or "/ccminer/data/state.journal") .. ".1",
+          journal.checkpointPath or "/ccminer/data/state.checkpoint.db",
+          journal.pendingPath or "/ccminer/data/state.pending",
+        }
+        local cleanupErrors = {}
+        for _, path in ipairs(cleanup) do
+          if fs.exists(path) then
+            local removed, removeError = pcall(fs.delete, path)
+            if not removed or fs.exists(path) then cleanupErrors[#cleanupErrors + 1] = tostring(removeError or path) end
+          end
+        end
+        if #cleanupErrors > 0 then
+          reportError("State was reset, but recovery-file cleanup failed: " .. table.concat(cleanupErrors, "; "))
+          reportError("Do not reboot until those files are removed.")
+        else
+          print("Worker coordinates, job, journal and recovery files were reset to home. Run: reboot")
+        end
+      end
     end
   elseif config.role == "controller" then
     if not tonumber(args[2]) or args[3] ~= "RESET" then reportError("Usage: ccm rehome <id> RESET") else forwardController() end
@@ -181,44 +218,3 @@ elseif command == "start" or command == "pause" or command == "resume" or comman
       if sub ~= "list" and sub ~= "register" then
         reportError("Usage: ccm " .. command .. " list|register <id> <x> <y> <z> [facing] [maxDepth]")
       else
-        -- Registry validation and coordinate normalization stay in the
-        -- controller.  Preserve every argument so legacy and extended
-        -- register forms remain compatible.
-        forwardController()
-      end
-    elseif command == "stop" then
-      local mode = string.lower(tostring(args[3] or ""))
-      local stopModes = {
-        now = "pause_now", row = "finish_row", layer = "finish_layer", home = "return_home",
-        pause_now = "pause_now", finish_row = "finish_row", finish_layer = "finish_layer",
-        return_home = "return_home", abort = "abort",
-      }
-      local controllerMode = stopModes[mode]
-      local valid = controllerMode ~= nil
-      if not tonumber(args[2]) or not valid then
-        reportError("Usage: ccm stop <id> <now|row|layer|home|abort>")
-      else
-        local forwarded = {}
-        for index = 1, #args do forwarded[index] = args[index] end
-        forwarded[3] = controllerMode
-        forwardController(forwarded)
-      end
-    else
-      forwardController()
-    end
-  end
-elseif command == "status" then
-  local config, configError = common.loadConfig()
-  if not config then reportError(configError or "Not configured."); return end
-  print("CC Miner " .. tostring(common.VERSION or ""))
-  print("Role: " .. tostring(config.role))
-  print("Computer ID: " .. tostring(os.getComputerID()))
-  print("Label: " .. tostring(os.getComputerLabel and os.getComputerLabel() or "-"))
-  if type(config.networkKey) == "string" and config.networkKey ~= "" then print("Network key: configured (masked)") else print("Network key: not configured") end
-  printStatusFeature("Profile", config.profile)
-  printStatusFeature("Lighting", config.lighting, config.lightMode)
-  printStatusFeature("Water", config.water, config.waterMode)
-  printStatusFeature("Materials", config.materials)
-  printStatusFeature("Staged stop", config.stagedStop)
-  if config.role == "worker" then
-    local state, stateError = common.loadTable(common.STATE_PATH, common.defaultState())

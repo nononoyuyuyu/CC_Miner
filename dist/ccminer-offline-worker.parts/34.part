@@ -1,3 +1,65 @@
+    return false, fluidKind == "water" and "water_seal_limit" or "lava_seal_limit"
+  end
+  local originalSlot = turtle.getSelectedSlot()
+  local slot = selectSealMaterial()
+  if not slot then
+    turtle.select(originalSlot)
+    return false, "seal_material"
+  end
+  local material = itemName(slot)
+  local prepared, prepareError = beginPhysicalAction("seal_" .. fluidKind .. "_" .. direction, {
+    fluid = blockName(data), material = material, fluidKind = fluidKind,
+  }, poseCopy())
+  if not prepared then turtle.select(originalSlot); return false, prepareError end
+  local placed, placeReason = action.place()
+  turtle.select(originalSlot)
+  if not placed then
+    cancelPhysicalAction()
+    return false, "lava_seal_failed:" .. tostring(placeReason or blockName(data))
+  end
+  if fluidKind == "water" then
+    state.stats.waterSealed = (state.stats.waterSealed or 0) + 1
+    state.water.sealed = (state.water.sealed or 0) + 1
+    state.water.lastRun = continuous + 1
+  else
+    state.stats.lavaSealed = (state.stats.lavaSealed or 0) + 1
+  end
+  state.fluidSealRun = continuous + 1
+  state.water.continuousSeals = state.fluidSealRun
+  state.fluidSealMarker = {
+    kind = fluidKind,
+    direction = direction,
+    material = material,
+    pose = poseCopy(),
+    at = common.nowSeconds(),
+  }
+  commitPhysicalAction()
+  sleep(0.15)
+  return true
+end
+
+local function sealLava(action, direction, data)
+  return sealFluid(action, direction, data, "lava")
+end
+
+local function effectiveLighting()
+  -- lighting.mode is an explicit safety choice and is never changed by a
+  -- profile.  Profiles only adjust the requested placement cadence.
+  return effectiveLightingValues()
+end
+
+local function noteMinedMaterial(name)
+  if not isSealItemName(name) then return end
+  local materials, recycle = materialsConfig()
+  local enabled = materials.recycleMinedBlocks
+  if enabled == nil then enabled = recycle.enabled end
+  if enabled == false then return end
+  state.recycle = state.recycle or { byName = {}, held = 0, cap = 64, overflow = 0 }
+  state.recycle.byName = state.recycle.byName or {}
+  state.recycle.byName[name] = (state.recycle.byName[name] or 0) + 1
+  state.recycle.held = (state.recycle.held or 0) + 1
+  state.recycle.cap = math.max(0, math.floor(tonumber(materials.retainSealTarget or recycle.maxHeld or config.retainSealTarget or config.sealTarget or state.recycle.cap or 64) or 64))
+  if state.recycle.held > state.recycle.cap then
     state.recycle.overflow = state.recycle.held - state.recycle.cap
   end
   state.stats.recycledBlocks = (state.stats.recycledBlocks or 0) + 1
@@ -217,67 +279,3 @@ local function moveOne(direction, context)
           and marker.direction == direction
           and marker.material == name
           and samePosePosition(marker.pose, state.pose)
-        state.water.lastRun = 0
-        if not preserveSealMarker then
-          state.fluidSealRun = 0
-          state.water.continuousSeals = 0
-          state.fluidSealMarker = nil
-        end
-        local _, emptySlots = inventoryStats()
-        if emptySlots <= 0 then return false, "inventory_full" end
-        local prepared, prepareError = beginPhysicalAction("dig_" .. direction, { block = name }, poseCopy())
-        if not prepared then return false, prepareError end
-]] },
-  { source = [[src/ccminer/worker_parts/03.part]], target = [[worker_parts/03.part]], digest = [[090bb2620b59f88f9880507add1162707af7633b668c92a97f6833df9badbab2]], content = [=[        local dug, digReason = action.dig()
-        if dug then
-          state.stats.blocksDug = (state.stats.blocksDug or 0) + 1
-          if not preserveSealMarker then noteMinedMaterial(name) end
-          commitPhysicalAction()
-          sleep(0.1)
-        else
-          cancelPhysicalAction()
-          lastReason = digReason or ("Cannot dig " .. name)
-          sleep(retryDelay)
-        end
-      end
-    end
-
-    local after = geo.poseAfterMove(state.pose, direction)
-    local prepared, prepareError = beginPhysicalAction("move_" .. direction, nil, after)
-    if not prepared then return false, prepareError end
-    local moved, moveReason = action.move()
-    if moved then
-      updatePoseAfterMove(direction)
-      -- A successful move normally ends a fluid-seal run.  When the moved
-      -- block was the seal marker we just carved, preserve the run so a
-      -- contiguous fluid column reaches maxContinuousSeal across cells.
-      if preserveSealMarker then
-        state.fluidSealMarker = nil
-      else
-        state.fluidSealRun = 0
-        state.water.continuousSeals = 0
-        state.fluidSealMarker = nil
-      end
-      local gpsOK, gpsError = verifyGPS(false)
-      if not gpsOK then return false, gpsError end
-      commitPhysicalAction()
-      heartbeat(false)
-      return true
-    end
-    cancelPhysicalAction()
-    lastReason = moveReason or lastReason
-    local blockedNow = action.inspect()
-    if not blockedNow then
-      if config.attackEntities and action.attack then pcall(action.attack) end
-      sleep(retryDelay)
-    else
-      sleep(0.1)
-    end
-  end
-  return false, lastReason
-end
-
-local function moveX(targetX, context)
-  while state.pose.x ~= targetX do
-    local targetDir = state.pose.x < targetX and 1 or 3
-    local ok, err = turnTo(targetDir)

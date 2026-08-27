@@ -1,3 +1,20 @@
+    finding("FAIL", "config.role", "unknown role: " .. (role == "" and "missing" or role))
+  else
+    finding("PASS", "config.role", role)
+  end
+  if config.version == nil then finding("WARN", "config.version", "missing") else finding("PASS", "config.version", tostring(config.version)) end
+
+  local networkKey = config.networkKey
+  if role ~= "gps" then
+    if type(networkKey) ~= "string" or networkKey == "" or networkKey == "CHANGE_ME" then
+      finding("FAIL", "config.networkKey", "missing or still CHANGE_ME")
+    else
+      finding("PASS", "config.networkKey", "configured (masked)")
+    end
+  end
+  if role == "worker" then
+    local numericChecks = {
+      { "config.maxWidth", config.maxWidth, 1 }, { "config.maxLength", config.maxLength, 1 },
       { "config.maxDepth", config.maxDepth, 1 }, { "config.maxVolume", config.maxVolume, 1 },
       { "config.reserveEmptySlots", config.reserveEmptySlots, 0 },
     }
@@ -176,14 +193,3 @@
         -- carries its own depth value.
         local depth = type(state.job) == "table" and tonumber(state.job.depth) or nil
         local numericBottom = tonumber(bottomY)
-        local expectedDepth = numericBottom and math.floor(homeY - numericBottom + 1) or nil
-        if not numericBottom or numericBottom ~= math.floor(numericBottom) or numericBottom > homeY then
-          finding("FAIL", "gps.absoluteY", "BOTTOM Y is above calibrated home Y")
-        elseif depth and expectedDepth ~= depth then
-          finding("FAIL", "gps.absoluteY", ("BOTTOM Y/depth mismatch (derived %d, depth %s)"):format(expectedDepth, tostring(depth)))
-        else finding("PASS", "gps.absoluteY", ("homeY=%s bottomY=%s"):format(tostring(homeY), tostring(bottomY))) end
-      else
-        finding("PASS", "gps.absoluteY", "homeY=" .. tostring(homeY))
-      end
-      doctorJournal(config, state, finding)
-    end

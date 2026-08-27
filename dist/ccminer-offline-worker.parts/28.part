@@ -1,3 +1,63 @@
+      active = remoteActive == true,
+      expiresAt = remoteActive and remoteSession.expiresAt or nil,
+      auditCount = #remoteAudit,
+      lastAuditAt = remoteAudit[#remoteAudit] and remoteAudit[#remoteAudit].at or nil,
+    },
+    lastError = state.lastError,
+    completionReason = state.completionReason,
+    recoveryRequired = state.pendingAction ~= nil,
+    pendingAction = state.pendingAction and {
+      kind = state.pendingAction.kind,
+      startedAt = state.pendingAction.startedAt,
+    } or nil,
+    request = state.request,
+    stats = common.copy(state.stats),
+    version = common.VERSION,
+    updatedAt = state.updatedAt,
+  }
+end
+
+local function sendStatus(target, request)
+  if not networkReady then return false end
+  local message = protocol.message("status", config.networkKey, statusPayload(), target)
+  if request and request.id then message.replyTo = request.id end
+  if target then return protocol.send(target, message) end
+  return protocol.broadcast(message)
+end
+
+local function sendAck(target, request, ok, text, result, session)
+  local payload = request and type(request.payload) == "table" and request.payload or {}
+  local ack = {
+    ok = ok == true,
+    message = tostring(text or ""),
+    status = statusPayload(),
+    -- Echo only sanitized assignment identity fields so a controller can
+    -- correlate negative/duplicate ACKs with the intended group dispatch.
+    command = payload.command and tostring(payload.command) or nil,
+    groupJobId = payload.groupJobId and tostring(payload.groupJobId) or nil,
+    assignmentId = payload.assignmentId and tostring(payload.assignmentId) or nil,
+    groupId = payload.groupId and tostring(payload.groupId) or nil,
+    -- Remote-console actions return bounded tables without changing the
+    -- existing ACK fields.  Copy the values so no mutable session object (or
+    -- network key) can leak through the response contract.
+    result = type(result) == "table" and common.copy(result) or nil,
+    session = type(session) == "table" and common.copy(session) or nil,
+  }
+  return protocol.reply(target, config.networkKey, request, "ack", ack)
+end
+
+local function markBlocked(message)
+  state.status = "blocked"
+  state.phase = state.pendingAction and "recovery_required" or "blocked"
+  state.lastError = tostring(message or "Unknown error")
+  common.log("ERROR", state.lastError)
+  saveState()
+  sendStatus()
+end
+
+local function commandSeen(id)
+  if not id then return false end
+  state.recentCommands = state.recentCommands or {}
   for _, existing in ipairs(state.recentCommands) do if existing == id then return true end end
   state.recentCommands[#state.recentCommands + 1] = id
   while #state.recentCommands > 32 do table.remove(state.recentCommands, 1) end
@@ -206,39 +266,3 @@ local function validateAssignmentResumeToken(value, job)
   if not layer or layer ~= math.floor(layer) or layer < 0 or layer >= job.depth then return nil, "assignmentResumeToken layer is invalid." end
   local walkCount = #(job.chunkPlan.walk or {})
   if not walkIndex or walkIndex ~= math.floor(walkIndex) or walkIndex < 1 or walkIndex > walkCount + 1 then return nil, "assignmentResumeToken walkIndex is invalid." end
-  if not localCursor or localCursor ~= math.floor(localCursor) or localCursor < 0 then return nil, "assignmentResumeToken localCursor is invalid." end
-  local currentKey = route.currentKey and tostring(route.currentKey) or job.chunkPlan.rootKey
-  if not ((job.assignmentSet and job.assignmentSet[currentKey]) or (job.transitSet and job.transitSet[currentKey])) then
-    return nil, "assignmentResumeToken currentKey is outside the assignment."
-  end
-  local walkStep = job.chunkPlan.walk and job.chunkPlan.walk[walkIndex]
-  local terminalWalk = walkIndex == walkCount + 1
-  local walkKey = walkStep and tostring(walkStep.key) or (terminalWalk and tostring(job.chunkPlan.walk[walkCount] and job.chunkPlan.walk[walkCount].key) or nil)
-  if not walkKey then return nil, "assignmentResumeToken walk step is missing." end
-  local phase = tostring(route.phase or "travel")
-  if terminalWalk and (phase ~= "travel" or currentKey ~= walkKey) then
-    return nil, "assignmentResumeToken terminal walk state is inconsistent."
-  end
-  if phase ~= "travel" and currentKey ~= walkKey then
-    return nil, "assignmentResumeToken currentKey does not match route walk step."
-  end
-  if phase == "travel" and currentKey ~= walkKey then
-    local previous = walkIndex > 1 and job.chunkPlan.walk[walkIndex - 1]
-    if not previous or tostring(previous.key) ~= currentKey then
-      return nil, "assignmentResumeToken travel key does not match route walk step."
-    end
-  end
-  local foundKey = quarry.findChunk(job.chunkPlan, localPose.x, localPose.z)
-  if foundKey ~= currentKey then return nil, "assignmentResumeToken worldPose is outside current assignment chunk." end
-  if localPose.y ~= -layer then return nil, "assignmentResumeToken worldPose layer does not match route." end
-  local currentChunk = job.chunkPlan.chunks[currentKey]
-  local count = currentChunk and quarry.chunkCellCount(currentChunk) or 0
-  if localCursor > (tonumber(count) or 0) then return nil, "assignmentResumeToken localCursor is outside chunk." end
-  local cursor = tonumber(value.cursor)
-  if not cursor or cursor ~= math.floor(cursor) or cursor < 0 or cursor > (tonumber(job.total) or 0) then
-    return nil, "assignmentResumeToken cursor is invalid."
-  end
-  if phase ~= "travel" and phase ~= "mine" and phase ~= "return" then return nil, "assignmentResumeToken phase is invalid." end
-  return {
-    pose = localPose,
-    x = localPose.x, y = localPose.y, z = localPose.z, dir = localPose.dir,

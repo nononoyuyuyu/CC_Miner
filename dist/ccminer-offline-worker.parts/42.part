@@ -1,3 +1,53 @@
+    end
+    local present, data = inspectPendingSide(kind)
+    if present and isTorchItemName(blockName(data)) then return true end
+    if not present then return true end
+    return false, "Pending torch target is occupied by " .. blockName(data) .. "."
+  end
+  return nil
+end
+
+local function tryResolvePendingAction()
+  local pending = state.pendingAction
+  if not pending then return true end
+  local kind = tostring(pending.kind or "")
+  if common.startsWith(kind, "turn_") or kind == "gps_calibration" then return false, "GPS cannot determine the result of " .. kind end
+  local nonMovement, nonMovementError = resolveNonMovementPending(pending)
+  if nonMovement ~= nil then
+    if not nonMovement then return false, nonMovementError end
+    state.pendingAction = nil
+    state.stats.journalRecoveries = (state.stats.journalRecoveries or 0) + 1
+    if common.startsWith(kind, "torch_") then
+      state.stats.torchesRecovered = (state.stats.torchesRecovered or 0) + 1
+      state.lighting.torchesRecovered = (state.lighting.torchesRecovered or 0) + 1
+    end
+    state.stats.powerRecoveries = (state.stats.powerRecoveries or 0) + 1
+    common.log("WARN", "Re-inspected pending action " .. kind .. " as resolved")
+    saveState("pending_recovered_" .. kind)
+    return true
+  end
+  if gpsConfig().autoResolvePending == false or not gpsCalibration() then return false, "GPS pending-action recovery is unavailable." end
+  local fix, fixError = locateGPS()
+  if not fix then return false, fixError end
+  local resolved, resolveError = geo.resolvePending(pending, fix, gpsCalibration())
+  if not resolved then return false, resolveError end
+  state.pose = poseCopy(resolved.pose)
+  state.pendingAction = nil
+  if resolved.outcome == "after" and common.startsWith(kind, "move_") then
+    state.stats.moves = (state.stats.moves or 0) + 1
+  end
+  state.stats.gpsRecoveries = (state.stats.gpsRecoveries or 0) + 1
+  state.stats.powerRecoveries = (state.stats.powerRecoveries or 0) + 1
+  state.gps.corrections = (state.gps.corrections or 0) + 1
+  common.log("WARN", "GPS resolved pending action " .. kind .. " as " .. resolved.outcome)
+  saveState()
+  return true
+end
+
+local function preflight()
+  if not os.getComputerLabel or not os.getComputerLabel() then
+    if os.setComputerLabel then os.setComputerLabel(config.workerName) end
+  end
   local opened, names = protocol.open()
   networkReady = opened
   if not opened then
@@ -224,53 +274,3 @@ local function atomicWrite(path, text)
   local temp, backup = path .. ".tmp", path .. ".bak"
   ensureDir(fs.getDir(path))
   if fs.exists(temp) then fs.delete(temp) end
-  local wrote, writeError = writeFile(temp, text)
-  if not wrote then return false, writeError end
-  local hadCurrent = fs.exists(path)
-  if hadCurrent then
-    if fs.exists(backup) then fs.delete(backup) end
-    local moved, moveError = moveChecked(path, backup)
-    if not moved then fs.delete(temp); return false, "Cannot rotate previous file: " .. moveError end
-  end
-  local moved, moveError = moveChecked(temp, path)
-  if not moved then
-    if fs.exists(path) then fs.delete(path) end
-    local restored = true
-    local restoreError
-    if hadCurrent and fs.exists(backup) then
-      restored, restoreError = moveChecked(backup, path)
-    elseif hadCurrent then
-      restored, restoreError = false, "backup is missing"
-    end
-    if fs.exists(temp) then fs.delete(temp) end
-    return false, "Atomic replace failed: " .. tostring(moveError) .. "; rollback: " .. tostring(restoreError or restored)
-  end
-  if fs.exists(backup) then fs.delete(backup) end
-  if fs.exists(temp) then fs.delete(temp) end
-  return true
-end
-local function readConfigRole()
-  local text = readFile(ROOT .. "/config.db")
-  if not text then return nil, "No existing installation found." end
-  if not textutils or type(textutils.unserialize) ~= "function" then return nil, "Cannot decode config.db." end
-  local ok, value = pcall(textutils.unserialize, text)
-  if not ok or type(value) ~= "table" then return nil, "Existing config.db is invalid." end
-  return tostring(value.role or ""), nil
-end
-local function validateAction()
-  local action = requested
-  if action == "" then action = ROLE end
-  if action ~= ROLE and action ~= "update" and action ~= "update-low-space" then
-    fail("This offline bundle is fixed to role " .. ROLE .. "; refusing action " .. tostring(action))
-  end
-  if action == "worker" and not turtle then fail("Worker installation requires a turtle.") end
-  if (action == "update" or action == "update-low-space") then
-    local configRole, configError = readConfigRole()
-    if not configRole then fail(configError) end
-    if configRole ~= ROLE then
-      fail("Refusing " .. action .. ": existing config role is " .. tostring(configRole)
-        .. ", but this bundle is fixed to " .. ROLE .. ".")
-    end
-  end
-  if action == "update" and fs.exists(LOW_SPACE_MARKER) then
-    fail("A low-space update is incomplete. Re-transfer the original "

@@ -1,3 +1,46 @@
+  if not text then return nil, "No existing installation found." end
+  if not textutils or type(textutils.unserialize) ~= "function" then return nil, "Cannot decode config.db." end
+  local ok, value = pcall(textutils.unserialize, text)
+  if not ok or type(value) ~= "table" then return nil, "Existing config.db is invalid." end
+  return tostring(value.role or ""), nil
+end
+local function validateAction()
+  local action = requested
+  if action == "" then action = ROLE end
+  if action ~= ROLE and action ~= "update" and action ~= "update-low-space" then
+    fail("This offline bundle is fixed to role " .. ROLE .. "; refusing action " .. tostring(action))
+  end
+  if action == "worker" and not turtle then fail("Worker installation requires a turtle.") end
+  if (action == "update" or action == "update-low-space") then
+    local configRole, configError = readConfigRole()
+    if not configRole then fail(configError) end
+    if configRole ~= ROLE then
+      fail("Refusing " .. action .. ": existing config role is " .. tostring(configRole)
+        .. ", but this bundle is fixed to " .. ROLE .. ".")
+    end
+  end
+  if action == "update" and fs.exists(LOW_SPACE_MARKER) then
+    fail("A low-space update is incomplete. Re-transfer the original "
+      .. "ccminer-offline-" .. ROLE .. ".lua and parts, then run update-low-space.")
+  end
+  return action
+end
+local function usage()
+  print("CC Miner V4 offline " .. ROLE .. " installer " .. VERSION .. " (schema " .. SCHEMA .. ")")
+  print("  ccminer-offline-" .. ROLE .. ".lua " .. ROLE)
+  print("  ccminer-offline-" .. ROLE .. ".lua update")
+  print("  ccminer-offline-" .. ROLE .. ".lua update-low-space")
+end
+
+local action = validateAction()
+if action == "" then usage(); return end
+if action == "update" then
+  term.clear(); term.setCursorPos(1, 1)
+  print("CC MINER V4 OFFLINE " .. string.upper(action) .. " / " .. ROLE); print("")
+  if fs.exists(TEMP) then fs.delete(TEMP) end
+  ensureDir(TEMP)
+  for index, file in ipairs(files) do
+    write(("[%d/%d] %s ... "):format(index, #files, file.target))
     local ok, writeError = writeFile(TEMP .. "/" .. file.target, file.content)
     if not ok then fs.delete(TEMP); fail(writeError) end
     print("OK")
@@ -207,21 +250,3 @@ if not moved then
   if fs.exists(ROOT) then fs.delete(ROOT) end
   local restored, restoreError = true, nil
   if hadRoot then
-    if fs.exists(BACKUP) then restored, restoreError = moveChecked(BACKUP, ROOT)
-    else restored, restoreError = false, "Backup directory is missing." end
-  end
-  if not restored then
-    fail("Install swap failed and rollback failed. Previous files remain at " .. BACKUP .. ": "
-      .. tostring(moveError) .. "; rollback: " .. tostring(restoreError))
-  end
-  fail("Install swap failed; previous installation was restored: " .. tostring(moveError))
-end
-print("")
-if action == "update" then
-  print("Offline update installed: " .. VERSION .. " (schema " .. SCHEMA .. ")")
-  print("Previous files: /ccminer.backup"); print("Run: reboot")
-else
-  local setupOk = shell.run(ROOT .. "/setup.lua", ROLE)
-  if not setupOk then printError("Setup did not complete. Run: " .. ROOT .. "/setup.lua " .. ROLE)
-  else print(""); print("Installation complete. Run: reboot") end
-end

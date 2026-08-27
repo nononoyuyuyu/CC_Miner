@@ -1,3 +1,44 @@
+  options.stripeFirst = options.stripeFirst ~= false
+  options.connected = true
+  options.balanced = true
+  options.requireConnected = true
+  if type(quarry.partitionGroup) == "function" then
+    local ok, raw, err = pcall(quarry.partitionGroup, catalog, specs, options)
+    if ok and raw then
+      local normalized, count = normalizeGroupAssignments(raw, specs)
+      local unassigned = raw and raw.unassigned
+      local hasUnassigned = type(unassigned) == "table" and ((#unassigned > 0) or next(unassigned) ~= nil)
+      if normalized and count == #specs and not hasUnassigned then return normalized, nil, raw end
+      if not err then err = count end
+    end
+  end
+  local mode = options.chunkMode == "world" and "world" or "local"
+  if mode ~= "world" and #specs > 1 then return nil, "local_group_partition_disabled" end
+  if #specs > 1 then return nil, "partitionGroup_required_for_multi_worker" end
+  if type(quarry.partitionChunks) ~= "function" then return nil, "group_partition_api_unavailable" end
+  local ids = {}
+  for _, spec in ipairs(specs) do ids[#ids + 1] = spec.workerId end
+  local ok, legacy = pcall(quarry.partitionChunks, catalog, ids)
+  if not ok or not legacy then return nil, tostring(legacy or "group_partition_api_unavailable") end
+  local normalized = {}
+  for _, spec in ipairs(specs) do
+    local value = legacy[spec.workerId] or legacy[tostring(spec.workerId)]
+    if type(value) ~= "table" then return nil, "legacy_partition_missing_worker_" .. tostring(spec.workerId) end
+    normalized[tostring(spec.workerId)] = {
+      workerId = spec.workerId,
+      chunkKeys = common.copy(value.chunkKeys or value.chunks or {}),
+      transitKeys = common.copy(value.transitKeys or {}),
+      seedKey = value.seedKey,
+      estimatedCost = tonumber(value.estimatedCost or value.cost or value.cells) or 0,
+      homeY = spec.homeY,
+    }
+  end
+  return normalized, nil, legacy
+end
+
+local function groupDraftDefaults(group)
+  local previous = db.lastDraft or {}
+  local workerIds = groupWorkerIds(group)
   local firstData = workerIds[1] and workerData(workerIds[1]) or nil
   local calibration = firstData and firstData.gps and firstData.gps.calibration
   local homeY = calibration and calibration.home and tonumber(calibration.home.y) or tonumber(firstData and firstData.homeY)
@@ -148,26 +189,3 @@ local function computeGroupPreflight(groupId, value)
         local homeCx, homeCz = math.floor(tonumber(gps.home.x) / 16), math.floor(tonumber(gps.home.z) / 16)
         local homeKey = quarry.chunkKey("world", homeCx, homeCz)
         spec.bayChunkKey = tostring(homeKey)
-        if not catalogWorldSet[tostring(homeKey)] then check("bay footprint:#" .. tostring(id), "bad", "worker bay entrance is outside common world footprint", true) end
-        local forwardX, forwardZ = tonumber(gps.home.x) + tonumber(gps.forward.x), tonumber(gps.home.z) + tonumber(gps.forward.z)
-        local forwardKey = quarry.chunkKey("world", math.floor(forwardX / 16), math.floor(forwardZ / 16))
-        if not catalogWorldSet[tostring(forwardKey)] then check("forward footprint:#" .. tostring(id), "bad", "worker bay forward entrance is outside common footprint", true) end
-        if tostring(homeKey) ~= tostring(forwardKey) then check("bay chunk:#" .. tostring(id), "bad", "worker home and forward entrance must share one bay chunk", true) end
-        if homeChunkOwners[tostring(homeKey)] then
-          check("bay chunk unique:#" .. tostring(id), "bad", "bay chunk already owned by worker #" .. tostring(homeChunkOwners[tostring(homeKey)]), true)
-        else
-          homeChunkOwners[tostring(homeKey)] = id
-        end
-        if type(quarry.inverseWorldToLocal) == "function" and referenceCalibration then
-          local okInverse, localForward = pcall(quarry.inverseWorldToLocal, referenceCalibration, forwardX, forwardZ)
-          if not okInverse or type(localForward) ~= "table" then
-            check("bay cell:#" .. tostring(id), "bad", "cannot rebase worker forward entrance to common catalog", true)
-          else
-            local forwardCell = false
-            for _, chunk in ipairs(catalog or {}) do
-              if tonumber(localForward.x) >= tonumber(chunk.minX) and tonumber(localForward.x) <= tonumber(chunk.maxX)
-                and tonumber(localForward.z) >= tonumber(chunk.minZ) and tonumber(localForward.z) <= tonumber(chunk.maxZ) then
-                forwardCell = tostring(chunk.key) == tostring(homeKey) or forwardCell
-              end
-            end
-            if not forwardCell then check("bay cell:#" .. tostring(id), "bad", "worker forward entrance is outside its bay chunk cells", true)

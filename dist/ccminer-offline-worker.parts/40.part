@@ -1,3 +1,55 @@
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_output", "waiting_output", err
+    saveState(); heartbeat(true); return false
+  end
+  if movementInterrupted("service") then return false end
+
+  ok, err = refuelAtHome()
+  if not ok then
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_fuel", "waiting_fuel", err
+    saveState(); heartbeat(true); return false
+  end
+  if movementInterrupted("service") then return false end
+
+  ok, err = refillSealAtHome()
+  if not ok then
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_seal", "waiting_seal", err
+    saveState(); heartbeat(true); return false
+  end
+  if movementInterrupted("service") then return false end
+
+  ok, err = refillTorchAtHome()
+  if not ok then
+    if err == "control_request" then return false end
+    state.status, state.phase, state.lastError = "waiting_torch", "waiting_torch", err
+    saveState("waiting_torch"); heartbeat(true); return false
+  end
+  if movementInterrupted("service") then return false end
+
+  if state.service.resumeAfter and (state.resumeToken or state.checkpoint) then
+    local token = state.resumeToken or state.checkpoint
+    local checkpoint = poseCopy(token)
+    checkpoint.dir = tonumber(token.dir) or checkpoint.dir
+    state.phase, state.status, state.lastError = "going_back", "working", nil
+    saveState("service_resume_start", true)
+    local preResumeGPS, preResumeError = verifyGPS(true)
+    if not preResumeGPS then markBlocked("GPS verification before resume failed: " .. tostring(preResumeError)); return false end
+    if state.job and state.job.strategy == "chunk_plan" then
+      ok, err = navigateChunkPlanWork(checkpoint, "service")
+    else
+      ok, err = navigateTo(checkpoint, "work", "service")
+    end
+    if not ok then
+      if err == "control_request" then return false end
+      markBlocked("Return to work point failed: " .. tostring(err))
+      return false
+    end
+    ok, err = turnTo(checkpoint.dir)
+    if not ok then markBlocked("Cannot restore work direction: " .. tostring(err)); return false end
+    if movementInterrupted("service") then return false end
+    local arrivedGPS, arrivedGPSError = verifyGPS(true)
     if not arrivedGPS then markBlocked("GPS verification after resume failed: " .. tostring(arrivedGPSError)); return false end
     if state.job and state.job.route then
       for _, key in ipairs({ "layer", "walkIndex", "localCursor", "phase", "currentKey" }) do
@@ -220,56 +272,3 @@ local function runChunkPlanStep(job)
   route.phase = route.phase or "travel"
   route.breadcrumbs = route.breadcrumbs or {}
   if route.currentKey and route.breadcrumbs[#route.breadcrumbs] ~= route.currentKey then
-    route.breadcrumbs[#route.breadcrumbs + 1] = route.currentKey
-    while #route.breadcrumbs > 128 do table.remove(route.breadcrumbs, 1) end
-  end
-
-  if route.walkIndex > #plan.walk then
-    if route.layer + 1 >= job.depth then completeJob("completed"); return end
-    local ok, err = moveOne("down", "mining")
-    if not ok then
-      if handleMoveFailure("Cannot descend to the next layer", err, true) then return end
-      markBlocked("Cannot descend to the next layer: " .. tostring(err))
-      return
-    end
-    route.layer = route.layer + 1
-    route.walkIndex, route.localCursor, route.phase = 1, 0, "travel"
-    route.currentKey = plan.rootKey
-    local layerGPS, layerGPSError = verifyGPS(true)
-    if not layerGPS then markBlocked("GPS verification after layer change failed: " .. tostring(layerGPSError)); return end
-    saveState()
-    return
-  end
-
-  local walkStep = plan.walk[route.walkIndex]
-  local chunk = plan.chunks[walkStep.key]
-  if not chunk then markBlocked("Chunk plan references an unknown chunk: " .. tostring(walkStep.key)); return end
-  local y = -route.layer
-  local anchor = { x = chunk.anchor.x, y = y, z = chunk.anchor.z }
-
-  if route.phase == "travel" then
-    local ok, err
-    if not quarry.findChunk(plan, state.pose.x, state.pose.z) then
-      -- The physical dock (0,0) is outside the quarry footprint.  The first
-      -- trip must bridge home -> dock and then follow the assigned
-      -- dock/transit BFS route, never a direct home -> seed shortcut.
-      ok, err = navigateChunkPlanWork(anchor, "mining")
-    elseif samePosePosition(state.pose, anchor) then
-      ok = true
-    elseif route.currentKey and route.currentKey ~= walkStep.key then
-      ok, err = moveBetweenChunkAnchors(plan, route.currentKey, walkStep.key, y, "mining")
-    else
-      ok, err = navigateTo(anchor, "inside", "mining")
-    end
-    if not ok then
-      if handleMoveFailure("Chunk transit failed", err, false) then return end
-      markBlocked("Chunk transit failed: " .. tostring(err)); return
-    end
-    route.currentKey = walkStep.key
-    if route.breadcrumbs[#route.breadcrumbs] ~= walkStep.key then
-      route.breadcrumbs[#route.breadcrumbs + 1] = walkStep.key
-      while #route.breadcrumbs > 128 do table.remove(route.breadcrumbs, 1) end
-    end
-    if walkStep.first then
-      route.phase, route.localCursor = "mine", 0
-    else

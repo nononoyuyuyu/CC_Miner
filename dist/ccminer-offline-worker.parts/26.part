@@ -1,3 +1,84 @@
+
+local function samePosePosition(a, b)
+  return tonumber(a and a.x) == tonumber(b and b.x)
+    and tonumber(a and a.y) == tonumber(b and b.y)
+    and tonumber(a and a.z) == tonumber(b and b.z)
+end
+
+-- A resume token is a durable route cursor, not merely a coordinate.  The
+-- service path may revisit a chunk anchor, so preserving layer/cursor/phase
+-- prevents mining the same cell twice after a return or a power loss.
+local function checkpointToken()
+  local token = {
+    pose = poseCopy(),
+    x = tonumber(state.pose and state.pose.x) or 0,
+    y = tonumber(state.pose and state.pose.y) or 0,
+    z = tonumber(state.pose and state.pose.z) or 0,
+    dir = (tonumber(state.pose and state.pose.dir) or 0) % 4,
+  }
+  local job = state.job
+  local route = job and job.route
+  if route then
+    token.layer = tonumber(route.layer) or 0
+    token.walkIndex = tonumber(route.walkIndex) or 1
+    token.localCursor = tonumber(route.localCursor) or 0
+    token.phase = route.phase or "travel"
+    token.currentKey = route.currentKey
+  end
+  token.cursor = job and tonumber(job.cursor) or nil
+  token.jobId = job and job.id or nil
+  return token
+end
+
+local function installCheckpointToken(token)
+  if type(token) ~= "table" then return end
+  state.resumeToken = common.copy(token)
+  state.checkpoint = common.copy(token)
+end
+
+local function beginPhysicalAction(kind, details, poseAfter)
+  if state.pendingAction then
+    return false, "An unresolved physical action is already recorded. Rehome the turtle before continuing."
+  end
+  state.pendingAction = {
+    kind = tostring(kind or "unknown"),
+    poseBefore = poseCopy(),
+    poseAfter = poseAfter and poseCopy(poseAfter) or nil,
+    details = details or {},
+    startedAt = common.nowSeconds(),
+  }
+  saveState()
+  return true
+end
+
+local function cancelPhysicalAction()
+  state.pendingAction = nil
+  state.journal = state.journal or {}
+  state.journal.lightweight = state.journal.lightweight or {}
+  state.journal.lightweight.force = true
+  saveState()
+end
+
+local function commitPhysicalAction()
+  state.pendingAction = nil
+  state.journal = state.journal or {}
+  state.journal.lightweight = state.journal.lightweight or {}
+  state.journal.lightweight.force = true
+  saveState()
+end
+
+local function isHome()
+  return state.pose.x == 0 and state.pose.y == 0 and state.pose.z == 0
+end
+
+local function distance(a, b)
+  a, b = a or state.pose, b or { x = 0, y = 0, z = 0 }
+  return math.abs((a.x or 0) - (b.x or 0))
+    + math.abs((a.y or 0) - (b.y or 0))
+    + math.abs((a.z or 0) - (b.z or 0))
+end
+
+local function inventoryStats()
   local used, empty, items = 0, 0, 0
   for slot = 1, 16 do
     local count = turtle.getItemCount(slot)
@@ -262,73 +343,3 @@ local function selectTorchMaterial()
   end
   return nil
 end
-
-local function gpsConfig()
-  config.gps = config.gps or {}
-  return config.gps
-end
-
-local function gpsCalibration()
-  local gpsSettings = gpsConfig()
-  if geo.validCalibration(gpsSettings.calibration) then return gpsSettings.calibration end
-  return nil
-end
-
-local function gpsSummary()
-  local calibration = gpsCalibration()
-  return {
-    enabled = gpsConfig().enabled ~= false,
-    required = gpsConfig().required == true,
-    available = state.gps and state.gps.available == true,
-    calibrated = calibration ~= nil,
-    calibration = calibration and common.copy(calibration) or nil,
-    lastFix = state.gps and common.copy(state.gps.lastFix) or nil,
-    lastFixAt = state.gps and state.gps.lastFixAt or nil,
-    lastError = state.gps and state.gps.lastError or nil,
-    corrections = state.gps and state.gps.corrections or 0,
-  }
-end
-
-local function jobSnapshot()
-  if not state.job then return nil end
-  local route = state.job.route
-  local layer, row, currentChunk
-  if state.job.strategy == "chunk_plan" and route then
-    layer = (tonumber(route.layer) or 0) + 1
-    currentChunk = route.currentKey
-  else
-    local cursor = tonumber(state.job.cursor) or 0
-    local rowWidth = math.max(1, tonumber(state.job.length) or 1)
-    local rowVolume = rowWidth * math.max(1, tonumber(state.job.width) or 1)
-    layer = math.floor(cursor / rowVolume) + 1
-    row = math.floor((cursor % rowVolume) / rowWidth) + 1
-  end
-  return {
-    id = state.job.id,
-    assignmentId = state.job.assignmentId,
-    groupJobId = state.job.groupJobId,
-    groupId = state.job.groupId,
-    bay = state.job.bay or state.job.bayId,
-    dock = state.job.dock and common.copy(state.job.dock) or nil,
-    seedKey = state.job.seedKey,
-    dockKey = state.job.dockKey,
-    lease = state.job.lease and common.copy(state.job.lease) or nil,
-    profile = state.job.profile,
-    name = state.job.name,
-    kind = state.job.kind,
-    strategy = state.job.strategy,
-    width = state.job.width,
-    length = state.job.length,
-    depth = state.job.depth,
-    targetY = state.job.targetY,
-    cursor = state.job.cursor or 0,
-    total = state.job.total or 0,
-    percent = common.percent(state.job.cursor or 0, state.job.total or 0),
-    startedAt = state.job.startedAt,
-    chunkMode = state.job.chunkMode,
-    excludedChunks = state.job.excludedChunks and #state.job.excludedChunks or 0,
-    currentLayer = layer,
-    currentRow = row,
-    currentChunk = currentChunk,
-    completedChunks = state.job.completedChunks or 0,
-    assignmentChunks = state.job.assignmentChunks and #state.job.assignmentChunks or 0,

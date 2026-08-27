@@ -1,3 +1,44 @@
+        -- Registry validation and coordinate normalization stay in the
+        -- controller.  Preserve every argument so legacy and extended
+        -- register forms remain compatible.
+        forwardController()
+      end
+    elseif command == "stop" then
+      local mode = string.lower(tostring(args[3] or ""))
+      local stopModes = {
+        now = "pause_now", row = "finish_row", layer = "finish_layer", home = "return_home",
+        pause_now = "pause_now", finish_row = "finish_row", finish_layer = "finish_layer",
+        return_home = "return_home", abort = "abort",
+      }
+      local controllerMode = stopModes[mode]
+      local valid = controllerMode ~= nil
+      if not tonumber(args[2]) or not valid then
+        reportError("Usage: ccm stop <id> <now|row|layer|home|abort>")
+      else
+        local forwarded = {}
+        for index = 1, #args do forwarded[index] = args[index] end
+        forwarded[3] = controllerMode
+        forwardController(forwarded)
+      end
+    else
+      forwardController()
+    end
+  end
+elseif command == "status" then
+  local config, configError = common.loadConfig()
+  if not config then reportError(configError or "Not configured."); return end
+  print("CC Miner " .. tostring(common.VERSION or ""))
+  print("Role: " .. tostring(config.role))
+  print("Computer ID: " .. tostring(os.getComputerID()))
+  print("Label: " .. tostring(os.getComputerLabel and os.getComputerLabel() or "-"))
+  if type(config.networkKey) == "string" and config.networkKey ~= "" then print("Network key: configured (masked)") else print("Network key: not configured") end
+  printStatusFeature("Profile", config.profile)
+  printStatusFeature("Lighting", config.lighting, config.lightMode)
+  printStatusFeature("Water", config.water, config.waterMode)
+  printStatusFeature("Materials", config.materials)
+  printStatusFeature("Staged stop", config.stagedStop)
+  if config.role == "worker" then
+    local state, stateError = common.loadTable(common.STATE_PATH, common.defaultState())
     if stateError then reportError(stateError) end
     print("Status: " .. tostring(state.status) .. " / " .. tostring(state.phase))
     if state.pose then print(("Pose: x=%s y=%s z=%s dir=%s"):format(state.pose.x, state.pose.y, state.pose.z, state.pose.dir)) end
@@ -219,45 +260,3 @@ local function atomicWrite(path, text)
   if fs.exists(backup) then fs.delete(backup) end
   if fs.exists(temp) then fs.delete(temp) end
   return true
-end
-local function readConfigRole()
-  local text = readFile(ROOT .. "/config.db")
-  if not text then return nil, "No existing installation found." end
-  if not textutils or type(textutils.unserialize) ~= "function" then return nil, "Cannot decode config.db." end
-  local ok, value = pcall(textutils.unserialize, text)
-  if not ok or type(value) ~= "table" then return nil, "Existing config.db is invalid." end
-  return tostring(value.role or ""), nil
-end
-local function validateAction()
-  local action = requested
-  if action == "" then action = ROLE end
-  if action ~= ROLE and action ~= "update" and action ~= "update-low-space" then
-    fail("This offline bundle is fixed to role " .. ROLE .. "; refusing action " .. tostring(action))
-  end
-  if action == "worker" and not turtle then fail("Worker installation requires a turtle.") end
-  if (action == "update" or action == "update-low-space") then
-    local configRole, configError = readConfigRole()
-    if not configRole then fail(configError) end
-    if configRole ~= ROLE then
-      fail("Refusing " .. action .. ": existing config role is " .. tostring(configRole)
-        .. ", but this bundle is fixed to " .. ROLE .. ".")
-    end
-  end
-  if action == "update" and fs.exists(LOW_SPACE_MARKER) then
-    fail("A low-space update is incomplete. Re-transfer the original "
-      .. "ccminer-offline-" .. ROLE .. ".lua and parts, then run update-low-space.")
-  end
-  return action
-end
-local function usage()
-  print("CC Miner V4 offline " .. ROLE .. " installer " .. VERSION .. " (schema " .. SCHEMA .. ")")
-  print("  ccminer-offline-" .. ROLE .. ".lua " .. ROLE)
-  print("  ccminer-offline-" .. ROLE .. ".lua update")
-  print("  ccminer-offline-" .. ROLE .. ".lua update-low-space")
-end
-
-local action = validateAction()
-if action == "" then usage(); return end
-if action == "update" then
-  term.clear(); term.setCursorPos(1, 1)
-  print("CC MINER V4 OFFLINE " .. string.upper(action) .. " / " .. ROLE); print("")
